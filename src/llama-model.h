@@ -330,6 +330,13 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+
+    // expert parallelism (LLAMA_EP): the routed experts are split by expert index across two
+    // devices. ffn_*_exps holds experts [0, n_expert_ep_a), ffn_*_exps_ep holds the rest.
+    struct ggml_tensor * ffn_gate_exps_ep  = nullptr;
+    struct ggml_tensor * ffn_down_exps_ep  = nullptr;
+    struct ggml_tensor * ffn_up_exps_ep    = nullptr;
+    int64_t n_expert_ep_a = 0;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -787,6 +794,12 @@ struct llama_model_base : public llama_model {
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
+    // routed-expert tensors, honoring an LLAMA_EP expert-parallel split for this layer
+    void create_tensor_down_exps(llama_layer & layer, int bid, int64_t n_ff_, int64_t n_embd_, int64_t n_expert_, int flags);
+    bool ep_split_layer(int bid) const;
+    void create_tensor_exps_ep(llama_layer & layer, int bid, llm_tensor type, const std::initializer_list<int64_t> & ne, int flags,
+            ggml_tensor *& t_a, ggml_tensor *& t_b);
+
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
 

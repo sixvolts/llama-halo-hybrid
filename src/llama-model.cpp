@@ -26,6 +26,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <climits>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -3112,9 +3113,113 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
     return create_tensor(*ml, tn, ne, flags);
 }
 
+// Expert parallelism (prototype). LLAMA_EP="<n_a>:<device_b>[:<first_layer>-<last_layer>]"
+// splits every routed-expert tensor of the selected layers by expert index: experts
+// [0, n_a) stay on the layer's device, [n_a, n_expert) go to device_b. Both halves are
+// read concurrently at runtime (see llm_graph_context::build_moe_ffn_ep_experts).
+struct llama_ep_config {
+    int64_t n_a = 0;
+    ggml_backend_dev_t dev_b = nullptr;
+    int first = 0;
+    int last  = INT_MAX;
+};
+
+static const llama_ep_config & llama_ep_cfg() {
+    static const llama_ep_config cfg = [] {
+        llama_ep_config c;
+        const char * env = getenv("LLAMA_EP");
+        if (!env || !*env) {
+            return c;
+        }
+        std::string s(env);
+        std::vector<std::string> parts;
+        size_t pos = 0;
+        while (true) {
+            size_t p = s.find(':', pos);
+            parts.push_back(s.substr(pos, p == std::string::npos ? std::string::npos : p - pos));
+            if (p == std::string::npos) break;
+            pos = p + 1;
+        }
+        if (parts.size() < 2) {
+            throw std::runtime_error("LLAMA_EP: expected <n_a>:<device>[:<first>-<last>]");
+        }
+        c.n_a   = std::stoll(parts[0]);
+        c.dev_b = ggml_backend_dev_by_name(parts[1].c_str());
+        if (!c.dev_b) {
+            throw std::runtime_error("LLAMA_EP: unknown device '" + parts[1] + "'");
+        }
+        if (parts.size() > 2) {
+            if (sscanf(parts[2].c_str(), "%d-%d", &c.first, &c.last) != 2) {
+                throw std::runtime_error("LLAMA_EP: bad layer range '" + parts[2] + "'");
+            }
+        }
+        LLAMA_LOG_INFO("%s: expert parallelism: experts [0,%lld) on layer device, [%lld,n_expert) on %s, layers %d-%d\n",
+                __func__, (long long) c.n_a, (long long) c.n_a, ggml_backend_dev_name(c.dev_b), c.first, c.last);
+        return c;
+    }();
+    return cfg;
+}
+
+bool llama_model_base::ep_split_layer(int bid) const {
+    const auto & c = llama_ep_cfg();
+    return c.n_a > 0 && bid >= c.first && bid <= c.last;
+}
+
+void llama_model_base::create_tensor_exps_ep(llama_layer & layer, int bid, llm_tensor type, const std::initializer_list<int64_t> & ne, int flags,
+        ggml_tensor *& t_a, ggml_tensor *& t_b) {
+    GGML_ASSERT(ml != nullptr);
+    const auto & c = llama_ep_cfg();
+    const int64_t n_expert_ = *(ne.begin() + 2);
+    GGML_ASSERT(c.n_a > 0 && c.n_a < n_expert_);
+
+    // a model without this tensor, or one whose context has no backend for device b (e.g. an
+    // MTP draft loaded with -devd on a single device), takes the normal path
+    bool has_dev_b = false;
+    for (const auto & d : devices) {
+        has_dev_b = has_dev_b || d.dev == c.dev_b;
+    }
+    if (!has_dev_b || ml->get_weight(tn(type, "weight", bid).str().c_str()) == nullptr) {
+        t_a = create_tensor(tn(type, "weight", bid), ne, flags);
+        t_b = nullptr;
+        return;
+    }
+
+    // LLAMA_EP_DEV_A: place slice a on this device instead of the layer's. With
+    // GGML_CUDA_DEVICES=3 the R9700 appears twice (ROCm0, ROCm2); giving slice a the second
+    // virtual device gives it its own stream so it can overlap slice b instead of queueing
+    // behind the merge that waits for b.
+    static ggml_backend_dev_t dev_a_override = [] {
+        const char * env = getenv("LLAMA_EP_DEV_A");
+        ggml_backend_dev_t d = env && *env ? ggml_backend_dev_by_name(env) : nullptr;
+        if (env && *env && !d) {
+            throw std::runtime_error(std::string("LLAMA_EP_DEV_A: unknown device '") + env + "'");
+        }
+        return d;
+    }();
+    ggml_backend_buffer_type_t buft_a = ggml_backend_dev_buffer_type(dev_a_override ? dev_a_override : pimpl->dev_layer.at(bid).dev);
+    ggml_backend_buffer_type_t buft_b = ggml_backend_dev_buffer_type(c.dev_b);
+
+    t_a = ml->create_tensor_expert_slice(hparams, tn(type, "weight", bid), 0,     c.n_a,             buft_a, /*count_as_created=*/ true);
+    t_b = ml->create_tensor_expert_slice(hparams, tn(type, "weight", bid), c.n_a, n_expert_ - c.n_a, buft_b, /*count_as_created=*/ false);
+    layer.n_expert_ep_a = c.n_a;
+}
+
+void llama_model_base::create_tensor_down_exps(llama_layer & layer, int bid, int64_t n_ff_, int64_t n_embd_, int64_t n_expert_, int flags) {
+    if (ep_split_layer(bid)) {
+        create_tensor_exps_ep(layer, bid, LLM_TENSOR_FFN_DOWN_EXPS, {n_ff_, n_embd_, n_expert_}, flags, layer.ffn_down_exps, layer.ffn_down_exps_ep);
+        return;
+    }
+    layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", bid), {n_ff_, n_embd_, n_expert_}, flags);
+}
+
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
     layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
     if (layer.ffn_gate_up_exps == nullptr) {
+        if (ep_split_layer(bid)) {
+            create_tensor_exps_ep(layer, bid, LLM_TENSOR_FFN_GATE_EXPS, {n_embd_, n_ff_, n_expert_}, flags, layer.ffn_gate_exps, layer.ffn_gate_exps_ep);
+            create_tensor_exps_ep(layer, bid, LLM_TENSOR_FFN_UP_EXPS,   {n_embd_, n_ff_, n_expert_}, flags, layer.ffn_up_exps,   layer.ffn_up_exps_ep);
+            return;
+        }
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
     }

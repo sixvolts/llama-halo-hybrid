@@ -1,4 +1,7 @@
 #include "models.h"
+
+#include <cstdlib>
+#include <string>
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -97,7 +100,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+        create_tensor_down_exps(layer, il, n_ff_exp, n_embd, n_expert, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
 
         // Shared experts
@@ -179,6 +182,16 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+    // DFlash tap experiment (env LLAMA_DFLASH_TAP): which tensor is exposed as "layer input" il.
+    //   unset/"resid": residual stream entering layer il (HF hidden_states[il]) -- the default
+    //   "norm":     attn_norm(resid) of layer il
+    //   "attnres":  layer il-1's post-attention residual (before its MoE block)
+    //   "postnorm": layer il-1's attn_post_norm output (normed pre-MoE)
+    //   "ffnout":   layer il-1's MoE output delta (before the residual add)
+    const char * tap_env = std::getenv("LLAMA_DFLASH_TAP");
+    const std::string tap_mode = tap_env ? tap_env : "resid";
+    ggml_tensor * prev_attnres = nullptr, * prev_postnorm = nullptr, * prev_ffnout = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
@@ -186,6 +199,16 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
+
+        if (tap_mode == "norm") {
+            res->t_layer_inp[il] = cur;
+        } else if (tap_mode == "attnres" && prev_attnres) {
+            res->t_layer_inp[il] = prev_attnres;
+        } else if (tap_mode == "postnorm" && prev_postnorm) {
+            res->t_layer_inp[il] = prev_postnorm;
+        } else if (tap_mode == "ffnout" && prev_ffnout) {
+            res->t_layer_inp[il] = prev_ffnout;
+        }
 
         ggml_build_forward_expand(gf, cur);
 
@@ -206,6 +229,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Residual connection
         cur = ggml_add(ctx0, cur, inpSA);
         cb(cur, "attn_residual", il);
+        prev_attnres = cur;
 
         // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
@@ -213,10 +237,12 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Post-attention norm
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
+        prev_postnorm = attn_post_norm;
 
         // MOE FFN layer
         cur = build_layer_ffn(attn_post_norm, il);
         cb(cur, "ffn_out", il);
+        prev_ffnout = cur;
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
@@ -294,6 +320,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
 
+    // K and V projections are built right after Q so the three matmuls of `cur` are adjacent
+    // in the graph (grouped mul_mat_vec_q quantizes the shared input once)
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    cb(Kcur, "Kcur", il);
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "Vcur", il);
+    ggml_build_forward_expand(gf, Qcur_full);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, Vcur);
+
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
@@ -302,12 +338,6 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
-
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-    cb(Kcur, "Kcur", il);
-
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
-    cb(Vcur, "Vcur", il);
 
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -383,14 +413,22 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * beta  = build_lora_mm(model.layers[il].ssm_beta,  cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+
+    // pin the four projections of `cur` -- qkv, z, beta, alpha -- adjacent in the graph so the
+    // CUDA backend can quantize the shared input once (grouped mul_mat_vec_q)
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, alpha);
+
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -453,8 +491,20 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    // q and k are adjacent head blocks of the same conv output: normalise both in one launch
+    // over a combined [head_k_dim, 2*num_k_heads] view and split the (contiguous) result.
+    // LLAMA_NO_GRAPH_FUSE=1 restores the two separate launches (A/B).
+    static const bool no_graph_fuse = getenv("LLAMA_NO_GRAPH_FUSE") != nullptr;
+    if (!no_graph_fuse) {
+        ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv * n_seq_tokens, 0);
+        qk_conv = ggml_l2_norm(ctx0, qk_conv, eps_norm);
+        q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);
+        k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], (size_t) num_k_heads * qk_conv->nb[1]);
+    } else {
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -512,7 +562,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr,
+            model.layers[il].ffn_up_exps_ep,
+            model.layers[il].ffn_gate_exps_ep,
+            model.layers[il].ffn_down_exps_ep,
+            model.layers[il].n_expert_ep_a);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation

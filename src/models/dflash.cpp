@@ -4,6 +4,8 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <cstdlib>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -74,6 +76,12 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
         hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+        // reference semantics: `is_causal = layer_type == "sliding_attention"` -- SWA layers are causal,
+        // the full-attention layers are bidirectional within the block. LLAMA_DFLASH_SWA_BIDIR=1 restores
+        // the previous (all-bidirectional) behaviour for A/B comparison.
+        hparams.swa_causal_override = std::getenv("LLAMA_DFLASH_SWA_BIDIR") == nullptr;
+        LLAMA_LOG_INFO("%s: dflash sliding-window layers are %s\n", __func__,
+                hparams.swa_causal_override ? "causal (reference semantics)" : "bidirectional (LLAMA_DFLASH_SWA_BIDIR)");
     }
 
     type = LLM_TYPE_UNKNOWN;

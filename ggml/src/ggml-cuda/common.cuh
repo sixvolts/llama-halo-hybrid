@@ -1412,7 +1412,13 @@ struct ggml_cuda_stream_context {
     }
 };
 
+static inline bool ggml_cuda_mmvq_group_disabled_env() {
+    static const bool v = getenv("GGML_CUDA_NO_MMVQ_GROUP") != nullptr;
+    return v;
+}
+
 struct ggml_backend_cuda_context {
+    const bool mmvq_group_disabled = ggml_cuda_mmvq_group_disabled_env();
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

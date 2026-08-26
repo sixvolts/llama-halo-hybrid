@@ -425,12 +425,22 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // LLAMA_PIPELINE_PARALLEL_FORCE=1: keep pipeline parallelism (and with it the
+        // scheduler's event-based split synchronisation) even when --override-tensor is
+        // used. Experiment: with -ot the scheduler falls back to blocking device syncs at
+        // every split boundary; on a 2-device asymmetric MoE layout that is 98 syncs/token.
+        static const bool pp_force = getenv("LLAMA_PIPELINE_PARALLEL_FORCE") != nullptr;
+        // expert parallelism (LLAMA_EP) puts cross-device inputs in every layer; n_copies=4 would
+        // multiply the compute buffers (9.5 GB seen) for no benefit now that the scheduler
+        // always uses events
+        static const bool ep_active = getenv("LLAMA_EP") != nullptr;
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            !ep_active &&
+            (pp_force || !model.has_tensor_overrides());
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {

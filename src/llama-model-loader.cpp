@@ -1070,38 +1070,60 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+ggml_context * llama_model_loader::ctx_for_buft(const llama_hparams & hparams, ggml_backend_buffer_type_t buft) {
+    auto it = ctx_map.find(buft);
+    if (it == ctx_map.end()) {
+        // one ggml context per buffer type
+        int max_n_tensors = n_tensors;
+        max_n_tensors += 1;                   // duplicated output tensor
+        max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+        if (files.empty()) {
+            max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
+        }
+        const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            throw std::runtime_error(format("failed to create ggml context"));
+        }
+
+        ctx_map.emplace(buft, ctx);
+
+        return ctx;
+    }
+    return it->second.get();
+}
+
+struct ggml_tensor * llama_model_loader::create_tensor_expert_slice(const llama_hparams & hparams, const LLM_TN_IMPL & tn,
+        int64_t first, int64_t n, ggml_backend_buffer_type_t buft, bool count_as_created) {
+    const std::string name = tn.str();
+    const llama_tensor_weight & w = require_weight(name.c_str());
+    const ggml_tensor * t_meta = w.tensor;
+    GGML_ASSERT(ggml_n_dims(t_meta) == 3 && ggml_is_contiguous(t_meta));
+    GGML_ASSERT(first >= 0 && n > 0 && first + n <= t_meta->ne[2]);
+
+    ggml_context * ctx = ctx_for_buft(hparams, buft);
+    ggml_tensor * t = ggml_new_tensor_3d(ctx, t_meta->type, t_meta->ne[0], t_meta->ne[1], n);
+    const std::string slice_name = name + "#ep" + std::to_string(first);
+    ggml_set_name(t, slice_name.c_str());
+
+    weights_map.emplace(slice_name, llama_tensor_weight(w.idx, w.offs + (size_t) first * t_meta->nb[2], t));
+    if (count_as_created) {
+        n_created++;
+    }
+    return t;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
-            // one ggml context per buffer type
-            int max_n_tensors = n_tensors;
-            max_n_tensors += 1;                   // duplicated output tensor
-            max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
-            if (files.empty()) {
-                max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
-            }
-            const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
-
-            ggml_init_params params = {
-                /*.mem_size   =*/ ctx_size,
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                throw std::runtime_error(format("failed to create ggml context"));
-            }
-
-            ctx_map.emplace(buft, ctx);
-
-            return ctx;
-        }
-        return it->second.get();
-    };
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * { return this->ctx_for_buft(hparams, buft); };
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {

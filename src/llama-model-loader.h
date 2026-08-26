@@ -36,6 +36,9 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        // a slice of a file tensor (expert parallelism): data starts at an explicit offset
+        llama_tensor_weight(uint16_t idx, size_t offs, ggml_tensor * tensor) : idx(idx), offs(offs), tensor(tensor) {}
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -187,6 +190,14 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // create a tensor holding experts [first, first + n) of the 3D expert tensor `tn` in the
+    // file, on buffer type `buft`. Used for expert parallelism. The expert axis is outermost,
+    // so the slice is a contiguous byte range of the original tensor.
+    struct ggml_tensor * create_tensor_expert_slice(const llama_hparams & hparams, const LLM_TN_IMPL & tn,
+            int64_t first, int64_t n, ggml_backend_buffer_type_t buft, bool count_as_created);
+
+    ggml_context * ctx_for_buft(const llama_hparams & hparams, ggml_backend_buffer_type_t buft);
 
     void done_getting_tensors(bool partial = false) const;
 
