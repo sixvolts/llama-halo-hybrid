@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1117,6 +1120,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                if (std::getenv("LLAMA_DFLASH_DUMP")) {
+                    // per-tap statistics of the first row in this chunk (env-gated debug aid)
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * row = features_buf.data() + k * (size_t) n_embd_tgt;
+                        double sum = 0, sq = 0, mx = 0; int nan = 0;
+                        for (int32_t j = 0; j < n_embd_tgt; ++j) {
+                            const float v = row[j];
+                            if (v != v) { nan++; continue; }
+                            sum += v; sq += (double) v * v; mx = std::max(mx, (double) std::fabs(v));
+                        }
+                        const double mean = sum / n_embd_tgt, rms = std::sqrt(sq / n_embd_tgt);
+                        LOG_INF("dflash-dump: seq %d chunk@%d tap %u (layer %d): mean %+.4f rms %.4f max %.3f nan %d  v[0..3] = %+.4f %+.4f %+.4f %+.4f\n",
+                                (int) seq_id, (int) offset, k, target_layer_ids[k], mean, rms, mx, nan, row[0], row[1], row[2], row[3]);
+                    }
+                }
+
+                if (const char * pfx = std::getenv("LLAMA_DFLASH_DUMP_FILE")) {
+                    // record: "F" n_chunk n_embd_enc, then n_chunk x (pos:int32, tok:int32, feats:float[n_embd_enc])
+                    FILE * fp = std::fopen((std::string(pfx) + ".feat.bin").c_str(), "ab");
+                    if (fp) {
+                        const int32_t hdr[3] = { (int32_t) 'F', n_chunk, n_embd_enc };
+                        std::fwrite(hdr, sizeof(int32_t), 3, fp);
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            const int32_t k = i_batch_beg[seq_id] + offset + i;
+                            const int32_t pos = batch_in.pos[k];
+                            const int32_t tok = batch_in.token ? batch_in.token[k] : -1;
+                            std::fwrite(&pos, sizeof(int32_t), 1, fp);
+                            std::fwrite(&tok, sizeof(int32_t), 1, fp);
+                            std::fwrite(features_buf.data() + (size_t) i * n_embd_enc, sizeof(float), n_embd_enc, fp);
+                        }
+                        std::fclose(fp);
+                    }
+                }
+
                 // fuse extracted features through DFlash encoder
                 llama_batch enc_batch = {
                     /*.n_tokens =*/ n_chunk,
@@ -1137,6 +1174,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+                if (std::getenv("LLAMA_DFLASH_DUMP")) {
+                    double sq = 0; int nan = 0;
+                    for (int32_t j = 0; j < n_embd_dec; ++j) { const float v = inp_g[j]; if (v != v) { nan++; continue; } sq += (double) v * v; }
+                    LOG_INF("dflash-dump: fused row0: rms %.4f nan %d  v[0..3] = %+.4f %+.4f %+.4f %+.4f  (n_chunk %d)\n",
+                            std::sqrt(sq / n_embd_dec), nan, inp_g[0], inp_g[1], inp_g[2], inp_g[3], (int) n_chunk);
+                }
 
                 // inject the DFlash decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
@@ -1267,6 +1310,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
 
+            if (const char * pfx = std::getenv("LLAMA_DFLASH_DUMP_FILE")) {
+                FILE * fp = std::fopen((std::string(pfx) + ".draft.txt").c_str(), "a");
+                if (fp) {
+                    std::fprintf(fp, "D %d %d %d", (int) seq_id, (int) dp.n_past, (int) dp.id_last);
+                    for (auto id : result) std::fprintf(fp, " %d", (int) id);
+                    std::fprintf(fp, "\n");
+                    std::fclose(fp);
+                }
+            }
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }

@@ -155,6 +155,27 @@ public:
     const int64_t n_embd = 0;
 };
 
+// expert parallelism: constant lookup tables mapping a global expert id to its local index
+// within expert slice a / slice b, or -1 when that slice does not serve the expert
+class llm_graph_input_ep_lut : public llm_graph_input_i {
+public:
+    llm_graph_input_ep_lut(int64_t n_expert, int64_t n_a) : n_expert(n_expert), n_a(n_a) {}
+    virtual ~llm_graph_input_ep_lut() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return true; // constant
+    }
+
+    ggml_tensor * lut_a = nullptr; // I32 [1, n_expert]
+    ggml_tensor * lut_b = nullptr; // I32 [1, n_expert]
+
+    const int64_t n_expert;
+    const int64_t n_a;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -1115,7 +1136,28 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * up_exps_ep   = nullptr,
+             ggml_tensor * gate_exps_ep = nullptr,
+             ggml_tensor * down_exps_ep = nullptr,
+                 int64_t   n_expert_a   = 0) const;
+
+    // expert parallelism: lookup tables shared by all split layers of this graph
+    mutable ggml_tensor * ep_lut_a   = nullptr;
+    mutable ggml_tensor * ep_lut_b   = nullptr;
+    mutable int64_t       ep_lut_n_a = 0;
+
+    // expert parallelism: run the gate/up/act/down chain on both expert slices concurrently
+    // and merge; returns [n_embd, n_expert_used, n_tokens] like the single-device down proj
+    ggml_tensor * build_moe_ffn_ep_experts(
+             ggml_tensor * cur,               // [n_embd, 1, n_tokens]
+             ggml_tensor * selected_experts,  // [n_expert_used, n_tokens] (i32)
+             ggml_tensor * up_a, ggml_tensor * gate_a, ggml_tensor * down_a,
+             ggml_tensor * up_b, ggml_tensor * gate_b, ggml_tensor * down_b,
+                 int64_t   n_expert_a,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+                     int   il) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1141,7 +1183,12 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             // expert parallelism: second expert slice on another device (see llama_layer)
+             ggml_tensor * up_exps_ep   = nullptr,
+             ggml_tensor * gate_exps_ep = nullptr,
+             ggml_tensor * down_exps_ep = nullptr,
+                 int64_t   n_expert_a   = 0) const;
 
     //
     // inputs

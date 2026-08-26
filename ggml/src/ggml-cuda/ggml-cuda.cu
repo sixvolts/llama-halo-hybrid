@@ -1976,6 +1976,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                GGML_ASSERT(expert_to_use >= 0 && "sparse expert ids (expert parallelism) are not supported on the mul_mat_id fallback path");
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
@@ -2472,6 +2473,54 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// Small cross-device copies as a push KERNEL instead of an SDMA-engine transfer.
+// The scheduler hands 12 KB activations between devices ~66 times per token on a two-GPU MoE
+// layout; each SDMA copy costs ~28 us on the APU side, almost all of it engine setup latency.
+// With peer access enabled the source device can write straight into the destination's
+// memory over PCIe (posted writes), and a 12 KB kernel write takes a few microseconds.
+// GGML_CUDA_KERNEL_COPY_MAX (bytes, default 262144) sets the threshold; 0 disables.
+static __global__ void k_peer_copy_bytes(const uint4 * __restrict__ src, uint4 * __restrict__ dst, const size_t n16) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n16) {
+        dst[i] = src[i];
+    }
+}
+
+static size_t ggml_cuda_kernel_copy_max() {
+    static const size_t v = [] {
+        const char * env = getenv("GGML_CUDA_KERNEL_COPY_MAX");
+        return env ? (size_t) atoll(env) : (size_t) 262144;
+    }();
+    return v;
+}
+
+static bool ggml_cuda_ensure_peer_access(int src_device, int dst_device) {
+    static bool enabled[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+    static bool failed [GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+    if (enabled[src_device][dst_device]) {
+        return true;
+    }
+    if (failed[src_device][dst_device]) {
+        return false;
+    }
+    int can = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&can, src_device, dst_device));
+    if (!can) {
+        failed[src_device][dst_device] = true;
+        return false;
+    }
+    ggml_cuda_set_device(src_device);
+    const cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
+    if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+        (void) cudaGetLastError();
+        failed[src_device][dst_device] = true;
+        return false;
+    }
+    (void) cudaGetLastError();
+    enabled[src_device][dst_device] = true;
+    return true;
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2510,7 +2559,36 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            static const bool lazy_inputs = getenv("GGML_SCHED_LAZY_INPUTS") != nullptr;
+            if (lazy_inputs) {
+                // With GGML_SCHED_LAZY_INPUTS a split may still be running on the destination device
+                // when this copy is issued, and the destination buffer may alias memory that work is
+                // using. Make the source stream wait for everything currently queued on the
+                // destination before copying. The copy itself stays on the source stream (HIP is
+                // happier that way), and the dst stream waits for it below as before.
+                if (!cuda_ctx_dst->copy_event) {
+                    ggml_cuda_set_device(cuda_ctx_dst->device);
+                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_dst->copy_event, cudaEventDisableTiming));
+                }
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->copy_event, cuda_ctx_dst->stream()));
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_dst->copy_event, 0));
+            }
+            const size_t nbytes = ggml_nbytes(dst);
+            const bool kernel_copy = nbytes <= ggml_cuda_kernel_copy_max() && nbytes % 16 == 0 &&
+                ((uintptr_t) src->data % 16 == 0) && ((uintptr_t) dst->data % 16 == 0) &&
+                ggml_cuda_ensure_peer_access(src_physical, dst_physical);
+            if (kernel_copy) {
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                const size_t n16 = nbytes / 16;
+                const int block = 256;
+                const int grid  = (int) ((n16 + block - 1) / block);
+                k_peer_copy_bytes<<<grid, block, 0, cuda_ctx_src->stream()>>>((const uint4 *) src->data, (uint4 *) dst->data, n16);
+                CUDA_CHECK(cudaGetLastError());
+            } else {
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, nbytes, cuda_ctx_src->stream()));
+            }
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -2579,6 +2657,22 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    // Keying the graph cache on the first node's address alone makes every batch width
+    // collide on a single entry. Workloads that alternate batch widths -- speculative
+    // decoding in particular, where the draft context sees a variable number of tokens per
+    // call -- then see ggml_cuda_graph_update_required() report a dst.ne change on node 0
+    // every call, which resets warmup and forces direct execution, so CUDA/HIP graphs never
+    // amortise. Mixing the first node's shape into the key gives each width its own captured
+    // graph. Measured on a 122B MoE + MTP draft: graph hits 10 -> 95 over the same run.
+    // Set GGML_CUDA_GRAPH_NO_SHAPE_KEY=1 to restore the previous behaviour.
+    static const bool no_shape_key = (getenv("GGML_CUDA_GRAPH_NO_SHAPE_KEY") != nullptr);
+    if (!no_shape_key && cgraph->n_nodes > 0 && cgraph->nodes[0]) {
+        uintptr_t k = (uintptr_t) cgraph->nodes[0];
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            k = k * 0x9E3779B97F4A7C15ull + (uintptr_t) cgraph->nodes[0]->ne[i];
+        }
+        return (const void *) k;
+    }
     return cgraph->nodes[0];
 }
 
@@ -3426,6 +3520,62 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // grouped mul_mat_vec_q: consecutive MUL_MATs that read the SAME activation vector
+    // (q/k/v of an attention layer, qkv/gate/beta/alpha of a Gated DeltaNet layer). Each would
+    // otherwise quantize src1 to q8_1 in its own launch; quantize once and reuse. On ROCm every
+    // launch costs ~10 us of host time, so this is worth 3-4 launches per layer.
+    // Gate/up pairs feeding a GLU are left to the dedicated fusion.
+    if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && !cuda_ctx->mmvq_group_disabled) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+        const ggml_tensor * src1 = node->src[1];
+        auto eligible = [&](const ggml_tensor * t) {
+            const ggml_tensor * w = t->src[0];
+            return t->op == GGML_OP_MUL_MAT && t->src[1] == src1 && t->type == GGML_TYPE_F32 &&
+                   ggml_is_quantized(w->type) && w->ne[2] == 1 && w->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                   w->buffer && ggml_backend_buft_is_cuda(w->buffer->buft) &&
+                   ggml_cuda_should_use_mmvq(w->type, cc, src1->ne[1]) &&
+                   !ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb, src1->ne[1], false);
+        };
+        if (eligible(node)) {
+            int idx[8];
+            int n = 1;
+            idx[0] = i;
+            for (int j = i + 1; j < cgraph->n_nodes && n < 8; ++j) {
+                const ggml_tensor * t = cgraph->nodes[j];
+                if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE) {
+                    continue; // reshapes between the matmuls are free
+                }
+                if (!eligible(t)) {
+                    break;
+                }
+                // (gate, up, GLU) is handled by the fused GLU path; do not split that triple
+                if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_GLU) {
+                    if (n >= 2 && idx[n - 1] == j - 1) {
+                        n--;
+                    }
+                    break;
+                }
+                idx[n++] = j;
+            }
+            if (n >= 2) {
+                cudaStream_t stream = cuda_ctx->stream();
+                const int64_t ne10 = src1->ne[0];
+                const int64_t ne11 = src1->ne[1];
+                const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+                const size_t  ts_src1 = ggml_type_size(src1->type);
+                ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+                quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), node->src[0]->type,
+                        ne10, src1->nb[1]/ts_src1, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, ne10_padded, ne11, 1, 1, stream);
+                for (int k = 0; k < n; ++k) {
+                    ggml_tensor * t = cgraph->nodes[idx[k]];
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, t->src[0], src1, nullptr, t, nullptr, src1_q8_1.get());
+                }
+                return idx[n - 1] - i;
+            }
         }
     }
 
@@ -4352,7 +4502,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
+    // The multi-device gate is lifted when GGML_CUDA_GRAPH_OPT_MULTI=1: the optimisation works
+    // per backend context on that context's own graph, and on a two-GPU MoE layout the
+    // ~1900 per-token dispatch gaps are the dominant idle (experiment, 2026-08-26).
+    static const bool allow_multi = getenv("GGML_CUDA_GRAPH_OPT_MULTI") != nullptr;
+    if (!use_cuda_graph || (!allow_multi && ggml_backend_cuda_get_device_count() != 1)) {
         return;
     }
 
