@@ -20,8 +20,9 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_tensor 
         const ggml_tensor * inj, int64_t n_embd, int64_t hc, int64_t nt,
         float s1, float b1, float s2, float b2, ggml_tensor * dst);
 
-// dst = x * sigmoid(g); g is either the same shape as x or a per-column scalar [1, ne1, ne2, ne3]
-void ggml_cuda_op_mul_sigmoid(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * g, ggml_tensor * dst);
+// dst = x * sigmoid(g) (+ y); g is either the same shape as x or a per-column scalar [1, ne1, ne2, ne3];
+// y, when given, is the same shape as x (the residual add that follows the shared-expert gate)
+void ggml_cuda_op_mul_sigmoid(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * g, const ggml_tensor * y, ggml_tensor * dst);
 
 // dst[i, t] = sum_c e[i, c, t] * w[c, t]   (MUL(e [ne0, m, nt], w [1, m, nt]) -> ADD over the m expert views)
 void ggml_cuda_op_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * e, const ggml_tensor * w,

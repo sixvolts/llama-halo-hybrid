@@ -144,11 +144,12 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_tensor 
             (float *) dst->data, n_embd, hc, nt, s1, b1, s2, b2);
 }
 
-static __global__ void k_mul_sigmoid(const float * x, const float * g, float * dst, block_q8_1 * q8, const int64_t n, const int64_t ne0, const bool g_per_col) {
+static __global__ void k_mul_sigmoid(const float * x, const float * g, const float * y, float * dst, block_q8_1 * q8, const int64_t n, const int64_t ne0, const bool g_per_col) {
     const int64_t stride = (int64_t) blockDim.x * gridDim.x;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
         const float gv = g_per_col ? g[i / ne0] : g[i];
-        const float r  = __fmul_rn(x[i], hc_sigmoid(gv));
+        float r  = __fmul_rn(x[i], hc_sigmoid(gv));
+        if (y) { r = __fadd_rn(y[i], r); }   // ADD(y, mul): same operand order as the separate kernel
         dst[i] = r;
         if (q8) { q8_side_store(q8, i, r); }
     }
@@ -182,13 +183,15 @@ static __global__ void k_gdn_gate(const float * x, const float * b, const float 
     }
 }
 
-void ggml_cuda_op_mul_sigmoid(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * g, ggml_tensor * dst) {
+void ggml_cuda_op_mul_sigmoid(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * g, const ggml_tensor * y, ggml_tensor * dst) {
     GGML_ASSERT(x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(g) && ggml_is_contiguous(dst));
+    GGML_ASSERT(!y || (y->type == GGML_TYPE_F32 && ggml_is_contiguous(y)));
     const bool per_col = g->ne[0] == 1 && x->ne[0] != 1;
     const int64_t n = ggml_nelements(dst);
-    block_q8_1 * q8 = ggml_cuda_q8_side_reserve(ctx, dst, n);
-    k_mul_sigmoid<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) x->data, (const float *) g->data, (float *) dst->data, q8, n, x->ne[0], per_col);
+    block_q8_1 * q8 = y ? nullptr : ggml_cuda_q8_side_reserve(ctx, dst, n);
+    k_mul_sigmoid<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) x->data, (const float *) g->data, y ? (const float *) y->data : nullptr,
+            (float *) dst->data, q8, n, x->ne[0], per_col);
 }
 
 void ggml_cuda_op_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * e, const ggml_tensor * w,
