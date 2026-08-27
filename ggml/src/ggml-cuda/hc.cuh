@@ -34,3 +34,23 @@ void ggml_cuda_op_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 // q8_1 side-copy registry (see ggml_backend_cuda_context::q8_side)
 void         ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx);   // call at graph-compute start, before capture
 const char * ggml_cuda_q8_side_find (ggml_backend_cuda_context & ctx, const ggml_tensor * src1);
+
+// reserve a q8_1 side buffer for `dst` (a single row of n elements); nullptr if not applicable
+block_q8_1 * ggml_cuda_q8_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t n);
+
+// quantise the value this thread just produced, exactly as quantize_q8_1 does: 32 consecutive
+// elements form a block; requires n % 32 == 0 and every lane of the 32-lane group active
+static __device__ __forceinline__ void q8_side_store(block_q8_1 * q8, const int64_t idx, const float v) {
+    float amax = fabsf(v);
+    float sum  = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    const int64_t ib  = idx / QK8_1;
+    const int     iqs = idx % QK8_1;
+    q8[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        q8[ib].ds = make_half2(d, sum);
+    }
+}

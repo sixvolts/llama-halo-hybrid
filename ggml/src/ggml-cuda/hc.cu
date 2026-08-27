@@ -31,7 +31,7 @@ void ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx) {
 }
 
 // reserve a q8_1 side buffer for `dst` if it is a single row of n elements; nullptr if not applicable
-static block_q8_1 * q8_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t n) {
+block_q8_1 * ggml_cuda_q8_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t n) {
     if (q8_side_disabled() || ctx.q8_arena == nullptr || n % QK8_1 != 0 || n > (int64_t) 65535 * HC_BLOCK) {
         return nullptr;
     }
@@ -62,22 +62,6 @@ const char * ggml_cuda_q8_side_find(ggml_backend_cuda_context & ctx, const ggml_
     return e.q8;
 }
 
-// quantise the value this thread just produced, exactly as quantize_q8_1 does: 32 consecutive
-// elements form a block; requires n % 32 == 0 and every lane of the group active
-static __device__ __forceinline__ void q8_side_store(block_q8_1 * q8, const int64_t idx, const float v) {
-    float amax = fabsf(v);
-    float sum  = v;
-    amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
-    const int64_t ib  = idx / QK8_1;
-    const int     iqs = idx % QK8_1;
-    q8[ib].qs[iqs] = q;
-    if (iqs == 0) {
-        q8[ib].ds = make_half2(d, sum);
-    }
-}
 
 static __global__ void k_scale_silu(const float * x, float * dst, block_q8_1 * q8, const float scale, const float bias, const int64_t n) {
     const int64_t stride = (int64_t) blockDim.x * gridDim.x;
@@ -136,7 +120,7 @@ void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor 
     memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
     memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
     const int64_t n = ggml_nelements(dst);
-    block_q8_1 * q8 = q8_side_reserve(ctx, dst, n);
+    block_q8_1 * q8 = ggml_cuda_q8_side_reserve(ctx, dst, n);
     k_scale_silu<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) src0->data, (float *) dst->data, q8, scale, bias, n);
 }
 
@@ -145,7 +129,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * xn
     GGML_ASSERT(xn->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(g) && ggml_is_contiguous(dst));
     const int64_t n = n_embd * nt;
-    block_q8_1 * q8 = nt == 1 ? q8_side_reserve(ctx, dst, n) : nullptr;
+    block_q8_1 * q8 = nt == 1 ? ggml_cuda_q8_side_reserve(ctx, dst, n) : nullptr;
     k_hc_mix<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) xn->data, (const float *) g->data, (float *) dst->data, q8,
             n_embd, hc, nt, scale, bias);
 }
@@ -203,7 +187,7 @@ void ggml_cuda_op_mul_sigmoid(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(g) && ggml_is_contiguous(dst));
     const bool per_col = g->ne[0] == 1 && x->ne[0] != 1;
     const int64_t n = ggml_nelements(dst);
-    block_q8_1 * q8 = q8_side_reserve(ctx, dst, n);
+    block_q8_1 * q8 = ggml_cuda_q8_side_reserve(ctx, dst, n);
     k_mul_sigmoid<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) x->data, (const float *) g->data, (float *) dst->data, q8, n, x->ne[0], per_col);
 }
 
