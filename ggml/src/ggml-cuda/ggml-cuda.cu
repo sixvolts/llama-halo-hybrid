@@ -3448,7 +3448,17 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
                 cgraph->nodes[k]->src[0]->op == GGML_OP_VIEW && hc_root(cgraph->nodes[k]->src[0]) == mul;
         if (!chain) {
             if (per_col && !hc_disjoint(cgraph->nodes[j], g)) { return 0; }
-            ggml_cuda_op_mul_sigmoid(*cuda_ctx, xn, g, cgraph->nodes[j]);
+            // trailing same-shape ADD(y, mul) with no other consumer of mul: fold it in (the shared-expert residual)
+            if (k < n && cgraph->nodes[k]->op == GGML_OP_ADD && hc_uses1(cgraph, j) && hc_views_belong(cgraph, j, k, { cgraph->nodes[j] })) {
+                ggml_tensor * add = cgraph->nodes[k];
+                const ggml_tensor * y = add->src[0] == mul ? add->src[1] : (add->src[1] == mul ? add->src[0] : nullptr);
+                if (y && y->type == GGML_TYPE_F32 && ggml_is_contiguous(y) && ggml_are_same_shape(y, add) && ggml_are_same_shape(add, mul) &&
+                        ggml_is_contiguous(add) && (per_col ? hc_disjoint(add, g) : true)) {
+                    ggml_cuda_op_mul_sigmoid(*cuda_ctx, xn, g, y, add);
+                    return k - i;
+                }
+            }
+            ggml_cuda_op_mul_sigmoid(*cuda_ctx, xn, g, nullptr, cgraph->nodes[j]);
             return j - i;
         }
         const ggml_tensor * add = cgraph->nodes[k];
