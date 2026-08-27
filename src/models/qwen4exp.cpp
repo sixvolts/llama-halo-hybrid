@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "ggml-backend.h"
+
 #include <cstdlib>
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
@@ -934,6 +936,11 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    // When the table lives in a host buffer the gather + dequant is done here
+    // instead of by a get_rows node, and fed as F32 [head_dim*n_heads, n_tokens].
+    // That keeps the 28 GB table out of the graph, so the scheduler no longer
+    // needs a CPU split (and a synchronising host->device copy) every token.
+    ggml_tensor * emb = nullptr;
 
     const llama_model_qwen4exp & pmodel;
 };
@@ -1044,6 +1051,18 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         h.next_pos = pos + 1;
     }
 
+    if (emb) {
+        const ggml_tensor * w  = pmodel.per_layer_tok_embd;
+        const auto *        tt = ggml_get_type_traits(w->type);   // same dequant the CPU get_rows uses
+        const int64_t       hd = hp.ple_head_dim;
+        std::vector<float> out(idx.size() * hd);
+        for (size_t r = 0; r < idx.size(); ++r) {
+            tt->to_float((const char *) w->data + (size_t) idx[r] * w->nb[1], out.data() + r*hd, hd);
+        }
+        ggml_backend_tensor_set(emb, out.data(), 0, out.size()*sizeof(float));
+        return;
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -1118,15 +1137,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model));
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
+    ggml_tensor * emb = nullptr;
+    const bool host_gather = model.per_layer_tok_embd->buffer != nullptr &&
+        ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer) &&
+        getenv("LLAMA_PLE_GET_ROWS") == nullptr;
+    if (host_gather) {
+        // table in host memory: gather on the host in set_input (see llm_graph_input_ple)
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows already lays the head dimension
-    // out slowest, matching the reference's flatten over the head axis
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-    emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+        // gather then flatten the heads: get_rows already lays the head dimension
+        // out slowest, matching the reference's flatten over the head axis
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    }
     cb(emb, "ple_embd", il);
 
     ggml_tensor * key   = build_lora_mm(model.layers[il].ple_key,   emb);

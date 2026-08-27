@@ -43,6 +43,19 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
     v.y = (c1 - 1) * d;
 }
 
+// Q4_0-style pair dequantiser for IQ4_NL (32-value blocks): low nibble -> element iqs, high -> iqs+16.
+// Lets get_rows use the generic 32-block gather for rows that are not a multiple of QK_K.
+static __device__ __forceinline__ void dequantize_iq4_nl_q(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_iq4_nl * x = (const block_iq4_nl *) vx;
+
+    const float d = x[ib].d;
+
+    const int vui = x[ib].qs[iqs];
+
+    v.x = d * kvalues_iq4nl[vui & 0xF];
+    v.y = d * kvalues_iq4nl[vui >> 4];
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

@@ -5405,6 +5405,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                         return true;
                     case GGML_TYPE_IQ4_NL:
+                        // gathered with the generic 32-block kernel (e.g. the 160-wide PLE n-gram table of qwen4exp)
+                        return op->src[0]->ne[0] % QK4_NL == 0;
                     case GGML_TYPE_MXFP4:
                         // 32-value sub-blocks, the row size does not guarantee
                         // the QK_K super-blocks the get_rows kernel iterates on
