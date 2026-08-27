@@ -30,3 +30,7 @@ void ggml_cuda_op_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tenso
 // dst = softplus(x + b[i % ne0]) * a[i % ne0]    (ADD -> UNARY(SOFTPLUS) -> MUL with per-row vectors)
 void ggml_cuda_op_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
         const ggml_tensor * a, ggml_tensor * dst);
+
+// q8_1 side-copy registry (see ggml_backend_cuda_context::q8_side)
+void         ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx);   // call at graph-compute start, before capture
+const char * ggml_cuda_q8_side_find (ggml_backend_cuda_context & ctx, const ggml_tensor * src1);

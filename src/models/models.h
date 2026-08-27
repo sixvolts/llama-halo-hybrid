@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+
 #include "llama-model.h"
 #include "llama-graph.h"
 #include "llama-model-loader.h"
@@ -2275,6 +2277,8 @@ struct llama_model_qwen35 : public llama_model_base {
 };
 
 
+class llm_graph_input_qsa;
+
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
@@ -2290,6 +2294,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
+        // one QSA input set per compress ratio, shared by every attention layer that uses it
+        std::unordered_map<uint32_t, llm_graph_input_qsa *> qsa_shared;
+
         graph(const llama_model & model, const llm_graph_params & params);
     private:
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]

@@ -441,21 +441,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
-    auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r);
+    // The index tensors depend only on the ubatch, the cache layout and the compress ratio, not on
+    // the layer: build one set per ratio and share it, so a decode step uploads them once instead
+    // of once per attention layer (each upload is a synchronous host->device copy).
+    llm_graph_input_qsa * inp = nullptr;
+    if (auto it = qsa_shared.find((uint32_t) r); it != qsa_shared.end()) {
+        inp = it->second;
+    }
+    if (inp == nullptr) {
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r);
+        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tps, n_stream);
 
-    qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-    qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-    qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-    qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tps, n_stream);
+        ggml_set_input(qsa->cell_blk);
+        ggml_set_input(qsa->blk_cells);
+        ggml_set_input(qsa->blk_pos);
+        ggml_set_input(qsa->bias);
 
-    ggml_set_input(qsa->cell_blk);
-    ggml_set_input(qsa->blk_cells);
-    ggml_set_input(qsa->blk_pos);
-    ggml_set_input(qsa->bias);
-
-    llm_graph_input_qsa * inp = qsa.get();
-    res->add_input(std::move(qsa));
+        inp = qsa.get();
+        qsa_shared[(uint32_t) r] = inp;
+        res->add_input(std::move(qsa));
+    }
 
     // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);

@@ -3792,12 +3792,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const int64_t ne11 = src1->ne[1];
                 const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
                 const size_t  ts_src1 = ggml_type_size(src1->type);
-                ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-                quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), node->src[0]->type,
-                        ne10, src1->nb[1]/ts_src1, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, ne10_padded, ne11, 1, 1, stream);
+                ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool());
+                const char * pre = ggml_cuda_q8_side_find(*cuda_ctx, src1);   // producer-side q8_1 copy, if any
+                if (!pre) {
+                    src1_q8_1.alloc(ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+                    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), node->src[0]->type,
+                            ne10, src1->nb[1]/ts_src1, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, ne10_padded, ne11, 1, 1, stream);
+                    pre = src1_q8_1.get();
+                }
                 for (int k = 0; k < n; ++k) {
                     ggml_tensor * t = cgraph->nodes[idx[k]];
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, t->src[0], src1, nullptr, t, nullptr, src1_q8_1.get());
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, t->src[0], src1, nullptr, t, nullptr, pre);
                 }
                 return idx[n - 1] - i;
             }
@@ -4623,6 +4628,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_q8_side_reset(*cuda_ctx);   // per-graph registry of producer-side q8_1 activation copies
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
