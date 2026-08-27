@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "hc.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1341,6 +1342,9 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     const char * src1_q8_1_d = src1_q8_1_pre;
+    if (!src1_q8_1_d && ne11 == 1 && ne12 == 1 && ne13 == 1) {
+        src1_q8_1_d = ggml_cuda_q8_side_find(ctx, src1);   // producer already wrote the q8_1 copy
+    }
     if (!src1_q8_1_d) {
         src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
