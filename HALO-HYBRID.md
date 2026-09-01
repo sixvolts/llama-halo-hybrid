@@ -25,7 +25,7 @@ llama-server -m model.gguf -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 \
 `-ot` may be given once only (llama.cpp keeps the last); join patterns with commas.
 For Qwen3.8-Flash-Next (unsloth GGUF: three expert tensors per layer) keep the 28.8 GB PLE n-gram
 table in host memory: `-ot 'blk\.(1[6-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU'`
-(hybrid-16: 4.6 GB dense + 16 expert layers on the R9700, 26.9 t/s before the fusions below; 34.4 t/s with everything in this document).
+(hybrid-16: 4.6 GB dense + 16 expert layers on the R9700, 26.9 t/s before the fusions below; 37.4 t/s with everything in this document, hybrid-14 36.7).
 The table's 16-row gather then runs on the host inside `set_input` (no CPU split, see below).
 It can also be placed on the APU (`per_layer_token_embd=ROCm1`) now that `get_rows` on IQ4_NL accepts
 160-wide rows — upstream's HIP backend declined those and silently fell back to a CPU gather of a
