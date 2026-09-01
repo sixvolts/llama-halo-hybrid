@@ -133,7 +133,31 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        int col2 = tid;
+        if constexpr (!has_fusion) {
+            // halo-hybrid: small-M shapes (512-row routers, 4-row hc inject) are latency-bound with one
+            // dependent load per trip; issue 4 loads per thread before using them. Same per-thread
+            // accumulation order as the plain loop below, so the result is bit-identical.
+            for (; col2 + 3*block_size < ncols2; col2 += 4*block_size) {
+                const float2 tx0 = x2[col2];
+                const float2 tx1 = x2[col2 +   block_size];
+                const float2 tx2 = x2[col2 + 2*block_size];
+                const float2 tx3 = x2[col2 + 3*block_size];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float2 * yj = y2 + j*stride_col_y2;
+                    const float2 ty0 = yj[col2];
+                    const float2 ty1 = yj[col2 +   block_size];
+                    const float2 ty2 = yj[col2 + 2*block_size];
+                    const float2 ty3 = yj[col2 + 3*block_size];
+                    ggml_cuda_mad(sumf[j], tx0.x, ty0.x); ggml_cuda_mad(sumf[j], tx0.y, ty0.y);
+                    ggml_cuda_mad(sumf[j], tx1.x, ty1.x); ggml_cuda_mad(sumf[j], tx1.y, ty1.y);
+                    ggml_cuda_mad(sumf[j], tx2.x, ty2.x); ggml_cuda_mad(sumf[j], tx2.y, ty2.y);
+                    ggml_cuda_mad(sumf[j], tx3.x, ty3.x); ggml_cuda_mad(sumf[j], tx3.y, ty3.y);
+                }
+            }
+        }
+        for (; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
             if constexpr (has_fusion) {
@@ -166,7 +190,28 @@ static __global__ void mul_mat_vec_f(
         }
 
         if (std::is_same_v<type_acc, float>) {
-            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+            int col2 = tid;
+            if constexpr (!has_fusion) {
+                for (; col2 + 3*block_size < ncols2; col2 += 4*block_size) {   // halo-hybrid: see the f32 path
+                    const float2 tx0 = __half22float2(x2[col2]);
+                    const float2 tx1 = __half22float2(x2[col2 +   block_size]);
+                    const float2 tx2 = __half22float2(x2[col2 + 2*block_size]);
+                    const float2 tx3 = __half22float2(x2[col2 + 3*block_size]);
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        const float2 * yj = y2 + j*stride_col_y2;
+                        const float2 ty0 = yj[col2];
+                        const float2 ty1 = yj[col2 +   block_size];
+                        const float2 ty2 = yj[col2 + 2*block_size];
+                        const float2 ty3 = yj[col2 + 3*block_size];
+                        ggml_cuda_mad(sumf[j], tx0.x, ty0.x); ggml_cuda_mad(sumf[j], tx0.y, ty0.y);
+                        ggml_cuda_mad(sumf[j], tx1.x, ty1.x); ggml_cuda_mad(sumf[j], tx1.y, ty1.y);
+                        ggml_cuda_mad(sumf[j], tx2.x, ty2.x); ggml_cuda_mad(sumf[j], tx2.y, ty2.y);
+                        ggml_cuda_mad(sumf[j], tx3.x, ty3.x); ggml_cuda_mad(sumf[j], tx3.y, ty3.y);
+                    }
+                }
+            }
+            for (; col2 < ncols2; col2 += block_size) {
                 const float2 tmpx = __half22float2(x2[col2]);
                 float2 tmpx_gate = make_float2(0.0f, 0.0f);
                 if constexpr (has_fusion) {
@@ -241,7 +286,25 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const int *) gate_x;
             }
         }
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        int col2 = tid;
+        if constexpr (!has_fusion) {
+            for (; col2 + 3*block_size < ncols2; col2 += 4*block_size) {   // halo-hybrid: see the f32 path
+                const int tx[4] = { x2[col2], x2[col2 + block_size], x2[col2 + 2*block_size], x2[col2 + 3*block_size] };
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float2 * yj = y2 + j*stride_col_y2;
+                    const float2 ty[4] = { yj[col2], yj[col2 + block_size], yj[col2 + 2*block_size], yj[col2 + 3*block_size] };
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const float tx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tx[u])[0]);
+                        const float tx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tx[u])[1]);
+                        ggml_cuda_mad(sumf[j], tx0, ty[u].x);
+                        ggml_cuda_mad(sumf[j], tx1, ty[u].y);
+                    }
+                }
+            }
+        }
+        for (; col2 < ncols2; col2 += block_size) {
             const int tmpx = x2[col2];
             int tmpx_gate = 0;
             if constexpr (has_fusion) {
