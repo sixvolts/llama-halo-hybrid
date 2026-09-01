@@ -25,7 +25,7 @@ llama-server -m model.gguf -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 \
 `-ot` may be given once only (llama.cpp keeps the last); join patterns with commas.
 For Qwen3.8-Flash-Next (unsloth GGUF: three expert tensors per layer) keep the 28.8 GB PLE n-gram
 table in host memory: `-ot 'blk\.(1[6-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU'`
-(hybrid-16: 4.6 GB dense + 16 expert layers on the R9700, 26.9 t/s before the fusions below).
+(hybrid-16: 4.6 GB dense + 16 expert layers on the R9700, 26.9 t/s before the fusions below; 34.4 t/s with everything in this document).
 The table's 16-row gather then runs on the host inside `set_input` (no CPU split, see below).
 It can also be placed on the APU (`per_layer_token_embd=ROCm1`) now that `get_rows` on IQ4_NL accepts
 160-wide rows — upstream's HIP backend declined those and silently fell back to a CPU gather of a
@@ -44,6 +44,7 @@ is a split either way and measured ~0.7 t/s slower than the host gather.
 | `ggml/src/ggml-cuda/hc.cu`, `mmvq.cu`, `norm.cu` | **q8_1 side copies**: a fused kernel that produces a single-row f32 activation also writes its q8_1 quantisation (same `warp_reduce` arithmetic as `quantize_q8_1`, so identical bits) into a per-graph arena; `mul_mat_vec_q` consumers (plain, GLU-fused, grouped) pick it up by data pointer, validated against the producing tensor, instead of launching a quantise kernel | `GGML_CUDA_NO_Q8_SIDE=1` |
 | `src/models/qwen4exp.cpp` | graph tidy-ups for the same model: no copy of stream 0 in the hyper-connection sum, strided `cpy` for the conv-state tail, same-input projections pinned adjacent (grouped `mul_mat_vec_q`), norm-weight view hoisted so `rms_norm+mul` fuses, one `l2_norm` over q and k, **one QSA/KV-index input set shared by all attention layers** (was one synchronous host→device upload per layer per token) | `LLAMA_NO_GRAPH_FUSE=1` (l2_norm) |
 | `src/models/qwen4exp.cpp`, `ggml/src/ggml-cuda/getrows.cu`, `dequantize.cuh`, `ggml-cuda.cu` | **PLE n-gram table**: with the table in a host buffer the 16-row gather + dequant runs on the host in `set_input` (same `to_float` as the CPU `get_rows`, bit-identical) and is fed as an F32 input, instead of a `get_rows` node that forced a CPU split with a synchronising host→device copy each token (72 → 70 splits, 33.9 → 33.0 ms/token cold decode). `get_rows` on IQ4_NL uses the generic 32-block gather, so the table may also live on a GPU | `LLAMA_PLE_GET_ROWS=1` (in-graph gather) |
+| `src/models/qwen4exp.cpp` | **graph reuse**: the model's two custom inputs (QSA block/bias tensors, PLE rows/embedding) implement `can_reuse`, so the 7k-node decode graph is rebuilt only when the token count, KV span, stream count or block count changes instead of for every token (`graphs reused = 0` → 94/95). Bit-identical; cold decode 33.0 → 29.3 ms/token, server hybrid-14 31.1 → 34.1 t/s, hybrid-16 @16k 31.4 → 34.4 | `LLAMA_GRAPH_REUSE_DISABLE=1` |
 | `src/models/dflash.cpp`, `src/llama-hparams.h`, `src/llama-graph.cpp` | DFlash drafts run their sliding-window layers **causally**, as the z-lab reference does (`is_causal = layer_type == "sliding_attention"`); upstream ran every draft layer bidirectionally. Verified token-for-token against the reference PyTorch draft | `LLAMA_DFLASH_SWA_BIDIR=1` |
 
 ## Changes, off by default (experiments kept behind env vars)

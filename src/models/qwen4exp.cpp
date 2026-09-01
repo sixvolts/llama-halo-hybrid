@@ -410,6 +410,32 @@ public:
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio);
     }
 
+    // The graph can be reused when every tensor built here would come out with the
+    // same shape for the new ubatch: token count, KV span, streams and block count.
+    // Without this the base class answers "no" and the whole 7k-node graph is rebuilt
+    // and re-scheduled for every decoded token.
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * mctx_new = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        if (mctx_new == nullptr || mctx_new->get_idx() == nullptr) {
+            return false;
+        }
+        this->mctx = mctx_new;
+
+        const int64_t n_tokens = params.ubatch.n_tokens;
+        const int64_t n_kv     = mctx_new->get_idx()->get_n_kv();
+        const int64_t ns       = mctx_new->get_n_stream();
+        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+
+        bool res = true;
+        res &= ns > 0 && n_tokens % ns == 0;
+        res &= k_idxs->ne[0]    == n_tokens;
+        res &= cell_blk->ne[0]  == n_kv && cell_blk->ne[1] == ns;
+        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks && blk_cells->ne[1] == ns;
+        res &= blk_pos->ne[0]   == 4*n_blocks*ns;
+        res &= bias->ne[0] == n_kv && (ns > 0 && bias->ne[1] == n_tokens/ns) && bias->ne[2] == ns;
+        return res;
+    }
+
     // Per-stream: a cell index means a different token in each stream. n_stream 1 = the old shapes.
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
@@ -934,6 +960,15 @@ public:
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    // shapes depend on the token count only; the hash itself is recomputed in set_input
+    bool can_reuse(const llm_graph_params & params) override {
+        const int64_t n_tokens = params.ubatch.n_tokens;
+        if (emb) {
+            return emb->ne[1] == n_tokens;
+        }
+        return rows != nullptr && rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * n_tokens;
+    }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
     // When the table lives in a host buffer the gather + dequant is done here
