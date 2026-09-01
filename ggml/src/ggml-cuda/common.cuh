@@ -1412,7 +1412,13 @@ struct ggml_cuda_stream_context {
     }
 };
 
+static inline bool ggml_cuda_mmvq_group_disabled_env() {
+    static const bool v = getenv("GGML_CUDA_NO_MMVQ_GROUP") != nullptr;
+    return v;
+}
+
 struct ggml_backend_cuda_context {
+    const bool mmvq_group_disabled = ggml_cuda_mmvq_group_disabled_env();
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
@@ -1433,6 +1439,16 @@ struct ggml_backend_cuda_context {
     // a cuda graph instance is only valid for the shapes it captured, so a caller that
     // alternates shapes needs one instance per shape to stay on the graph path
     static const size_t max_cuda_graphs = 64;
+
+    // q8_1 side copies of single-row f32 activations, written by the fused kernels in hc.cu in the
+    // same launch that produces the f32 value, and consumed by mul_mat_vec_q instead of a separate
+    // quantize launch. Keyed by data pointer, validated against the producing tensor; reset per
+    // graph compute. GGML_CUDA_NO_Q8_SIDE=1 disables.
+    struct q8_side_entry { const ggml_tensor * prod; const char * q8; int64_t ne0; };
+    std::unordered_map<const void *, q8_side_entry> q8_side;
+    char * q8_arena = nullptr;
+    size_t q8_arena_size = 0;
+    size_t q8_arena_used = 0;
 
     int64_t last_graph_eviction_sweep = 0;
 

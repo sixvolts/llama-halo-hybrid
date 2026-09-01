@@ -167,6 +167,12 @@ struct llama_hparams {
     // note: using uint32_t type for compatibility reason
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_swa_impl;
 
+    // DFlash drafters (z-lab reference `Qwen3DFlashAttention`): sliding-window layers are *causal*
+    // and only the full-attention layers are bidirectional, even though the draft context runs with
+    // causal_attn = false for the noise block. When set, the SWA kq mask is built causal regardless
+    // of cparams.causal_attn.
+    bool swa_causal_override = false;
+
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;
 
