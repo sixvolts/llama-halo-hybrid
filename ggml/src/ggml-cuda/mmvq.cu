@@ -523,6 +523,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_RDNA4) {
+        // halo-hybrid: small-K rows-per-block mode on RDNA4 (K=2560 rows took 2 loop trips + an 8-warp reduction)
+        return (ncols_dst == 1 && small_k) ? nwarps : 1;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -540,6 +544,19 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
         }
     }
     return 1;
+}
+
+// halo-hybrid: upstream disables the small-K rows-per-block mode on every RDNA part. On RDNA4
+// (R9700, gfx1201) it is what fixes short-K matvecs: a Q8_0 [10240 x 320] row went from 23 us
+// (150 GB/s, one 256-thread block per row doing one loop trip) to 7 us (490 GB/s), and the
+// large-K shapes are unchanged within 1%. Measured -6% per decoded token on Qwen3.8-Flash-Next.
+// GGML_CUDA_MMVQ_NO_SMALLK=1 restores the upstream behaviour.
+static bool ggml_cuda_mmvq_rdna4_small_k() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_MMVQ_NO_SMALLK");
+        return env == nullptr || atoi(env) == 0;
+    }();
+    return enabled;
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
@@ -977,7 +994,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
+                (GGML_CUDA_CC_IS_RDNA(cc) && !(GGML_CUDA_CC_IS_RDNA4(cc) && ggml_cuda_mmvq_rdna4_small_k()))) {
             use = false;
         }
 
