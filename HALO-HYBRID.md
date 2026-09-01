@@ -45,6 +45,8 @@ is a split either way and measured ~0.7 t/s slower than the host gather.
 | `src/models/qwen4exp.cpp` | graph tidy-ups for the same model: no copy of stream 0 in the hyper-connection sum, strided `cpy` for the conv-state tail, same-input projections pinned adjacent (grouped `mul_mat_vec_q`), norm-weight view hoisted so `rms_norm+mul` fuses, one `l2_norm` over q and k, **one QSA/KV-index input set shared by all attention layers** (was one synchronous host→device upload per layer per token) | `LLAMA_NO_GRAPH_FUSE=1` (l2_norm) |
 | `src/models/qwen4exp.cpp`, `ggml/src/ggml-cuda/getrows.cu`, `dequantize.cuh`, `ggml-cuda.cu` | **PLE n-gram table**: with the table in a host buffer the 16-row gather + dequant runs on the host in `set_input` (same `to_float` as the CPU `get_rows`, bit-identical) and is fed as an F32 input, instead of a `get_rows` node that forced a CPU split with a synchronising host→device copy each token (72 → 70 splits, 33.9 → 33.0 ms/token cold decode). `get_rows` on IQ4_NL uses the generic 32-block gather, so the table may also live on a GPU | `LLAMA_PLE_GET_ROWS=1` (in-graph gather) |
 | `src/models/qwen4exp.cpp` | **graph reuse**: the model's two custom inputs (QSA block/bias tensors, PLE rows/embedding) implement `can_reuse`, so the 7k-node decode graph is rebuilt only when the token count, KV span, stream count or block count changes instead of for every token (`graphs reused = 0` → 94/95). Bit-identical; cold decode 33.0 → 29.3 ms/token, server hybrid-14 31.1 → 34.1 t/s, hybrid-16 @16k 31.4 → 34.4 | `LLAMA_GRAPH_REUSE_DISABLE=1` |
+| `ggml/src/ggml-cuda/mmvq.cu` | **small-K matvec mode on RDNA4**: upstream disables `mul_mat_vec_q`'s rows-per-block ("small_k") mode on every RDNA part, so a short-K row (Qwen3.8's 96 hyper-connection up-projections/token are Q8_0 [10240 × 320]) ran as one 256-thread block per row doing a single loop trip: 23 µs, 150 GB/s. Enabled for RDNA4: 7 µs, 490 GB/s; K=640 shared-expert down 6.3 → 3.5 µs; large-K shapes unchanged within 1%. Bit-identical; cold decode 29.1 → 27.3 ms/token (−6%) | `GGML_CUDA_MMVQ_NO_SMALLK=1` |
+| `ggml/src/ggml-cuda/mmvf.cu` | **load pipelining in the f32/f16/bf16 matvec**: the per-row loop issued one dependent load per trip, which is fine for wide launches but latency-bound for the few-row shapes here (48 f32 routers [512 × 2560] at 25 µs / 210 GB/s, the 4-row hyper-connection inject at 6 µs, ssm alpha/beta). Four loads in flight per thread with the same per-thread accumulation order (bit-identical); cold decode 27.3 → 26.8 ms/token (−2%). Batched `test-backend-ops` cannot see this shape effect (it hides launch latency), only the real run does | none (unfused path only) |
 | `src/models/dflash.cpp`, `src/llama-hparams.h`, `src/llama-graph.cpp` | DFlash drafts run their sliding-window layers **causally**, as the z-lab reference does (`is_causal = layer_type == "sliding_attention"`); upstream ran every draft layer bidirectionally. Verified token-for-token against the reference PyTorch draft | `LLAMA_DFLASH_SWA_BIDIR=1` |
 
 ## Changes, off by default (experiments kept behind env vars)
@@ -60,6 +62,13 @@ is a split either way and measured ~0.7 t/s slower than the host gather.
 | `LLAMA_DFLASH_TAP=norm\|attnres\|postnorm\|ffnout` | expose an alternative tensor as the DFlash "layer input" in `qwen35moe.cpp` | diagnostics; all collapse |
 
 ## Notes
+
+Benchmarking note: `test-backend-ops perf` replays one weight tensor, so anything under the R9700's 64 MB
+infinity cache reports cache bandwidth (1.4 TB/s for a 62 MB Q8_0 matrix). `TBO_Q38_SHAPES=1` adds this
+model's decode shapes as 64-matrix batches (working sets of 0.1–3.5 GB) to `tests/test-backend-ops.cpp`;
+even then, per-launch latency effects only show up in the real decode (rocprofv3 kernel trace, grid size
+identifies the tensor). HIP graphs must stay on (`GGML_CUDA_DISABLE_GRAPHS=1` costs 8–40%); the DPM
+`high` perf level caps the R9700 core clock at 2.3 GHz and is 9% slower than `auto`; `profile_peak` is neutral.
 
 * Measurement drift on this box is ~3% within a session and larger across memory-state
   changes (page cache, TTM pool, fragmentation); always A/B by alternating in one session.
