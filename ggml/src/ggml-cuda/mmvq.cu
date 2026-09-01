@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "hc.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -522,6 +523,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_RDNA4) {
+        // halo-hybrid: small-K rows-per-block mode on RDNA4 (K=2560 rows took 2 loop trips + an 8-warp reduction)
+        return (ncols_dst == 1 && small_k) ? nwarps : 1;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -539,6 +544,19 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
         }
     }
     return 1;
+}
+
+// halo-hybrid: upstream disables the small-K rows-per-block mode on every RDNA part. On RDNA4
+// (R9700, gfx1201) it is what fixes short-K matvecs: a Q8_0 [10240 x 320] row went from 23 us
+// (150 GB/s, one 256-thread block per row doing one loop trip) to 7 us (490 GB/s), and the
+// large-K shapes are unchanged within 1%. Measured -6% per decoded token on Qwen3.8-Flash-Next.
+// GGML_CUDA_MMVQ_NO_SMALLK=1 restores the upstream behaviour.
+static bool ggml_cuda_mmvq_rdna4_small_k() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_MMVQ_NO_SMALLK");
+        return env == nullptr || atoi(env) == 0;
+    }();
+    return enabled;
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
@@ -580,6 +598,13 @@ static __global__ void mul_mat_vec_q(
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
+
+    // expert parallelism: a negative expert id marks a slot not served by this expert slice.
+    // Compute against expert 0 (uniform per block, cache-resident) and write zeros.
+    const bool ep_zero_row = ncols_dst == 1 && ids && (int32_t) channel_x < 0;
+    if (ep_zero_row) {
+        channel_x = 0;
+    }
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
@@ -657,7 +682,8 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    // expert parallelism: skipped slot -> no work, zeros are written below
+    for (int kbx = tid / (qi/vdr); kbx < (ep_zero_row ? 0 : blocks_per_row_x); kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -756,7 +782,7 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+                dst[j*stride_col_dst + i] = ep_zero_row ? 0.0f : result;
             }
         }
     }
@@ -829,8 +855,14 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+
+    // expert parallelism: negative id -> this slice does not serve the slot, output zeros
+    const bool ep_zero_row = (int32_t) channel_x < 0;
+    if (ep_zero_row) {
+        channel_x = 0;
+    }
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
@@ -839,7 +871,8 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    // expert parallelism: skipped slot -> no work, zeros are written below
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < (ep_zero_row ? 0 : blocks_per_row_x); kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
@@ -1058,7 +1091,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
+                (GGML_CUDA_CC_IS_RDNA(cc) && !(GGML_CUDA_CC_IS_RDNA4(cc) && ggml_cuda_mmvq_rdna4_small_k()))) {
             use = false;
         }
 
@@ -1345,7 +1378,7 @@ static void mul_mat_vec_q_switch_type(
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const char * src1_q8_1_pre) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1423,12 +1456,18 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const char * src1_q8_1_d = src1_q8_1_pre;
+    if (!src1_q8_1_d && ne11 == 1 && ne12 == 1 && ne13 == 1) {
+        src1_q8_1_d = ggml_cuda_q8_side_find(ctx, src1);   // producer already wrote the q8_1 copy
+    }
+    if (!src1_q8_1_d) {
+        src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        src1_q8_1_d = src1_q8_1.get();
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1454,7 +1493,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

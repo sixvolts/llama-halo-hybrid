@@ -331,7 +331,9 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
+    // s_copy has no buffer when the single-slot fast path in build_rs replaced the gather with
+    // a view (no node consumes it, so it is never allocated); the identity map needs no writing
+    if (s_copy && s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
@@ -629,7 +631,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
-        mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+        mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn || hparams.swa_causal_override);
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -696,7 +698,7 @@ void llm_graph_input_attn_k_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
-        mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+        mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn || hparams.swa_causal_override);
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -1099,7 +1101,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) { // unallocated when build_rs took the view fast path
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1143,7 +1145,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) { // unallocated when build_rs took the view fast path
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1217,7 +1219,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) { // unallocated when build_rs took the view fast path
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -3477,6 +3479,24 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   n_seqs,
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
+
+    // Single-slot fast path: when every sequence in the batch reads the state cell it will
+    // write back to (the copy map is the identity), nothing must be zeroed and there are no
+    // extra cells to shuffle, the gather is a plain view of the cache rows -- two launches
+    // fewer per recurrent layer at batch 1. s_copy() is side-effect free only without
+    // rollback slots (n_rs_seq == 0), so the check is limited to that case.
+    static const bool no_graph_fuse = getenv("LLAMA_NO_GRAPH_FUSE") != nullptr;
+    if (!no_graph_fuse && cparams.n_rs_seq == 0 && kv_state->get_rs_z() < 0 && kv_state->get_n_rs() == (uint32_t) n_seqs) {
+        const uint32_t head = kv_state->get_head();
+        bool identity = true;
+        for (int32_t i = 0; i < n_seqs && identity; ++i) {
+            identity = kv_state->s_copy(i) == (int32_t) (head + i);
+        }
+        if (identity) {
+            ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+            return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], (size_t) head * states->nb[1]);
+        }
+    }
 
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),

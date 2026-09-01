@@ -796,6 +796,7 @@ struct ggml_backend_sched {
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
+    int                 * hv_tensor_split_ids;   // [hash_set.size] split that produced the tensor (GGML_SCHED_LAZY_INPUTS)
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
 
     int * node_backend_ids; // [graph_size]
@@ -1323,6 +1324,41 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+
+            // GGML_SCHED_LAZY_INPUTS=1: a split waits for ALL of its cross-backend inputs before any of
+            // it runs. When a node consumes an activation produced by the immediately preceding split
+            // (on another backend) and the current split already holds work that does not depend on
+            // it, cut the split here so that work is enqueued -- and overlaps the producer -- instead
+            // of queueing behind the wait. Inputs consumed by a split's first node are unaffected.
+            static const bool lazy_inputs = getenv("GGML_SCHED_LAZY_INPUTS") != nullptr;
+            if (lazy_inputs && node_backend_id == cur_backend_id && i > split->i_start) {
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src == NULL || (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+                        continue;
+                    }
+                    const size_t sid = hash_id(src);
+                    const int src_backend_id = sched->hv_tensor_backend_ids[sid];
+                    if (src_backend_id == -1 || src_backend_id == cur_backend_id || sched->hv_tensor_split_ids[sid] != i_split - 1) {
+                        continue;
+                    }
+                    if (ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        continue;
+                    }
+                    bool already_input = false;
+                    for (int k = 0; k < split->n_inputs; k++) {
+                        if (split->inputs[k] == src) {
+                            already_input = true;
+                            break;
+                        }
+                    }
+                    if (!already_input) {
+                        need_new_split = true;
+                        break;
+                    }
+                }
+            }
+
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1371,6 +1407,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
             }
+
+            sched->hv_tensor_split_ids[hash_id(node)] = i_split;
 
             // find inputs that are not on the same backend
             for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1668,7 +1706,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // GGML_SCHED_LAZY_INPUTS: a split without cross-backend inputs is exactly the one that
+        // should overlap the previous split on the other device; its own stream order already
+        // protects everything it touches, so skip the host-side wait.
+        static const bool lazy_inputs = getenv("GGML_SCHED_LAZY_INPUTS") != nullptr;
+        if (!lazy_inputs && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -1879,6 +1921,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    sched->hv_tensor_split_ids   = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_split_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
@@ -1906,7 +1949,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        // Events are used for GPU-side synchronization between splits. They were only
+        // created with n_copies > 1 (pipeline parallelism), so any other multi-backend
+        // configuration fell back to a host-blocking ggml_backend_synchronize at every
+        // split boundary -- on a 2-GPU MoE layout with -ot that is ~100 blocking syncs
+        // per token. An event costs nothing here and event_new returns NULL for devices
+        // without support, which every call site already handles.
+        // GGML_SCHED_NO_EVENTS=1 restores the old behavior (for A/B measurement).
+        static const bool no_events = getenv("GGML_SCHED_NO_EVENTS") != nullptr;
+        if (sched->n_copies > 1 || !no_events) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
@@ -1939,6 +1990,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->splits);
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
+    free(sched->hv_tensor_split_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
@@ -1956,6 +2008,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+        memset(sched->hv_tensor_split_ids,   -1, sched->hash_set.size * sizeof(sched->hv_tensor_split_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
     }
