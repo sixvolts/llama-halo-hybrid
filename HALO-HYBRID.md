@@ -105,8 +105,11 @@ Two things to know:
   0.48/0.39, `-ub 2` 0.47/0.44, `-ub 1` 0.38/0.50. The chunked (multi-token) and recurrent
   (single-token) delta-net paths of upstream `qwen4exp` disagree by ~0.1 in probability; the verify
   batch simply lands on the multi-token side. Worth an upstream report; it affects chunked prefill too.
-* The CUDA-side patches are bit-identical to the stock new base; the graph-level edits (hyper-connection
-  order, host PLE gather) change which of upstream's own fusions fire, see the notes below.
+* This branch's greedy output differs from the stock new base's, but the port itself is exact: with
+  `GGML_CUDA_DISABLE_FUSION=1` (plus this branch's own switches off) the stock graph and the ported graph
+  produce byte-identical text, whereas the stock graph with upstream's fusions on differs from itself
+  with them off. Upstream's rms_norm+mul+rope / MoE-reduction fusions are not bit-exact, and the graph
+  edits here (hyper-connection order, host PLE gather, projection adjacency) change which of them fire.
 
 ## Notes
 
