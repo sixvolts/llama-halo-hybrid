@@ -134,6 +134,15 @@ Two things to know:
   with them off. Upstream's rms_norm+mul+rope / MoE-reduction fusions are not bit-exact, and the graph
   edits here (hyper-connection order, host PLE gather, projection adjacency) change which of them fire.
 
+Prefill ubatch sweep (hybrid-12, no draft, 4K / 16K / 32K prompts): `-ub 1024` 593 / 618 / 543 tok/s, `-ub 2048`
+705 / 731 / 641, `-ub 4096` 781 / 804 / 689; decode unchanged (33–34 t/s). Compute buffers: 0.75 / 1.5 / 3.0 GB on
+the R9700. Pipeline parallelism across ubatches (`LLAMA_PIPELINE_PARALLEL_FORCE=1` keeps it on despite `-ot`;
+the server logs "pipeline parallelism enabled") measured 0–2% at every ubatch: a kernel trace of a 3.7K prefill at
+`-ub 4096` shows the R9700 busy 42% of the wall and the APU 42%, summing to 100%, so the devices still run
+strictly in turn — why the scheduler does not overlap them is the open question. On the APU the expert GEMM runs
+at ~6 TFLOPS at `-ub 1024` and ~13.5 at 4096 (90% / 69% of APU kernel time); `mm_ids_helper` is 15% and the MoE
+reduction 8% at 4096, which is the cheap part to fix.
+
 ## For upstream (facts to report; not filed)
 
 0. **#28118's prompt-checkpoint restore** uses `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` for checkpoints that were saved without it (`tools/server/server-context.cpp`, the `it->load_tgt/load_dft` pair after `checking checkpoint`); any prompt over the 8K checkpoint spacing then aborts on its second request. Fixed in this branch by restoring host-side.

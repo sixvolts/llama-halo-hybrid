@@ -425,12 +425,16 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // halo-hybrid: tensor overrides normally disable pipeline parallelism, but on a two-device
+        // MoE split the dense trunk of ubatch k+1 can overlap the experts of ubatch k during prefill.
+        // LLAMA_PIPELINE_PARALLEL_FORCE=1 keeps it on despite -ot (needs n_batch > n_ubatch to matter).
+        static const bool pp_force = getenv("LLAMA_PIPELINE_PARALLEL_FORCE") != nullptr && atoi(getenv("LLAMA_PIPELINE_PARALLEL_FORCE")) != 0;
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            (!model.has_tensor_overrides() || pp_force);
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
