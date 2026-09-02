@@ -1010,6 +1010,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // Decode fast path (ported from ucicelos/flashnext-hybrid): gather the selected K/V rows and
+    // attend over exactly those instead of masking all n_kv cells, so per-token attention is
+    // O(n_sel) rather than O(n_kv). Off below LLAMA_QSA_GATHER cells (default 65536), where the
+    // dense path is cheaper. The value-side rotation is undone after either path identically.
+    {
+        const int64_t width_qsa = top_k->ne[0];
+        if (v->nb[1] <= v->nb[2] && attn_top_k_gather_n_sel(k->ne[2], width_qsa) == width_qsa) {
+            ggml_tensor * gcur = build_attn_top_k_gather(kq_mask, k, v, q, top_k, width_qsa, kq_scale, il);
+            cb(gcur, "kqv_out", il);
+            if (inp->self_v_rot) {
+                gcur = llama_mul_mat_hadamard(ctx0, gcur, inp->self_v_rot);
+            }
+            return gcur;
+        }
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 

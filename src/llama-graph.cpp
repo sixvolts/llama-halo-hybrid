@@ -2534,6 +2534,132 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// Decides whether the top-k attention may gather the selected rows instead of masking all
+// n_kv cells. Returns 0 to keep the dense path. Ported from ucicelos/flashnext-hybrid.
+//
+// LLAMA_QSA_GATHER=0 disables; an integer sets the minimum n_kv it activates at. The default
+// (65536) is where they measured the crossover on a Strix Halo + eGPU: the gather removes the
+// O(n_kv) attention but not the O(n_kv) indexer scan that produces the top-k, so it only pays
+// once the cache is much larger than the ~2k-cell selection (-5.8% at 16K, a wash at 64K,
+// +8.7% at 128K on their machine).
+int64_t llm_graph_context::attn_top_k_gather_n_sel(int64_t n_kv, int64_t width) const {
+    static const int64_t min_kv = [] {
+        const char * env = getenv("LLAMA_QSA_GATHER");
+        if (env == nullptr) {
+            return (int64_t) 65536;
+        }
+        const int64_t v = atoll(env);
+        return v <= 0 ? INT64_MAX : v;
+    }();
+
+    // the gather relies on flash attention: a non-transposed V cache and an f16 mask.
+    // alibi encodes distances in the mask, and only the dense path is exercised with it.
+    if (!cparams.flash_attn || hparams.use_alibi) {
+        return 0;
+    }
+
+    // decode-sized batches only: a prefill ubatch amortises the dense pass over many
+    // queries, while the gather cost scales with n_tokens (each gathers its own rows)
+    if (n_tokens > 16 || n_kv < min_kv || width <= 0) {
+        return 0;
+    }
+
+    // the selection is used at exactly `width`; padding it to the flash-attention KV
+    // granularity and re-masking the surplus lost needles in the original work, so it is not offered
+    const int64_t n_sel = width;
+
+    // nothing to gain unless the gather actually shrinks the attended range
+    if (n_sel >= n_kv) {
+        return 0;
+    }
+
+    return n_sel;
+}
+
+// Attend over exactly the cells top_k names, by gathering their K/V rows out of the cache,
+// rather than masking all n_kv cells. Each token attends to its own selection, so tokens ride
+// in ne3 with one query per slice.
+//   k, v      [d, n_head_kv, n_kv, n_stream] cache views
+//   kq_mask   F16 [n_kv, n_tokens/n_stream, 1, n_stream]
+//   q_cur     F32 [d_k, n_head, n_tokens]
+//   top_k     I32 [n_sel, n_tokens/n_stream, 1, n_stream]
+ggml_tensor * llm_graph_context::build_attn_top_k_gather(
+        ggml_tensor * kq_mask,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * q_cur,
+        ggml_tensor * top_k,
+            int64_t   width,
+              float   kq_scale,
+                int   il) const {
+    const int64_t d_k  = k->ne[0];
+    const int64_t d_v  = v->ne[0];
+    const int64_t hkv  = k->ne[1];
+    const int64_t n_kv = k->ne[2];
+    const int64_t ns   = k->ne[3];
+
+    const int64_t n_sel = top_k->ne[0];
+    const int64_t n_tps = top_k->ne[1];
+    const int64_t nt    = n_tps*ns;
+
+    GGML_ASSERT(top_k->ne[3] == ns);
+    GGML_ASSERT(nt == q_cur->ne[2]);
+    GGML_ASSERT(width > 0 && width <= n_sel && n_sel <= n_kv);
+    GGML_ASSERT(kq_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(top_k));
+    GGML_ASSERT(ggml_is_contiguous(q_cur));
+
+    // every stream's indices in one flat list; get_rows picks stream s's cells for row list s
+    ggml_tensor * idx = ggml_view_2d(ctx0, top_k, n_sel*n_tps, ns, top_k->nb[3], 0);
+
+    // a cell is one contiguous row of d*hkv values in the cache, so fold the head dim away
+    ggml_tensor * k_rows = ggml_view_3d(ctx0, k, d_k*hkv, n_kv, ns, k->nb[2], k->nb[3], 0);
+    ggml_tensor * v_rows = ggml_view_3d(ctx0, v, d_v*hkv, n_kv, ns, v->nb[2], v->nb[3], 0);
+
+    // note: get_rows always returns F32; a fused quant->F16 gather would halve this intermediate
+    ggml_tensor * k_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, k_rows, idx), GGML_TYPE_F16);
+    ggml_tensor * v_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, v_rows, idx), GGML_TYPE_F16);
+    cb(k_sel, "qsa_k_sel", il);
+    cb(v_sel, "qsa_v_sel", il);
+
+    // [d*hkv, n_sel*n_tps, ns] -> [d, n_sel, hkv, nt]: token t of stream s is ne3 slice
+    // s*n_tps + t, the same order the ubatch lays its tokens out in
+    ggml_tensor * k_g = ggml_view_4d(ctx0, k_sel, d_k, n_sel, hkv, nt,
+            ggml_row_size(k_sel->type, d_k*hkv),
+            ggml_row_size(k_sel->type, d_k),
+            ggml_row_size(k_sel->type, d_k*hkv*n_sel), 0);
+    ggml_tensor * v_g = ggml_view_4d(ctx0, v_sel, d_v, n_sel, hkv, nt,
+            ggml_row_size(v_sel->type, d_v*hkv),
+            ggml_row_size(v_sel->type, d_v),
+            ggml_row_size(v_sel->type, d_v*hkv*n_sel), 0);
+
+    // per-row visibility: gather each selected cell's original mask value (rows of size 1)
+    ggml_tensor * m_sel = ggml_get_rows(ctx0,
+            ggml_reshape_4d(ctx0, kq_mask, 1, n_kv, n_tps, ns),
+            ggml_view_3d(ctx0, top_k, width, n_tps, ns, top_k->nb[1], top_k->nb[3], 0));
+
+    ggml_tensor * m = ggml_cast(ctx0, m_sel, GGML_TYPE_F16);
+    m = ggml_reshape_4d(ctx0, m, n_sel, 1, 1, nt);
+    cb(m, "qsa_kq_mask_sel", il);
+
+    // one query per ne3 slice against that token's own n_sel rows
+    ggml_tensor * q = ggml_reshape_4d(ctx0, q_cur, d_k, 1, q_cur->ne[1], nt);
+
+    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k_g, v_g, m, kq_scale,
+            hparams.f_max_alibi_bias,
+            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+
+    // [d_v, n_head, 1, nt] -> [d_v*n_head, n_tokens], token order unchanged
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
