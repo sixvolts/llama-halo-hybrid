@@ -143,6 +143,13 @@ Two things to know:
 
 ## Notes
 
+Validation of the merged base (2026-09-02): `test-backend-ops test` passes 14571/14571 on both devices
+(ROCm0 = R9700, ROCm1 = APU), which covers the small-K and pipelined matvecs, `MUL_MAT_ID`, the IQ4_NL
+`get_rows` and `rms_norm` against the CPU reference; the fused hyper-connection kernels and q8 side copies
+are covered by the byte-identical greedy check with fusions disabled. Server under MTP: back-to-back short
+requests, a 1k-token prompt, a 2000-token generation to the context limit, and a 6k-token chunked prompt
+at `-c 8192` all complete without an assert (`bench/results/chain_solid.sh`).
+
 Benchmarking note: `test-backend-ops perf` replays one weight tensor, so anything under the R9700's 64 MB
 infinity cache reports cache bandwidth (1.4 TB/s for a 62 MB Q8_0 matrix). `TBO_Q38_SHAPES=1` adds this
 model's decode shapes as 64-matrix batches (working sets of 0.1–3.5 GB) to `tests/test-backend-ops.cpp`;
