@@ -55,6 +55,9 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
 * 128 GB is the working minimum: ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in host RAM,
   26 GB + the head on the R9700. Drain caches before launching after big file activity.
 * The draft head only pays for one or two streams. For multi-user serving leave the `-md`/`--spec-type` lines out.
+* **Prefill wants a big ubatch.** `-b 4096 -ub 4096` prefills at 780–800 tok/s (4K–16K prompts) and 690 at 32K,
+  against 590–620 / 540 with `-ub 1024`; `-ub 2048` gets most of it. Decode is unaffected. The cost is R9700 memory
+  (3 GB of compute buffers at 4096), so with the draft head use hybrid-10 for `-ub 4096`, or `-ub 2048` at hybrid-12.
 
 Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`; "agg" is the
 sum over streams, single-stream rows are the per-stream number):
