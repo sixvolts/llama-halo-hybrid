@@ -140,6 +140,16 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
+    // halo-hybrid: the first half of process_ubatch (apply memory, build or reuse the graph, allocate it on
+    // the lane's scheduler, set the inputs) without computing it. lane 0 is the main scheduler, lane 1 the
+    // second prefill lane. Compute with graph_compute (lane 0) or graph_compute_pair (both).
+    llm_graph_result * prepare_ubatch(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret,
+                               int   lane);
+
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
@@ -232,7 +242,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, ggml_backend_sched_t sch = nullptr);
 
     //
     // graph
@@ -247,9 +257,12 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // halo-hybrid: compute the graphs prepared on both lanes with their splits interleaved
+    ggml_status graph_compute_pair(bool batched);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, int lane = 0);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -258,7 +271,11 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                     int   lane = 0) const;
+
+    // set the thread counts of the backends for the next graph compute
+    void graph_compute_set_threads(bool batched);
 
     llm_graph_cb graph_get_cb() const;
 
@@ -342,6 +359,7 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr sched_lane; // halo-hybrid: second scheduler (own compute buffers) for two-lane prefill
 
     bool sched_need_reserve = true;
 
@@ -365,6 +383,7 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_prev_lane;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

@@ -706,8 +706,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-    if (copy_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(copy_event));
+    for (int i = 0; i < GGML_CUDA_COPY_EVENTS; ++i) {
+        if (copy_events[i] != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(copy_events[i]));
+        }
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -2527,7 +2529,7 @@ static bool ggml_cuda_ensure_peer_access(int src_device, int dst_device) {
     return true;
 }
 
-static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst, const bool wait_dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
@@ -2572,14 +2574,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
                 // using. Make the source stream wait for everything currently queued on the
                 // destination before copying. The copy itself stays on the source stream (HIP is
                 // happier that way), and the dst stream waits for it below as before.
-                if (!cuda_ctx_dst->copy_event) {
-                    ggml_cuda_set_device(cuda_ctx_dst->device);
-                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_dst->copy_event, cudaEventDisableTiming));
-                }
+                cudaEvent_t ev_dst = cuda_ctx_dst->next_copy_event();
                 ggml_cuda_set_device(cuda_ctx_dst->device);
-                CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->copy_event, cuda_ctx_dst->stream()));
+                CUDA_CHECK(cudaEventRecord(ev_dst, cuda_ctx_dst->stream()));
                 ggml_cuda_set_device(cuda_ctx_src->device);
-                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_dst->copy_event, 0));
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), ev_dst, 0));
             }
             const size_t nbytes = ggml_nbytes(dst);
             const bool kernel_copy = nbytes > 0 && nbytes <= ggml_cuda_kernel_copy_max() && nbytes % 16 == 0 &&   // an empty copy would launch a zero-block grid
@@ -2598,21 +2597,28 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
-        // record event on src stream after the copy
-        if (!cuda_ctx_src->copy_event) {
+        if (wait_dst) {
+            // record event on src stream after the copy (a fresh event from the pool, see next_copy_event)
+            cudaEvent_t ev_src = cuda_ctx_src->next_copy_event();
             ggml_cuda_set_device(cuda_ctx_src->device);
-            CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(ev_src, cuda_ctx_src->stream()));
+
+            // wait on dst stream for the copy to complete
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), ev_src, 0));
         }
-
-        CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
-
-        // wait on dst stream for the copy to complete
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
     return true;
+}
+
+static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    return ggml_backend_cuda_cpy_tensor_async_impl(backend_src, backend_dst, src, dst, /*wait_dst=*/true);
+}
+
+static bool ggml_backend_cuda_cpy_tensor_async_nowait(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    return ggml_backend_cuda_cpy_tensor_async_impl(backend_src, backend_dst, src, dst, /*wait_dst=*/false);
 }
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
@@ -5180,6 +5186,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .cpy_tensor_async_nowait = */ ggml_backend_cuda_cpy_tensor_async_nowait,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

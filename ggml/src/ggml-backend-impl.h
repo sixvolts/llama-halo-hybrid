@@ -148,6 +148,12 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) like cpy_tensor_async, but only enqueues the copy on backend_src's queue: it does NOT make
+        // backend_dst wait for it. The caller records an event on backend_src afterwards and makes backend_dst
+        // wait on it when the copy is consumed (ggml_backend_sched eager copies). Appended last so that the
+        // positional initializers of the other backends stay valid (they get NULL).
+        bool (*cpy_tensor_async_nowait)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
     };
 
     struct ggml_backend {

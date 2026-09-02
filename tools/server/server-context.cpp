@@ -3538,7 +3538,12 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // halo-hybrid: with two-lane prefill (LLAMA_PREFILL_LANES=2) consecutive ubatches of one
+                            // llama_decode are computed together, so the tail chunk before the last 4 tokens is
+                            // sized to two ubatches instead of one; a checkpoint restore then re-processes up to
+                            // 2*n_ubatch tokens instead of n_ubatch
+                            static const int prefill_lanes = std::max(1, getenv("LLAMA_PREFILL_LANES") ? atoi(getenv("LLAMA_PREFILL_LANES")) : 1);
+                            static const int checkpoint_offsets[] = {4 + prefill_lanes * n_ubatch, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

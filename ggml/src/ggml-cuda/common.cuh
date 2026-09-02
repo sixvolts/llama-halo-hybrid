@@ -1421,7 +1421,23 @@ struct ggml_backend_cuda_context {
     const bool mmvq_group_disabled = ggml_cuda_mmvq_group_disabled_env();
     int device;
     std::string name;
-    cudaEvent_t copy_event = nullptr;
+    // events for cross-device copies. A pool, not a single event: on ROCm a queued cudaStreamWaitEvent
+    // binds to the latest cudaEventRecord of that event when it executes (CUDA snapshots at call time),
+    // so re-recording one event per copy made every earlier wait bind to a later copy and serialized
+    // work that could overlap across devices (two-lane prefill, pipeline parallelism).
+    static constexpr int GGML_CUDA_COPY_EVENTS = 512; // >= copies queued between two host synchronizations (two lanes x 74 splits x 2)
+    cudaEvent_t copy_events[GGML_CUDA_COPY_EVENTS] = { nullptr };
+    int copy_event_next = 0;
+
+    cudaEvent_t next_copy_event() {
+        cudaEvent_t & ev = copy_events[copy_event_next];
+        copy_event_next = (copy_event_next + 1) % GGML_CUDA_COPY_EVENTS;
+        if (ev == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        }
+        return ev;
+    }
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

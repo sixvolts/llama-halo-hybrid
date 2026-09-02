@@ -59,6 +59,9 @@ The expert-parallel prototype (`LLAMA_EP`), `LLAMA_PIPELINE_PARALLEL_FORCE` and 
 |---|---|---|
 | `GGML_SCHED_LAZY_INPUTS=1` | cut a split at the first consumer of a cross-backend activation; skip host syncs for no-input splits; source stream waits for the destination's progress before a peer copy | net loss on ROCm |
 | `GGML_CUDA_GRAPH_OPT_MULTI=1` | lift the multi-device gate on the CUDA graph-optimisation pass | −3% |
+| `LLAMA_PREFILL_LANES=2` | two-lane prefill: consecutive prefill ubatches on two schedulers with interleaved splits, eager cross-device copies, stream-ordered input copies, a lane-aware server tail chunk (see "Two-lane prefill") | prefill +30–45% at `-ub 1024`/`2048`; decode unchanged; a second set of compute buffers |
+| `LLAMA_LANES_DEBUG=1` | log every computed pair (tokens, outputs, splits, wall, tok/s) after a host sync | diagnostic |
+| `GGML_SCHED_TRACE_WAITS=1` | per graph: count of the scheduler's host-blocking points (no-input splits, synchronous input copies, sync-copy fallbacks) and the host submit time split into copies / compute; names the first 48 input copies | diagnostic |
 
 ## Qwen3.8-Flash-Next with the MTP draft head (branch `hetero-qwen38-mtp`)
 
@@ -138,10 +141,74 @@ Prefill ubatch sweep (hybrid-12, no draft, 4K / 16K / 32K prompts): `-ub 1024` 5
 705 / 731 / 641, `-ub 4096` 781 / 804 / 689; decode unchanged (33–34 t/s). Compute buffers: 0.75 / 1.5 / 3.0 GB on
 the R9700. Pipeline parallelism across ubatches (`LLAMA_PIPELINE_PARALLEL_FORCE=1` keeps it on despite `-ot`;
 the server logs "pipeline parallelism enabled") measured 0–2% at every ubatch: a kernel trace of a 3.7K prefill at
-`-ub 4096` shows the R9700 busy 42% of the wall and the APU 42%, summing to 100%, so the devices still run
-strictly in turn — why the scheduler does not overlap them is the open question. On the APU the expert GEMM runs
-at ~6 TFLOPS at `-ub 1024` and ~13.5 at 4096 (90% / 69% of APU kernel time); `mm_ids_helper` is 15% and the MoE
-reduction 8% at 4096, which is the cheap part to fix.
+`-ub 4096` shows the R9700 busy 42% of the wall and the APU 42%, summing to 100%, so the devices run strictly in
+turn (resolved below: two-lane prefill). On the APU the expert GEMM runs at ~6 TFLOPS at `-ub 1024` and ~13.5 at
+4096 (90% / 69% of APU kernel time); `mm_ids_helper` is 15% and the MoE reduction 8% at 4096, which is the cheap
+part to fix.
+
+### Two-lane prefill (`LLAMA_PREFILL_LANES=2`)
+
+Why the devices never overlapped: with the experts on the APU every ubatch's graph is a chain of 74 splits that
+alternate R9700 / APU / R9700 ..., and the scheduler submits one graph at a time onto one in-order stream per
+device. Ubatch k+1's first R9700 split therefore queues behind ubatch k's last R9700 split, which is itself
+waiting on the APU, so pipeline parallelism (`LLAMA_PIPELINE_PARALLEL_FORCE=1`) cannot overlap anything here;
+it only works for layer splits where the two devices' work is not interleaved. Kernel traces of every variant
+showed the R9700 busy 36%, the APU 46%, and both busy 0 ms.
+
+What was needed (all in `ggml/src/ggml-backend.cpp`, `ggml-cuda.cu`, `src/llama-context.cpp`):
+
+1. **Two schedulers, interleaved splits.** `llama_context` builds consecutive prefill ubatches on two
+   `ggml_backend_sched` instances (own compute buffers, shared backends and streams) and
+   `ggml_backend_sched_graph_compute_async_pair` submits their splits alternately (a0 b0 a1 b1 ...). Lane b's
+   attention then sits in the R9700 queue right behind lane a's, ahead of lane a's wait for the APU.
+   Cross-lane ordering (b reads the KV/recurrent state a wrote at the same layer) follows from the stream order.
+2. **Stream-ordered input copies** (`ggml_backend_sched_set_async_inputs`). Graph inputs live in host memory and
+   the scheduler copied each one to its device with a host wait for that device's previous split plus a
+   synchronous copy. Ten inputs are consumed at the first split, but the output-row selector is first used at
+   split 71 of 74, so the host blocked there until almost the whole graph had run and could not submit the other
+   lane. `GGML_SCHED_TRACE_WAITS=1` prints these waits per graph. Now `ggml_backend_tensor_set_async` on the
+   destination stream; `prepare_ubatch` synchronizes a lane before rewriting its host inputs. Zero-byte inputs
+   (the selector on ubatches without outputs) are skipped instead of waited for.
+3. **A pool of copy events** (`ggml_backend_cuda_context::next_copy_event`, 512 per device). On ROCm a queued
+   `hipStreamWaitEvent` resolves against the event's newest record when the queue reaches it, not the record at
+   call time as on CUDA (`docs/halo-hybrid/lane_pattern.hip`: the two-lane pattern takes 599 ms with distinct
+   events, 873 ms with one re-recorded event per device, 780 ms if fully serialized). `cpy_tensor_async`
+   re-recorded one `copy_event` per device on every cross-device copy, so every earlier wait became a wait for a
+   later copy. This alone also serializes upstream's pipeline parallelism on ROCm.
+4. **Eager copies** (`ggml_backend_sched_set_eager_copies`, backend iface `cpy_tensor_async_nowait`). The
+   scheduler enqueued a cross-device copy on the producer's stream only when the consumer split was submitted,
+   i.e. in the interleaved order a0 b0 a1 the copy of a0's output landed on the R9700 stream behind b0 and the
+   APU started a1 only after b0 (the trace showed the first expert block starting after both trunks). Now the
+   copy is pushed right behind its producer and the consumer waits on a pooled event. Same caller contract as 2:
+   synchronize before the next graph on that scheduler (`graph_compute` does it when lanes are on).
+
+5. **The server's prompt chunking** (`tools/server/server-context.cpp`). For models with recurrent state the
+   server ends the prompt batch `4 + n_ubatch` tokens before the end (a checkpoint is taken there), processes that
+   ubatch alone, then the last 4 tokens. So the last `n_ubatch` tokens of every prompt ran single-lane and prompts
+   under ~2·n_ubatch never paired at all (a 3.7K prompt at `-ub 2048` showed no gain; per-pair timing with
+   `LLAMA_LANES_DEBUG=1` showed the pairs that did form at 1230–1270 tok/s). With `LLAMA_PREFILL_LANES=2` the
+   break is now `4 + 2·n_ubatch` before the end, so the tail is a pair; a checkpoint restore then re-processes up
+   to two ubatches instead of one. `-b` must be at least `2 × -ub` for pairs to form at all.
+
+Items 1–3 each measured zero gain on their own; 4 made the pairs overlap and 5 made the pairs form. Output is byte-identical to single-lane
+(greedy text compared at 4K). `rocprofv3 --kernel-trace` serializes dispatch across the two agents and shows
+0 ms overlap even when throughput says otherwise, so it cannot measure this.
+
+Cost: a second set of compute buffers (R9700 0.75 GB at `-ub 1024`, 1.5 GB at 2048; APU 0.29 / 0.57 GB).
+Decode is untouched (single-token ubatches never pair; 33–34 t/s no draft, 45 t/s with the MTP head as before).
+
+Measured (hybrid-12, warm, 4K / 16K / 32K prompts, tok/s; `-b 4096`):
+
+| | `-ub 1024` | `-ub 2048` | `-ub 4096` |
+|---|---|---|---|
+| single lane | 676 / 616 / 540 | 830 / 730 / 640 | 781 / 804 / 689 |
+| `LLAMA_PREFILL_LANES=2` | 891 / 835 / 722 | **1179 / 1041 / 858** | does not fit (2 × 3 GB) |
+
+The launch line with the MTP head (hybrid-12, `-ub 1024`): 644 / 592 / 510 → 833 / 784 / 678, decode unchanged
+(46.6 greedy, 44.9 sampled). Two and four streams at `-ub 1024`, measured before the last two fixes: aggregate
+prefill 627 → 736 and 634 → 747, decode 48.9 → 50.2 and 66.6 → 63.1 (that row's usual noise band). Prompts are
+processed at one to two decode calls per 4K, so the gain grows with prompt length up to the point where the
+32K attention cost dominates.
 
 ## For upstream (facts to report; not filed)
 
@@ -168,6 +235,25 @@ reduction 8% at 4096, which is the cheap part to fix.
    the 32-block gather in this branch's `getrows.cu` handles any multiple of 32.
 4. **`mul_mat_vec_q` small-K mode is disabled for all RDNA;** enabling it on RDNA4 takes a Q8_0
    [10240 × 320] matvec from 150 to 490 GB/s with large shapes unchanged (`mmvq.cu` here).
+
+5. **ROCm event semantics vs. `ggml-cuda`'s single `copy_event`.** On ROCm 7.2.2 a queued
+   `hipStreamWaitEvent` resolves against the event's newest `hipEventRecord` when the queue reaches it (CUDA
+   snapshots the record at call time). `ggml_backend_cuda_cpy_tensor_async` re-records one `copy_event` per
+   device on every cross-device copy, so every earlier queued wait becomes a wait for a later copy and any
+   cross-device overlap (pipeline parallelism included) collapses to a total order. Repro:
+   `docs/halo-hybrid/lane_pattern.hip` (599 ms with distinct events, 873 ms with one re-recorded event, 780 ms if
+   fully serialized). Fix in this branch: a per-context pool of copy events.
+6. **The scheduler's cross-backend copies are issued too late to overlap.** A split input is copied on the
+   producer's stream only when the consumer split is submitted, so anything queued on the producer's stream in
+   between (another graph's split) delays the copy and the consumer. Graph inputs in host memory are worse:
+   each consuming split does a host wait for the destination's previous split plus a synchronous copy
+   (`ggml_backend_sched_compute_splits`, the `GGML_TENSOR_FLAG_INPUT` branch), and a *view* of an input (the
+   output-row selector slice) takes the sync-copy fallback. With splits alternating between two devices this
+   blocks the host mid-graph. This branch adds eager producer-side copies with deferred consumer waits
+   (`cpy_tensor_async_nowait`) and stream-ordered input copies, both opt-in.
+7. **Server prompt chunking for recurrent models** (`checkpoint_offsets = {4 + n_ubatch, 4}`, PR #20288) means
+   the last `n_ubatch` tokens of every prompt are always a separate `llama_decode`, which defeats any scheme that
+   overlaps consecutive ubatches; an option to size that tail chunk would help.
 
 ## Notes
 
