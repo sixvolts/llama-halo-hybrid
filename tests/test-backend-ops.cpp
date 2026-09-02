@@ -10434,9 +10434,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.8-Flash-Next dense decode shapes (halo-hybrid): the Q8_0 matvecs that dominate the token
     if (getenv("TBO_Q38_SHAPES") != nullptr) {
         // bs=64: 64 distinct matrices per launch so the working set exceeds the 64 MB infinity cache
+        // n = 1 (decode) and 2..4 (speculative verify batches)
         for (auto [m, k] : std::vector<std::pair<int64_t,int64_t>>{{10240, 2560}, {6144, 2560}, {2560, 6144}, {2560, 2560},
                                                                     {320, 10240}, {10240, 320}, {640, 2560}, {2560, 640}}) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, k, {64, 1}, {1, 1}));
+            for (int64_t n : {1, 2, 3, 4}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {64, 1}, {1, 1}));
+            }
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, 1, 2560, {1, 1}, {1, 1}));
         // f32 routers / bf16 indexer / f32 hc inject + ssm alpha (mul_mat_vec_f shapes), cache-busting batches
