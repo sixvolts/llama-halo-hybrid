@@ -92,6 +92,21 @@ brackets):
 | stock new base | 27–28 (27–28) | 35–38 (38–41) | 0.50 / 0.60 |
 | this branch | 35–37 (35–36) | **42–45 (47–52)** | 0.51 / 0.70 |
 
+Full table on the merged base (model-card sampler, 4K prompts, 256-token completions, `-b 4096 -ub 1024`;
+`bench/streams_q38.py` drives N concurrent chat requests, "agg" sums the streams):
+
+| streams | layout | prefill agg tok/s | decode, no draft | decode, MTP n-max 2 |
+|---|---|---|---|---|
+| 1 | hybrid-12 | 610 (16K prompt: 623) | 34.3 | 45.4 (greedy ~52) |
+| 2 | hybrid-12 | 627 | 49.0 agg / 26.0 each | 53.0 agg / 29.8 each |
+| 4 | hybrid-12 | 642 | 66.3 agg / 17.9 each | does not fit with the head |
+| 4 | hybrid-10 | 585 | 47.8 agg / 12.7 each | 51.5 agg / 14.0 each |
+| 1 @ 68K ctx | hybrid-12 / hybrid-10 | 413 (`-ub 1024`) / 306 (`-ub 512`) | 25.7 | 43.6 |
+
+Four-stream decode moves by up to 30% between sessions (a hybrid-1 run gave 61.6 agg plain / 49.3 MTP), so the
+multi-stream rows say "the head is about break-even at four streams", nothing finer. The flashnext-hybrid fix 5
+(uniform draft lengths across streams) is not ported; it is what makes the head pay at four streams there.
+
 `--spec-draft-n-max 3` is equal within noise, 4 collapses (acceptance 0.32), and `--spec-draft-p-min`
 0.5–0.7 raises acceptance but not throughput. The hyper-connection fusions and q8 side copies still
 pay under speculation (all switches off: 41–43 sampled).

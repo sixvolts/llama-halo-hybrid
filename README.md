@@ -19,8 +19,58 @@ I kept going on tuning, and tried to reduce the number of kernel launches, which
 
 https://huggingface.co/SixVolts/Qwen3.5-122B-A10B-Opus-Reasoning-MTP-GGUF
 
+## Qwen3.8-Flash-Next on the same box
 
+The model that replaced the 122B for me: 512 experts per layer, 36 layers of gated DeltaNet, 12 layers of
+top-k sparse attention, a 28.8 GB n-gram table, and (since 1 Sep) an MTP draft head shipped separately.
+Same idea as above: dense trunk, KV cache and the draft head on the R9700, the routed experts of most layers on
+the Strix, the n-gram table in host RAM. This repo's `main` is upstream master plus the MTP work from
+unslothai/llama.cpp#144 and ggml-org#28118, plus the kernel and scheduler changes described in
+[HALO-HYBRID.md](HALO-HYBRID.md). Stock llama.cpp on this layout decodes at 27–28 tok/s; this branch does
+~45 with the model-card sampler and ~52 greedy, from 22 on the Strix alone.
 
+Launch (single user, 8K context; ROCm0 is the R9700, ROCm1 the iGPU — check the device order in the startup log):
+
+```
+sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
+
+llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 --no-mmap -np 1 \
+  -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU' \
+  -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 \
+  --spec-type draft-mtp --spec-draft-n-max 2 \
+  --host 0.0.0.0 --port 8080
+```
+
+* Model: `unsloth/Qwen3.8-Flash-Next-GGUF` UD-Q4_K_XL (four shards, 111 GB). Draft head: the `shared-Q8_0` file in
+  that repo's `MTP/` folder (2.6 GB). It borrows the target's embeddings and lm head, so `-devd ROCm0` is required.
+* `-ot` moves the routed experts of layers 14–47 to the iGPU ("hybrid-14") and keeps the n-gram table in host RAM.
+  Hybrid-14 is the most the R9700 holds next to the draft head at 8K context. For 16K use `blk\.(1[2-9]|[2-4][0-9])`
+  (hybrid-12), for 64K+ use `blk\.(1[0-9]|[2-4][0-9])` (hybrid-10); past 64K the sparse-attention gather turns on by itself.
+* Use `/v1/chat/completions`. A bare prompt on `/completion` stops after one token with this model.
+  `"chat_template_kwargs": {"enable_thinking": false}` turns thinking off per request.
+* `--spec-draft-n-max 2`; 3 is the same within noise, 4 is worse, and `--spec-draft-p-min` raises acceptance but
+  not speed. Acceptance is ~0.70 greedy and ~0.51 with the model-card sampler (temperature 1.0, top-p 0.95, top-k 20),
+  which is the whole difference between 52 and 45 tok/s.
+* 128 GB is the working minimum: ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in host RAM,
+  26 GB + the head on the R9700. Drain caches before launching after big file activity.
+* The draft head only pays for one or two streams. For multi-user serving leave the `-md`/`--spec-type` lines out.
+
+Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`; "agg" is the
+sum over streams, single-stream rows are the per-stream number):
+
+| streams | layout | prefill, agg tok/s | decode, no draft | decode, MTP n-max 2 |
+|---|---|---|---|---|
+| 1 | hybrid-12 | 610 (16K prompt: 623) | 34.3 | **45.4** (greedy ~52) |
+| 2 | hybrid-12 | 627 | 49.0 agg, 26.0 each | 53.0 agg, 29.8 each |
+| 4 | hybrid-12 | 642 | 66.3 agg, 17.9 each | does not fit with the head |
+| 4 | hybrid-10 | 585 | 47.8 agg, 12.7 each | 51.5 agg, 14.0 each |
+| 1 at 68K context | hybrid-12 / hybrid-10 | 413 (`-ub 1024`) / 306 (`-ub 512`) | 25.7 | **43.6** |
+
+The 4-stream rows move by up to 30% between sessions on this box (the 122B behaved the same), so read them as
+"the head is roughly break-even at four streams", not as a ranking of hybrid-12 against hybrid-10. The 68K rows use
+the sparse-attention gather ported from ucicelos/flashnext-hybrid; both needles in a 2,300-record haystack are retrieved
+with it on and off, and the answer text is identical.
 
 
 # llama.cpp
