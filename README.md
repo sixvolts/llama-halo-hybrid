@@ -66,15 +66,16 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   `-ub 1024` at hybrid-12/14 and `-ub 2048` at hybrid-10. `-b` must be at least twice `-ub`. The mechanism and the
   four scheduler fixes it needed are in [HALO-HYBRID.md](HALO-HYBRID.md) ("Two-lane prefill").
 
-Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`; "agg" is the
-sum over streams, single-stream rows are the per-stream number):
+Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`,
+`LLAMA_PREFILL_LANES=2`; "agg" is the sum over streams, single-stream rows are the per-stream number; the prefill
+column's first request of a fresh server is cold, warm numbers are 10–15% higher):
 
 | streams | layout | prefill, agg tok/s | decode, no draft | decode, MTP n-max 2 |
 |---|---|---|---|---|
-| 1 | hybrid-12 | 610 (16K prompt: 623) | 34.3 | **45.4** (greedy ~52) |
-| 2 | hybrid-12 | 627 | 49.0 agg, 26.0 each | 53.0 agg, 29.8 each |
-| 4 | hybrid-12 | 642 | 66.3 agg, 17.9 each | does not fit with the head |
-| 4 | hybrid-10 | 585 | 47.8 agg, 12.7 each | 51.5 agg, 14.0 each |
+| 1 | hybrid-12 | 766 (16K prompt: 834) | 35.0 | **45.1** (greedy ~52) |
+| 2 | hybrid-12 | 720 | 48.5 agg, 25.7 each | 54.1 agg, 29.7 each |
+| 4 | hybrid-12 | 827 | 66.9 agg, 18.1 each | does not fit with the head |
+| 4 | hybrid-10 | 585 (single lane) | 47.8 agg, 12.7 each | 51.5 agg, 14.0 each |
 | 1 at 68K context | hybrid-12 / hybrid-10 | 413 (`-ub 1024`) / 306 (`-ub 512`) | 25.7 | **43.6** |
 
 The 4-stream rows move by up to 30% between sessions on this box (the 122B behaved the same), so read them as
