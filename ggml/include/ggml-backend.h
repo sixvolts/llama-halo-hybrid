@@ -343,6 +343,20 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // Compute two already-allocated graphs (see ggml_backend_sched_alloc_graph) on two schedulers that share the same
+    // backends, submitting their splits alternately so that work of one graph on one device can overlap work of the
+    // other graph on another device. Neither scheduler may have an eval callback set.
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_t sched_a, ggml_backend_sched_t sched_b);
+    // Copy host-resident graph inputs to their split backend with stream-ordered async copies instead of a host wait and a
+    // synchronous copy. The caller must not modify the input data until the graph has been computed
+    // (ggml_backend_sched_synchronize) - llama.cpp does this before set_inputs when it enables this.
+    GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool enable);
+    // Issue each cross-backend copy right after the split that produces its source, on the producer's queue, and make the
+    // consumer wait on an event instead of copying when it is submitted. Without this a copy is enqueued on the producer's
+    // queue only when the consumer is submitted, i.e. behind whatever else was queued there meanwhile (the other lane
+    // of ggml_backend_sched_graph_compute_async_pair), which serializes the devices. Same caller contract as async
+    // inputs: synchronize before the next graph. Needs backends with cpy_tensor_async_nowait and events.
+    GGML_API void                 ggml_backend_sched_set_eager_copies(ggml_backend_sched_t sched, bool enable);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

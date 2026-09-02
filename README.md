@@ -34,8 +34,9 @@ Launch (single user, 8K context; ROCm0 is the R9700, ROCm1 the iGPU — check th
 ```
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
 
+LLAMA_PREFILL_LANES=2 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 --no-mmap -np 1 \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --no-mmap -np 1 \
   -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU' \
   -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 \
   --spec-type draft-mtp --spec-draft-n-max 2 \
@@ -55,9 +56,15 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
 * 128 GB is the working minimum: ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in host RAM,
   26 GB + the head on the R9700. Drain caches before launching after big file activity.
 * The draft head only pays for one or two streams. For multi-user serving leave the `-md`/`--spec-type` lines out.
-* **Prefill wants a big ubatch.** `-b 4096 -ub 4096` prefills at 780–800 tok/s (4K–16K prompts) and 690 at 32K,
-  against 590–620 / 540 with `-ub 1024`; `-ub 2048` gets most of it. Decode is unaffected. The cost is R9700 memory
-  (3 GB of compute buffers at 4096), so with the draft head use hybrid-10 for `-ub 4096`, or `-ub 2048` at hybrid-12.
+* **Prefill: `LLAMA_PREFILL_LANES=2`.** With the experts on the iGPU the two devices took turns during prefill
+  (each ~40% busy, never together). This branch computes consecutive prefill ubatches on two schedulers with their
+  work interleaved so the iGPU's expert GEMMs of one overlap the R9700's attention of the other. Warm prefill,
+  4K / 16K / 32K prompts, hybrid-12, no draft: `-ub 1024` 676 / 616 / 540 → 891 / 835 / 722 tok/s, `-ub 2048`
+  830 / 730 / 640 → **1179 / 1041 / 858**; the launch line above (draft head, `-ub 1024`) 644 / 592 / 510 →
+  833 / 784 / 678. Decode is unchanged and the output is identical. It costs a second set of compute buffers on
+  the R9700 (0.75 GB at `-ub 1024`, 1.5 GB at 2048; two lanes of `-ub 4096` do not fit), so with the draft head use
+  `-ub 1024` at hybrid-12/14 and `-ub 2048` at hybrid-10. `-b` must be at least twice `-ub`. The mechanism and the
+  four scheduler fixes it needed are in [HALO-HYBRID.md](HALO-HYBRID.md) ("Two-lane prefill").
 
 Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`; "agg" is the
 sum over streams, single-stream rows are the per-stream number):
