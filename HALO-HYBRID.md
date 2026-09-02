@@ -39,27 +39,24 @@ is a split either way and measured ~0.7 t/s slower than the host gather.
 | `ggml/src/ggml-backend.cpp` | scheduler events are created regardless of `n_copies`, so split boundaries are GPU-side waits instead of host syncs (+5–7% on this layout) | `GGML_SCHED_NO_EVENTS=1` |
 | `ggml/src/ggml-cuda/ggml-cuda.cu`, `mmvq.cu` | grouped `mul_mat_vec_q`: quantise a shared activation once for adjacent matmuls; `qwen35moe.cpp` reorders projections so they are adjacent (bit-exact) | `GGML_CUDA_NO_MMVQ_GROUP=1` |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | cross-device copies ≤ 256 KB as a push kernel on the source device into peer-mapped memory (+1.5%) | `GGML_CUDA_KERNEL_COPY_MAX=0` (SDMA), or a byte limit |
-| `src/llama-graph.cpp`, `src/models/qwen35moe.cpp` | recurrent-state gathers become views when the copy map is the identity; one `l2_norm` over q and k instead of two (bit-exact, +3.7%) | `LLAMA_NO_GRAPH_FUSE=1` |
+| `src/llama-graph.cpp` (`qwen35moe.cpp` part not yet re-applied on this base) | recurrent-state gathers become views when the copy map is the identity; one `l2_norm` over q and k instead of two (bit-exact, +3.7%) | `LLAMA_NO_GRAPH_FUSE=1` |
 | `ggml/src/ggml-cuda/hc.cu`, `ggml-cuda.cu` (`ggml_cuda_try_fuse_hc`) | Qwen3.8-Flash-Next (`qwen4exp`) launch-count fusions, matched by op pattern with data-flow, use-count and aliasing checks: hyper-connection mix (sigmoid·mul·stream-sum·scale → 1 kernel), hyper-connection combine (repeat·scale·sigmoid·scale·mul·add → 1), scale+silu, x·sigmoid(g) (GDN output gate, attention gate, shared-expert gate), MoE weighted expert sum (mul + fused adds → 1), GDN gate chain (add·softplus·mul → 1). Bit-identical to the unfused graph (`__fmul_rn`/`__fadd_rn`, same summation order); a matcher declines when ggml-alloc placed the output over an input it reads non-elementwise | `GGML_CUDA_NO_HC_FUSE=1` |
 | `ggml/src/ggml-cuda/hc.cu`, `mmvq.cu`, `norm.cu` | **q8_1 side copies**: a fused kernel that produces a single-row f32 activation also writes its q8_1 quantisation (same `warp_reduce` arithmetic as `quantize_q8_1`, so identical bits) into a per-graph arena; `mul_mat_vec_q` consumers (plain, GLU-fused, grouped) pick it up by data pointer, validated against the producing tensor, instead of launching a quantise kernel | `GGML_CUDA_NO_Q8_SIDE=1` |
-| `src/models/qwen4exp.cpp` | graph tidy-ups for the same model: no copy of stream 0 in the hyper-connection sum, strided `cpy` for the conv-state tail, same-input projections pinned adjacent (grouped `mul_mat_vec_q`), norm-weight view hoisted so `rms_norm+mul` fuses, one `l2_norm` over q and k, **one QSA/KV-index input set shared by all attention layers** (was one synchronous host→device upload per layer per token) | `LLAMA_NO_GRAPH_FUSE=1` (l2_norm) |
+| `src/models/qwen4exp.cpp` | graph tidy-ups for the same model: no copy of stream 0 in the hyper-connection sum, strided `cpy` for the conv-state tail, same-input projections pinned adjacent (grouped `mul_mat_vec_q`), norm-weight view hoisted so `rms_norm+mul` fuses, one `l2_norm` over q and k, one QSA/KV-index input set shared by all attention layers (was one synchronous host→device upload per layer per token; upstream master now does the same, and the branch uses upstream's) | `LLAMA_NO_GRAPH_FUSE=1` (l2_norm) |
 | `src/models/qwen4exp.cpp`, `ggml/src/ggml-cuda/getrows.cu`, `dequantize.cuh`, `ggml-cuda.cu` | **PLE n-gram table**: with the table in a host buffer the 16-row gather + dequant runs on the host in `set_input` (same `to_float` as the CPU `get_rows`, bit-identical) and is fed as an F32 input, instead of a `get_rows` node that forced a CPU split with a synchronising host→device copy each token (72 → 70 splits, 33.9 → 33.0 ms/token cold decode). `get_rows` on IQ4_NL uses the generic 32-block gather, so the table may also live on a GPU | `LLAMA_PLE_GET_ROWS=1` (in-graph gather) |
-| `src/models/qwen4exp.cpp` | **graph reuse**: the model's two custom inputs (QSA block/bias tensors, PLE rows/embedding) implement `can_reuse`, so the 7k-node decode graph is rebuilt only when the token count, KV span, stream count or block count changes instead of for every token (`graphs reused = 0` → 94/95). Bit-identical; cold decode 33.0 → 29.3 ms/token, server hybrid-14 31.1 → 34.1 t/s, hybrid-16 @16k 31.4 → 34.4 | `LLAMA_GRAPH_REUSE_DISABLE=1` |
+| *(superseded)* `src/models/qwen4exp.cpp` | **graph reuse** for the QSA/PLE inputs (`can_reuse`): implemented here first (cold decode 33.0 → 29.3 ms/token, +10% on the server); upstream master now carries its own, so the branch uses upstream's. Kept in the table because the numbers above include it | `LLAMA_GRAPH_REUSE_DISABLE=1` |
 | `ggml/src/ggml-cuda/mmvq.cu` | **small-K matvec mode on RDNA4**: upstream disables `mul_mat_vec_q`'s rows-per-block ("small_k") mode on every RDNA part, so a short-K row (Qwen3.8's 96 hyper-connection up-projections/token are Q8_0 [10240 × 320]) ran as one 256-thread block per row doing a single loop trip: 23 µs, 150 GB/s. Enabled for RDNA4: 7 µs, 490 GB/s; K=640 shared-expert down 6.3 → 3.5 µs; large-K shapes unchanged within 1%. Bit-identical; cold decode 29.1 → 27.3 ms/token (−6%) | `GGML_CUDA_MMVQ_NO_SMALLK=1` |
 | `ggml/src/ggml-cuda/mmvf.cu` | **load pipelining in the f32/f16/bf16 matvec**: the per-row loop issued one dependent load per trip, which is fine for wide launches but latency-bound for the few-row shapes here (48 f32 routers [512 × 2560] at 25 µs / 210 GB/s, the 4-row hyper-connection inject at 6 µs, ssm alpha/beta). Four loads in flight per thread with the same per-thread accumulation order (bit-identical); cold decode 27.3 → 26.8 ms/token (−2%). Batched `test-backend-ops` cannot see this shape effect (it hides launch latency), only the real run does | none (unfused path only) |
 | `src/models/dflash.cpp`, `src/llama-hparams.h`, `src/llama-graph.cpp` | DFlash drafts run their sliding-window layers **causally**, as the z-lab reference does (`is_causal = layer_type == "sliding_attention"`); upstream ran every draft layer bidirectionally. Verified token-for-token against the reference PyTorch draft | `LLAMA_DFLASH_SWA_BIDIR=1` |
 
 ## Changes, off by default (experiments kept behind env vars)
 
+The expert-parallel prototype (`LLAMA_EP`), `LLAMA_PIPELINE_PARALLEL_FORCE` and the DFlash dump/tap diagnostics were dropped when the branch moved to the merged base; they are in the history up to tag `main-pre-mtp`.
+
 | Env | What | Outcome |
 |---|---|---|
-| `LLAMA_EP=<n_a>:<dev>[:first-last]` | expert parallelism: each expert tensor is sliced by index into two device buffers (`create_tensor_expert_slice`), the graph runs gate/up/down on both slices with `-1` sentinel ids (CUDA `mmvq`/`mmq`/`mmid` skip and zero-fill), LUT id remap | correct; slower at every batch size on ROCm (split/launch cost > overlap) |
-| `LLAMA_EP_DEV_A=<dev>`, `GGML_CUDA_DEVICES=<n>` | virtual device so slice A gets its own stream | same |
 | `GGML_SCHED_LAZY_INPUTS=1` | cut a split at the first consumer of a cross-backend activation; skip host syncs for no-input splits; source stream waits for the destination's progress before a peer copy | net loss on ROCm |
 | `GGML_CUDA_GRAPH_OPT_MULTI=1` | lift the multi-device gate on the CUDA graph-optimisation pass | −3% |
-| `LLAMA_PIPELINE_PARALLEL_FORCE=1` | keep pipeline-parallel on despite `-ot` | superseded by the events change |
-| `LLAMA_DFLASH_DUMP=1`, `LLAMA_DFLASH_DUMP_FILE=<prefix>` | per-tap statistics / raw dump of the target features and drafts (`common/speculative.cpp`) | diagnostics |
-| `LLAMA_DFLASH_TAP=norm\|attnres\|postnorm\|ffnout` | expose an alternative tensor as the DFlash "layer input" in `qwen35moe.cpp` | diagnostics; all collapse |
 
 ## Qwen3.8-Flash-Next with the MTP draft head (branch `hetero-qwen38-mtp`)
 
@@ -119,6 +116,30 @@ Two things to know:
   produce byte-identical text, whereas the stock graph with upstream's fusions on differs from itself
   with them off. Upstream's rms_norm+mul+rope / MoE-reduction fusions are not bit-exact, and the graph
   edits here (hyper-connection order, host PLE gather, projection adjacency) change which of them fire.
+
+## For upstream (facts to report; not filed)
+
+1. **`qwen4exp`: chunked and recurrent delta-net paths disagree.** Same prompt, greedy, no draft,
+   ROCm build, `-c 4096`; first generated token after the prompt's `\n\n`:
+
+   | `-ub` | P(`<think>`) | P(`Unified`) |
+   |---|---|---|
+   | 512 (one ubatch) | 0.534 | 0.358 |
+   | 8 | 0.476 | 0.393 |
+   | 2 | 0.467 | 0.443 |
+   | 1 (pure recurrence) | 0.378 | 0.496 |
+
+   The prompt: `Explain in about 300 words why unified memory changes the tradeoffs for running large
+   MoE models locally, then list three practical tips.` Repeatable run-to-run. Speculative verify
+   batches (2–3 tokens) land on the multi-token side, so greedy text differs with and without the draft.
+2. **CUDA fusions are not bit-exact.** Same build and prompt: `GGML_CUDA_DISABLE_FUSION=1` changes the
+   greedy text (829 vs 950 chars in the test above), and two graphs that are byte-identical unfused
+   diverge once fused because node order decides which fusions fire (rms_norm+mul+rope, MoE reduction).
+3. **`get_rows` on IQ4_NL declines rows that are not a multiple of 256** in `supports_op`, so a
+   device-resident IQ4_NL table falls back to a CPU gather (28.8 GB host copy for the PLE table here);
+   the 32-block gather in this branch's `getrows.cu` handles any multiple of 32.
+4. **`mul_mat_vec_q` small-K mode is disabled for all RDNA;** enabling it on RDNA4 takes a Q8_0
+   [10240 × 320] matvec from 150 to 490 GB/s with large shapes unchanged (`mmvq.cu` here).
 
 ## Notes
 
