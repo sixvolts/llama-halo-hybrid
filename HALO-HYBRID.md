@@ -105,6 +105,15 @@ Two things to know:
   0.48/0.39, `-ub 2` 0.47/0.44, `-ub 1` 0.38/0.50. The chunked (multi-token) and recurrent
   (single-token) delta-net paths of upstream `qwen4exp` disagree by ~0.1 in probability; the verify
   batch simply lands on the multi-token side. Worth an upstream report; it affects chunked prefill too.
+* Where an MTP round goes (rocprofv3, n-max 2, greedy; shares, since profiling inflates absolute
+  times ~2.7×): the 3-token verify forward is ~92% of the round, the two draft steps ~6%, host gaps
+  ~1–3%. Inside the verify forward the dense matvecs cost about what they cost for one token (the
+  multi-column `mul_mat_vec_q` config on RDNA4 already streams at 530–545 GB/s for 2–4 columns), the
+  extra is the APU expert traffic: three tokens select up to 30 experts per layer, so APU busy goes
+  5.5 → 13.5 ms. That is inherent to MoE speculation. Extending the q8 side copies to ≤4-row
+  activations was exact but measured neutral (the verify batch is not launch-bound), so it was not
+  kept; the remaining host overhead (~85 stream syncs per round from input uploads, logits/embedding
+  readbacks and per-backend scheduler syncs) is worth ~3% and has no single owner.
 * This branch's greedy output differs from the stock new base's, but the port itself is exact: with
   `GGML_CUDA_DISABLE_FUSION=1` (plus this branch's own switches off) the stock graph and the ported graph
   produce byte-identical text, whereas the stock graph with upstream's fusions on differs from itself
