@@ -47,6 +47,8 @@ is a split either way and measured ~0.7 t/s slower than the host gather.
 | *(superseded)* `src/models/qwen4exp.cpp` | **graph reuse** for the QSA/PLE inputs (`can_reuse`): implemented here first (cold decode 33.0 → 29.3 ms/token, +10% on the server); upstream master now carries its own, so the branch uses upstream's. Kept in the table because the numbers above include it | `LLAMA_GRAPH_REUSE_DISABLE=1` |
 | `ggml/src/ggml-cuda/mmvq.cu` | **small-K matvec mode on RDNA4**: upstream disables `mul_mat_vec_q`'s rows-per-block ("small_k") mode on every RDNA part, so a short-K row (Qwen3.8's 96 hyper-connection up-projections/token are Q8_0 [10240 × 320]) ran as one 256-thread block per row doing a single loop trip: 23 µs, 150 GB/s. Enabled for RDNA4: 7 µs, 490 GB/s; K=640 shared-expert down 6.3 → 3.5 µs; large-K shapes unchanged within 1%. Bit-identical; cold decode 29.1 → 27.3 ms/token (−6%) | `GGML_CUDA_MMVQ_NO_SMALLK=1` |
 | `ggml/src/ggml-cuda/mmvf.cu` | **load pipelining in the f32/f16/bf16 matvec**: the per-row loop issued one dependent load per trip, which is fine for wide launches but latency-bound for the few-row shapes here (48 f32 routers [512 × 2560] at 25 µs / 210 GB/s, the 4-row hyper-connection inject at 6 µs, ssm alpha/beta). Four loads in flight per thread with the same per-thread accumulation order (bit-identical); cold decode 27.3 → 26.8 ms/token (−2%). Batched `test-backend-ops` cannot see this shape effect (it hides launch latency), only the real run does | none (unfused path only) |
+| `src/llama-graph.cpp`, `src/models/qwen4exp.cpp` | **QSA gather at depth** (ported from ucicelos/flashnext-hybrid, their fix 4): above `LLAMA_QSA_GATHER` cells (default 65536) a decode step gathers the ~2k selected K/V rows out of the cache and runs flash attention over exactly those instead of masking the whole cache. Below the threshold the graph is unchanged by construction. Measured here at 68.5K tokens (hybrid-12, no draft): needles at positions 200 and 1400 of 2300 records retrieved with it on and off, identical answer text, decode 23.9 → 25.7 t/s (+7%); prefill unchanged. The padded variant of the original was not ported (it lost needles for them) | `LLAMA_QSA_GATHER=0` (off) or `=<n_kv>` |
+| `tools/server/server-context.cpp` | prompt-history checkpoints are saved host-side but PR #28118 restored them with the on-device flag, which asserts (`mem_storage.find(seq_id_read)`) on the first request that reuses a prompt longer than the checkpoint spacing (8K tokens). Restore with the same flags as the save | none |
 | `src/models/dflash.cpp`, `src/llama-hparams.h`, `src/llama-graph.cpp` | DFlash drafts run their sliding-window layers **causally**, as the z-lab reference does (`is_causal = layer_type == "sliding_attention"`); upstream ran every draft layer bidirectionally. Verified token-for-token against the reference PyTorch draft | `LLAMA_DFLASH_SWA_BIDIR=1` |
 
 ## Changes, off by default (experiments kept behind env vars)
@@ -119,6 +121,8 @@ Two things to know:
 
 ## For upstream (facts to report; not filed)
 
+0. **#28118's prompt-checkpoint restore** uses `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` for checkpoints that were saved without it (`tools/server/server-context.cpp`, the `it->load_tgt/load_dft` pair after `checking checkpoint`); any prompt over the 8K checkpoint spacing then aborts on its second request. Fixed in this branch by restoring host-side.
+
 1. **`qwen4exp`: chunked and recurrent delta-net paths disagree.** Same prompt, greedy, no draft,
    ROCm build, `-c 4096`; first generated token after the prompt's `\n\n`:
 
@@ -142,6 +146,10 @@ Two things to know:
    [10240 × 320] matvec from 150 to 490 GB/s with large shapes unchanged (`mmvq.cu` here).
 
 ## Notes
+
+Long-context items from the flashnext-hybrid report: their v3 pair (indexer heads summed by slices, #28023, and
+the sequence-position index for the n-gram predecessor lookup, #28040) is already in this base; their fix 4
+(the QSA gather) is ported above.
 
 Validation of the merged base (2026-09-02): `test-backend-ops test` passes 14571/14571 on both devices
 (ROCm0 = R9700, ROCm1 = APU), which covers the small-K and pipelined matvecs, `MUL_MAT_ID`, the IQ4_NL
