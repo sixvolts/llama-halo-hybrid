@@ -1381,6 +1381,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    int64_t ncols_hint; // 0: choose the column tile from ncols_max; else from this (MoE: expected tokens per expert)
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1491,7 +1492,11 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+        // MoE: ncols_max is the whole ubatch (any expert could get every token) but a typical expert gets a small
+        // fraction of it, so the tile that minimizes the tile count for ncols_max (J = 128) runs mostly empty
+        // columns; choose J for the expected per-expert count instead, the grid still covers ncols_max
+        const int64_t ncols_for_J = args.ncols_hint > 0 ? args.ncols_hint : args.ncols_max;
+        const int ntiles_x = (ncols_for_J + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
