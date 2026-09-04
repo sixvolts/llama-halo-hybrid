@@ -62,8 +62,9 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   4K / 16K / 32K prompts, hybrid-12, no draft: `-ub 1024` 676 / 616 / 540 → 891 / 835 / 722 tok/s, `-ub 2048`
   830 / 730 / 640 → **1179 / 1041 / 858**; the launch line above (draft head, `-ub 1024`) 644 / 592 / 510 →
   833 / 784 / 678. Decode is unchanged and the output is identical. On top of that the MoE GEMM tile fixes
-  (`GGML_CUDA_MMQ_MOE_J_FACTOR` and the compact tile list, both on by default, see HALO-HYBRID.md) add another
-  20–40%: 3.7K / 15K / 30K prompts reach **1603 / 1284 / 1018** at `-ub 2048` and **1470 / 1225 / 997** at
+  (`GGML_CUDA_MMQ_MOE_J_FACTOR` and the compact tile list, both on by default) and the R9700's f32 matmul
+  paths (rocBLAS instead of hipBLASLt, swapped MMVF for the thin inject matrices; see HALO-HYBRID.md) add another
+  20–45%: 3.7K / 15K / 30K prompts reach **1626 / 1324 / 1049** at `-ub 2048` and **1503 / 1258 / 1025** at
   `-ub 1024`, so `-ub 1024` with the draft head gives up very little. It costs a second set of compute buffers on
   the R9700 (0.75 GB at `-ub 1024`, 1.5 GB at 2048; two lanes of `-ub 4096` do not fit), so with the draft head use
   `-ub 1024` at hybrid-12/14 and `-ub 2048` at hybrid-10. `-b` must be at least twice `-ub`. The mechanism and the

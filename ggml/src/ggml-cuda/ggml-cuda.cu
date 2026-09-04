@@ -220,6 +220,15 @@ static int ggml_cuda_parse_id(char devName[]) {
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
+#ifdef GGML_USE_HIP
+    // rocBLAS 7.x hands f32 GEMMs to hipBLASLt, whose gfx1201 sgemm solutions are 8x8 macro-tile fallbacks
+    // (a [2560 -> 512] x 1024 sgemm runs at 2.5 TFLOPS; rocBLAS' own Tensile kernels reach 11).
+    // Prefer rocBLAS unless the user chose explicitly.
+    if (getenv("ROCBLAS_USE_HIPBLASLT") == nullptr) {
+        setenv("ROCBLAS_USE_HIPBLASLT", "0", 1);
+    }
+#endif // GGML_USE_HIP
+
     cudaError_t err = cudaGetDeviceCount(&info.physical_device_count);
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: failed to initialize " GGML_CUDA_NAME ": %s\n", __func__, cudaGetErrorString(err));
@@ -1857,6 +1866,35 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dst_vec.nb[2] = dst_vec.nb[1];
         dst_vec.nb[3] = dst_vec.nb[1];
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
+        return;
+    }
+    // A thin f32 matrix (a few output rows, many tokens) is a batched dot product over the activations:
+    // run MMVF with the operands swapped (the activations are the "weights", the rows the batch) into a
+    // [ne11, ne01] scratch and transpose it into dst. hipBLASLt runs this shape at a fifth of the bandwidth.
+    static const bool no_mmvf_swap = getenv("GGML_CUDA_NO_MMVF_SWAP") != nullptr && atoi(getenv("GGML_CUDA_NO_MMVF_SWAP")) != 0;
+    if (!no_mmvf_swap && ne01 > 1 && ne01 <= MMVF_MAX_BATCH_SIZE && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
+            && src0->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ ne01)) {
+        ggml_cuda_pool_alloc<float> tmp(ctx.pool(), ne01*ne11);
+
+        ggml_tensor dst_t = *dst;            // [ne11, ne01]: one row of dot products per token
+        dst_t.data  = tmp.get();
+        dst_t.ne[0] = ne11;
+        dst_t.ne[1] = ne01;
+        dst_t.nb[1] = dst_t.nb[0]*ne11;
+        dst_t.nb[2] = dst_t.nb[1]*ne01;
+        dst_t.nb[3] = dst_t.nb[2];
+        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_t);
+
+        ggml_tensor view = *dst;             // the scratch seen as the transposed [ne01, ne11]
+        view.data  = tmp.get();
+        view.nb[0] = sizeof(float)*ne11;
+        view.nb[1] = sizeof(float);
+        view.nb[2] = sizeof(float)*ne01*ne11;
+        view.nb[3] = view.nb[2];
+        view.view_src = nullptr;
+        ggml_cuda_cpy(ctx, &view, dst);
         return;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {

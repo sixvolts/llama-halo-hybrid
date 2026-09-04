@@ -9420,6 +9420,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 #if 1
+    // thin f32 matrices with many columns (CUDA: swapped MMVF + transpose)
+    for (int64_t m : {2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 1024, 256, {1, 1}, {1, 1}));
+    }
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             std::vector<int> ks = { 256 };
@@ -10451,6 +10455,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 320, {1024, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 1, 2560, {256, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 640, 1, 2560, {1024, 1}, {1, 1}));
+        return test_cases;
+    }
+
+    // Qwen3.8-Flash-Next prefill f32-weight matmuls on the R9700 (halo-hybrid): router, hc inject, ssm alpha/beta
+    if (getenv("TBO_Q38_F32") != nullptr) {
+        for (int64_t n_tokens : {1024, 2048}) {
+            for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n_tokens, 2560,  {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4,   n_tokens, 10240, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48,  n_tokens, 2560,  {1, 1}, {1, 1}));
+            }
+        }
         return test_cases;
     }
 
