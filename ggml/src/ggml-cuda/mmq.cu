@@ -5,6 +5,20 @@
 
 #include <cstdint>
 
+// GGML_CUDA_MMQ_MOE_J_FACTOR=f (default 2, 0 = off): size the MoE column tile for f x the expected tokens per
+// expert instead of the whole ubatch (mul_mat_q_switch_J); the grid still covers every column
+static int64_t ggml_cuda_mmq_moe_ncols_hint(const int64_t n_tokens, const int64_t n_expert_used, const int64_t n_expert) {
+    static const float factor = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_MOE_J_FACTOR");
+        return env ? (float) atof(env) : 2.0f;
+    }();
+    if (factor <= 0.0f || n_expert <= 0) {
+        return 0;
+    }
+    const int64_t expected = (n_tokens * n_expert_used + n_expert - 1) / n_expert;
+    return std::max<int64_t>(8, (int64_t) (factor * expected));
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -171,7 +185,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, 0};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -251,7 +265,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, ggml_cuda_mmq_moe_ncols_hint(ne12, n_expert_used, ne02)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
