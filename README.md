@@ -76,9 +76,9 @@ column's first request of a fresh server is cold, warm numbers are 10–15% high
 
 | streams | layout | prefill, agg tok/s | decode, no draft | decode, MTP n-max 2 |
 |---|---|---|---|---|
-| 1 | hybrid-12 | 766 (16K prompt: 834) | 35.0 | **45.1** (greedy ~52) |
-| 2 | hybrid-12 | 720 | 48.5 agg, 25.7 each | 54.1 agg, 29.7 each |
-| 4 | hybrid-12 | 827 | 66.9 agg, 18.1 each | does not fit with the head |
+| 1 | hybrid-12 | 1227 (16K prompt: 1264) | 35.4 | **45.6** (greedy ~52) |
+| 2 | hybrid-12 | 1157 | 50.7 agg, 26.8 each | 56.1 agg, 30.4 each |
+| 4 | hybrid-12 | 1262 | 67.6 agg, 18.0 each | does not fit with the head |
 | 4 | hybrid-10 | 585 (single lane) | 47.8 agg, 12.7 each | 51.5 agg, 14.0 each |
 | 1 at 68K context | hybrid-12 / hybrid-10 | 413 (`-ub 1024`) / 306 (`-ub 512`) | 25.7 | **43.6** |
 
