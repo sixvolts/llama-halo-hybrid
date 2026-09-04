@@ -1406,7 +1406,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
 // MoE: per expert e the tiling grid has ntx column tiles but only ceil(tokens_e/J) of them hold tokens;
 // build the compact list of (expert, column tile) pairs so the GEMM launches no empty blocks.
 // tile_list[cap] receives the pair count; the pairs are packed as expert | (tile << 16).
-#define MMQ_MOE_TILE_LIST_THREADS 1024
+static constexpr int MMQ_MOE_TILE_LIST_THREADS = 1024;
 static __global__ void mmq_moe_tile_list(const int32_t * __restrict__ expert_bounds, const int n_expert, const int J,
         const int ntx, int32_t * __restrict__ tile_list, const int cap) {
     __shared__ int scan[MMQ_MOE_TILE_LIST_THREADS];
@@ -1432,7 +1432,7 @@ static __global__ void mmq_moe_tile_list(const int32_t * __restrict__ expert_bou
         }
         const int base = carry + scan[threadIdx.x] - n; // exclusive prefix
         for (int t = 0; t < n; ++t) {
-            if (base + t < cap) {
+            if (base + t < cap) { // never taken: cap bounds the sum, kept as a guard for the launch grid
                 tile_list[base + t] = e | (t << 16);
             }
         }
