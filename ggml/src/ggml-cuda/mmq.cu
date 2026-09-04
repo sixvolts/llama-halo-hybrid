@@ -5,12 +5,12 @@
 
 #include <cstdint>
 
-// GGML_CUDA_MMQ_MOE_J_FACTOR=f (default 2, 0 = off): size the MoE column tile for f x the expected tokens per
+// GGML_CUDA_MMQ_MOE_J_FACTOR=f (default 1, 0 = off): size the MoE column tile for f x the expected tokens per
 // expert instead of the whole ubatch (mul_mat_q_switch_J); the grid still covers every column
 static int64_t ggml_cuda_mmq_moe_ncols_hint(const int64_t n_tokens, const int64_t n_expert_used, const int64_t n_expert) {
     static const float factor = [] {
         const char * env = getenv("GGML_CUDA_MMQ_MOE_J_FACTOR");
-        return env ? (float) atof(env) : 2.0f;
+        return env ? (float) atof(env) : 1.0f;
     }();
     if (factor <= 0.0f || n_expert <= 0) {
         return 0;

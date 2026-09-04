@@ -10454,6 +10454,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         return test_cases;
     }
 
+    // Qwen3.8-Flash-Next prefill expert GEMMs (halo-hybrid): 512 experts, 10 used; gate/up q4_K [2560 -> 640]
+    // with the broadcast src1, down q8_0 [640 -> 2560]
+    if (getenv("TBO_Q38_MOE") != nullptr) {
+        for (int64_t n_tokens : {256, 512, 1024, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,  640,  n_tokens, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+        }
+        return test_cases;
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

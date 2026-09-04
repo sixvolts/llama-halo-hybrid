@@ -958,7 +958,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int32_t * __restrict__ tile_list) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -991,10 +991,22 @@ static __global__ void mul_mat_q(
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
-        const int wt = tmp2.x;
-        const int zt = tmp2.y;
-        const int jt = blockIdx.y;
+        int wt = tmp2.x;
+        int zt = tmp2.y;
+        int jt = blockIdx.y;
         const int it = blockIdx.x;
+
+        if (tile_list) {
+            // MoE with a compact tile list: blockIdx.y indexes the (expert, column tile) pairs that hold tokens,
+            // the pair count is stored behind the list (see mmq_moe_tile_list)
+            if ((int) blockIdx.y >= tile_list[gridDim.y]) {
+                return;
+            }
+            const int packed = tile_list[blockIdx.y];
+            wt = 0;
+            zt = packed & 0xFFFF;
+            jt = packed >> 16;
+        }
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1391,6 +1403,58 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// MoE: per expert e the tiling grid has ntx column tiles but only ceil(tokens_e/J) of them hold tokens;
+// build the compact list of (expert, column tile) pairs so the GEMM launches no empty blocks.
+// tile_list[cap] receives the pair count; the pairs are packed as expert | (tile << 16).
+#define MMQ_MOE_TILE_LIST_THREADS 1024
+static __global__ void mmq_moe_tile_list(const int32_t * __restrict__ expert_bounds, const int n_expert, const int J,
+        const int ntx, int32_t * __restrict__ tile_list, const int cap) {
+    __shared__ int scan[MMQ_MOE_TILE_LIST_THREADS];
+    __shared__ int carry;
+    if (threadIdx.x == 0) {
+        carry = 0;
+    }
+    __syncthreads();
+    for (int e0 = 0; e0 < n_expert; e0 += MMQ_MOE_TILE_LIST_THREADS) {
+        const int e = e0 + threadIdx.x;
+        int n = 0;
+        if (e < n_expert) {
+            const int diff = expert_bounds[e + 1] - expert_bounds[e];
+            n = min((diff + J - 1) / J, ntx);
+        }
+        scan[threadIdx.x] = n;
+        __syncthreads();
+        for (int off = 1; off < MMQ_MOE_TILE_LIST_THREADS; off *= 2) {
+            const int v = threadIdx.x >= off ? scan[threadIdx.x - off] : 0;
+            __syncthreads();
+            scan[threadIdx.x] += v;
+            __syncthreads();
+        }
+        const int base = carry + scan[threadIdx.x] - n; // exclusive prefix
+        for (int t = 0; t < n; ++t) {
+            if (base + t < cap) {
+                tile_list[base + t] = e | (t << 16);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == MMQ_MOE_TILE_LIST_THREADS - 1) {
+            carry += scan[threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        tile_list[cap] = min(carry, cap);
+    }
+}
+
+static bool mmq_moe_use_tile_list() {
+    static const bool use = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_MOE_TILE_LIST"); // 0 disables the compact tile list
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return use;
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1426,12 +1490,24 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        ggml_cuda_pool_alloc<int32_t> tile_list(ctx.pool(id));
+        dim3 block_nums = block_nums_xy_tiling;
+        if (args.ids_dst && args.nsamples_y == 1 && args.nchannels_y < (1 << 16) && ntx < (1 << 15) && mmq_moe_use_tile_list()) {
+            // sum_e ceil(tokens_e/J) <= ncols_dst/J + n_expert, and never more than the full grid
+            const int64_t cap = std::min<int64_t>((int64_t) ntx * args.nchannels_y,
+                                                  (args.ncols_dst + config.J - 1) / config.J + args.nchannels_y);
+            tile_list.alloc(cap + 1);
+            mmq_moe_tile_list<<<1, MMQ_MOE_TILE_LIST_THREADS, 0, stream>>>
+                (args.expert_bounds, args.nchannels_y, config.J, ntx, tile_list.ptr, cap);
+            CUDA_CHECK(cudaGetLastError());
+            block_nums = dim3(nty, cap, 1);
+        }
+        mul_mat_q<type, J, fallback><<<block_nums, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, tile_list.ptr);
         return;
     }
 
@@ -1460,7 +1536,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, nullptr);
 
     if (!fixup_needed) {
         return;
