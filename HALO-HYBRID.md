@@ -68,7 +68,7 @@ The expert-parallel prototype (`LLAMA_EP`), `LLAMA_PIPELINE_PARALLEL_FORCE` and 
 | `LLAMA_LANES_DEBUG=1` | log every computed pair (tokens, outputs, splits, wall, tok/s) after a host sync | diagnostic |
 | `GGML_SCHED_TRACE_WAITS=1` | per graph: count of the scheduler's host-blocking points (no-input splits, synchronous input copies, sync-copy fallbacks) and the host submit time split into copies / compute; names the first 48 input copies | diagnostic |
 
-## Qwen3.8-Flash-Next with the MTP draft head (branch `hetero-qwen38-mtp`)
+## Qwen3.8-Flash-Next with the MTP draft head (on `main`; the pre-MTP history ends at tag `main-pre-mtp`)
 
 This branch is ggml-org `master` (3466812d1, the merged `qwen4exp`) + unslothai/llama.cpp#144
 (NextN/MTP draft head, draft-only exports, borrowing the target's embeddings and head, conv-state
