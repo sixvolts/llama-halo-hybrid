@@ -61,10 +61,10 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   work interleaved so the iGPU's expert GEMMs of one overlap the R9700's attention of the other. Warm prefill,
   4K / 16K / 32K prompts, hybrid-12, no draft: `-ub 1024` 676 / 616 / 540 → 891 / 835 / 722 tok/s, `-ub 2048`
   830 / 730 / 640 → **1179 / 1041 / 858**; the launch line above (draft head, `-ub 1024`) 644 / 592 / 510 →
-  833 / 784 / 678. Decode is unchanged and the output is identical. On top of that the MoE GEMM tile fix
-  (`GGML_CUDA_MMQ_MOE_J_FACTOR`, on by default, see HALO-HYBRID.md) adds another 16–38%: 3.7K / 15K / 30K prompts
-  reach **1368 / 1152 / 935** at `-ub 2048` and 1231 / 1058 / 886 at `-ub 1024`, so `-ub 1024` with the draft head
-  gives up very little. It costs a second set of compute buffers on
+  833 / 784 / 678. Decode is unchanged and the output is identical. On top of that the MoE GEMM tile fixes
+  (`GGML_CUDA_MMQ_MOE_J_FACTOR` and the compact tile list, both on by default, see HALO-HYBRID.md) add another
+  20–40%: 3.7K / 15K / 30K prompts reach **1603 / 1284 / 1018** at `-ub 2048` and **1470 / 1225 / 997** at
+  `-ub 1024`, so `-ub 1024` with the draft head gives up very little. It costs a second set of compute buffers on
   the R9700 (0.75 GB at `-ub 1024`, 1.5 GB at 2048; two lanes of `-ub 4096` do not fit), so with the draft head use
   `-ub 1024` at hybrid-12/14 and `-ub 2048` at hybrid-10. `-b` must be at least twice `-ub`. The mechanism and the
   four scheduler fixes it needed are in [HALO-HYBRID.md](HALO-HYBRID.md) ("Two-lane prefill").
