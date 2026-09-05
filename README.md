@@ -22,12 +22,11 @@ https://huggingface.co/SixVolts/Qwen3.5-122B-A10B-Opus-Reasoning-MTP-GGUF
 ## Qwen3.8-Flash-Next on the same box
 
 The model that replaced the 122B for me: 512 experts per layer, 36 layers of gated DeltaNet, 12 layers of
-top-k sparse attention, a 28.8 GB n-gram table, and (since 1 Sep) an MTP draft head shipped separately.
-Same idea as above: dense trunk, KV cache and the draft head on the R9700, the routed experts of most layers on
-the Strix, the n-gram table in host RAM. This repo's `main` is upstream master plus the MTP work from
-unslothai/llama.cpp#144 and ggml-org#28118, plus the kernel and scheduler changes described in
-[HALO-HYBRID.md](HALO-HYBRID.md). Stock llama.cpp on this layout decodes at 27–28 tok/s; this branch does
-~45 with the model-card sampler and ~52 greedy, from 22 on the Strix alone.
+top-k sparse attention, a 28.8 GB n-gram table, and an MTP draft head shipped separately. Same idea as above:
+dense trunk, KV cache and the draft head on the R9700, the routed experts of most layers on the Strix, the n-gram
+table in host RAM. This repo's `main` is upstream master plus the MTP work from unslothai/llama.cpp#144 and
+ggml-org#28118, plus the kernel and scheduler changes in [HALO-HYBRID.md](HALO-HYBRID.md). On this layout stock
+llama.cpp decodes at 27–28 tok/s; this branch does ~45 (52 greedy), and prefills at ~1,500 tok/s.
 
 Launch (single user, 8K context; ROCm0 is the R9700, ROCm1 the iGPU — check the device order in the startup log):
 
@@ -43,36 +42,36 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --host 0.0.0.0 --port 8080
 ```
 
-* Model: `unsloth/Qwen3.8-Flash-Next-GGUF` UD-Q4_K_XL (four shards, 111 GB). Draft head: the `shared-Q8_0` file in
-  that repo's `MTP/` folder (2.6 GB). It borrows the target's embeddings and lm head, so `-devd ROCm0` is required.
-* `-ot` moves the routed experts of layers 14–47 to the iGPU ("hybrid-14") and keeps the n-gram table in host RAM.
-  Hybrid-14 is the most the R9700 holds next to the draft head at 8K context. For 16K use `blk\.(1[2-9]|[2-4][0-9])`
-  (hybrid-12), for 64K+ use `blk\.(1[0-9]|[2-4][0-9])` (hybrid-10); past 64K the sparse-attention gather turns on by itself.
-* Use `/v1/chat/completions`. A bare prompt on `/completion` stops after one token with this model.
-  `"chat_template_kwargs": {"enable_thinking": false}` turns thinking off per request.
-* `--spec-draft-n-max 2`; 3 is the same within noise, 4 is worse, and `--spec-draft-p-min` raises acceptance but
-  not speed. Acceptance is ~0.70 greedy and ~0.51 with the model-card sampler (temperature 1.0, top-p 0.95, top-k 20),
-  which is the whole difference between 52 and 45 tok/s.
-* 128 GB is the working minimum: ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in host RAM,
-  26 GB + the head on the R9700. Drain caches before launching after big file activity.
-* The draft head only pays for one or two streams. For multi-user serving leave the `-md`/`--spec-type` lines out.
-* **Prefill: `LLAMA_PREFILL_LANES=2`.** With the experts on the iGPU the two devices took turns during prefill
-  (each ~40% busy, never together). This branch computes consecutive prefill ubatches on two schedulers with their
-  work interleaved so the iGPU's expert GEMMs of one overlap the R9700's attention of the other. Warm prefill,
-  4K / 16K / 32K prompts, hybrid-12, no draft: `-ub 1024` 676 / 616 / 540 → 891 / 835 / 722 tok/s, `-ub 2048`
-  830 / 730 / 640 → **1179 / 1041 / 858**; the launch line above (draft head, `-ub 1024`) 644 / 592 / 510 →
-  833 / 784 / 678. Decode is unchanged and the output is identical. On top of that the MoE GEMM tile fixes
-  (`GGML_CUDA_MMQ_MOE_J_FACTOR` and the compact tile list, both on by default) and the R9700's f32 matmul
-  paths (rocBLAS instead of hipBLASLt, swapped MMVF for the thin inject matrices; see HALO-HYBRID.md) add another
-  20–45%: 3.7K / 15K / 30K prompts reach **1626 / 1324 / 1049** at `-ub 2048` and **1503 / 1258 / 1025** at
-  `-ub 1024`, so `-ub 1024` with the draft head gives up very little. It costs a second set of compute buffers on
-  the R9700 (0.75 GB at `-ub 1024`, 1.5 GB at 2048; two lanes of `-ub 4096` do not fit), so with the draft head use
-  `-ub 1024` at hybrid-12/14 and `-ub 2048` at hybrid-10. `-b` must be at least twice `-ub`. The mechanism and the
-  four scheduler fixes it needed are in [HALO-HYBRID.md](HALO-HYBRID.md) ("Two-lane prefill").
+* **Model:** `unsloth/Qwen3.8-Flash-Next-GGUF` UD-Q4_K_XL (four shards, 111 GB). Draft head: the `shared-Q8_0` file
+  in that repo's `MTP/` folder (2.6 GB); it borrows the target's embeddings and lm head, so `-devd ROCm0` is required.
+* **Layout:** `-ot` sends the routed experts of layers N–47 to the iGPU ("hybrid-N") and keeps the n-gram table in
+  host RAM. Each layer kept on the R9700 costs it ~1.4 GB, so pick N by what has to fit next to the 2.6 GB head:
+
+  | context | layout | `-ot` pattern |
+  |---|---|---|
+  | 1 slot, 8K | hybrid-14 | `blk\.(1[4-9]\|[2-4][0-9])` |
+  | 1–2 slots, 16K each | hybrid-12 | `blk\.(1[2-9]\|[2-4][0-9])` |
+  | 2 slots, 32K each | hybrid-11 | `blk\.(1[1-9]\|[2-4][0-9])` |
+  | 64K+ (sparse-attention gather turns on by itself) | hybrid-10 | `blk\.(1[0-9]\|[2-4][0-9])` |
+
+  Without the head, 4 slots at 32K fit at hybrid-12. `-ctk q8_0 -ctv q8_0` halves the KV cost (1.1 GB per 32K slot).
+* **Prefill:** `LLAMA_PREFILL_LANES=2` runs consecutive ubatches on two schedulers so the iGPU's expert GEMMs
+  overlap the R9700's attention; with the MoE GEMM tile fixes and the R9700's f32 matmul paths (all on by
+  default) warm prefill at 3.7K / 15K / 30K is **1503 / 1258 / 1025** tok/s at `-ub 1024` and 1626 / 1324 / 1049
+  at `-ub 2048`, from 676 / 616 / 540 on the single-lane branch. The second lane costs a second set of compute
+  buffers on the R9700 (0.75 GB at `-ub 1024`, 1.5 GB at 2048), so with the head use `-ub 1024`; `-b` must be at
+  least twice `-ub`. Details and the scheduler fixes it needed: HALO-HYBRID.md, "Two-lane prefill".
+* **Decode:** `--spec-draft-n-max 2` (3 is the same within noise, 4 is worse). Acceptance is ~0.70 greedy and
+  ~0.51 with the model-card sampler (temperature 1.0, top-p 0.95, top-k 20), which is the whole difference between
+  52 and 45 tok/s. The head only pays at one or two streams; for more users leave the `-md`/`--spec-*` lines out.
+* **API:** use `/v1/chat/completions` (a bare prompt on `/completion` stops after one token with this model). The
+  model thinks by default; `"chat_template_kwargs": {"enable_thinking": false}` turns it off per request.
+* **Memory:** 128 GB is the working minimum: ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in
+  host RAM, 23–26 GB plus the head on the R9700. Drain caches before launching after big file activity.
 
 Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`,
 `LLAMA_PREFILL_LANES=2`; "agg" is the sum over streams, single-stream rows are the per-stream number; the prefill
-column's first request of a fresh server is cold, warm numbers are 10–15% higher):
+column's first request of a fresh server is cold, warm numbers are 10–20% higher):
 
 | streams | layout | prefill, agg tok/s | decode, no draft | decode, MTP n-max 2 |
 |---|---|---|---|---|
