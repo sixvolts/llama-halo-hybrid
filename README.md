@@ -21,8 +21,7 @@ https://huggingface.co/SixVolts/Qwen3.5-122B-A10B-Opus-Reasoning-MTP-GGUF
 
 ## Qwen3.8-Flash-Next on the same box
 
-The model that replaced the 122B for me: 512 experts per layer, 36 layers of gated DeltaNet, 12 layers of
-top-k sparse attention, a 28.8 GB n-gram table, and an MTP draft head shipped separately. Same idea as above:
+New model, who dis. Same idea as above:
 dense trunk, KV cache and the draft head on the R9700, the routed experts of most layers on the Strix, the n-gram
 table in host RAM. This repo's `main` is upstream master plus the MTP work from unslothai/llama.cpp#144 and
 ggml-org#28118, plus the kernel and scheduler changes in [HALO-HYBRID.md](HALO-HYBRID.md). On this layout stock
@@ -66,7 +65,7 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   52 and 45 tok/s. The head only pays at one or two streams; for more users leave the `-md`/`--spec-*` lines out.
 * **API:** use `/v1/chat/completions` (a bare prompt on `/completion` stops after one token with this model). The
   model thinks by default; `"chat_template_kwargs": {"enable_thinking": false}` turns it off per request.
-* **Memory:** 128 GB is the working minimum: ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in
+* **Memory:**  ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in
   host RAM, 23–26 GB plus the head on the R9700. Drain caches before launching after big file activity.
 
 Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`,
@@ -81,10 +80,7 @@ column's first request of a fresh server is cold, warm numbers are 10–20% high
 | 4 | hybrid-10 | 585 (single lane) | 47.8 agg, 12.7 each | 51.5 agg, 14.0 each |
 | 1 at 68K context | hybrid-12 / hybrid-10 | 413 (`-ub 1024`) / 306 (`-ub 512`) | 25.7 | **43.6** |
 
-The 4-stream rows move by up to 30% between sessions on this box (the 122B behaved the same), so read them as
-"the head is roughly break-even at four streams", not as a ranking of hybrid-12 against hybrid-10. The 68K rows use
-the sparse-attention gather ported from ucicelos/flashnext-hybrid; both needles in a 2,300-record haystack are retrieved
-with it on and off, and the answer text is identical.
+
 
 
 # llama.cpp
