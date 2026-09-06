@@ -2153,10 +2153,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
         // per token. An event costs nothing here and event_new returns NULL for devices
         // without support, which every call site already handles.
         // GGML_SCHED_NO_EVENTS=1 restores the old behavior (for A/B measurement).
+        // Only local GPU backends get this: the RPC backend is asynchronous and implements events,
+        // but a scheduler event on it stood in for the full synchronize the split loop relied on and
+        // the client read stale results back (GLM-5.3-Flash over ggml-rpc: garbage from token one,
+        // 2026-09-06). RPC keeps upstream's host synchronize unless pipeline parallelism asks for events.
         static const bool no_events = getenv("GGML_SCHED_NO_EVENTS") != nullptr;
-        if (sched->n_copies > 1 || !no_events) {
+        ggml_backend_dev_t dev = backends[b]->device;
+        const bool local_gpu = dev != NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "RPC") != 0;
+        if (sched->n_copies > 1 || (!no_events && local_gpu)) {
             for (int c = 0; c < sched->n_copies; c++) {
-                sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+                sched->events[b][c] = ggml_backend_event_new(dev);
             }
         }
     }
