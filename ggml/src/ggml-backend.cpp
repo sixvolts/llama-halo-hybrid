@@ -986,10 +986,14 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             if (src == NULL) {
                 continue;
             }
-            if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            // a view of a weight has no buffer of its own at this point (hyper-connection scales, sliced
+            // projections); without looking through it the op falls to the priority rules and can land on
+            // another device, which costs a synchronous copy per token when that device is an RPC hop away
+            ggml_backend_buffer_t src_buf = src->buffer ? src->buffer : (src->view_src ? src->view_src->buffer : NULL);
+            if (src_buf != NULL && src_buf->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
-                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src_buf)) {
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
@@ -1928,7 +1932,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                         st.n_wait_cpyfail++;
                         if (ggml_backend_sched_trace_waits()) {
                             static int n_logged = 0;
-                            if (n_logged < 16) {
+                            if (n_logged < 256) {
                                 n_logged++;
                                 GGML_LOG_INFO("sched-trace sync-copy: %s [%s] %zu bytes %s -> %s (split %d, first %s)\n",
                                     input->name, ggml_op_desc(input), ggml_nbytes(input), ggml_backend_name(input_backend), ggml_backend_name(split_backend),

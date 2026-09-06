@@ -164,7 +164,7 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_g_b = create_tensor(tn(LLM_TENSOR_SSM_G_B, "weight", il), {head_dim, d_inner}, flags);
 
             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", il), {n_embd, n_head}, flags);
-            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A,              il), {n_head}, flags);
+            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,       il), {n_head}, flags);
             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT,   "bias",   il), {d_inner}, flags);
 
             layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", il), {head_dim}, flags);
