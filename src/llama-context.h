@@ -384,6 +384,9 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_prev_lane;
+    // stream-ordered copies of the host graph inputs (ggml_backend_sched_set_async_inputs): on with two-lane
+    // prefill, or LLAMA_ASYNC_INPUTS=1 for layouts whose splits re-copy many small host inputs (RPC)
+    bool async_inputs = false;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

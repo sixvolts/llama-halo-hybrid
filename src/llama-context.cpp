@@ -735,8 +735,21 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // halo-hybrid: stream-ordered host input copies without the second lane (LLAMA_ASYNC_INPUTS=1). Every split
+    // that reads a host-resident input otherwise pays a host wait for that device plus a synchronous copy;
+    // GLM-5.3-Flash's sparse-attention pool inputs are read by dozens of splits per token.
+    {
+        const char * env = getenv("LLAMA_ASYNC_INPUTS");
+        if (env && atoi(env) != 0 && !model.hparams.no_alloc) {
+            async_inputs = true;
+            ggml_backend_sched_set_async_inputs(sched.get(), true);
+            LLAMA_LOG_INFO("%s: stream-ordered graph input copies enabled (LLAMA_ASYNC_INPUTS)\n", __func__);
+        }
+    }
+
     // halo-hybrid: second prefill lane - its own scheduler and compute buffers, reserved for the pp graph
     if (cparams.prefill_lanes >= 2) {
+        async_inputs = true;
         gf_res_prev_lane.reset(new llm_graph_result(max_nodes));
         sched_lane.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
 
@@ -1466,7 +1479,7 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // with async input copies the host inputs of this lane may still be in flight from its previous graph
-        if (cparams.prefill_lanes >= 2) {
+        if (async_inputs) {
             ggml_backend_sched_synchronize(sch);
         }
 
