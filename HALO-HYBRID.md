@@ -215,6 +215,54 @@ prefill 627 → 736 and 634 → 747, decode 48.9 → 50.2 and 66.6 → 63.1 (tha
 processed at one to two decode calls per 4K, so the gain grows with prompt length up to the point where the
 32K attention cost dominates.
 
+## GLM-5.3-Flash across two hosts (branch `glm53-flash`)
+
+GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB; 45 layers + 1 MTP block, 288 experts / 8 used, 34 KDA linear-attention
+layers, 11 DSA sparse-attention layers, mHC hyper-connections) does not fit one box, so it runs across gibson and a
+second Strix Halo (`mainframe`, 128 GB, no dGPU) over a direct 100G Intel E810 link with llama.cpp's RPC backend.
+The branch is `main` + upstream PR #27754 (`glm5next`, open at the time) + the fixes below. Launcher and MTP export:
+`docs/halo-hybrid/run_glm_two_host.sh`, `docs/halo-hybrid/export_mtp.py`.
+
+**Layout.** Contiguous by layer so the link is crossed twice per token: layers 0–24 on gibson (dense trunk, KV and
+the experts of layers 3–5 on the R9700, experts of 6–24 on the iGPU), layers 25–44 on mainframe's iGPU exposed as
+`RPC0` by `ggml-rpc-server -H 10.100.100.2 -p 50052 -d ROCm0`, output head pulled back to the R9700. Per token the
+residual (64 KB) goes out and the last hidden state comes back; the split is expressed as
+`-dev ROCm0,RPC0,ROCm1 -ts 25,22,0` (layer `il` goes to the device whose cumulative split exceeds `il/47`, so the
+denominator is `n_layer_all + 1`). RDMA over RoCE is negotiated automatically once both builds have `GGML_RPC_RDMA`;
+its bytes do not show in the netdev counters, only in `/sys/class/infiniband/irdma0/ports/1/hw_counters`. The 86 GB
+remote load takes ~3 minutes and is bound by the loader's read-then-send loop, not the link (TCP 561 MB/s, RDMA
+~500 MB/s, iperf3 27.6 Gbit/s).
+
+**Fixes it needed** (each found by bisecting two-host runs with the mainframe session; a run costs 4 minutes):
+
+| Change | Symptom | Effect |
+|---|---|---|
+| `ggml-rpc/transport.cpp`: retry `ibv_create_qp` with inline 256 → 64 → 0, log why a connection stays on TCP | irdma caps `max_inline_data` at 101, the QP creation failed and both peers dropped to TCP without a word | RDMA active (`RDMA probed ... inline=64`, `RDMA activated`) |
+| `ggml-backend.cpp`: the always-on split events (this branch's two-GPU optimisation) only for backends with `cpy_tensor_async_nowait` | the asynchronous RPC backend implements events, so `event_synchronize` replaced the full synchronize the split loop relied on: garbage from token one, same op counts as a correct run | correct output |
+| `ggml-backend.cpp`: the "run the op where its weights are" rule looks through views (`src->view_src->buffer`) | hyper-connection scale/base weights are used through views, which have no buffer at split time; the ops fell to the priority passes and ran on the R9700 with weights and activations copied over the link twice per layer per token | sync copies per token 136 → 56, decode 10.8 → 11.7 |
+| `glm5next.cpp`: `ssm_a` as `LLM_TENSOR_SSM_A_NOSCAN` (a MUL operand, like every other KDA/GDN model) | the loader's support probe used `GGML_OP_SSM_SCAN`, HIP declined it, the 256-byte tensor landed on the host and every split re-copied it with a device synchronize | 19 sync copies per token |
+| launch line: `^output\.weight$` | an unanchored `output\.weight` override also matched every `attn_output.weight` and pinned all 45 output projections to the R9700 | splits per token 80 → 40, decode 11.7 → 13.9, prefill 206 → 296 |
+| `LLAMA_ASYNC_INPUTS=1`: the two-lane prefill's stream-ordered host-input copies without the second lane | the sparse-attention pool inputs are host-resident and read by many splits | sync copies 16 → 4 (the inherent boundary), decode 13.9 → 14.2 |
+| MTP draft head from `blk.45`, exported into a draft-only GGUF (`export_mtp.py`; no such file is published), on the R9700 | | decode 14.2 → **20.2** tok/s at 4K, 19.0 at 16K; acceptance 0.85 greedy / 0.82 sampled; `--spec-draft-n-max 2` (3: 18.8, 4: 18.3, 6: 18.4–19.2 on prose; code at temperature 0.7 prefers 4: 23.5 tok/s vs 20.1) |
+
+**Where the time goes now** (single stream, 4K prompt): ~66 ms per token submit, of which ~60 waits for the remote
+graph (20 layers on the 215 GB/s iGPU) behind the local 25 layers; both GPUs are ~50% busy. `GGML_SCHED_TRACE_WAITS=1`
+names every synchronous copy (cap 256), which is how each of the fixes above was found; the server-side kernel
+profile (`rocprofv3`) could not see any of them, since a blocking host copy consumes no kernel time.
+
+**Numbers** (warm, single stream, `-c 131072`, RDMA; prefill / decode in tok/s at 4K and 16K prompts):
+
+| Run | 4K | 16K |
+|---|---|---|
+| first correct run (upstream code both ends, TCP) | 206 / 10.3 | 184 / 10.1 |
+| + RDMA | 206 / 10.7 | 184 / 10.1 |
+| + view-aware weight rule, `ssm_a`, anchored override | 296 / 13.9 | 329 / 13.6 |
+| + `LLAMA_ASYNC_INPUTS=1` | 288 / 14.2 | 326 / 13.6 |
+| + MTP draft head, n-max 2 | 254 / **20.2** | 222 / **19.0** |
+
+Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
+state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
+
 ## For upstream (facts to report; not filed)
 
 0. **#28118's prompt-checkpoint restore** uses `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` for checkpoints that were saved without it (`tools/server/server-context.cpp`, the `it->load_tgt/load_dft` pair after `checking checkpoint`); any prompt over the 8K checkpoint spacing then aborts on its second request. Fixed in this branch by restoring host-side.
