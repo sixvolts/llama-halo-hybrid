@@ -303,10 +303,19 @@ bool socket_t::impl::rdma_probe() {
     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
     qia.cap.max_send_sge    = 1;
     qia.cap.max_recv_sge    = 1;
-    qia.cap.max_inline_data = 256;
-
-    rdma->qp = ibv_create_qp(rdma->pd, &qia);
-    if (!rdma->qp) return false;
+    // inline data is an optimisation only (bulk transfers go through the registered buffers), and some
+    // providers cap it well below 256 (Intel irdma/E810: 101) and reject the QP outright, which used to
+    // drop the whole connection to TCP without a word: retry with smaller requests before giving up
+    static const uint32_t inline_sizes[] = { 256, 64, 0 };
+    for (uint32_t inl : inline_sizes) {
+        qia.cap.max_inline_data = inl;
+        rdma->qp = ibv_create_qp(rdma->pd, &qia);
+        if (rdma->qp) break;
+    }
+    if (!rdma->qp) {
+        GGML_LOG_INFO("RDMA: ibv_create_qp failed on %s, using TCP\n", matched_dev ? matched_dev : "?");
+        return false;
+    }
     rdma->max_inline = qia.cap.max_inline_data;
 
     rdma->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
@@ -564,6 +573,7 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
         remote_rdma |= remote_caps[i] != 0;
     }
     if (!rdma || !remote_rdma) {
+        GGML_LOG_INFO("RDMA: %s, using TCP\n", !rdma ? "local probe failed" : "peer advertises no RDMA");
         rdma.reset();
         return;
     }
