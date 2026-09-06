@@ -17,6 +17,7 @@ enum ffn_op_type {
     FFN_SILU,
     FFN_GELU_QUICK,
     FFN_RELU_SQR,
+    FFN_SILU_CLAMP,
 };
 
 enum norm_type {
@@ -89,6 +90,9 @@ struct clip_hparams {
 
     ffn_op_type ffn_op = FFN_GELU;
 
+    // clamp applied to the SwiGLU gate/up before the activation (FFN_SILU_CLAMP)
+    float swiglu_limit = 0.0f;
+
     patch_merge_type mm_patch_merge_type = PATCH_MERGE_FLAT;
 
     float eps = 1e-6;
@@ -99,6 +103,10 @@ struct clip_hparams {
     int32_t n_wa_pattern = 0;
     std::unordered_set<int32_t> wa_layer_indexes; // explicit layer indexes that use full attention (for irregular patterns like YoutuVL)
     std::vector<int32_t> wa_pattern_mode; // mimovl: per-layer window-attention mode
+
+    // deepseek4v: resize solver caps the LLM token count of the aligner grid
+    int32_t dsv4_max_n_token  = 0;
+    int32_t dsv4_max_wh_ratio = 0;
 
     // deepseek-ocr (sam)
     int32_t sam_n_layer = 0;
@@ -724,6 +732,11 @@ struct clip_model {
 
     // pixtral, glm4v
     ggml_tensor * token_embd_img_break = nullptr;
+
+    // deepseek4v sentinel embeddings (image_newline is reused for IMAGE_NEW_LINE)
+    ggml_tensor * token_embd_img_start = nullptr;
+    ggml_tensor * token_embd_img_end   = nullptr;
+    ggml_tensor * token_embd_img_pad   = nullptr;
     ggml_tensor * mm_patch_merger_w = nullptr;
     ggml_tensor * mm_patch_merger_b = nullptr;
 

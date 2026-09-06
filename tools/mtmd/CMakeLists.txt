@@ -30,6 +30,7 @@ add_library(mtmd
             models/models.h
             models/cogvlm.cpp
             models/conformer.cpp
+            models/deepseek4v.cpp
             models/dots3note.cpp
             models/dotsocr.cpp
             models/exaone4_5.cpp
@@ -38,6 +39,7 @@ add_library(mtmd
             models/gemma4ua.cpp
             models/gemma4uv.cpp
             models/glm4v.cpp
+            models/glm5next-vision.cpp
             models/granite-speech.cpp
             models/granite4-vision.cpp
             models/hunyuanvl.cpp

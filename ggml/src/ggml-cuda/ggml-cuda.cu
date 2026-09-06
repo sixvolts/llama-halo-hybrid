@@ -4991,6 +4991,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         return;
     }
 
+    ggml_cuda_set_device(cuda_ctx->device);
+
     // number of out-degrees for a particular node
     std::unordered_map<const ggml_tensor *, int> fan_out;
     // reverse mapping of node to index in the cgraph
