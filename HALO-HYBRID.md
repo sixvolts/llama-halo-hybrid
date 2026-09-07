@@ -221,7 +221,9 @@ GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB; 45 layers + 1 MTP block, 288 experts 
 layers, 11 DSA sparse-attention layers, mHC hyper-connections) does not fit one box, so it runs across gibson and a
 second Strix Halo (`mainframe`, 128 GB, no dGPU) over a direct 100G Intel E810 link with llama.cpp's RPC backend.
 The branch is `main` + upstream PR #27754 (`glm5next`, open at the time) + the fixes below. Launcher and MTP export:
-`docs/halo-hybrid/run_glm_two_host.sh`, `docs/halo-hybrid/export_mtp.py`.
+`docs/halo-hybrid/run_glm_two_host.sh`, `docs/halo-hybrid/export_mtp.py`. Both hosts must run `ggml-rpc-server` and `llama-server`
+from the same commit of this tree: the RPC wire format is fork-local (graph compute replies) and a mismatch hangs with no
+error on either end. `LLAMA_PREFILL_LANES` is ignored on this layout (it halves decode with the draft head).
 
 **Layout.** Contiguous by layer so the link is crossed twice per token: layers 0–24 on gibson (dense trunk, KV and
 the experts of layers 3–5 on the R9700, experts of 6–24 on the iGPU), layers 25–44 on mainframe's iGPU exposed as
