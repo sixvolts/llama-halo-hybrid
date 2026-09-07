@@ -179,6 +179,8 @@ struct llama_hparams {
     // causal_attn = false for the noise block. When set, the SWA kq mask is built causal regardless
     // of cparams.causal_attn.
     bool swa_causal_override = false;
+    // the model file is a draft-only MTP head (no trunk tensors); set by the loaders that support one
+    bool mtp_only = false;
 
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;

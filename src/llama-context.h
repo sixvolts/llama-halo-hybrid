@@ -387,6 +387,9 @@ private:
     // stream-ordered copies of the host graph inputs (ggml_backend_sched_set_async_inputs): on with two-lane
     // prefill, or LLAMA_ASYNC_INPUTS=1 for layouts whose splits re-copy many small host inputs (RPC)
     bool async_inputs = false;
+    // a two-lane pair was submitted and no synchronize has happened since: the next single graph on the
+    // main scheduler must wait for it (the per-ubatch path already synchronizes before set_inputs)
+    bool lanes_sync_pending = false;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
