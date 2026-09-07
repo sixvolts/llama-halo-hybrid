@@ -245,6 +245,21 @@ remote load takes ~3 minutes and is bound by the loader's read-then-send loop, n
 | `LLAMA_ASYNC_INPUTS=1`: the two-lane prefill's stream-ordered host-input copies without the second lane | the sparse-attention pool inputs are host-resident and read by many splits | sync copies 16 → 4 (the inherent boundary), decode 13.9 → 14.2 |
 | MTP draft head from `blk.45`, exported into a draft-only GGUF (`export_mtp.py`; no such file is published), on the R9700 | | decode 14.2 → **20.2** tok/s at 4K, 19.0 at 16K; acceptance 0.85 greedy / 0.82 sampled; `--spec-draft-n-max 2` (3: 18.8, 4: 18.3, 6: 18.4–19.2 on prose; code at temperature 0.7 prefers 4: 23.5 tok/s vs 20.1; `--spec-draft-p-min` 0.5/0.7 with n-max 2/3 all within ±5% of the default; `-ub 2048` does not fit on the R9700 next to the draft) |
 
+**Two-lane prefill across the hosts** (2026-09-07). The first attempt died on RDMA with `RDMA CQ wc error: status=12
+(transport retry counter exceeded)` and nothing logged on the server. Cause: `GRAPH_COMPUTE` / `GRAPH_RECOMPUTE` had no
+reply, so the client's dispatcher kept sending while the single-threaded server was inside a graph and not reposting
+its 24 x 256 KB receive ring; the second lane's inputs and graph overflowed it and the Intel NIC gave up within
+seconds (TCP survived on kernel buffering; a longer queue-pair ACK timeout did nothing). Fix: the server answers
+graph compute with an empty reply and the dispatcher waits for it before the next command, without blocking the
+caller (wire change: both peers must run this tree). With the lanes stable, the alternating split order gave nothing
+(both lanes reach the remote split together and serialize there), so with a remote backend the pair now runs lane a
+through its remote submit, then lane b's local splits, then the tails (`GGML_SCHED_PAIR_LOCKSTEP=1` restores):
+prefill 288 / 326 → 316 / 347 tok/s at 4K / 16K over TCP, 296 / 275 over RDMA (the 16K figure is unexplained);
+upstream's pipeline parallelism forced on gives the same 308 / 345. Both are capped by the host-blocking copy of the
+remote result. The lanes are opt-in for this layout: with the draft head the target's verify graphs wait ~2.3x longer
+in the copy path (257 vs 113 ms per graph, same splits) and decode falls from 20 to 9 tok/s, not yet understood; the
+per-graph synchronize the lanes used to do was removed (one-time after a pair) and a draft-only head keeps one lane.
+
 **Where the time goes now** (single stream, 4K prompt): ~66 ms per token submit, of which ~60 waits for the remote
 graph (20 layers on the 215 GB/s iGPU) behind the local 25 layers; both GPUs are ~50% busy. `GGML_SCHED_TRACE_WAITS=1`
 names every synchronous copy (cap 256), which is how each of the fixes above was found; the server-side kernel
