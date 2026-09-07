@@ -391,7 +391,11 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
     {
         struct ibv_qp_attr a = {};
         a.qp_state     = IBV_QPS_RTS;
-        a.timeout      = 14;
+        // the receiver only reposts its 24 receive buffers between commands, so a sender that streams a large
+        // tensor while the peer is inside a long graph_compute sees no ACKs for the duration of that graph;
+        // 14 (~67 ms x 7 retries) was exceeded by a prefill ubatch with two-lane prefill (RDMA CQ status 12,
+        // transport retry counter exceeded). 20 is ~4.3 s per retry, ~30 s in all.
+        a.timeout      = 20;
         a.retry_cnt    = 7;
         a.rnr_retry    = 7;
         a.sq_psn       = rdma_local.psn;
