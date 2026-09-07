@@ -2072,6 +2072,48 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
     // Cross-graph ordering (b reads the KV/recurrent state a writes at the same layer) follows from a's
     // split i being queued on the shared stream before b's split i.
     ggml_backend_sched_compute_state st_a, st_b;
+
+    // With a remote backend (RPC: asynchronous, serial on its own host, no stream-ordered copies) the
+    // alternating order runs both lanes in lockstep: they reach their remote split together, queue behind
+    // each other on the remote host, and the local devices idle meanwhile. Instead run lane a through its
+    // remote split (submitted asynchronously), then lane b's local splits while the remote host computes a,
+    // then the tails. Cross-lane ordering still holds: every split of a precedes the same split of b on
+    // every backend. GGML_SCHED_PAIR_LOCKSTEP=1 restores the alternating order.
+    static const bool lockstep = getenv("GGML_SCHED_PAIR_LOCKSTEP") != nullptr;
+    auto first_remote_split = [](ggml_backend_sched_t sched) -> int {
+        for (int i = 0; i < sched->n_splits; i++) {
+            ggml_backend_t backend = sched->backends[sched->splits[i].backend_id];
+            ggml_backend_dev_t dev = backend->device;
+            if (dev != NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    backend->iface.cpy_tensor_async_nowait == NULL) {
+                return i;
+            }
+        }
+        return -1;
+    };
+    const int ra = first_remote_split(sched_a);
+    const int rb = first_remote_split(sched_b);
+    if (!lockstep && ra >= 0 && rb >= 0) {
+        struct phase { ggml_backend_sched_t sched; int from; int to; ggml_backend_sched_compute_state * st; };
+        const phase phases[4] = {
+            { sched_a, 0,      ra + 1,             &st_a },
+            { sched_b, 0,      rb + 1,             &st_b },
+            { sched_a, ra + 1, sched_a->n_splits,  &st_a },
+            { sched_b, rb + 1, sched_b->n_splits,  &st_b },
+        };
+        for (const phase & ph : phases) {
+            for (int split_id = ph.from; split_id < ph.to; split_id++) {
+                enum ggml_status ec = ggml_backend_sched_compute_split(ph.sched, split_id, *ph.st);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+            }
+        }
+        ggml_backend_sched_trace_report("pair-a", sched_a, st_a);
+        ggml_backend_sched_trace_report("pair-b", sched_b, st_b);
+        return GGML_STATUS_SUCCESS;
+    }
+
     const int n = std::max(sched_a->n_splits, sched_b->n_splits);
     for (int split_id = 0; split_id < n; split_id++) {
         if (split_id < sched_a->n_splits) {
