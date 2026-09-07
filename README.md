@@ -84,12 +84,12 @@ column's first request of a fresh server is cold, warm numbers are 10–20% high
 
 ## GLM-5.3-Flash across two Strix Halo boxes
 
-The 320B GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB) runs split over this machine and a second Strix Halo over a
-direct 100G link, using llama.cpp's RPC backend with RDMA: layers 0–24 here (dense trunk, KV and the MTP draft head on
-the R9700, experts on the iGPU), layers 25–44 on the other box's iGPU. Single stream, 128K context: **20 tok/s decode**
+The GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB) runs split between two 128G Strix Halo boxes over a
+direct 100G link (Intel E810), using llama.cpp's RPC backend with RDMA, with an R9700 on the primary box. KV and the MTP draft head on
+the R9700, Layers 0–24 here (dense trunk, experts on the iGPU), layers 25–44 on the secondary box's unified memory. Single stream, 128K context: **20 tok/s decode**
 (19 at 16K) with the model's own MTP head at 0.85 acceptance, prefill ~250–300 tok/s; 14 tok/s without the head. It
 took two scheduler fixes, an RDMA transport fix and a loader fix, all on branch `glm53-flash` (upstream's
-GLM-5.3-Flash PR is not merged yet); the story, the launch line and the draft-head export are in
+GLM-5.3-Flash PR is not merged yet); More details and the draft-head export are in
 [HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
 
 
