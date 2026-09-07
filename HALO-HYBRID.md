@@ -223,7 +223,10 @@ second Strix Halo (`mainframe`, 128 GB, no dGPU) over a direct 100G Intel E810 l
 The branch is `main` + upstream PR #27754 (`glm5next`, open at the time) + the fixes below. Launcher and MTP export:
 `docs/halo-hybrid/run_glm_two_host.sh`, `docs/halo-hybrid/export_mtp.py`. Both hosts must run `ggml-rpc-server` and `llama-server`
 from the same commit of this tree: the RPC wire format is fork-local (graph compute replies) and a mismatch hangs with no
-error on either end. `LLAMA_PREFILL_LANES` is ignored on this layout (it halves decode with the draft head).
+error on either end. `LLAMA_PREFILL_LANES` is ignored on this layout (it halves decode with the draft head). If gibson goes down, restart mainframe's
+`ggml-rpc-server` too (it spins on the dead connection and keeps the model resident). The R9700's runtime power
+management is pinned on (`/etc/udev/rules.d/90-r9700-no-runtime-pm.rules`) after the card dropped off the PCIe bus
+following a resume from D3 during an interactive session (`device lost from bus`, host power-cycled).
 
 **Layout.** Contiguous by layer so the link is crossed twice per token: layers 0–24 on gibson (dense trunk, KV and
 the experts of layers 3–5 on the R9700, experts of 6–24 on the iGPU), layers 25–44 on mainframe's iGPU exposed as
@@ -327,6 +330,9 @@ state), so the limit is the dense-attention scratch, not the cache. Mainframe pe
 8. **Thin f32 matrices at prefill go to cuBLAS.** `ggml_cuda_mul_mat` swaps a `[K → 1]` f32 matrix into
    `mul_mat_vec_f` but a `[K → 2..8]` one (hyper-connection inject matrices, `[10240 → 4]` at 1024 tokens)
    goes to cuBLAS/hipBLASLt; the swapped MMVF plus a transpose is 7× faster on gfx1201 (this branch).
+10. **`ggml-rpc-server` never notices a dead client.** A client crash or host reboot leaves the server spinning in its
+   RDMA poll loop (or waiting on a TCP socket with no keepalive) with every buffer still allocated (92 GB here) until
+   it is restarted by hand; the poll loop needs a deadline plus a TCP keepalive on the control socket.
 9. **ROCm 7.2.2: rocBLAS routes f32 GEMMs to hipBLASLt on gfx1201**, whose sgemm solutions are 8x8 macro-tile
    fallbacks (`[2560 → 512] × 1024` at 2.5 TFLOPS); `ROCBLAS_USE_HIPBLASLT=0` is 4× faster for that shape but
    slower for f16 GEMMs. A ROCm issue rather than a llama.cpp one; ggml could pick per data type if hipBLASLt
