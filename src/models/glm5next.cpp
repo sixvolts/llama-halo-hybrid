@@ -121,6 +121,7 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
     const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
     const bool trunk_only = (n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
     const int trunk_flags = mtp_only   ? TENSOR_NOT_REQUIRED : 0;
+    hparams.mtp_only = mtp_only;
     int       mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
 
     if (!ml.load_mtp) {

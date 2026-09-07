@@ -167,6 +167,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // so the trunk is described and absent. same probe as qwen35.
     const bool mtp_only    = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr);
     const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    hparams.mtp_only = mtp_only;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 

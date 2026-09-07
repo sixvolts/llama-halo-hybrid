@@ -487,7 +487,9 @@ llama_context::llama_context(
                     n_gpu++;
                 }
             }
-            if (env && atoi(env) >= 2) {
+            // a draft-only MTP head keeps one lane: its prefill is small and the second set of compute buffers
+            // would not fit next to the target's on the R9700
+            if (env && atoi(env) >= 2 && !model.hparams.mtp_only) {
                 if (n_gpu >= 2 && !cparams.pipeline_parallel && !model.hparams.no_alloc) {
                     cparams.prefill_lanes = 2;
                     LLAMA_LOG_INFO("%s: two-lane prefill enabled (LLAMA_PREFILL_LANES)\n", __func__);
@@ -2710,10 +2712,14 @@ ggml_status llama_context::graph_compute(
     graph_compute_set_threads(batched);
 
     // eager copies and async inputs (two-lane prefill) require that the previous graph is done before the
-    // next one is submitted on the same scheduler; process_ubatch already synchronized before set_inputs,
-    // this covers the other callers (memory updates)
-    if (cparams.prefill_lanes >= 2) {
+    // next one is submitted on the same scheduler; process_ubatch already synchronizes before set_inputs,
+    // so this only has to cover a graph that follows a pair without going through it (memory updates).
+    // Synchronizing before every graph cost half the decode rate on the two-host layout, where a
+    // synchronize is a round trip to the remote device.
+    if (cparams.prefill_lanes >= 2 && lanes_sync_pending) {
         ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_sched_synchronize(sched_lane.get());
+        lanes_sync_pending = false;
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
@@ -2735,6 +2741,7 @@ ggml_status llama_context::graph_compute_pair(bool batched) {
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async_pair failed with error %d\n", __func__, status);
     }
+    lanes_sync_pending = true;
 
     return status;
 }
