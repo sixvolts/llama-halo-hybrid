@@ -332,7 +332,8 @@ state), so the limit is the dense-attention scratch, not the cache. Mainframe pe
    goes to cuBLAS/hipBLASLt; the swapped MMVF plus a transpose is 7× faster on gfx1201 (this branch).
 10. **`ggml-rpc-server` never notices a dead client.** A client crash or host reboot leaves the server spinning in its
    RDMA poll loop (or waiting on a TCP socket with no keepalive) with every buffer still allocated (92 GB here) until
-   it is restarted by hand; the poll loop needs a deadline plus a TCP keepalive on the control socket.
+   it is restarted by hand (SIGTERM suffices). A TCP keepalive on the control socket is the safe fix: a poll-loop deadline
+   alone would also fire during a legitimately long remote graph (long-context prefill graphs run for seconds).
 9. **ROCm 7.2.2: rocBLAS routes f32 GEMMs to hipBLASLt on gfx1201**, whose sgemm solutions are 8x8 macro-tile
    fallbacks (`[2560 → 512] × 1024` at 2.5 TFLOPS); `ROCBLAS_USE_HIPBLASLT=0` is 4× faster for that shape but
    slower for f16 GEMMs. A ROCm issue rather than a llama.cpp one; ggml could pick per data type if hipBLASLt
