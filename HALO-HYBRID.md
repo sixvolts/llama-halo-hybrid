@@ -248,6 +248,7 @@ remote load takes ~3 minutes and is bound by the loader's read-then-send loop, n
 | `glm5next.cpp`: `ssm_a` as `LLM_TENSOR_SSM_A_NOSCAN` (a MUL operand, like every other KDA/GDN model) | the loader's support probe used `GGML_OP_SSM_SCAN`, HIP declined it, the 256-byte tensor landed on the host and every split re-copied it with a device synchronize | 19 sync copies per token |
 | launch line: `^output\.weight$` | an unanchored `output\.weight` override also matched every `attn_output.weight` and pinned all 45 output projections to the R9700 | splits per token 80 → 40, decode 11.7 → 13.9, prefill 206 → 296 |
 | `LLAMA_ASYNC_INPUTS=1`: the two-lane prefill's stream-ordered host-input copies without the second lane | the sparse-attention pool inputs are host-resident and read by many splits | sync copies 16 → 4 (the inherent boundary), decode 13.9 → 14.2 |
+| `ggml-rpc/transport.cpp`: `rdma_poll` spins 5 ms, then polls with 50 µs sleeps (b8679d33f) | an idle `rpc-server` sat at 100% CPU on one core between requests and looked exactly like a hung process (last log line `get_tensor`, GPU idle, spinning); the client burned a core for every remote `graph_compute`. Twice diagnosed as a deadlock before a backtrace of the client showed it idle in the server queue | no idle spin, no measurable decode/prefill change |
 | MTP draft head from `blk.45`, exported into a draft-only GGUF (`export_mtp.py`; no such file is published), on the R9700 | | decode 14.2 → **20.2** tok/s at 4K, 19.0 at 16K; acceptance 0.85 greedy / 0.82 sampled; `--spec-draft-n-max 2` (3: 18.8, 4: 18.3, 6: 18.4–19.2 on prose; code at temperature 0.7 prefers 4: 23.5 tok/s vs 20.1; `--spec-draft-p-min` 0.5/0.7 with n-max 2/3 all within ±5% of the default; `-ub 2048` does not fit on the R9700 next to the draft) |
 
 **Two-lane prefill across the hosts** (2026-09-07). The first attempt died on RDMA with `RDMA CQ wc error: status=12
@@ -334,6 +335,8 @@ state), so the limit is the dense-attention scratch, not the cache. Mainframe pe
    RDMA poll loop (or waiting on a TCP socket with no keepalive) with every buffer still allocated (92 GB here) until
    it is restarted by hand (SIGTERM suffices). A TCP keepalive on the control socket is the safe fix: a poll-loop deadline
    alone would also fire during a legitimately long remote graph (long-context prefill graphs run for seconds).
+   Related: upstream's `rdma_poll` busy-loops on `ibv_poll_cq` with no backoff, so an *idle* server also pins a core
+   at 100% and is indistinguishable from a hung one from outside (this branch spins 5 ms, then sleeps 50 µs per poll).
 9. **ROCm 7.2.2: rocBLAS routes f32 GEMMs to hipBLASLt on gfx1201**, whose sgemm solutions are 8x8 macro-tile
    fallbacks (`[2560 → 512] × 1024` at 2.5 TFLOPS); `ROCBLAS_USE_HIPBLASLT=0` is 4× faster for that shape but
    slower for f16 GEMMs. A ROCm issue rather than a llama.cpp one; ggml could pick per data type if hipBLASLt
