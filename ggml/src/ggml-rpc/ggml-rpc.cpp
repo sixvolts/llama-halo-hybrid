@@ -1019,16 +1019,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
+    // halo-hybrid: the server answers graph compute with an empty reply and the dispatcher waits for it
+    // before sending the next command (the caller does not wait). The server is single-threaded per
+    // connection and does not read the socket while it computes; with the RDMA transport its receive
+    // ring holds 24 chunks, so a client that keeps sending (two-lane prefill: the other lane's inputs
+    // and graph) overflowed it and the NIC gave up (CQ status 12). TCP survived on kernel buffering.
+    static uint8_t graph_done;
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
         request->device = rpc_ctx->device;
-        rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
+        rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request), &graph_done, 0);
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         size_t input_size = 0;
         uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-        rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+        rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size, &graph_done, 0);
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -2021,6 +2027,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.graph_compute(input)) {
                     return;
                 }
+                // halo-hybrid: empty reply, see ggml_backend_rpc_graph_compute
+                static const uint8_t done = 0;
+                if (!send_msg(sock, &done, 0)) {
+                    return;
+                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2029,6 +2040,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
+                    return;
+                }
+                static const uint8_t done = 0;
+                if (!send_msg(sock, &done, 0)) {
                     return;
                 }
                 break;
