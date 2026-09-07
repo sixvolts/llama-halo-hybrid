@@ -17,6 +17,8 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -412,7 +414,15 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
     return true;
 }
 
+// Wait for one completion. Spin for RDMA_SPIN_US (the latency-critical case: the peer answers within a
+// few microseconds), then poll with short sleeps so an idle rpc-server, or a client waiting for a remote
+// graph_compute, does not pin a core at 100% (that idle spin looks exactly like a hang from outside).
+static constexpr int64_t RDMA_SPIN_US  = 5000;
+static constexpr int64_t RDMA_SLEEP_US = 50;
+
 bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
+    const auto t0 = std::chrono::steady_clock::now();
+    bool spinning = true;
     for (uint64_t s = 0; ; s++) {
         int n = ibv_poll_cq(cq, 1, wc);
         if (n > 0) {
@@ -422,8 +432,17 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
             }
             return wc->status == IBV_WC_SUCCESS;
         }
+        if (spinning) {
+            if ((s & 0x3FF) == 0 && std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0).count() > RDMA_SPIN_US) {
+                spinning = false;
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(RDMA_SLEEP_US));
+        }
         if (n < 0) return false;
-        if ((s & 0xFFFFF) == 0 && s > 0) {
+        // peer liveness check: ~every 30 ms while spinning, ~every second while sleeping
+        if (s > 0 && ((spinning && (s & 0xFFFFF) == 0) || (!spinning && (s & 0x3FFF) == 0))) {
             if (tcp_peer_closed()) {
                 return false;
             }
