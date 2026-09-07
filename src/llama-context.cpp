@@ -487,6 +487,21 @@ llama_context::llama_context(
                     n_gpu++;
                 }
             }
+            // a remote (RPC) device: the lanes gain ~8% prefill there but halve decode with a draft head
+            // (2026-09-07, cause open), so they stay off unless LLAMA_PREFILL_LANES_RPC=1 forces them
+            bool has_remote = false;
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                        strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "RPC") == 0) {
+                    has_remote = true;
+                }
+            }
+            static const bool lanes_rpc = getenv("LLAMA_PREFILL_LANES_RPC") != nullptr;
+            if (env && atoi(env) >= 2 && has_remote && !lanes_rpc) {
+                LLAMA_LOG_WARN("%s: LLAMA_PREFILL_LANES ignored: a remote device is present (set LLAMA_PREFILL_LANES_RPC=1 to force)\n", __func__);
+                env = nullptr;
+            }
             // a draft-only MTP head keeps one lane: its prefill is small and the second set of compute buffers
             // would not fit next to the target's on the R9700
             if (env && atoi(env) >= 2 && !model.hparams.mtp_only) {
