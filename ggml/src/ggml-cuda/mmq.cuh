@@ -483,18 +483,25 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
 
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    // RDNA3.5 Q8_0 J=128: 8 waves on a 64-row tile, each wave owns half of J (from halo-box/strix-llama.cpp)
+    constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
+    constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr bool split_j      = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && I == 64 && nwarps == 8;
+    constexpr int j_group       = split_j ? J/2 : J;
 
-    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
+    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
+    const int warp_j = split_j ? threadIdx.y / 4 : 0;
+    const int i0 = (warp_i / ntx) * (ntx*tile_C::I);
 
     const bool y_scale_used = y_scale != nullptr;
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+    for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
 #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                const int j = warp_j*j_group + j0 + (warp_i % ntx)*tile_C::J + tile_C::get_j(l);
 
                 if (j > j_max) {
                     continue;
