@@ -1,10 +1,15 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
-// RDNA3.5 (gfx1151): 16 waves per block, measured 2.3x faster on the KDA recurrence at H=64, S=128
+#include <algorithm>
+
+// RDNA3.5 (gfx1151): 32 waves per block, measured 3.3x faster on the KDA recurrence at H=64, S=128 (16 waves: 2.6x)
 //     (GLM-5.3-Flash prefill; from halo-box/strix-llama.cpp). Other devices keep the upstream 4.
+#ifndef GDN_RDNA35_WARPS
+#define GDN_RDNA35_WARPS 32
+#endif
 static constexpr int gdn_num_warps(int cc) {
-    return GGML_CUDA_CC_IS_RDNA3_5(cc) ? 16 : 4;
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) ? GDN_RDNA35_WARPS : 4;
 }
 #if defined(RDNA3_5)
 static constexpr int gdn_num_warps_dev = gdn_num_warps(GGML_CUDA_CC_RDNA3_5);
@@ -177,6 +182,7 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -192,7 +198,8 @@ static void launch_gated_delta_net(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
-    const int num_warps = gdn_num_warps(cc);
+    // one column per wave: never more waves than columns (S_v = 16 with 32 waves indexed past the state)
+    const int num_warps = std::min<int>(gdn_num_warps(cc), (int) S_v);
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
