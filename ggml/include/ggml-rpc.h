@@ -6,7 +6,9 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    6
+// 7: halo-hybrid wire (GRAPH_COMPUTE / GRAPH_RECOMPUTE return an empty reply that the client waits for); an upstream
+//    6.x peer would hang on the missing reply or desync on the extra one, so the handshake must reject the pairing
+#define RPC_PROTO_MAJOR_VERSION    7
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 

@@ -1245,6 +1245,8 @@ private:
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
+        SRV_INF("speculative seq_rm type = %d (0 none, full checkpoints, partial, recurrent rollback), n_rs_seq = %u\n",
+                (int) ctx_tgt_seq_rm_type, llama_n_rs_seq(ctx_tgt));
 
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
@@ -3553,8 +3555,8 @@ private:
                             // llama_decode are computed together, so the tail chunk before the last 4 tokens is
                             // sized to two ubatches instead of one; a checkpoint restore then re-processes up to
                             // 2*n_ubatch tokens instead of n_ubatch
-                            static const int prefill_lanes = std::max(1, getenv("LLAMA_PREFILL_LANES") ? atoi(getenv("LLAMA_PREFILL_LANES")) : 1);
-                            static const int checkpoint_offsets[] = {4 + prefill_lanes * n_ubatch, 4};
+                            const int prefill_lanes = std::max(1, (int) llama_n_prefill_lanes(ctx_tgt));
+                            const int checkpoint_offsets[] = {4 + prefill_lanes * n_ubatch, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

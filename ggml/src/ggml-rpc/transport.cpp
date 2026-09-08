@@ -668,6 +668,23 @@ static bool set_no_delay(sockfd_t sockfd) {
     return ret == 0;
 }
 
+// The control socket blocks in recv for the whole remote graph (the GRAPH_COMPUTE reply), and the RDMA poll loop only
+// notices a FIN/RST. A peer that powers off or loses its link would otherwise leave the client waiting forever: with
+// keepalive the kernel probes the idle connection and turns a dead peer into a socket error (30 s idle, 10 s x 3 probes).
+static bool set_keepalive(sockfd_t sockfd) {
+    int flag = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (char *)&flag, sizeof(int)) != 0) {
+        return false;
+    }
+#if defined(__linux__)
+    int idle = 30, intvl = 10, cnt = 3;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(int));
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(int));
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(int));
+#endif
+    return true;
+}
+
 static bool set_reuse_addr(sockfd_t sockfd) {
     int flag = 1;
     int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
@@ -682,6 +699,9 @@ socket_ptr socket_t::accept() {
     if (!set_no_delay(client_socket_fd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
+    }
+    if (!set_keepalive(client_socket_fd)) {
+        GGML_LOG_WARN("Failed to set SO_KEEPALIVE\n");
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
@@ -721,6 +741,9 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (!set_no_delay(sockfd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
+    }
+    if (!set_keepalive(sockfd)) {
+        GGML_LOG_WARN("Failed to set SO_KEEPALIVE\n");
     }
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;

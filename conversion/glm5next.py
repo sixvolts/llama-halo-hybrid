@@ -146,9 +146,11 @@ class Glm5NextModel(TextModel):
 
         if is_mtp and cls.no_mtp:
             return None
-        if cls.mtp_only and not is_mtp and name not in (
+        # a draft-only export keeps the embeddings, final norm and head unless --mtp-shared-embd says the
+        # target lends them (nextn_shared_target_tensors); the other MTP-capable archs use the same rule
+        if cls.mtp_only and not is_mtp and (cls.mtp_shared_embd or name not in (
             "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
-        ):
+        )):
             return None
 
         return name, gen

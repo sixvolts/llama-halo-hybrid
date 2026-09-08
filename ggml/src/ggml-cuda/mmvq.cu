@@ -611,12 +611,6 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
-    // expert parallelism: a negative expert id marks a slot not served by this expert slice.
-    // Compute against expert 0 (uniform per block, cache-resident) and write zeros.
-    const bool ep_zero_row = ncols_dst == 1 && ids && (int32_t) channel_x < 0;
-    if (ep_zero_row) {
-        channel_x = 0;
-    }
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
@@ -694,8 +688,7 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    // expert parallelism: skipped slot -> no work, zeros are written below
-    for (int kbx = tid / (qi/vdr); kbx < (ep_zero_row ? 0 : blocks_per_row_x); kbx += blocks_per_iter) {
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -794,7 +787,7 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = ep_zero_row ? 0.0f : result;
+                dst[j*stride_col_dst + i] = result;
             }
         }
     }
@@ -870,11 +863,6 @@ static __global__ void mul_mat_vec_q_moe(
     uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
-    // expert parallelism: negative id -> this slice does not serve the slot, output zeros
-    const bool ep_zero_row = (int32_t) channel_x < 0;
-    if (ep_zero_row) {
-        channel_x = 0;
-    }
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
@@ -883,8 +871,7 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    // expert parallelism: skipped slot -> no work, zeros are written below
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < (ep_zero_row ? 0 : blocks_per_row_x); kbx += blocks_per_iter) {
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 

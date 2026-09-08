@@ -877,6 +877,10 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+uint32_t llama_context::n_prefill_lanes() const {
+    return cparams.prefill_lanes;
+}
+
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
@@ -4040,6 +4044,10 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+uint32_t llama_n_prefill_lanes(const llama_context * ctx) {
+    return ctx->n_prefill_lanes();
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {

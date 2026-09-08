@@ -22,7 +22,7 @@ llama-server -m model.gguf -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 \
 #   --spec-draft-n-max 4 --spec-draft-p-min 0.5
 ```
 
-`-ot` may be given once only (llama.cpp keeps the last); join patterns with commas.
+Repeated `-ot` flags accumulate and patterns may be comma-joined in one flag (`common/arg.cpp`); the first pattern that matches a tensor wins (`src/llama-model-loader.cpp`). The launchers comma-join into a single flag.
 For Qwen3.8-Flash-Next (unsloth GGUF: three expert tensors per layer) keep the 28.8 GB PLE n-gram
 table in host memory: `-ot 'blk\.(1[6-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU'`
 (hybrid-16: 4.6 GB dense + 16 expert layers on the R9700, 26.9 t/s before the fusions below; 37.4 t/s with everything in this document, hybrid-14 36.7).
@@ -36,7 +36,7 @@ is a split either way and measured ~0.7 t/s slower than the host gather.
 
 | Where | What | Off switch |
 |---|---|---|
-| `ggml/src/ggml-backend.cpp` | scheduler events are created regardless of `n_copies`, so split boundaries are GPU-side waits instead of host syncs (+5–7% on this layout) | `GGML_SCHED_NO_EVENTS=1` |
+| `ggml/src/ggml-backend.cpp` | scheduler events are created regardless of `n_copies` for backends that implement `cpy_tensor_async_nowait` (local CUDA/HIP; not RPC or CPU), so split boundaries are GPU-side waits instead of host syncs (+5–7% on this layout); other backends keep upstream's host synchronize (see the GLM two-host table). Cross-device input copies go through a staging buffer on the source device: the source stream stages in order, the destination stream pulls in order, so neither compute stream waits on the other and ggml-alloc reuse cannot race the copy; eager-copied inputs are allocated at their producer split | `GGML_SCHED_NO_EVENTS=1` |
 | `ggml/src/ggml-cuda/ggml-cuda.cu`, `mmvq.cu` | grouped `mul_mat_vec_q`: quantise a shared activation once for adjacent matmuls; `qwen35moe.cpp` reorders projections so they are adjacent (bit-exact) | `GGML_CUDA_NO_MMVQ_GROUP=1` |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | cross-device copies ≤ 256 KB as a push kernel on the source device into peer-mapped memory (+1.5%) | `GGML_CUDA_KERNEL_COPY_MAX=0` (SDMA), or a byte limit |
 | `src/llama-graph.cpp` (`qwen35moe.cpp` part not yet re-applied on this base) | recurrent-state gathers become views when the copy map is the identity; one `l2_norm` over q and k instead of two (bit-exact, +3.7%) | `LLAMA_NO_GRAPH_FUSE=1` |
@@ -48,16 +48,18 @@ is a split either way and measured ~0.7 t/s slower than the host gather.
 | `ggml/src/ggml-cuda/mmvq.cu` | **small-K matvec mode on RDNA4**: upstream disables `mul_mat_vec_q`'s rows-per-block ("small_k") mode on every RDNA part, so a short-K row (Qwen3.8's 96 hyper-connection up-projections/token are Q8_0 [10240 × 320]) ran as one 256-thread block per row doing a single loop trip: 23 µs, 150 GB/s. Enabled for RDNA4: 7 µs, 490 GB/s; K=640 shared-expert down 6.3 → 3.5 µs; large-K shapes unchanged within 1%. Bit-identical; cold decode 29.1 → 27.3 ms/token (−6%) | `GGML_CUDA_MMVQ_NO_SMALLK=1` |
 | `ggml/src/ggml-cuda/mmvf.cu` | **load pipelining in the f32/f16/bf16 matvec**: the per-row loop issued one dependent load per trip, which is fine for wide launches but latency-bound for the few-row shapes here (48 f32 routers [512 × 2560] at 25 µs / 210 GB/s, the 4-row hyper-connection inject at 6 µs, ssm alpha/beta). Four loads in flight per thread with the same per-thread accumulation order (bit-identical); cold decode 27.3 → 26.8 ms/token (−2%). Batched `test-backend-ops` cannot see this shape effect (it hides launch latency), only the real run does | none (unfused path only) |
 | `src/llama-graph.cpp`, `src/models/qwen4exp.cpp` | **QSA gather at depth** (ported from ucicelos/flashnext-hybrid, their fix 4): above `LLAMA_QSA_GATHER` cells (default 65536) a decode step gathers the ~2k selected K/V rows out of the cache and runs flash attention over exactly those instead of masking the whole cache. Below the threshold the graph is unchanged by construction. Measured here at 68.5K tokens (hybrid-12, no draft): needles at positions 200 and 1400 of 2300 records retrieved with it on and off, identical answer text, decode 23.9 → 25.7 t/s (+7%); prefill unchanged. The padded variant of the original was not ported (it lost needles for them) | `LLAMA_QSA_GATHER=0` (off) or `=<n_kv>` |
-| `tools/server/server-context.cpp` | prompt-history checkpoints are saved host-side but PR #28118 restored them with the on-device flag, which asserts (`mem_storage.find(seq_id_read)`) on the first request that reuses a prompt longer than the checkpoint spacing (8K tokens). Restore with the same flags as the save | none |
+| `tools/server/server-context.cpp` | speculative recurrent-state checkpoints are saved and restored with `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` (the `spec_ckpt` update/load pairs); on both shipped archs the `n_rs_seq` rollback path makes them unreachable, they are the fallback for recurrent targets outside `llm_arch_supports_rs_rollback` | none |
+| `src/llama-context.cpp`, `src/models/glm5next.cpp` | fused lightning-indexer scoring for the DSA layers (the fused kernel sums heads in a different order, so a near-tied top-k can differ from the unfused path) | `LLAMA_FUSED_LID_DISABLE=1` |
 | `src/models/dflash.cpp`, `src/llama-hparams.h`, `src/llama-graph.cpp` | DFlash drafts run their sliding-window layers **causally**, as the z-lab reference does (`is_causal = layer_type == "sliding_attention"`); upstream ran every draft layer bidirectionally. Verified token-for-token against the reference PyTorch draft | `LLAMA_DFLASH_SWA_BIDIR=1` |
 
 ## Changes, off by default (experiments kept behind env vars)
 
-The expert-parallel prototype (`LLAMA_EP`), `LLAMA_PIPELINE_PARALLEL_FORCE` and the DFlash dump/tap diagnostics were dropped when the branch moved to the merged base; they are in the history up to tag `main-pre-mtp`.
+The expert-parallel prototype (`LLAMA_EP`) and the DFlash dump/tap diagnostics were dropped when the branch moved to the merged base; they are in the history up to tag `main-pre-mtp`.
 
 | Env | What | Outcome |
 |---|---|---|
 | `GGML_SCHED_LAZY_INPUTS=1` | cut a split at the first consumer of a cross-backend activation; skip host syncs for no-input splits; source stream waits for the destination's progress before a peer copy | net loss on ROCm |
+| `LLAMA_PIPELINE_PARALLEL_FORCE=1` | keep pipeline parallelism on despite `-ot` (`src/llama-context.cpp`; needs `n_batch > n_ubatch`) | 0–2% single-host; cannot overlap the interleaved-split layout; the same 308 / 345 as the lane pair two-host |
 | `GGML_CUDA_GRAPH_OPT_MULTI=1` | lift the multi-device gate on the CUDA graph-optimisation pass | −3% |
 | `mm_ids_helper_wide` (default for ≥ 512 tokens, `GGML_CUDA_MMID_WIDE_MIN=0` restores the warp kernel) | the MoE expert-id compaction ran one wave per expert walking the tokens two at a time with a ubatch-sized shared-memory store: 182 µs per launch at 1024 tokens, 628 at 2048, 2453 at 4096 (15% of the APU's prefill time). One 256-thread block per expert, two passes (count, stable scan), same order, no shared-memory dependence on the ubatch | prefill at `-ub 2048` +2–10% (1169 / 951 / 846 → 1209 / 1050 / 867 tok/s with two lanes), none at 1024 |
 | `GGML_CUDA_MMQ_MOE_J_FACTOR` (default 1, `0` restores upstream) | MMQ picks the column tile `J` that minimizes the tile count for `ncols_max`, which for MUL_MAT_ID is the whole ubatch, so the expert GEMMs always ran `J = 128` while an average expert has 20 tokens at `-ub 1024` (10 of 512 experts per token): 15–30% of each tile's columns were live. The ids path now sizes `J` for `factor × expected tokens per expert` (`ncols_hint`, `J = 32` at `-ub 1024`, 48 at 2048); the grid still covers every column | factor 2 alone (before the tile list): warm two-lane prefill, hybrid-12, 3.7K / 15K / 30K prompts, `-ub 2048` 1178 / 1036 / 853 → 1368 / 1152 / 935, `-ub 1024` 891 / 832 / 723 → 1231 / 1058 / 886; with the tile list factor 1 is best (isolated expert GEMMs at 1024 tokens: gate/up 4.6 → 3.4 ms, down 6.0 → 6.0; at 2048: 6.8 → 5.1, 8.5 → 6.9); output identical |
@@ -72,9 +74,9 @@ The expert-parallel prototype (`LLAMA_EP`), `LLAMA_PIPELINE_PARALLEL_FORCE` and 
 
 This branch is ggml-org `master` (3466812d1, the merged `qwen4exp`) + unslothai/llama.cpp#144
 (NextN/MTP draft head, draft-only exports, borrowing the target's embeddings and head, conv-state
-rollback, CUDA graph key by shape) + ggml-org#28118 (the server keeps speculative recurrent-state
-checkpoints on-device; without it every round serialises the recurrent state to host memory and
-speculation is a net loss on Strix Halo) + the patch set above ported onto it. Upstream now has graph
+rollback, CUDA graph key by shape) + ggml-org#28118 (speculative recurrent-state checkpoints on-device; on HEAD
+both shipped archs take the `n_rs_seq` rollback path instead, so the on-device checkpoints are only the fallback for
+recurrent targets that cannot roll back) + the patch set above ported onto it. Upstream now has graph
 reuse for the QSA/PLE inputs, QSA input sharing and a MoE weighted-reduction fusion of its own, so those
 parts of the old branch were dropped; so were the expert-parallel prototype and the DFlash dump
 diagnostics.
@@ -215,15 +217,15 @@ prefill 627 → 736 and 634 → 747, decode 48.9 → 50.2 and 66.6 → 63.1 (tha
 processed at one to two decode calls per 4K, so the gain grows with prompt length up to the point where the
 32K attention cost dominates.
 
-## GLM-5.3-Flash across two hosts (branch `glm53-flash`)
+## GLM-5.3-Flash across two hosts (on `main`; the pre-rewrite history is on branch `glm53-flash`)
 
 GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB; 45 layers + 1 MTP block, 288 experts / 8 used, 34 KDA linear-attention
 layers, 11 DSA sparse-attention layers, mHC hyper-connections) does not fit one box, so it runs across gibson and a
 second Strix Halo (`mainframe`, 128 GB, no dGPU) over a direct 100G Intel E810 link with llama.cpp's RPC backend.
-The branch is `main` + upstream PR #27754 (`glm5next`, open at the time) + the fixes below. Launcher and MTP export:
+This work is on `main`: upstream PR #27754's `glm5next` plus the fixes below. Launcher and MTP export:
 `docs/halo-hybrid/run_glm_two_host.sh`, `docs/halo-hybrid/export_mtp.py`. Both hosts must run `ggml-rpc-server` and `llama-server`
 from the same commit of this tree: the RPC wire format is fork-local (graph compute replies) and a mismatch hangs with no
-error on either end. `LLAMA_PREFILL_LANES` is ignored on this layout (it halves decode with the draft head). If gibson goes down, restart mainframe's
+error on either end. `LLAMA_PREFILL_LANES` is ignored when a remote device is present unless `LLAMA_PREFILL_LANES_RPC=1` (it halves decode with the draft head). If gibson goes down, restart mainframe's
 `ggml-rpc-server` too (it spins on the dead connection and keeps the model resident). The R9700's runtime power
 management is pinned on (`/etc/udev/rules.d/90-r9700-no-runtime-pm.rules`) after the card dropped off the PCIe bus
 following a resume from D3 during an interactive session (`device lost from bus`, host power-cycled).
@@ -291,7 +293,7 @@ state), so the limit is the dense-attention scratch, not the cache. Mainframe pe
 
 ## For upstream (facts to report; not filed)
 
-0. **#28118's prompt-checkpoint restore** uses `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` for checkpoints that were saved without it (`tools/server/server-context.cpp`, the `it->load_tgt/load_dft` pair after `checking checkpoint`); any prompt over the 8K checkpoint spacing then aborts on its second request. Fixed in this branch by restoring host-side.
+0. *(historical, resolved before the merge-base)* the un-merged `pr-28118` branch restored prompt checkpoints with `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` although they were saved without it; upstream master and this tree restore with `PARTIAL_ONLY` only. Kept so the fix history is findable; nothing to report.
 
 1. **`qwen4exp`: chunked and recurrent delta-net paths disagree.** Same prompt, greedy, no draft,
    ROCm build, `-c 4096`; first generated token after the prompt's `\n\n`:
@@ -336,16 +338,16 @@ state), so the limit is the dense-attention scratch, not the cache. Mainframe pe
 8. **Thin f32 matrices at prefill go to cuBLAS.** `ggml_cuda_mul_mat` swaps a `[K → 1]` f32 matrix into
    `mul_mat_vec_f` but a `[K → 2..8]` one (hyper-connection inject matrices, `[10240 → 4]` at 1024 tokens)
    goes to cuBLAS/hipBLASLt; the swapped MMVF plus a transpose is 7× faster on gfx1201 (this branch).
-10. **`ggml-rpc-server` never notices a dead client.** A client crash or host reboot leaves the server spinning in its
+9. **ROCm 7.2.2: rocBLAS routes f32 GEMMs to hipBLASLt on gfx1201**, whose sgemm solutions are 8x8 macro-tile
+   fallbacks (`[2560 → 512] × 1024` at 2.5 TFLOPS); `ROCBLAS_USE_HIPBLASLT=0` is 4× faster for that shape but
+   slower for f16 GEMMs. A ROCm issue rather than a llama.cpp one; ggml could pick per data type if hipBLASLt
+   were called directly.
+10. **`ggml-rpc-server` never notices a dead client.** A client crash or host reboot leaves the server spinning in its This tree now sets `SO_KEEPALIVE` (30 s idle, 10 s × 3 probes) on both ends of the control socket.
    RDMA poll loop (or waiting on a TCP socket with no keepalive) with every buffer still allocated (92 GB here) until
    it is restarted by hand (SIGTERM suffices). A TCP keepalive on the control socket is the safe fix: a poll-loop deadline
    alone would also fire during a legitimately long remote graph (long-context prefill graphs run for seconds).
    Related: upstream's `rdma_poll` busy-loops on `ibv_poll_cq` with no backoff, so an *idle* server also pins a core
    at 100% and is indistinguishable from a hung one from outside (this branch spins 5 ms, then sleeps 50 µs per poll).
-9. **ROCm 7.2.2: rocBLAS routes f32 GEMMs to hipBLASLt on gfx1201**, whose sgemm solutions are 8x8 macro-tile
-   fallbacks (`[2560 → 512] × 1024` at 2.5 TFLOPS); `ROCBLAS_USE_HIPBLASLT=0` is 4× faster for that shape but
-   slower for f16 GEMMs. A ROCm issue rather than a llama.cpp one; ggml could pick per data type if hipBLASLt
-   were called directly.
 
 ## Notes
 

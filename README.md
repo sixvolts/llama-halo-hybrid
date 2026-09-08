@@ -88,7 +88,7 @@ The GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB) runs split between two 128G Strix
 direct 100G link (Intel E810), using llama.cpp's RPC backend with RDMA, with an R9700 on the primary box. KV and the MTP draft head on
 the R9700, Layers 0–24 here (dense trunk, experts on the iGPU), layers 25–44 on the secondary box's unified memory. Single stream, 128K context: **20 tok/s decode**
 (19 at 16K) with the model's own MTP head at 0.85 acceptance, prefill ~250–300 tok/s; 14 tok/s without the head. It
-took two scheduler fixes, an RDMA transport fix and a loader fix, all on branch `glm53-flash` (upstream's
+took two scheduler fixes, an RDMA transport fix and a loader fix, all on `main` (upstream's
 GLM-5.3-Flash PR is not merged yet); More details and the draft-head export are in
 [HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
 

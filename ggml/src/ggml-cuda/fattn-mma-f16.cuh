@@ -1744,11 +1744,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        // Warps read columns of tile_Q that were written by other warps, so a barrier is needed before tile_Q is
-        //     reused: by the next nbatch_combine batch (DV/2 > nbatch_combine) or by the Q load of the next tile.
-        if (np > 1 || DV/2 > nbatch_combine) {
-            __syncthreads();
-        }
+        // Warps read tile_Q columns that other warps wrote (the combine read is cross-warp even at np == 1), and
+        //     tile_Q is rewritten by the next nbatch_combine batch or by the Q load of the next tile before any other
+        //     barrier, so the barrier is needed unconditionally (upstream's `if (np > 1)` leaves the last batch unguarded
+        //     for the RDNA ncols=64 configs with DKQ <= 128).
+        __syncthreads();
     }
 #else
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dstk_fixup,
