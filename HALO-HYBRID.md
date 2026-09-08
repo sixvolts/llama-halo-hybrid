@@ -224,8 +224,8 @@ layers, 11 DSA sparse-attention layers, mHC hyper-connections) does not fit one 
 second Strix Halo (`mainframe`, 128 GB, no dGPU) over a direct 100G Intel E810 link with llama.cpp's RPC backend.
 This work is on `main`: upstream PR #27754's `glm5next` plus the fixes below. Launcher and MTP export:
 `docs/halo-hybrid/run_glm_two_host.sh`, `docs/halo-hybrid/export_mtp.py`. Both hosts must run `ggml-rpc-server` and `llama-server`
-from the same commit of this tree: the RPC wire format is fork-local (graph compute replies) and a mismatch hangs with no
-error on either end. `LLAMA_PREFILL_LANES` is ignored when a remote device is present unless `LLAMA_PREFILL_LANES_RPC=1` (it halves decode with the draft head). If gibson goes down, restart mainframe's
+from the same commit of this tree: the RPC wire format is fork-local (graph compute replies, protocol major 7); a mismatched
+pair is refused at the handshake ("RPC server version mismatch" on the client) instead of hanging with no error on either end. `LLAMA_PREFILL_LANES` is ignored when a remote device is present unless `LLAMA_PREFILL_LANES_RPC=1` (it halves decode with the draft head). If gibson goes down, restart mainframe's
 `ggml-rpc-server` too (it spins on the dead connection and keeps the model resident). The R9700's runtime power
 management is pinned on (`/etc/udev/rules.d/90-r9700-no-runtime-pm.rules`) after the card dropped off the PCIe bus
 following a resume from D3 during an interactive session (`device lost from bus`, host power-cycled).
