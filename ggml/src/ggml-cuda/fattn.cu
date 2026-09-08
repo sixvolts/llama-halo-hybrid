@@ -651,6 +651,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // D=512 (MLA): the tile kernel is FMA-bound and its cost grows with context (GLM-5.3-Flash prefill on the R9700:
     //     7 ms per call at 1K, 130 ms at 13K); the WMMA kernel with the RDNA 512/512 config takes over above
     //     GGML_CUDA_FA_MMA512_MIN columns (env, default 8; -1 disables). Measured on gfx1201 and gfx1151.
+    // D=256 (Qwen3.8-Flash-Next, 24 q heads over 2 kv heads): same kernel above GGML_CUDA_FA_MMA256_MIN columns (default 64,
+    //     -1 disables): the 64-column prefill config halves the tile kernel on the R9700, the 16-column config used by the
+    //     3-token verify batch is slower than tile, so small batches stay on it
+    if (amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256) {
+        static const int min_cols = getenv("GGML_CUDA_FA_MMA256_MIN") ? atoi(getenv("GGML_CUDA_FA_MMA256_MIN")) : 64;
+        if (min_cols >= 0 && Q->ne[1] * gqa_ratio_eff > min_cols) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+    }
     if (amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] == 512 && V->ne[0] == 512) {
         static const int min_cols = getenv("GGML_CUDA_FA_MMA512_MIN") ? atoi(getenv("GGML_CUDA_FA_MMA512_MIN")) : 8;
         if (min_cols >= 0 && Q->ne[1] * gqa_ratio_eff > min_cols) {
