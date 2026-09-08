@@ -1089,6 +1089,8 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+static bool ggml_backend_sched_is_input(const struct ggml_tensor * t);
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1568,6 +1570,44 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     int n_dep_nodes_added = 0;
 
+    // Eager copies (ggml_backend_sched_compute_splits) write a consumer split's input copy right after its producer
+    // split, on the source stream. An input copy allocated at the consumer's position may share memory with tensors
+    // of the destination splits in between, which would then overwrite it (write-after-read against the reusable
+    // buffer; the ordinary copies at consumer time are ordered by the data dependencies of the alternating layout).
+    // Allocate such copies at the producer's position instead: their live range then spans producer -> consumer and
+    // nothing in between can alias them. GGML_SCHED_NO_EAGER_PRODUCER_ALLOC=1 restores the consumer-position allocation.
+    // eager_producer[c][k] is the producer split of consumer split c's input k, or -1 when the copy stays at the consumer.
+    std::vector<std::vector<int>> eager_producer;
+    static const bool no_producer_alloc = getenv("GGML_SCHED_NO_EAGER_PRODUCER_ALLOC") != nullptr;
+    if (sched->eager_copies && !no_producer_alloc) {
+        eager_producer.resize(sched->n_splits);
+        for (int c = 0; c < sched->n_splits; c++) {
+            struct ggml_backend_sched_split * cs = &sched->splits[c];
+            eager_producer[c].assign(cs->n_inputs, -1);
+            for (int k = 0; k < cs->n_inputs; k++) {
+                struct ggml_tensor * x = cs->inputs[k];
+                if (ggml_backend_sched_is_input(x) || ggml_nbytes(x) == 0) {
+                    continue;
+                }
+                if (x->buffer != NULL && ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    continue;
+                }
+                struct ggml_tensor * root = x;
+                while (root->view_src) {
+                    root = root->view_src;
+                }
+                const int ps = sched->hv_tensor_split_ids[hash_id(root)];
+                if (ps < 0 || ps >= c || sched->splits[ps].backend_id == cs->backend_id) {
+                    continue;
+                }
+                if (sched->backends[sched->splits[ps].backend_id]->iface.cpy_tensor_async_nowait == NULL) {
+                    continue;
+                }
+                eager_producer[c][k] = ps;
+            }
+        }
+    }
+
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
 
@@ -1586,8 +1626,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             graph_copy->nodes[graph_copy->n_nodes++] = input_dep;
 
             // add a dependency to the input copy so that it is allocated at the start of the split
-            sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
-            graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
+            // (eager-copied inputs were already placed after their producer split)
+            if (eager_producer.empty() || eager_producer[i][j] < 0) {
+                sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+                graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
+            }
         }
 
         for (int j = split->i_start; j < split->i_end; j++) {
@@ -1612,6 +1655,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
                     graph_copy->nodes[graph_copy->n_nodes++] = dep;
                     n_dep_nodes_added++;
+                }
+            }
+        }
+        // input copies of later splits that this split produces and that will be eager-copied: allocate them here
+        if (!eager_producer.empty()) {
+            for (int c = i + 1; c < sched->n_splits; c++) {
+                struct ggml_backend_sched_split * cs = &sched->splits[c];
+                for (int k = 0; k < cs->n_inputs; k++) {
+                    if (eager_producer[c][k] != i) {
+                        continue;
+                    }
+                    assert(graph_copy->size > graph_copy->n_nodes);
+                    struct ggml_tensor * input_cpy = tensor_id_copy(hash_id(cs->inputs[k]), cs->backend_id, sched->cur_copy);
+                    sched->node_backend_ids[graph_copy->n_nodes] = cs->backend_id;
+                    graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
                 }
             }
         }

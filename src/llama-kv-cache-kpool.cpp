@@ -2,6 +2,7 @@
 
 #include "llama-batch.h"
 #include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 #include "llama-kv-cells.h"
 
 #include <algorithm>
@@ -455,6 +456,57 @@ void llama_kv_cache_set_input_kpool(
             }
         }
     }
+}
+
+bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+
+    const auto * attn = mctx_cur->get_attn();
+    const auto * idx  = mctx_cur->get_idx();
+    if (attn == nullptr || idx == nullptr) {
+        return false;
+    }
+
+    // rebind: the memory context is recreated for every batch
+    mctx_attn = attn;
+    mctx_idx  = idx;
+
+    bool res = k_idxs->ne[0] == params.ubatch.n_tokens;
+
+    if (pool_cells == nullptr) {
+        // non-scoring shape (see build_inp_kpool)
+        return res;
+    }
+
+    // recompute the shapes exactly as build_inp_kpool does
+    const int64_t n_kv     = attn->get_n_kv();
+    const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+    if (n_stream <= 0 || params.ubatch.n_tokens % n_stream != 0) {
+        return false;
+    }
+    const int64_t n_tps = params.ubatch.n_tokens/n_stream;
+    const int64_t n_ps  = (int64_t) params.ubatch.n_seqs_unq/n_stream;
+    if (n_ps < 1 || (int64_t) params.ubatch.n_seqs_unq != n_ps*n_stream) {
+        return false;
+    }
+    const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
+
+    // the rebuild flag and n_new_max are baked into the graph at build time
+    const bool    rebuild_now   = attn->get_kv()->get_kpool_dirty();
+    const int64_t n_new_max_now = rebuild_now ? n_pools : n_tps/kpool + n_ps;
+
+    res &= rebuild == rebuild_now;
+    res &= (int64_t) n_new_max == n_new_max_now;
+
+    res &= pool_cells->ne[0] == (int64_t) kpool*n_pools && pool_cells->ne[1] == n_stream;
+    res &= pool_bias->ne[0]  == n_pools && pool_bias->ne[1] == n_tps && pool_bias->ne[2] == n_stream;
+    res &= sel_mask->ne[0]   == n_kv && sel_mask->ne[1]  == n_tps && sel_mask->ne[3]  == n_stream;
+    res &= cand_mask->ne[0]  == n_kv && cand_mask->ne[1] == n_tps && cand_mask->ne[3] == n_stream;
+    res &= pool_reps->ne[0]  == n_pools && pool_reps->ne[1] == n_stream;
+    res &= new_pool_cells->ne[0] == (int64_t) kpool*n_new_max_now && new_pool_cells->ne[1] == n_stream;
+    res &= new_pool_reps->ne[0]  == n_new_max_now*n_stream;
+
+    return res;
 }
 
 void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
