@@ -10633,6 +10633,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Qwen3.8-Flash-Next attention on the R9700: 24 q heads over 2 kv heads, D=256, QSA selects ~8K cells per query
+    if (getenv("TBO_Q38_FA") != nullptr) {
+        for (int64_t kv : {4096, 8192}) {
+            for (int64_t nb : {1024, 3, 1}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            }
+        }
+        return test_cases;
+    }
+
     // GLM-5.3-Flash UD-Q4_K_XL (halo-hybrid two-host): 288 experts, 8 used, expert width 2048, n_embd 4096
     if (getenv("TBO_GLM") != nullptr) {
         // routed experts (APU on gibson, mainframe): gate/up q4_K with the broadcast src1, down q5_K
