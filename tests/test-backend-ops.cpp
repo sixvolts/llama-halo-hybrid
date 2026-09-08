@@ -8606,6 +8606,18 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // GLM-5.3-Flash shapes at prefill widths, correctness of the RDNA3.5 MMQ configs (TBO_GLM_EVAL=1)
+    if (getenv("TBO_GLM_EVAL") != nullptr) {
+        for (int64_t n : {1, 3, 128, 1024, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 288, 8, true,  2048, n, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 288, 8, false, 4096, n, 2048));
+            for (auto [m, k] : std::vector<std::pair<int64_t,int64_t>>{{2048, 4096}, {4096, 2048}, {8192, 4096}, {512, 4096}}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1, 1, false, true));
+    }
     std::default_random_engine rng(0);
 
     // unary ops
