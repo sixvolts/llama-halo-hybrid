@@ -10614,6 +10614,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // GLM-5.3-Flash UD-Q4_K_XL (halo-hybrid two-host): 288 experts, 8 used, expert width 2048, n_embd 4096
+    if (getenv("TBO_GLM") != nullptr) {
+        // routed experts (APU on gibson, mainframe): gate/up q4_K with the broadcast src1, down q5_K
+        // n = 1 decode, 3 draft verify, 128..4096 prefill ubatches
+        for (int64_t n : {1, 3, 128, 512, 1024, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 288, 8, true,  2048, n, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 288, 8, false, 4096, n, 2048));
+        }
+        // dense q8_0 projections on the mainframe layers: shared expert, KDA qkv/out, MLA a/b, decode and prefill
+        for (int64_t n : {1, 3, 1024}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t,int64_t>>{{2048, 4096}, {4096, 2048}, {8192, 4096}, {4096, 8192}, {1536, 4096}, {512, 4096}}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        // KDA recurrence: 64 heads of 128, decode and a 1024-token prefill chunk
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1,    1, 1, false, true));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1, 1, false, true));
+        return test_cases;
+    }
+
     // Qwen3.8-Flash-Next dense decode shapes (halo-hybrid): the Q8_0 matvecs that dominate the token
     if (getenv("TBO_Q38_SHAPES") != nullptr) {
         // bs=64: 64 distinct matrices per launch so the working set exceeds the 64 MB infinity cache
