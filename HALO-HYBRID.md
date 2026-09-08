@@ -287,6 +287,7 @@ profile (`rocprofv3`) could not see any of them, since a blocking host copy cons
 | + MTP draft head, n-max 2 | 254 / **20.2** | 222 / **19.0** |
 | + halo-box gfx1151 kernels (a6db5f49e) | **277** / 19.7 | **236** / 18.4 |
 | + 32-wave KDA, WMMA flash attention for D=512 on both parts (c23469e3e) | **283** / 20.0 | **264** / 19.7 |
+| + review fixes: eager-copy allocation, kpool graph reuse (graphs reused 0 → 36-80 per request), RPC major 7 + keepalive (5d6d07f2a) | 282 / 20.4 | 264 / 19.6 |
 
 Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
 state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
