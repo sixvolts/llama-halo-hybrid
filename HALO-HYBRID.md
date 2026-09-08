@@ -249,6 +249,7 @@ remote load takes ~3 minutes and is bound by the loader's read-then-send loop, n
 | launch line: `^output\.weight$` | an unanchored `output\.weight` override also matched every `attn_output.weight` and pinned all 45 output projections to the R9700 | splits per token 80 → 40, decode 11.7 → 13.9, prefill 206 → 296 |
 | `LLAMA_ASYNC_INPUTS=1`: the two-lane prefill's stream-ordered host-input copies without the second lane | the sparse-attention pool inputs are host-resident and read by many splits | sync copies 16 → 4 (the inherent boundary), decode 13.9 → 14.2 |
 | `ggml-rpc/transport.cpp`: `rdma_poll` spins 5 ms, then polls with 50 µs sleeps (b8679d33f) | an idle `rpc-server` sat at 100% CPU on one core between requests and looked exactly like a hung process (last log line `get_tensor`, GPU idle, spinning); the client burned a core for every remote `graph_compute`. Twice diagnosed as a deadlock before a backtrace of the client showed it idle in the server queue | no idle spin, no measurable decode/prefill change |
+| gfx1151 kernels from [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) (d7f683e6c..9dabcb10b): 16 waves per block for the Gated DeltaNet recurrence, RDNA3.5 MMQ tile configs (128 threads / 64 rows for J ≥ 48), MMQ register prefetch, split-J Q8_0 J=128 tile | the KDA recurrence ran 4 waves per block (21.6 ms per 1024-token chunk per layer on the iGPU; their tiled KDA kernel is H=16/32 only, GLM has 64 heads); the dense q8_0 prefill GEMMs used 256-thread / 128-row tiles, 1-2 blocks per CU with 64 KiB of LDS | KDA 21.6 → 8.3 ms, dense q8_0 GEMMs at 1024 tokens −11-17%, expert GEMMs −4-7% at ≥ 2K tokens and neutral below (their routed-compact MoE path measures at parity with the tile list and was not ported; their MMVQ is faster at batch 1 but slower at the n=3 verify batch, not ported). Prefill 254 → 277 tok/s at 3K, 222 → 236 at 13K, decode unchanged. The 8-wave / 64-row Q8_0 config without the split-J vec-dot and write-back returns wrong output at a fake 5x; `TBO_GLM_EVAL=1 test-backend-ops test` carries the GLM shapes that catch it, `TBO_GLM=1 … perf` the timing cases |
 | MTP draft head from `blk.45`, exported into a draft-only GGUF (`export_mtp.py`; no such file is published), on the R9700 | | decode 14.2 → **20.2** tok/s at 4K, 19.0 at 16K; acceptance 0.85 greedy / 0.82 sampled; `--spec-draft-n-max 2` (3: 18.8, 4: 18.3, 6: 18.4–19.2 on prose; code at temperature 0.7 prefers 4: 23.5 tok/s vs 20.1; `--spec-draft-p-min` 0.5/0.7 with n-max 2/3 all within ±5% of the default; `-ub 2048` does not fit on the R9700 next to the draft) |
 
 **Two-lane prefill across the hosts** (2026-09-07). The first attempt died on RDMA with `RDMA CQ wc error: status=12
@@ -280,6 +281,7 @@ profile (`rocprofv3`) could not see any of them, since a blocking host copy cons
 | + view-aware weight rule, `ssm_a`, anchored override | 296 / 13.9 | 329 / 13.6 |
 | + `LLAMA_ASYNC_INPUTS=1` | 288 / 14.2 | 326 / 13.6 |
 | + MTP draft head, n-max 2 | 254 / **20.2** | 222 / **19.0** |
+| + halo-box gfx1151 kernels (9dabcb10b) | **277** / 19.7 | **236** / 18.4 |
 
 Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
 state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
@@ -370,3 +372,12 @@ identifies the tensor). HIP graphs must stay on (`GGML_CUDA_DISABLE_GRAPHS=1` co
   garbage from this target's features in both llama.cpp and the reference implementation;
   the Apr 26 checkpoint works but does not pay back on this platform. The built-in MTP head
   is the production drafter.
+
+- **Other Strix Halo trees (surveyed 2026-09-08).** halo-box/strix-llama.cpp is the one with HIP work for gfx1151 and it
+  accepts agent-authored PRs (its AGENTS.md overrides upstream's); halo-box/llama.cpp stages upstream submissions.
+  peonist-ai/halogen-flash-server is a closed engine (container only) whose Qwen3.8-Flash-Next numbers on the iGPU alone
+  (prefill ~1,200-1,300 tok/s flat to 131K, decode ~42 tok/s with MTP) are the comparison target for the hybrid endpoint.
+  myhacsint's `production/strix-halo-qwen4exp-b10685` is a Vulkan snapshot, nothing HIP-side. halo-box's warning about a
+  gfx1151 HIP async bug (`HIP_LAUNCH_BLOCKING=1`) did not reproduce here: identical perplexity with and without it.
+- **TOPK_MOE on the R9700** fails one random case per run at the 1e-7 tolerance (ERR 1e-5..3e-4, a different case each time,
+  before and after the halo-box ports); it is the fused top-k's summation order on gfx1201, not a port regression.
