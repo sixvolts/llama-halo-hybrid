@@ -8617,6 +8617,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1, 1, false, true));
+        for (int64_t T : {17, 1024}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, T, 1, 1, false, true, 3));
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 33, 1, 1, false, true));
+        for (int64_t nb : {1024, 3, 1}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
     }
     std::default_random_engine rng(0);
 
@@ -10643,6 +10650,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // KDA recurrence: 64 heads of 128, decode and a 1024-token prefill chunk
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1,    1, 1, false, true));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1, 1, false, true));
+        // full-attention layers (MLA, D=512, 64 q heads over one kv head), f16 KV cache: prefill ubatch and the
+        // 3-token draft-verify batch at 4K and 13K context
+        for (int64_t kv : {4096, 13312}) {
+            for (int64_t nb : {1024, 3}) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            }
+        }
+        // with the draft head the op keeps K = n_rs_seq + 1 = 3 rollback snapshots
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1, 1, false, true, 3));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1,    1, 1, false, true, 3));
         return test_cases;
     }
 

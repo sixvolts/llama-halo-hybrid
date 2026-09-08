@@ -166,7 +166,9 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, true);
+    // gfx1151 / gfx1201, measured 2026-09-08 (GLM-5.3-Flash MLA): 8 waves, one block per CU; larger K/V batches overflow
+    //     the 64 KiB of LDS next to the 32 KiB Q tile, occupancy 2 spills the 128-VGPR VKQ accumulator
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 1,  64,  64,  32,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 128, 2,  32, 128, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
@@ -1742,7 +1744,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // Warps read columns of tile_Q that were written by other warps, so a barrier is needed before tile_Q is
+        //     reused: by the next nbatch_combine batch (DV/2 > nbatch_combine) or by the Q load of the next tile.
+        if (np > 1 || DV/2 > nbatch_combine) {
             __syncthreads();
         }
     }
@@ -1826,7 +1830,8 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
+    // D=512 (MLA, GLM-5.3-Flash) is the FMA-bound tile kernel's worst case on RDNA; its WMMA config is measured below
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || (DKQ > 128 && DKQ != 512)) {
         NO_DEVICE_CODE;
         return;
     }

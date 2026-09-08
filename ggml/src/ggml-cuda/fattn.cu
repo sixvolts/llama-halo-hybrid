@@ -648,6 +648,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
+    // D=512 (MLA): the tile kernel is FMA-bound and its cost grows with context (GLM-5.3-Flash prefill on the R9700:
+    //     7 ms per call at 1K, 130 ms at 13K); the WMMA kernel with the RDNA 512/512 config takes over above
+    //     GGML_CUDA_FA_MMA512_MIN columns (env, default 8; -1 disables). Measured on gfx1201 and gfx1151.
+    if (amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] == 512 && V->ne[0] == 512) {
+        static const int min_cols = getenv("GGML_CUDA_FA_MMA512_MIN") ? atoi(getenv("GGML_CUDA_FA_MMA512_MIN")) : 8;
+        if (min_cols >= 0 && Q->ne[1] * gqa_ratio_eff > min_cols) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+    }
 
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
