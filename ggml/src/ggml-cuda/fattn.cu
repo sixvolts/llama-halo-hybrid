@@ -766,7 +766,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     // halo-hybrid: D=256 and D=512 are governed by the measured rules below (upstream's 16-column threshold at
     // D=256 would take the draft head's 3-token verify batch off the faster tile kernel)
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] < 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+    // (the RDNA kernel has device code for DKQ <= 128, 256 and 512 only; 192 would launch NO_DEVICE_CODE)
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
