@@ -8887,7 +8887,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, T, 1, 1, false, true, 3));
         }
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 33, 1, 1, false, true));
-        for (int64_t nb : {1024, 3, 1}) {
+        for (int64_t nb : {1024, 64, 9, 3, 1}) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             // sparse (DSA-selected) rows: 2052 finite entries of 4096 / 8192, V a view of K as in MLA
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4352, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2052));

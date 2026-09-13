@@ -20,7 +20,8 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     const int query    = blockIdx.x;
 
     const half * mask = mask_ptr + sequence*s33 + query*s31;
-    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*n_kv_max;
+    // row layout: [count, entries..., -1 padding], capacity n_kv_max + 1 (see the HIP kernel below)
+    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*(n_kv_max + 1) + 1;
 
     __shared__ int warp_offsets[256/WARP_SIZE];
     __shared__ int row_count;
@@ -82,6 +83,9 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
         indices[i] = -1;
     }
+    if (tid == 0) {
+        indices[-1] = min(count, n_kv_max);
+    }
     __syncthreads();
 
     // the dependent grid reads indices, signal once the row is complete
@@ -92,18 +96,23 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 // One block per mask row; each thread takes ITEMS consecutive entries per chunk, the block prefix-sums the
 // per-thread counts through shared memory, and every selected entry is written at its rank. Same output
 // as the ballot version: the finite entries' positions in row order, then -1 up to n_kv_max.
+// group > 1: one index list per GROUP of consecutive query rows, the union of their finite columns (the
+// kernel's ncols1 queries of a tile share the gathered K/V tile and each keeps its own mask values), row
+// layout [count, entries..., -1 padding] with capacity group*n_kv_max + 1, stored at the group's first row.
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
-        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
+        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max, const int group, const int ne31,
         const int64_t s31, const int64_t s33) {
     constexpr int NT    = 256;
     constexpr int ITEMS = 8;
     const int tid      = threadIdx.x;
     const int sequence = blockIdx.y;
-    const int query    = blockIdx.x;
+    const int query0   = blockIdx.x * group;
+    const int nrows    = min(group, ne31 - query0);
+    const int cap      = group*n_kv_max; // entries per row (plus the count slot)
 
-    const half * mask = mask_ptr + sequence*s33 + query*s31;
-    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*n_kv_max;
+    const half * mask = mask_ptr + sequence*s33 + int64_t(query0)*s31;
+    int32_t * indices = indices_ptr + (int64_t(sequence)*ne31 + query0)*(cap + 1) + 1;
 
     __shared__ int counts[NT];
     __shared__ int row_count;
@@ -118,8 +127,14 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 #pragma unroll
         for (int item = 0; item < ITEMS; ++item) {
             const int i = i0 + tid*ITEMS + item;
-            sel[item] = i < ne30 && isfinite(__half2float(mask[i]));
-            my_count += sel[item] ? 1 : 0;
+            bool f = false;
+            if (i < ne30) {
+                for (int r = 0; r < nrows; ++r) {
+                    f = f || isfinite(__half2float(mask[int64_t(r)*s31 + i]));
+                }
+            }
+            sel[item] = f;
+            my_count += f ? 1 : 0;
         }
         counts[tid] = my_count;
         __syncthreads();
@@ -136,7 +151,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 #pragma unroll
         for (int item = 0; item < ITEMS; ++item) {
             if (sel[item]) {
-                if (rank < n_kv_max) {
+                if (rank < cap) {
                     indices[rank] = i0 + tid*ITEMS + item;
                 }
                 rank++;
@@ -149,25 +164,36 @@ static __global__ void flash_attn_mask_to_sparse_indices(
         __syncthreads();
     }
     const int count = row_count;
-    for (int i = count + tid; i < n_kv_max; i += NT) {
+    for (int i = count + tid; i < cap; i += NT) {
         indices[i] = -1;
+    }
+    if (tid == 0) {
+        indices[-1] = min(count, cap);
     }
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
+        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, int group, cudaStream_t stream) {
 #if defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(mask, indices, n_kv_max, stream);
+    GGML_UNUSED_VARS(mask, indices, n_kv_max, group, stream);
     GGML_ABORT("sparse flash attention is not supported on MUSA");
 #else
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
-    const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
     const dim3 block_dim(256, 1, 1);
+#if defined(GGML_USE_HIP)
+    const dim3 blocks_num((mask->ne[1] + group - 1) / group, mask->ne[3], 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
+        (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, group, int(mask->ne[1]), s31, s33);
+#else
+    GGML_ASSERT(group == 1);
+    const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
+#endif // defined(GGML_USE_HIP)
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_MUSA)
 }
@@ -285,7 +311,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // so a sparse DKQ=512 call takes the 16-head variant (GLM-5.3-Flash: 64 query heads over one MLA head)
     if constexpr (DKQ == 512 && DV == 512) {
         if (use_gqa_opt && gqa_ratio % 16 == 0 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 16>(ctx, dst);
+            // prefill: two consecutive queries share one gathered tile (the union of their selections, 32
+            // columns = the tuned config); decode and the verify batch keep the one-query variant
+            static const bool pairs = getenv("GGML_CUDA_FA_SPARSE_PAIRS") == nullptr || atoi(getenv("GGML_CUDA_FA_SPARSE_PAIRS")) != 0;
+            if (pairs && Q->ne[1] > 8) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, 16>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 16>(ctx, dst);
+            }
             return;
         }
         // one query per sequence slot (a per-token gathered key set): 16 heads fill the tile instead of
