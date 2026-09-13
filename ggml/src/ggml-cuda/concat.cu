@@ -139,6 +139,46 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// halo-hybrid: dim-0 concat whose second operand is a transposed 2D view (ne10 strided, ne11 contiguous), the
+//     recurrent conv-state concat of the Mamba/KDA layers (conv_states [d_conv-1, C] ++ transpose(x [C, n_tokens])).
+//     The generic kernel reads one element per lane down the strided dimension, a separate cache line each, at
+//     ~9 GB/s on gfx1151 (5.6 ms per KDA layer at 1024 tokens); a 32x32 tile through LDS reads and writes rows.
+#define CONCAT_TRANSPOSE_TILE 32
+template <typename T>
+static __global__ void __launch_bounds__(CONCAT_TRANSPOSE_TILE*8) concat_transpose_dim0(
+        const char * __restrict__ src1, char * __restrict__ dst,
+        const int64_t ne10, const int64_t ne11, const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne00, const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    __shared__ T tile[CONCAT_TRANSPOSE_TILE][CONCAT_TRANSPOSE_TILE + 1];
+
+    const int64_t i3 = blockIdx.z / gridDim.y;
+    const int64_t i2 = blockIdx.z % gridDim.y;
+    const int64_t i1_0 = int64_t(blockIdx.y) * CONCAT_TRANSPOSE_TILE; // along ne11 (rows of dst)
+    const int64_t i0_0 = int64_t(blockIdx.x) * CONCAT_TRANSPOSE_TILE; // along ne10 (columns of dst after ne00)
+
+    const char * s = src1 + i3*nb13 + i2*nb12;
+    // read: for each i0 (strided in src1), ne11 consecutive elements are contiguous
+#pragma unroll
+    for (int r = threadIdx.y; r < CONCAT_TRANSPOSE_TILE; r += blockDim.y) {
+        const int64_t i0 = i0_0 + r;
+        const int64_t i1 = i1_0 + threadIdx.x;
+        if (i0 < ne10 && i1 < ne11) {
+            tile[r][threadIdx.x] = *(const T *)(s + i0*nb10 + i1*nb11);
+        }
+    }
+    __syncthreads();
+    // write: dst rows i1, columns ne00 + i0 contiguous
+    char * d = dst + i3*nb3 + i2*nb2;
+#pragma unroll
+    for (int r = threadIdx.y; r < CONCAT_TRANSPOSE_TILE; r += blockDim.y) {
+        const int64_t i1 = i1_0 + r;
+        const int64_t i0 = i0_0 + threadIdx.x;
+        if (i0 < ne10 && i1 < ne11) {
+            *(T *)(d + i1*nb1 + (ne00 + i0)*nb0) = tile[threadIdx.x][r];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -163,6 +203,22 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
+        // transposed second operand along dim 0: tile the src1 part, leave the (small, first) src0 part to the
+        //     generic kernel by bounding its loop at ne00
+        const bool src1_transposed = dim == 0 && src1->nb[1] == ggml_type_size(src1->type) && src1->nb[0] > src1->nb[1] &&
+            dst->nb[0] == ggml_type_size(dst->type) && src1->ne[0] > 1 && src1->ne[1] > 1;
+        const int64_t ne0_generic = src1_transposed ? src0->ne[0] : dst->ne[0];
+        if (src1_transposed) {
+            dim3 block(CONCAT_TRANSPOSE_TILE, 8, 1);
+            dim3 grid((src1->ne[0] + CONCAT_TRANSPOSE_TILE - 1) / CONCAT_TRANSPOSE_TILE,
+                      (src1->ne[1] + CONCAT_TRANSPOSE_TILE - 1) / CONCAT_TRANSPOSE_TILE,
+                      dst->ne[2] * dst->ne[3]);
+            concat_transpose_dim0<T><<<grid, block, 0, stream>>>(
+                (const char *) src1->data, (char *) dst->data,
+                src1->ne[0], src1->ne[1], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                src0->ne[0], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+        }
+
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
@@ -171,7 +227,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
                 src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
                 src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                ne0_generic, dst->ne[1], dst->ne[2], dst->ne[3],
                 dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
         };
         switch (dim) {

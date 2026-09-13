@@ -6417,6 +6417,32 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT with a transposed second operand (the Mamba/KDA conv-state concat)
+struct test_concat_transpose : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;  // a: [ne_a0, C, ne2, ne3], contiguous
+    const int64_t n_tokens;             // b: transpose of [C, n_tokens, ne2, ne3]
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne_a, n_tokens);
+    }
+
+    test_concat_transpose(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne_a = {3, 64, 2, 1},
+            int64_t n_tokens = 16)
+        : type(type), ne_a(ne_a), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, type, ne_a[1], n_tokens, ne_a[2], ne_a[3]);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, b), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -8887,6 +8913,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, T, 1, 1, false, true, 3));
         }
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 33, 1, 1, false, true));
+        for (auto [ne_a, nt] : std::vector<std::pair<std::array<int64_t, 4>, int64_t>>{{{3, 64, 2, 1}, 16}, {{3, 100, 1, 2}, 37}, {{3, 12288, 1, 1}, 33}, {{1, 8, 1, 1}, 1}}) {
+            test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F32, ne_a, nt));
+            test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F16, ne_a, nt));
+        }
         for (int64_t nb : {1024, 64, 9, 3, 1}) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             // sparse (DSA-selected) rows: 2052 finite entries of 4096 / 8192, V a view of K as in MLA
@@ -11001,6 +11031,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // GLM-5.3-Flash UD-Q4_K_XL (halo-hybrid two-host): 288 experts, 8 used, expert width 2048, n_embd 4096
     if (getenv("TBO_GLM") != nullptr) {
+        // elementwise / memory-bound kernels at a 1024-token ubatch (mainframe's profile: rms_norm, cpy, the KDA
+        // conv-state concat and the hyper-connection adds run far below the APU's bandwidth)
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {4096, 1024, 1, 1}, false, 1e-6f));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {4096, 1024, 1, 1}));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {4096, 1024, 1, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
+        test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F32, {3, 12288, 1, 1}, 1024));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4096, 1024, 1, 1}, 4096, 0, 0));
+        test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1024, 1, 1}, {1, 1, 1, 1}));
+        test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {4096, 1024, 1, 1}, {1, 1, 1, 1}));
+        test_cases.emplace_back(new test_glu(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {2048, 1024, 1, 1}, false, false));
         // routed experts (APU on gibson, mainframe): gate/up q4_K with the broadcast src1, down q5_K
         // n = 1 decode, 3 draft verify, 128..4096 prefill ubatches
         for (int64_t n : {1, 3, 128, 512, 1024, 2048, 4096}) {

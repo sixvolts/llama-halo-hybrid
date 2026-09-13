@@ -886,7 +886,7 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
     return (type == GGML_TYPE_Q8_0    && (J == 48 || J == 128) && !fallback) ||
            (type == GGML_TYPE_Q6_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q5_K    &&  J == 32)              ||
-           (type == GGML_TYPE_Q4_K    &&  J == 48)              ||
+           (type == GGML_TYPE_Q4_K    && (J == 16 || J == 32 || J == 48)) ||
            (type == GGML_TYPE_IQ2_S   &&  J == 128)             ||
            (type == GGML_TYPE_IQ3_XXS &&  J == 128);
 #else
@@ -934,12 +934,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         //     registers while the current one is consumed. The arithmetic is unchanged.
         constexpr int  nthreads  = nwarps*warp_size;
         constexpr int  y_regs_n  = (J*MMQ_TILE_Y_K + nthreads - 1) / nthreads;
-        constexpr bool x_regs_ok = type == GGML_TYPE_Q8_0;
+        constexpr bool x_regs_ok = ggml_cuda_mmq_x_regs<type, J, fallback>::ok;
         const     int  tid       = threadIdx.y*warp_size + threadIdx.x;
 
         int yr0[y_regs_n];
         int yr1[y_regs_n];
-        ggml_cuda_mmq_x_regs_q8_0<type, J, fallback> xr;
+        ggml_cuda_mmq_x_regs<type, J, fallback> xr;
         GGML_UNUSED(xr);
 
         auto load_y_regs = [&](int (&yr)[y_regs_n], const int kb0, const int half) {
@@ -958,7 +958,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         if (kb0_start < kb0_stop) {
             if constexpr (x_regs_ok) {
-                ggml_cuda_mmq_load_tiles_q8_0_regs<type, J, fallback>(x, xr, offset_x + kb0_start, tile_x_max_i, stride_row_x);
+                xr.load(x, offset_x + kb0_start, tile_x_max_i, stride_row_x);
             }
             load_y_regs(yr0, kb0_start, 0);
             load_y_regs(yr1, kb0_start, 1);
@@ -968,7 +968,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             const bool has_next = kb0 + blocks_per_iter < kb0_stop;
 
             if constexpr (x_regs_ok) {
-                ggml_cuda_mmq_store_tiles_q8_0_regs<type, J, fallback>(xr, tile_x, tile_x_max_i);
+                xr.store(tile_x, tile_x_max_i);
             } else {
                 load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
             }
@@ -978,7 +978,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
             if (has_next) {
                 if constexpr (x_regs_ok) {
-                    ggml_cuda_mmq_load_tiles_q8_0_regs<type, J, fallback>(x, xr, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x);
+                    xr.load(x, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x);
                 }
                 load_y_regs(yr0, kb0 + blocks_per_iter, 0);
             }
