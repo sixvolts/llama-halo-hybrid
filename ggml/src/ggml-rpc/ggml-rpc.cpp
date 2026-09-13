@@ -457,9 +457,17 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = nullptr;
     msg->output_size = 0;
+    static const bool trace = getenv("GGML_RPC_SEND_TRACE") != nullptr;
+    const int64_t t0 = trace ? ggml_time_us() : 0;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
+    if (trace) {
+        const int64_t d = ggml_time_us() - t0;
+        if (d > 2000) {
+            GGML_LOG_INFO("rpc blocking send: cmd %d (%zu bytes in) waited %.1f ms\n", (int) cmd, input_size, d / 1000.0);
+        }
+    }
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
@@ -479,9 +487,17 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
+    static const bool trace = getenv("GGML_RPC_SEND_TRACE") != nullptr;
+    const int64_t t0 = trace ? ggml_time_us() : 0;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
+    if (trace) {
+        const int64_t d = ggml_time_us() - t0;
+        if (d > 2000) {
+            GGML_LOG_INFO("rpc blocking send: cmd %d (%zu bytes in, %zu out) waited %.1f ms\n", (int) cmd, input_size, output_size, d / 1000.0);
+        }
+    }
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
@@ -927,7 +943,9 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    // halo-hybrid: the hash round trip is a blocking wait for the whole queue; only weights can be de-duplicated
+    // (activations change every graph), and a compute-buffer upload must not stall behind an in-flight graph
+    if (size > HASH_THRESHOLD && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -1149,7 +1167,7 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
-    bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor(const uint8_t * input, size_t input_size);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1403,15 +1421,15 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
-bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+bool rpc_server::set_tensor(const uint8_t * input, size_t input_size) {
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-    if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+    if (input_size < sizeof(rpc_tensor) + sizeof(uint64_t)) {
         return false;
     }
-    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
+    const rpc_tensor * in_tensor = (const rpc_tensor *)input;
     uint64_t offset;
-    memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
-    const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
+    memcpy(&offset, input + sizeof(rpc_tensor), sizeof(offset));
+    const size_t size = input_size - sizeof(rpc_tensor) - sizeof(offset);
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1440,7 +1458,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         }
     }
 
-    const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
+    const void * data = input + sizeof(rpc_tensor) + sizeof(offset);
     if (cache_dir && size > HASH_THRESHOLD) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
@@ -1958,11 +1976,30 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
+                // halo-hybrid: a persistent, never-zeroed receive buffer. A fresh vector per command
+                // allocated and zero-filled the payload before a byte was read (8 ms per 64 MB activation
+                // stream, 200 ms per 1.6 GB weight tensor); during that window the sender filled every
+                // pre-posted RDMA slot and hit receiver-not-ready retries (one ~70 ms stall per message).
+                // Single-threaded per connection, so a thread-local raw buffer that only ever grows is safe.
+                static thread_local uint8_t * buf = nullptr;
+                static thread_local size_t    cap = 0;
+                uint64_t size;
+                if (!sock->recv_data(&size, sizeof(size))) {
                     return;
                 }
-                if (!server.set_tensor(input)) {
+                if (size > cap) {
+                    uint8_t * nbuf = (uint8_t *) realloc(buf, size);
+                    if (nbuf == nullptr) {
+                        GGML_LOG_ERROR("Failed to allocate input buffer of size %" PRIu64 "\n", size);
+                        return;
+                    }
+                    buf = nbuf;
+                    cap = size;
+                }
+                if (!sock->recv_data(buf, size)) {
+                    return;
+                }
+                if (!server.set_tensor(buf, size)) {
                     return;
                 }
                 break;

@@ -357,6 +357,24 @@ extern "C" {
     // of ggml_backend_sched_graph_compute_async_pair), which serializes the devices. Same caller contract as async
     // inputs: synchronize before the next graph. Needs backends with cpy_tensor_async_nowait and events.
     GGML_API void                 ggml_backend_sched_set_eager_copies(ggml_backend_sched_t sched, bool enable);
+    // halo-hybrid: remote (RPC) split boundaries without draining the remote's command queue: a local device's
+    // output for the remote split is downloaded (waiting for the local producer only) and uploaded with an async
+    // set, and the remote split's outputs are fetched right behind its graph with a queue marker the consumer
+    // waits on. Lets a second graph's remote work queue behind the first while the local devices run ahead.
+    GGML_API void                 ggml_backend_sched_set_remote_fetch(ggml_backend_sched_t sched, bool enable);
+    // the synchronize before a graph re-allocation covers the local backends only (the caller guarantees that
+    // this scheduler's remote work is complete; see ggml_backend_sched_graph_compute_async_head)
+    GGML_API void                 ggml_backend_sched_set_local_sync(ggml_backend_sched_t sched, bool enable);
+    // index of the first split on a remote backend, or -1
+    GGML_API int                  ggml_backend_sched_first_remote_split(ggml_backend_sched_t sched);
+    GGML_API int                  ggml_backend_sched_last_remote_split(ggml_backend_sched_t sched);
+    // split the submission of an allocated graph at its first remote split: head submits the splits up to and
+    // including it (the remote work then runs asynchronously), tail submits the rest. Between the two the caller
+    // may prepare and submit the head of another scheduler's graph.
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_head(ggml_backend_sched_t sched);
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_tail(ggml_backend_sched_t sched);
+    // synchronize the local backends only (a remote's queue is ordered by itself)
+    GGML_API void                 ggml_backend_sched_synchronize_local(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

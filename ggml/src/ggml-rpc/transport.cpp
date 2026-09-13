@@ -17,6 +17,7 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <cstdlib>
@@ -56,6 +57,12 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
 static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
+// halo-hybrid: send ring. One chunk in flight at a time (post, then poll its completion) capped bulk transfers
+// at ~570 MB/s: 64 MB residual streams cost 112 ms each on the two-host prefill. Up to RDMA_TX_DEPTH chunks
+// are now posted before the oldest completion is reaped; the receiver reposts each slot as it lands, so the
+// ring never outruns RDMA_RX_DEPTH. 6 × 256 KiB keeps the pinned total (7.5 MiB) under the 8 MiB memlock
+// default; receiver side unchanged (wire-compatible with the one-chunk sender).
+static constexpr int    RDMA_TX_DEPTH = 6;
 
 struct rdma_conn {
     struct ibv_context * ctx = nullptr;
@@ -64,8 +71,12 @@ struct rdma_conn {
     struct ibv_cq * rcq = nullptr;   // recv completions
     struct ibv_qp * qp  = nullptr;
 
-    void          * tx_buf = nullptr;
+    void          * tx_buf = nullptr; // RDMA_TX_DEPTH × RDMA_CHUNK contiguous
     struct ibv_mr * tx_mr  = nullptr;
+
+    uint8_t * tx_slot(int i) const {
+        return static_cast<uint8_t *>(tx_buf) + static_cast<size_t>(i) * RDMA_CHUNK;
+    }
 
     void          * rx_buf = nullptr; // RDMA_RX_DEPTH × RDMA_CHUNK contiguous
     struct ibv_mr * rx_mr  = nullptr;
@@ -301,7 +312,7 @@ bool socket_t::impl::rdma_probe() {
     qia.send_cq = rdma->scq;
     qia.recv_cq = rdma->rcq;
     qia.qp_type = IBV_QPT_RC;
-    qia.cap.max_send_wr     = 4;
+    qia.cap.max_send_wr     = RDMA_TX_DEPTH + 2;
     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
     qia.cap.max_send_sge    = 1;
     qia.cap.max_recv_sge    = 1;
@@ -320,11 +331,11 @@ bool socket_t::impl::rdma_probe() {
     }
     rdma->max_inline = qia.cap.max_inline_data;
 
-    rdma->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
+    rdma->tx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_TX_DEPTH) * RDMA_CHUNK);
     rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
     if (!rdma->tx_buf || !rdma->rx_buf) return false;
 
-    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
+    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, static_cast<size_t>(RDMA_TX_DEPTH) * RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
     rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!rdma->tx_mr || !rdma->rx_mr) return false;
@@ -454,7 +465,22 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
     rdma_conn * c = rdma.get();
     const uint8_t * src = (const uint8_t *)data;
     size_t rem = size;
+    int inflight = 0; // signaled sends posted and not yet reaped (RC completes them in order)
+    int next     = 0; // ring slot for the next chunk
+    // GGML_RPC_SEND_TRACE=1: phase timing of bulk sends (>= 8 MiB)
+    static const bool trace = getenv("GGML_RPC_SEND_TRACE") != nullptr;
+    const bool tr = trace && size >= 8u * 1024 * 1024;
+    int64_t t_start = 0, t_copy = 0, t_post = 0, t_poll = 0, t_poll_max = 0;
+    if (tr) { t_start = ggml_time_us(); }
     while (rem > 0) {
+        if (inflight == RDMA_TX_DEPTH) {
+            // the oldest send owns slot `next`; reap it before reusing the buffer
+            struct ibv_wc wc;
+            const int64_t t0 = tr ? ggml_time_us() : 0;
+            if (!rdma_poll(c->scq, &wc)) return false;
+            if (tr) { const int64_t d = ggml_time_us() - t0; t_poll += d; t_poll_max = std::max(t_poll_max, d); }
+            inflight--;
+        }
         size_t chunk = std::min(rem, RDMA_CHUNK);
 
         struct ibv_sge sge = {};
@@ -462,25 +488,44 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
         wr.opcode  = IBV_WR_SEND;
         wr.sg_list = &sge;
         wr.num_sge = 1;
+        wr.wr_id   = next;
 
         if (chunk <= c->max_inline) {
             sge.addr   = (uintptr_t)src;
             sge.length = chunk;
             wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
         } else {
-            memcpy(c->tx_buf, src, chunk);
-            sge.addr   = (uintptr_t)c->tx_buf;
+            uint8_t * slot = c->tx_slot(next);
+            const int64_t t0 = tr ? ggml_time_us() : 0;
+            memcpy(slot, src, chunk);
+            if (tr) { t_copy += ggml_time_us() - t0; }
+            sge.addr   = (uintptr_t)slot;
             sge.length = chunk;
             sge.lkey   = c->tx_mr->lkey;
             wr.send_flags = IBV_SEND_SIGNALED;
         }
 
+        const int64_t t1 = tr ? ggml_time_us() : 0;
         if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
-        struct ibv_wc wc;
-        if (!rdma_poll(c->scq, &wc)) return false;
+        if (tr) { t_post += ggml_time_us() - t1; }
+        inflight++;
+        next = (next + 1) % RDMA_TX_DEPTH;
 
         src += chunk;
         rem -= chunk;
+    }
+    while (inflight > 0) {
+        struct ibv_wc wc;
+        const int64_t t0 = tr ? ggml_time_us() : 0;
+        if (!rdma_poll(c->scq, &wc)) return false;
+        if (tr) { const int64_t d = ggml_time_us() - t0; t_poll += d; t_poll_max = std::max(t_poll_max, d); }
+        inflight--;
+    }
+    if (tr) {
+        const int64_t total = ggml_time_us() - t_start;
+        GGML_LOG_INFO("rdma_send: %zu bytes in %.1f ms (%.0f MB/s): memcpy %.1f, post %.1f, poll %.1f (max %.2f) ms, %zu chunks, depth %d\n",
+            size, total / 1000.0, total > 0 ? size / (double) total : 0.0, t_copy / 1000.0, t_post / 1000.0, t_poll / 1000.0,
+            t_poll_max / 1000.0, (size + RDMA_CHUNK - 1) / RDMA_CHUNK, RDMA_TX_DEPTH);
     }
     return true;
 }

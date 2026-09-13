@@ -775,6 +775,13 @@ static bool ggml_is_view_op(enum ggml_op op) {
 // eager cross-backend copies: events per backend, must exceed the copies queued between two host synchronizations
 #define GGML_SCHED_COPY_EVENTS 512
 
+// host staging slot for one split input that crosses to or from a remote backend
+struct ggml_backend_sched_stage {
+    void * data;
+    size_t cap;
+    ggml_backend_event_t ev;
+};
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -784,6 +791,9 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // per input: event recorded on the producer backend after an eager copy of this input (NULL: copy lazily)
     ggml_backend_event_t * input_events;
+    // per input: host staging for a remote (RPC) producer or consumer (ggml_backend_sched_set_remote_fetch);
+    // ev != NULL: the producer's queue marker after the eager fetch into data
+    struct ggml_backend_sched_stage * stages;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -829,6 +839,13 @@ struct ggml_backend_sched {
 
     // see ggml_backend_sched_set_eager_copies
     bool eager_copies;
+    // see ggml_backend_sched_set_remote_fetch
+    bool remote_fetch;
+    // see ggml_backend_sched_set_local_sync
+    bool local_sync;
+    // split loop state between ggml_backend_sched_graph_compute_async_head and _tail
+    struct ggml_backend_sched_compute_state * pipe_state;
+    int pipe_first_remote;
     ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPY_EVENTS];
     int copy_event_next[GGML_SCHED_MAX_BACKENDS];
     int next_copy;
@@ -879,7 +896,43 @@ static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split
     }
     memset(enew + split->inputs_capacity, 0, (new_cap - split->inputs_capacity) * sizeof(ggml_backend_event_t));
     split->input_events = enew;
+    auto * snew = (struct ggml_backend_sched_stage *) realloc((void *) split->stages, new_cap * sizeof(struct ggml_backend_sched_stage));
+    if (snew == NULL) {
+        GGML_ABORT("failed to grow split stages container");
+    }
+    memset(snew + split->inputs_capacity, 0, (new_cap - split->inputs_capacity) * sizeof(struct ggml_backend_sched_stage));
+    split->stages = snew;
     split->inputs_capacity = new_cap;
+}
+
+// drop the queue markers of a split's staging slots (the host memory is kept for reuse)
+static void ggml_backend_sched_split_reset_stages(struct ggml_backend_sched_split * split) {
+    if (split->stages == NULL) {
+        return;
+    }
+    for (int k = 0; k < split->inputs_capacity; k++) {
+        if (split->stages[k].ev != NULL) {
+            ggml_backend_event_free(split->stages[k].ev);
+            split->stages[k].ev = NULL;
+        }
+    }
+}
+
+static void * ggml_backend_sched_stage_reserve(struct ggml_backend_sched_stage * st, size_t size) {
+    if (st->cap < size) {
+        free(st->data);
+        st->data = malloc(size);
+        GGML_ASSERT(st->data != NULL);
+        st->cap = size;
+    }
+    return st->data;
+}
+
+// a remote backend: a GPU device without stream-ordered copies (the RPC backend)
+static bool ggml_backend_sched_backend_is_remote(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = backend->device;
+    return dev != NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+        backend->iface.cpy_tensor_async_nowait == NULL;
 }
 
 static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
@@ -1338,6 +1391,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         if (split->input_events) { memset(split->input_events, 0, split->inputs_capacity * sizeof(ggml_backend_event_t)); }
+        ggml_backend_sched_split_reset_stages(split);
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1434,6 +1488,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
         if (split->input_events) { memset(split->input_events, 0, split->inputs_capacity * sizeof(ggml_backend_event_t)); }
+                ggml_backend_sched_split_reset_stages(split);
                 cur_backend_id = node_backend_id;
             }
 
@@ -1760,7 +1815,15 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        // halo-hybrid (local_sync): with a remote backend this wait covers the remote's whole command queue,
+        // which in the prefill pipeline holds the OTHER lane's graph (1.5-2 s per 1024 tokens): the growing
+        // shapes of a long prompt re-plan the allocation every ubatch, so the pipeline serialized here. This
+        // scheduler's own remote work is complete (its outputs were fetched) and any pending reads of its
+        // remote buffer are ordered ahead of a re-allocation by the queue, so only the local devices need it.
         for (int i = 0; i < sched->n_backends; i++) {
+            if (sched->local_sync && ggml_backend_sched_backend_is_remote(sched->backends[i])) {
+                continue;
+            }
             ggml_backend_synchronize(sched->backends[i]);
         }
 
@@ -1807,6 +1870,10 @@ struct ggml_backend_sched_compute_state {
     int64_t t_submit_us = 0; // host time spent submitting
     int64_t t_copy_us   = 0; // ... of which in the input copies (event waits + cpy_tensor_async)
     int64_t t_comp_us   = 0; // ... of which in graph_compute_async
+    // remote fetch: local->remote sends (time waiting for the local producer) and remote->local fetch waits
+    int n_remote_send = 0; int64_t t_remote_send_us = 0;
+    int n_remote_wait = 0; int64_t t_remote_wait_us = 0;
+    int n_remote_fetch = 0;
 };
 
 static bool ggml_backend_sched_trace_waits() {
@@ -1816,8 +1883,9 @@ static bool ggml_backend_sched_trace_waits() {
 
 static void ggml_backend_sched_trace_report(const char * tag, ggml_backend_sched_t sched, const ggml_backend_sched_compute_state & st) {
     if (ggml_backend_sched_trace_waits()) {
-        GGML_LOG_INFO("sched-trace %s: splits %d, host waits: no-input %d, input-copy %d, sync-copy %d, submit %.1f ms (copies %.1f, compute %.1f)\n",
-            tag, sched->n_splits, st.n_wait_noinput, st.n_wait_input, st.n_wait_cpyfail, st.t_submit_us/1000.0, st.t_copy_us/1000.0, st.t_comp_us/1000.0);
+        GGML_LOG_INFO("sched-trace %s: splits %d, host waits: no-input %d, input-copy %d, sync-copy %d, submit %.1f ms (copies %.1f, compute %.1f); remote send %d (%.1f ms), fetch %d, fetch-wait %d (%.1f ms)\n",
+            tag, sched->n_splits, st.n_wait_noinput, st.n_wait_input, st.n_wait_cpyfail, st.t_submit_us/1000.0, st.t_copy_us/1000.0, st.t_comp_us/1000.0,
+            st.n_remote_send, st.t_remote_send_us/1000.0, st.n_remote_fetch, st.n_remote_wait, st.t_remote_wait_us/1000.0);
     }
 }
 
@@ -1864,6 +1932,44 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                 // already copied right after its producer (eager copies): only order this backend after that copy
                 ggml_backend_event_wait(split_backend, split->input_events[input_id]);
                 split->input_events[input_id] = NULL;
+                continue;
+            }
+
+            if (split->stages && split->stages[input_id].ev != NULL) {
+                // fetched from a remote producer right behind its graph (remote fetch): wait for that queue
+                // position only, then a stream-ordered upload on this backend
+                struct ggml_backend_sched_stage * stg = &split->stages[input_id];
+                const int64_t t_w0 = ggml_time_us();
+                ggml_backend_event_synchronize(stg->ev);
+                st.n_remote_wait++; st.t_remote_wait_us += ggml_time_us() - t_w0;
+                ggml_backend_event_free(stg->ev);
+                stg->ev = NULL;
+                ggml_backend_tensor_set_async(split_backend, input_cpy, stg->data, 0, ggml_nbytes(input));
+                continue;
+            }
+
+            if (sched->remote_fetch && split->stages && ggml_backend_sched_backend_is_remote(split_backend) &&
+                    !ggml_backend_buffer_is_host(input->buffer) &&
+                    ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    !ggml_backend_sched_backend_is_remote(input_backend) && split_backend->iface.set_tensor_async) {
+                // a local device's output for the remote split: download it (waits for the local producer only),
+                // then queue the upload behind the remote's in-flight commands instead of draining its queue
+                struct ggml_backend_sched_stage * stg = &split->stages[input_id];
+                void * data = ggml_backend_sched_stage_reserve(stg, ggml_nbytes(input));
+                const int64_t t_s0 = ggml_time_us();
+                ggml_backend_tensor_get_async(input_backend, input, data, 0, ggml_nbytes(input));
+                ggml_backend_synchronize(input_backend);
+                st.n_remote_send++; st.t_remote_send_us += ggml_time_us() - t_s0;
+                if (ggml_backend_sched_trace_waits()) {
+                    static int n_logged = 0;
+                    if (n_logged < 32) {
+                        n_logged++;
+                        GGML_LOG_INFO("sched-trace remote-send: %s [%s] %zu bytes %s -> %s (split %d) waited %.1f ms\n",
+                            input->name, ggml_op_desc(input), ggml_nbytes(input), ggml_backend_name(input_backend), ggml_backend_name(split_backend),
+                            split_id, (ggml_time_us() - t_s0) / 1000.0);
+                    }
+                }
+                ggml_backend_tensor_set_async(split_backend, input_cpy, data, 0, ggml_nbytes(input));
                 continue;
             }
 
@@ -2049,6 +2155,46 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                 }
 
                 j0 = j1;
+            }
+        }
+
+        // remote fetch: queue the download of this remote split's outputs that later local splits consume right
+        // behind its graph, and leave the consumer a queue marker to wait on (instead of draining the queue)
+        if (sched->remote_fetch && ggml_backend_sched_backend_is_remote(split_backend)) {
+            for (int c = split_id + 1; c < sched->n_splits; c++) {
+                struct ggml_backend_sched_split * cs = &sched->splits[c];
+                if (cs->backend_id == split_backend_id || cs->stages == NULL ||
+                        ggml_backend_sched_backend_is_remote(sched->backends[cs->backend_id]) ||
+                        !sched->backends[cs->backend_id]->iface.set_tensor_async) {
+                    continue;
+                }
+                for (int k = 0; k < cs->n_inputs; k++) {
+                    struct ggml_tensor * x = cs->inputs[k];
+                    if (ggml_backend_sched_is_input(x) || ggml_nbytes(x) == 0 || cs->stages[k].ev != NULL) {
+                        continue;
+                    }
+                    struct ggml_tensor * root = x;
+                    while (root->view_src) {
+                        root = root->view_src;
+                    }
+                    if (sched->hv_tensor_split_ids[hash_id(root)] != split_id) {
+                        continue;
+                    }
+                    if (ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                        continue;
+                    }
+                    struct ggml_backend_sched_stage * stg = &cs->stages[k];
+                    void * data = ggml_backend_sched_stage_reserve(stg, ggml_nbytes(x));
+                    ggml_backend_tensor_get_async(split_backend, x, data, 0, ggml_nbytes(x));
+                    ggml_backend_event_t ev = ggml_backend_event_new(split_backend->device);
+                    if (ev == NULL) {
+                        // no events: fall back to the lazy sync copy at the consumer
+                        continue;
+                    }
+                    ggml_backend_event_record(ev, split_backend);
+                    stg->ev = ev;
+                    st.n_remote_fetch++;
+                }
             }
         }
 
@@ -2297,7 +2443,15 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->splits_capacity; i++) {
         free(sched->splits[i].inputs);
         free(sched->splits[i].input_events);
+        if (sched->splits[i].stages) {
+            ggml_backend_sched_split_reset_stages(&sched->splits[i]);
+            for (int k = 0; k < sched->splits[i].inputs_capacity; k++) {
+                free(sched->splits[i].stages[k].data);
+            }
+            free(sched->splits[i].stages);
+        }
     }
+    delete sched->pipe_state;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < GGML_SCHED_COPY_EVENTS; c++) {
             ggml_backend_event_free(sched->copy_events[b][c]);
@@ -2439,6 +2593,101 @@ void ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool enable
 void ggml_backend_sched_set_eager_copies(ggml_backend_sched_t sched, bool enable) {
     GGML_ASSERT(sched);
     sched->eager_copies = enable;
+}
+
+void ggml_backend_sched_set_remote_fetch(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->remote_fetch = enable;
+}
+
+void ggml_backend_sched_set_local_sync(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->local_sync = enable;
+}
+
+int ggml_backend_sched_first_remote_split(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_splits; i++) {
+        if (ggml_backend_sched_backend_is_remote(sched->backends[sched->splits[i].backend_id])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int ggml_backend_sched_last_remote_split(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    for (int i = sched->n_splits - 1; i >= 0; i--) {
+        if (ggml_backend_sched_backend_is_remote(sched->backends[sched->splits[i].backend_id])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_head(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched && sched->is_alloc && !sched->callback_eval);
+    GGML_ASSERT(sched->pipe_state == NULL && "head called twice without tail");
+    // cut after the LAST remote split: GLM's graph emits a six-node recurrent-state split for the first remote
+    // layer before the last local layer's expert tail, so the first remote split is not the heavy one. A local
+    // split between two remote splits only stalls the head if it consumes a remote output (fetch-wait; the
+    // trace counts them), which the current graphs do not.
+    const int r = ggml_backend_sched_last_remote_split(sched);
+    GGML_ASSERT(r >= 0 && "no remote split");
+    sched->pipe_state = new ggml_backend_sched_compute_state;
+    sched->pipe_first_remote = r;
+    if (ggml_backend_sched_trace_waits()) {
+        // one-time picture of the split structure the pipeline is cutting
+        static int n_logged = 0;
+        if (n_logged < 2) {
+            n_logged++;
+            for (int i = 0; i < sched->n_splits; i++) {
+                const struct ggml_backend_sched_split * sp = &sched->splits[i];
+                GGML_LOG_INFO("sched-trace split %2d: %-28s nodes %5d (%s .. %s) inputs %d:%s%s%s%s\n", i,
+                    ggml_backend_name(sched->backends[sp->backend_id]), sp->graph.n_nodes,
+                    sp->graph.n_nodes > 0 ? sp->graph.nodes[0]->name : "-",
+                    sp->graph.n_nodes > 0 ? sp->graph.nodes[sp->graph.n_nodes - 1]->name : "-", sp->n_inputs,
+                    sp->n_inputs > 0 ? " " : "", sp->n_inputs > 0 ? sp->inputs[0]->name : "",
+                    sp->n_inputs > 1 ? " " : "", sp->n_inputs > 1 ? sp->inputs[1]->name : "");
+            }
+        }
+    }
+    for (int split_id = 0; split_id <= r; split_id++) {
+        enum ggml_status ec = ggml_backend_sched_compute_split(sched, split_id, *sched->pipe_state);
+        if (ec != GGML_STATUS_SUCCESS) {
+            delete sched->pipe_state;
+            sched->pipe_state = NULL;
+            return ec;
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_tail(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched && sched->pipe_state != NULL && "tail without head");
+    enum ggml_status ec = GGML_STATUS_SUCCESS;
+    for (int split_id = sched->pipe_first_remote + 1; split_id < sched->n_splits; split_id++) {
+        ec = ggml_backend_sched_compute_split(sched, split_id, *sched->pipe_state);
+        if (ec != GGML_STATUS_SUCCESS) {
+            break;
+        }
+    }
+    ggml_backend_sched_trace_report("pipe", sched, *sched->pipe_state);
+    delete sched->pipe_state;
+    sched->pipe_state = NULL;
+    return ec;
+}
+
+void ggml_backend_sched_synchronize_local(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_backends; i++) {
+        if (!ggml_backend_sched_backend_is_remote(sched->backends[i])) {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
+    }
+    if (!sched->is_alloc) {
+        sched->next_copy = 0;
+    }
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

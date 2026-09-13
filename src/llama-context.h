@@ -260,6 +260,10 @@ public:
 
     // halo-hybrid: compute the graphs prepared on both lanes with their splits interleaved
     ggml_status graph_compute_pair(bool batched);
+    // halo-hybrid: rolling prefill pipeline across a remote device (see decode)
+    ggml_status graph_compute_lane(ggml_cgraph * gf, int lane);
+    ggml_status graph_compute_head(int lane);
+    ggml_status graph_compute_tail(int lane);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -391,6 +395,12 @@ private:
     // a two-lane pair was submitted and no synchronize has happened since: the next single graph on the
     // main scheduler must wait for it (the per-ubatch path already synchronizes before set_inputs)
     bool lanes_sync_pending = false;
+    // halo-hybrid: a remote (RPC) device is present; with two lanes the prefill runs as a rolling pipeline
+    bool has_remote_backend = false;
+    bool prefill_pipeline   = false;
+    bool remote_fetch_enabled = false;
+    bool pipeline_active    = false; // a pipelined graph is in flight: prepare_ubatch synchronizes local backends only
+    uint32_t pipe_min_tokens = 32;   // smaller ubatches (decode, verify batches) bypass the pipeline
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
