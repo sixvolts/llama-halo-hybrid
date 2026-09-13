@@ -194,10 +194,13 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     const bool amd = !no_sparse && amd_wmma_available(cc);
     const bool arch_ok = (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd;
     // RDNA, measured on gfx1201 / gfx1151 at DKQ = DV = 512, 64 heads, bound 2052 (GGML_CUDA_FA_SPARSE_MIN_RATIO
-    // overrides): the one-query-column sparse tile costs ~3x a 32-column dense tile, so at 1024 queries the
-    // sparse walk of 33 tiles only breaks even with the dense walk of 208 at ~13K context and pays off from
-    // ~16K (8x the bound); the 3-token verify batch already gains 9% / 22% at 13K (2x the bound)
-    static const int64_t amd_pp_ratio = getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO")) : 8;
+    // overrides): the one-query-column sparse tile costs ~3x a 32-column dense tile, so the sparse walk of 33
+    // tiles per query pays off only once the dense walk is long enough; the 3-token verify batch gains from 2x
+    // the bound on both parts
+    // after the upstream sync (#28102's tuning): the sparse walk is ~flat at 25-28 ms (gfx1201) / 99-120 ms (gfx1151)
+    // per 1024 queries while dense grows with the context, break-even ~8K on gfx1201 and ~14K on gfx1151
+    static const int64_t amd_pp_ratio = getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO"))
+                                      : (GGML_CUDA_CC_IS_RDNA4(cc) ? 4 : 7);
     const int64_t min_ratio = amd && Q->ne[1] > 8 ? amd_pp_ratio : 2;
     // the only sparse variant with device code on RDNA is (512, 512, 1, 16)
     if (amd && !(K->ne[0] == 512 && dst->src[2]->ne[0] == 512 && (Q->ne[2] / K->ne[2]) % 16 == 0)) {

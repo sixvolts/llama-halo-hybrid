@@ -9,7 +9,7 @@ Getting this working was a little bit of a mind-bender, so wanted to share with 
 Here's part of the config:
 
 llama-server -m Qwen3.5-122B-A10B-Opus-Reasoning-Q4_K_XL.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -ngl 999 -fa on --jinja --no-mmap \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -ngl 999 -fa on --jinja --load-mode none \
   -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -c 32768 -ub 4096 -b 4096 \
   -md mtp-draft-out-q4_K.gguf --spec-type draft-mtp -devd ROCm0 \
@@ -34,7 +34,7 @@ sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool bef
 
 LLAMA_PREFILL_LANES=2 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --no-mmap -np 1 \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --load-mode none -np 1 \
   -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU' \
   -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 \
   --spec-type draft-mtp --spec-draft-n-max 2 \

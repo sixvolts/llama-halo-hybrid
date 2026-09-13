@@ -31,6 +31,6 @@ DRAFTARGS=""
 if [ "${DRAFT:-0}" = 1 ]; then DRAFTARGS="-md /home/sixvolts/models/glm-5.3-flash/MTP/GLM-5.3-Flash-mtp-UD-Q4_K_XL.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max ${NMAX:-2}"; fi
 exec env GGML_RPC_DEBUG=1 LLAMA_ASYNC_INPUTS=${LLAMA_ASYNC_INPUTS:-1} $BIN/llama-server -m "$M" --rpc $RPC $DRAFTARGS \
   -dev "ROCm0,RPC0,ROCm1" -ts $LOCAL,$REMOTE,0 --fit off -fa on -ngl 999 \
-  -c $CTX -b 4096 -ub 1024 --no-mmap -np 1 -t 16 \
+  -c $CTX -b 4096 -ub 1024 --load-mode none -np 1 -t 16 \
   -ot "$OT" \
   --alias glm-5.3-flash --metrics --host 0.0.0.0 --port 8081 -lv 4 "$@" >> $LOG 2>&1
