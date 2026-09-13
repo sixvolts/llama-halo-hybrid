@@ -11042,6 +11042,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1024, 1, 1}, {1, 1, 1, 1}));
         test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {4096, 1024, 1, 1}, {1, 1, 1, 1}));
         test_cases.emplace_back(new test_glu(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {2048, 1024, 1, 1}, false, false));
+        // the MoE weighted reduction (8 experts, expert scale) and the f32 router GEMM (ffn_gate_inp [4096 x 288]) at 1024 tokens
+        test_cases.emplace_back(new test_moe_weighted_reduction(4096, 8, 1024, false, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, 1024, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 288, 1024, 4096, {1, 1}, {1, 1}));
         // routed experts (APU on gibson, mainframe): gate/up q4_K with the broadcast src1, down q5_K
         // n = 1 decode, 3 draft verify, 128..4096 prefill ubatches
         for (int64_t n : {1, 3, 128, 512, 1024, 2048, 4096}) {
