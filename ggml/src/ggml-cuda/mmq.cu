@@ -185,7 +185,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, 0};
+            ne1, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -258,6 +258,16 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    // halo-hybrid: measured on gfx1151 (RDNA3.5) as well, so the hint applies to every arch; GGML_CUDA_MMQ_MOE_J_FACTOR
+    // scales the expected count (0 restores ne12)
+    int64_t ncols_opt = ggml_cuda_mmq_moe_ncols_hint(ne12, n_expert_used, ne02);
+    if (ncols_opt <= 0) {
+        ncols_opt = ne12;
+    }
+    GGML_UNUSED(cc);
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
@@ -265,7 +275,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, ggml_cuda_mmq_moe_ncols_hint(ne12, n_expert_used, ne02)};
+        ne12, ncols_opt};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -389,10 +399,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return true;
     }
 
-    // gfx900 (Vega 10) lacks native dp4a, loses to dequant + hipBLAS
+    // gfx900 (Vega 10), gfx909, and gfx90c lack native dp4a, losing to dequant + hipBLAS
     // for dense matrices; keep MMQ only for MoE, where the
     // hipBLAS path is much slower.
-    if (cc == GGML_CUDA_CC_VEGA) {
+    if (cc == GGML_CUDA_CC_VEGA || GGML_CUDA_CC_IS_GCN_APU(cc)) {
         return n_experts > 0;
     }
 

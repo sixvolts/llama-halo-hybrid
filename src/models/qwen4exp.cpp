@@ -1231,6 +1231,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
+
     const float eps_norm = hparams.f_norm_rms_eps;
 
     // q and k are adjacent in the conv output: one l2_norm over both instead of two launches
@@ -1242,8 +1243,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);
         k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], (size_t) num_k_heads * qk_conv->nb[1]);
     } else {
-        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
     }
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
