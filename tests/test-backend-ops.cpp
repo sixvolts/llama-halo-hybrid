@@ -11037,6 +11037,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {4096, 1024, 1, 1}));
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {4096, 1024, 1, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
         test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F32, {3, 12288, 1, 1}, 1024));
+        test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F32, {32, 12288, 1, 1}, 1024)); // aligned dst rows
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4096, 1024, 1, 1}, 4096, 0, 0));
         test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1024, 1, 1}, {1, 1, 1, 1}));
         test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {4096, 1024, 1, 1}, {1, 1, 1, 1}));

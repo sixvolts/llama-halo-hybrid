@@ -883,6 +883,10 @@ template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
 #if defined(RDNA3_5) && defined(AMD_WMMA_AVAILABLE)
     // Whitelist: the extra registers cause spills in several other specializations.
+    // halo-hybrid: Q4_K at J=16/32 too (the MoE column hint picks J=32 at a 1024-token ubatch; the expert GEMMs of
+    //     GLM-5.3-Flash are q4_K) with the weight tile staged as well (ggml_cuda_mmq_x_regs): gfx1151 288 experts x
+    //     2048x4096, n=1024 9.8 -> 8.5 ms. Staging the Q5_K weight tile measured no gain over its activation-only
+    //     prefetch, so Q5_K keeps J=32 activation-only.
     return (type == GGML_TYPE_Q8_0    && (J == 48 || J == 128) && !fallback) ||
            (type == GGML_TYPE_Q6_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q5_K    &&  J == 32)              ||
