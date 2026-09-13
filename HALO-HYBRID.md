@@ -317,6 +317,9 @@ At 26K: **484 / 21.2** (was 463 / 20.0). At 13K the prefill is mainframe-bound (
 | + Q4_K expert-GEMM prefetch and the tiled conv-state concat on both APUs (58ed7d325) | 379 / 19.9 | **525** / 19.6 |
 
 At 26K: **512 / 19.8** (was 484 / 21.2). The APU-side kernels move the two-host number because mainframe's lane is the critical path: the expert GEMMs there are 14% cheaper and the concat 3x.
+| + f32 tiled router GEMM on both APUs (dedecad89) | 378 / 19.3 | 526 / 20.3 |
+
+At 26K: 513 / 20.3. Within noise of the row above, as the router's ~1% share predicts; the draft's acceptance on the same prompts moved (0.77 → 0.82 at 13K, 0.88 → 0.84 at 26K) because the router logits now sum in a different f32 order and near-tied expert choices flip, greedy output unchanged.
 
 Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
 state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
