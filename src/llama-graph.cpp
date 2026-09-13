@@ -3853,7 +3853,13 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, 0, kq_scale, il);
+    // halo-hybrid: the finite entries of a mask row are the selected pools' cells plus the query's partial
+    // pool (kpool - 1 cells at most), so the sparse flash-attention path (CUDA/HIP: the mask is compacted to
+    // per-query index lists and only those keys are gathered) may be told that bound; it engages once the
+    // cache holds at least twice that many cells and otherwise the dense masked kernel runs as before
+    const int64_t n_kv_max = top_k->ne[0] + hparams.indexer_kpool;
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, n_kv_max, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {

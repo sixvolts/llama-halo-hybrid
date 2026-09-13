@@ -165,7 +165,8 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
+    // 16 columns = the sparse (DSA) variant: one query, 16 heads; occupancy 1 like the 32-column config below
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 1,  64,  64,  32,  64, 1, false);
     // gfx1151 / gfx1201, measured 2026-09-08 (GLM-5.3-Flash MLA): 8 waves, one block per CU; larger K/V batches overflow
     //     the 64 KiB of LDS next to the 32 KiB Q tile, occupancy 2 spills the 128-VGPR VKQ accumulator
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 1,  64,  64,  32,  64, 1, false);
@@ -441,6 +442,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 return;
             }
 
+            // halo-hybrid: the gathered rows' indices are read once per row into registers ahead of the loads.
+            // Read inside the chunk loop they were a dependent global load in front of every 16-byte chunk,
+            // and at occupancy 1 (the RDNA D=512 configs) that latency was 5x the tile's load time.
+            int32_t idx_reg[use_sparse ? nbatch_fa / nwarps : 1];
+            if constexpr (use_sparse) {
+#pragma unroll
+                for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
+                    const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+                    idx_reg[i0/(nwarps*stride_i)] = i < nbatch_fa && i < i_sup ? indices[k_VKQ_0 + i] : -1;
+                }
+            }
+
 #pragma unroll
             for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
                 const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
@@ -455,7 +468,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
                     const half2 * src;
                     if constexpr (use_sparse) {
-                        const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
+                        const int32_t index = idx_reg[i0/(nwarps*stride_i)];
                         src = index >= 0 ? KV + int64_t(index)*stride_KV + k*h2_per_chunk : zero;
                     } else {
                         src = !oob_check || i < i_sup ? KV + int64_t(k_VKQ_0 + i)*stride_KV + k*h2_per_chunk : zero;
@@ -1761,7 +1774,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
+    // (512, 512, 1, 16): the RDNA WMMA kernel needs 16 columns per tile; GLM-5.3-Flash's DSA layers are
+    // 64 query heads over one MLA head at DKQ = DV = 512, so their GQA ratio saturates the 16-column cap
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
+           (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
 }
 
@@ -2017,7 +2033,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     bool use_sparse = false;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
                 constexpr bool use_sparse_kernel = true;
@@ -2040,7 +2056,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 }
             }
         } else
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
         {
             constexpr bool use_sparse_kernel = false;
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;

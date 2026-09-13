@@ -87,13 +87,79 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     // the dependent grid reads indices, signal once the row is complete
     ggml_cuda_pdl_lc();
 }
+#else
+// halo-hybrid: a warp-size-agnostic compaction for HIP (RDNA runs wave32, CDNA wave64; no __ballot_sync).
+// One block per mask row; each thread takes ITEMS consecutive entries per chunk, the block prefix-sums the
+// per-thread counts through shared memory, and every selected entry is written at its rank. Same output
+// as the ballot version: the finite entries' positions in row order, then -1 up to n_kv_max.
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_mask_to_sparse_indices(
+        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
+        const int64_t s31, const int64_t s33) {
+    constexpr int NT    = 256;
+    constexpr int ITEMS = 8;
+    const int tid      = threadIdx.x;
+    const int sequence = blockIdx.y;
+    const int query    = blockIdx.x;
+
+    const half * mask = mask_ptr + sequence*s33 + query*s31;
+    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*n_kv_max;
+
+    __shared__ int counts[NT];
+    __shared__ int row_count;
+    if (tid == 0) {
+        row_count = 0;
+    }
+    __syncthreads();
+
+    for (int i0 = 0; i0 < ne30; i0 += NT*ITEMS) {
+        bool sel[ITEMS];
+        int  my_count = 0;
+#pragma unroll
+        for (int item = 0; item < ITEMS; ++item) {
+            const int i = i0 + tid*ITEMS + item;
+            sel[item] = i < ne30 && isfinite(__half2float(mask[i]));
+            my_count += sel[item] ? 1 : 0;
+        }
+        counts[tid] = my_count;
+        __syncthreads();
+        // exclusive scan over the 256 counts (Hillis-Steele in shared memory)
+#pragma unroll
+        for (int off = 1; off < NT; off *= 2) {
+            const int v = tid >= off ? counts[tid - off] : 0;
+            __syncthreads();
+            counts[tid] += v;
+            __syncthreads();
+        }
+        const int my_off = row_count + counts[tid] - my_count; // inclusive -> exclusive
+        int rank = my_off;
+#pragma unroll
+        for (int item = 0; item < ITEMS; ++item) {
+            if (sel[item]) {
+                if (rank < n_kv_max) {
+                    indices[rank] = i0 + tid*ITEMS + item;
+                }
+                rank++;
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            row_count += counts[NT - 1];
+        }
+        __syncthreads();
+    }
+    const int count = row_count;
+    for (int i = count + tid; i < n_kv_max; i += NT) {
+        indices[i] = -1;
+    }
+}
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(mask, indices, n_kv_max, stream);
-    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+    GGML_ABORT("sparse flash attention is not supported on MUSA");
 #else
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
@@ -103,11 +169,11 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(ctx, dst);
     return false;
 #else
@@ -122,11 +188,26 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+    // halo-hybrid: RDNA (WMMA) parts too - GLM-5.3-Flash's DSA layers select 2051 of the cache's cells per
+    // query and otherwise walk the whole context under a mask (GGML_CUDA_FA_NO_SPARSE=1 restores that)
+    static const bool no_sparse = getenv("GGML_CUDA_FA_NO_SPARSE") != nullptr;
+    const bool amd = !no_sparse && amd_wmma_available(cc);
+    const bool arch_ok = (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd;
+    // RDNA, measured on gfx1201 / gfx1151 at DKQ = DV = 512, 64 heads, bound 2052 (GGML_CUDA_FA_SPARSE_MIN_RATIO
+    // overrides): the one-query-column sparse tile costs ~3x a 32-column dense tile, so at 1024 queries the
+    // sparse walk of 33 tiles only breaks even with the dense walk of 208 at ~13K context and pays off from
+    // ~16K (8x the bound); the 3-token verify batch already gains 9% / 22% at 13K (2x the bound)
+    static const int64_t amd_pp_ratio = getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO")) : 8;
+    const int64_t min_ratio = amd && Q->ne[1] > 8 ? amd_pp_ratio : 2;
+    // the only sparse variant with device code on RDNA is (512, 512, 1, 16)
+    if (amd && !(K->ne[0] == 512 && dst->src[2]->ne[0] == 512 && (Q->ne[2] / K->ne[2]) % 16 == 0)) {
+        return false;
+    }
+    return arch_ok &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        K->ne[1] >= std::max<int64_t>(4096, min_ratio*n_kv_max);
+#endif // !defined(GGML_USE_MUSA)
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -134,14 +215,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
         if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
     }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
@@ -195,6 +276,24 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+#if defined(GGML_USE_HIP)
+    // halo-hybrid: the RDNA WMMA kernel needs 16 columns per tile, and the sparse variant has one query column,
+    // so a sparse DKQ=512 call takes the 16-head variant (GLM-5.3-Flash: 64 query heads over one MLA head)
+    if constexpr (DKQ == 512 && DV == 512) {
+        if (use_gqa_opt && gqa_ratio % 16 == 0 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 16>(ctx, dst);
+            return;
+        }
+        // one query per sequence slot (a per-token gathered key set): 16 heads fill the tile instead of
+        // padding 4 query columns with one query (GGML_CUDA_FA_NCOLS16=0 restores the 8-head dispatch)
+        static const bool ncols16 = getenv("GGML_CUDA_FA_NCOLS16") == nullptr || atoi(getenv("GGML_CUDA_FA_NCOLS16")) != 0;
+        if (ncols16 && use_gqa_opt && gqa_ratio % 16 == 0 && Q->ne[1] == 1) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 16>(ctx, dst);
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {

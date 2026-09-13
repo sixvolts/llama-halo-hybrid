@@ -8623,6 +8623,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 33, 1, 1, false, true));
         for (int64_t nb : {1024, 3, 1}) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            // sparse (DSA-selected) rows: 2052 finite entries of 4096 / 8192, V a view of K as in MLA
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4352, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2052));
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2052));
         }
     }
     std::default_random_engine rng(0);
@@ -10671,9 +10674,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1, 1, false, true));
         // full-attention layers (MLA, D=512, 64 q heads over one kv head), f16 KV cache: prefill ubatch and the
         // 3-token draft-verify batch at 4K and 13K context
+        // a per-token gathered key set (2051 selected cells, padded): one query per sequence slot, 1024 slots
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1024}, 2304, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false, true));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 3},    2304, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false, true));
         for (int64_t kv : {4096, 13312}) {
             for (int64_t nb : {1024, 3}) {
                 test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                if (kv >= 4352) {
+                    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2052));
+                }
+            }
+        }
+        // sparse at a fixed bound versus the cache length (the kernel must walk the bound, not the cache),
+        // and the long-context point where the sparse walk pays off on RDNA (26K: dense vs sparse)
+        for (int64_t kv : {4352, 8192, 26624}) {
+            for (int64_t nb : {1024}) {
+                if (kv == 26624) {
+                    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 0));
+                }
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2052));
             }
         }
         // with the draft head the op keeps K = n_rs_seq + 1 = 3 rollback snapshots

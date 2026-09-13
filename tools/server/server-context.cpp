@@ -3551,12 +3551,20 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            // halo-hybrid: with two-lane prefill (LLAMA_PREFILL_LANES=2) consecutive ubatches of one
-                            // llama_decode are computed together, so the tail chunk before the last 4 tokens is
-                            // sized to two ubatches instead of one; a checkpoint restore then re-processes up to
-                            // 2*n_ubatch tokens instead of n_ubatch
+                            // halo-hybrid: with two-lane prefill (LLAMA_PREFILL_LANES=2) the ubatches of one
+                            // llama_decode overlap across the devices (a rolling pipeline with a remote device),
+                            // and every extra llama_decode boundary drains that pipeline: 1-2 s per boundary at 13K
+                            // on the two-host layout. The checkpoint 4 + n_ubatch tokens before the end only
+                            // bounds how much a restore re-processes, and the user-message-start checkpoints
+                            // already cover an edited last message, so the lanes keep just the one 4 tokens
+                            // before the end (a 13K prompt: 2 drains -> 1, a 3K prompt likewise).
+                            // LLAMA_TAIL_CKPT=2 restores the second checkpoint with the lanes (A/B: with it the
+                            // draft's acceptance measured 0.84 / 0.86 vs 0.81 / 0.83 without, decode 20.5 vs 20.0,
+                            // prefill 430 vs 457 tok/s at 13K; the ubatch boundaries move with it and so do the
+                            // hidden states at the noise level)
+                            static const int tail_ckpt = getenv("LLAMA_TAIL_CKPT") ? atoi(getenv("LLAMA_TAIL_CKPT")) : 0;
                             const int prefill_lanes = std::max(1, (int) llama_n_prefill_lanes(ctx_tgt));
-                            const int checkpoint_offsets[] = {4 + prefill_lanes * n_ubatch, 4};
+                            const int checkpoint_offsets[] = {prefill_lanes >= 2 && tail_ckpt != 2 ? 4 : 4 + prefill_lanes * n_ubatch, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
