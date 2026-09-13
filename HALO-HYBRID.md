@@ -312,6 +312,10 @@ At 26K on the merged tree: **463 / 20.0** (was 406 / 20.1).
 
 At 26K: **484 / 21.2** (was 463 / 20.0). At 13K the prefill is mainframe-bound (its lane is the longer one in the pipeline), so gibson's attention savings do not show there; they do at 26K where the dense walk would have grown on both hosts. Qwen3.8 service on the same build (19.5K prompt): prefill 1274 → 1359 tok/s, decode 45, acceptance 0.71.
 
+| + Q4_K expert-GEMM prefetch and the tiled conv-state concat on both APUs (58ed7d325) | 379 / 19.9 | **525** / 19.6 |
+
+At 26K: **512 / 19.8** (was 484 / 21.2). The APU-side kernels move the two-host number because mainframe's lane is the critical path: the expert GEMMs there are 14% cheaper and the concat 3x.
+
 Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
 state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
 
