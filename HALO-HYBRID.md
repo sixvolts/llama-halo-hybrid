@@ -300,6 +300,9 @@ profile (`rocprofv3`) could not see any of them, since a blocking host copy cons
 | + one tail checkpoint under the lanes, sparse attention for the DSA layers on RDNA (d0e679c6d; the sparse kernel serves the verify batch here and prefill from ~16K) | 349 / 19.9 | **457** / 20.5 |
 
 At 26K (1100 records, `-b 32768`, same binary): 385 / 19.2 with `GGML_CUDA_FA_NO_SPARSE=1`, **406 / 20.1** with the sparse path.
+| + upstream master merged (2c2661941; #28102's gfx1201 flash-attention tuning lifts the DKQ=512 WMMA kernel on both parts, 70 → 36 ms and 186 → 100 ms per 1024-query call at 13K; per-arch sparse gate, 5080fabc2) | 359 / 20.1 | **491** / 21.4 |
+
+At 26K on the merged tree: **463 / 20.0** (was 406 / 20.1). Qwen3.8 service on the same build (19.5K prompt): prefill 1274 → 1359 tok/s, decode 45, acceptance 0.71.
 
 Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
 state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
