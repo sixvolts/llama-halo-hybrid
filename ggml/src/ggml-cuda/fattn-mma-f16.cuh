@@ -165,8 +165,15 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
-    // 16 columns = the sparse (DSA) variant: one query, 16 heads; occupancy 1 like the 32-column config below
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 1,  64,  64,  32,  64, 1, false);
+    // 16 columns = one query x 16 heads (sparse DSA rows, and single-token decode via GGML_CUDA_FA_NCOLS16). The LDS
+    //     footprint decides the occupancy: a 64 KiB WGP holds two 4-wave blocks only below 32 KiB per block, and with the
+    //     16 x 1040 B Q tile (16.6 KB) that leaves ~15 KB for the K/V tile. nbatch_K2 = 64 half2 (64 x 272 B = 17.4 KB)
+    //     was 34.2 KB -> one block per WGP, one wave per SIMD, nothing to hide the gather and LDS latency behind; 32 half2
+    //     (9.2 KB, two K passes per tile) is 26.0 KB -> two blocks, two waves per SIMD (the same occupancy the 32-column
+    //     config gets from its 8 waves): 13K sparse per 1024 queries 28.4 -> 23.4 ms gfx1201, 131 -> 122 gfx1151, the
+    //     3-token verify batch's kernel 242 -> 155 us. The kernel still spills (256 VGPRs: the 16 x 512 VKQ accumulator
+    //     alone is 128 per lane); see HALO-HYBRID.md for the first-principles account
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 1,  64,  32,  32,  64, 1, false);
     // gfx1151 / gfx1201, measured 2026-09-08 (GLM-5.3-Flash MLA): 8 waves, one block per CU; larger K/V batches overflow
     //     the 64 KiB of LDS next to the 32 KiB Q tile, occupancy 2 spills the 128-VGPR VKQ accumulator
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 1,  64,  64,  32,  64, 1, false);
@@ -1774,10 +1781,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    // (512, 512, 1, 16): the RDNA WMMA kernel needs 16 columns per tile; GLM-5.3-Flash's DSA layers are
-    // 64 query heads over one MLA head at DKQ = DV = 512, so their GQA ratio saturates the 16-column cap
+    // (512, 512, 1, 16) / (512, 512, 1, 32): the RDNA WMMA kernel needs 16 columns per tile; GLM-5.3-Flash's DSA
+    // layers are 64 query heads over one MLA head at DKQ = DV = 512, so one query fills a 16- or 32-column tile
+    // with its heads alone. 32 heads per tile is the default on RDNA (fattn.cu): the query's gathered rows feed
+    // twice the MMA work per byte and the per-query walk is done in two head groups instead of four
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
+           (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 32) ||
            (DKQ == 512 && DV == 512 && ncols1 == 2 && ncols2 == 16) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
 }

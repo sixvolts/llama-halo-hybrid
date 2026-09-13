@@ -225,10 +225,13 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     // the bound on both parts
     // after the upstream sync (#28102's tuning): the sparse walk is ~flat at 25-28 ms (gfx1201) / 99-120 ms (gfx1151)
     // per 1024 queries while dense grows with the context, break-even ~8K on gfx1201 and ~14K on gfx1151
+    // with two blocks per WGP for the 16-column tile and 32 heads per tile (fattn-mma-f16.cuh): 19-21 ms (gfx1201)
+    // / 76-78 ms (gfx1151) per 1024 queries against a dense walk of 2.8 / 7.7 ms per 1K of context, break-even
+    // ~6.7K (ratio 3.3) on gfx1201 and ~10K (ratio 4.9) on gfx1151
     static const int64_t amd_pp_ratio = getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO"))
-                                      : (GGML_CUDA_CC_IS_RDNA4(cc) ? 4 : 7);
+                                      : (GGML_CUDA_CC_IS_RDNA4(cc) ? 3 : 5);
     const int64_t min_ratio = amd && Q->ne[1] > 8 ? amd_pp_ratio : 2;
-    // the only sparse variant with device code on RDNA is (512, 512, 1, 16)
+    // the sparse variants with device code on RDNA are (512, 512, 1, 16), (512, 512, 2, 16) and (512, 512, 1, 32)
     if (amd && !(K->ne[0] == 512 && dst->src[2]->ne[0] == 512 && (Q->ne[2] / K->ne[2]) % 16 == 0)) {
         return false;
     }
@@ -314,7 +317,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             // prefill: two consecutive queries share one gathered tile (the union of their selections, 32
             // columns = the tuned config); decode and the verify batch keep the one-query variant
             static const bool pairs = getenv("GGML_CUDA_FA_SPARSE_PAIRS") == nullptr || atoi(getenv("GGML_CUDA_FA_SPARSE_PAIRS")) != 0;
-            if (pairs && Q->ne[1] > 8) {
+            // 32 heads of one query per tile (GGML_CUDA_FA_SPARSE_HEADS=16 restores the 16-head tiles): the
+            // same 32-column tile as the pair variant, but every column shares the query's exact selection,
+            // so each gathered row feeds twice the MMA work of a 16-head tile and the union padding is gone
+            static const int sparse_heads = getenv("GGML_CUDA_FA_SPARSE_HEADS") ? atoi(getenv("GGML_CUDA_FA_SPARSE_HEADS")) : 32;
+            if (sparse_heads == 32 && gqa_ratio % 32 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 32>(ctx, dst);
+            } else if (pairs && Q->ne[1] > 8) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, 16>(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 16>(ctx, dst);
