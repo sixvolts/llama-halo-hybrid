@@ -1494,7 +1494,7 @@ struct ggml_backend_cuda_context {
     // same launch that produces the f32 value, and consumed by mul_mat_vec_q instead of a separate
     // quantize launch. Keyed by data pointer, validated against the producing tensor; reset per
     // graph compute. GGML_CUDA_NO_Q8_SIDE=1 disables.
-    struct q8_side_entry { const ggml_tensor * prod; const char * q8; int64_t ne0; };
+    struct q8_side_entry { const ggml_tensor * prod; const char * q8; int64_t ne0; int64_t ne1; };
     std::unordered_map<const void *, q8_side_entry> q8_side;
     char * q8_arena = nullptr;
     size_t q8_arena_size = 0;

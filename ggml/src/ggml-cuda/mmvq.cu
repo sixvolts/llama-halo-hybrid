@@ -1504,16 +1504,24 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     const char * src1_q8_1_d = src1_q8_1_pre;
-    if (!src1_q8_1_d && ne11 == 1 && ne12 == 1 && ne13 == 1) {
-        src1_q8_1_d = ggml_cuda_q8_side_find(ctx, src1);   // producer already wrote the q8_1 copy
+    const bool side_ok = ne11 <= 8 && ne12 == 1 && ne13 == 1 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1);
+    if (!src1_q8_1_d && side_ok) {
+        src1_q8_1_d = ggml_cuda_q8_side_find(ctx, src1);   // a producer or an earlier GEMV already wrote the q8_1 copy
     }
     if (!src1_q8_1_d) {
-        src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+        // halo-hybrid: at decode and verify widths the same activation feeds several GEMVs (q/k/v/f/g/beta of a KDA
+        // layer, the q_a/kv_a/indexer projections of a DSA layer): quantize it once into the side arena and register it
+        block_q8_1 * side = side_ok ? ggml_cuda_q8_side_reserve_rows(ctx, src1, ne10, ne11, ne10_padded) : nullptr;
+        char * q8 = (char *) side;
+        if (!q8) {
+            src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+            q8 = src1_q8_1.get();
+        }
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-        src1_q8_1_d = src1_q8_1.get();
+        quantize_row_q8_1_cuda(src1_d, nullptr, q8, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        src1_q8_1_d = q8;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

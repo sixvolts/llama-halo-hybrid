@@ -31,6 +31,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/sgemm-tile.cuh"
 #include "ggml-cuda/mmq-wmma.cuh"
+#include "ggml-cuda/ewchain.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -3808,6 +3809,146 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
 }
 
 
+// ---- generic element-wise chain fusion (ewchain.cuh) ---------------------------------------------
+static bool ew_unary_ok(const ggml_tensor * t) {
+    switch (ggml_get_unary_op(t)) {
+        case GGML_UNARY_OP_SIGMOID: case GGML_UNARY_OP_SILU: case GGML_UNARY_OP_EXP: case GGML_UNARY_OP_NEG:
+        case GGML_UNARY_OP_RELU:    case GGML_UNARY_OP_TANH: case GGML_UNARY_OP_ABS:
+            return true;
+        default:
+            return false;
+    }
+}
+// a node the chain can absorb: f32, the chain input in src[0] (or src[1] for the commutative ops), a broadcastable
+// f32 src1 for the binary ops
+static bool ew_node_ok(const ggml_tensor * t, const ggml_tensor * prev, const ggml_tensor ** in, const ggml_tensor ** other) {
+    if (t->type != GGML_TYPE_F32 || ggml_is_empty(t)) {
+        return false;
+    }
+    *other = nullptr;
+    switch (t->op) {
+        case GGML_OP_MUL: case GGML_OP_ADD: case GGML_OP_SUB: case GGML_OP_DIV: {
+            const ggml_tensor * a = t->src[0];
+            const ggml_tensor * b = t->src[1];
+            if (prev && a != prev && b == prev && (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD)) {
+                std::swap(a, b);
+            }
+            if (prev && a != prev) {
+                return false;
+            }
+            if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, t) || !ggml_can_repeat(b, t)) {
+                return false;
+            }
+            *in = a; *other = b;
+            return true;
+        }
+        case GGML_OP_SCALE: case GGML_OP_SQR: case GGML_OP_SQRT:
+            if (prev && t->src[0] != prev) { return false; }
+            if (t->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(t->src[0], t)) { return false; }
+            *in = t->src[0];
+            return true;
+        case GGML_OP_UNARY:
+            if (prev && t->src[0] != prev) { return false; }
+            if (!ew_unary_ok(t) || t->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(t->src[0], t)) { return false; }
+            *in = t->src[0];
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_EWCHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_NO_EWCHAIN"));
+    if (disabled) {
+        return 0;
+    }
+    const int n = cgraph->n_nodes;
+    const ggml_tensor * in0 = nullptr;
+    const ggml_tensor * other = nullptr;
+    if (!ew_node_ok(cgraph->nodes[i], nullptr, &in0, &other)) {
+        return 0;
+    }
+    int idx[GGML_CUDA_EW_MAX_OPS];
+    const ggml_tensor * others[GGML_CUDA_EW_MAX_OPS];
+    idx[0] = i; others[0] = other;
+    int cnt = 1;
+    int last = i;
+    while (cnt < GGML_CUDA_EW_MAX_OPS) {
+        const ggml_tensor * prev = cgraph->nodes[last];
+        if (!hc_uses1(cgraph, last) || (prev->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        const int j = hc_next(cgraph, last + 1);
+        if (j >= n) {
+            break;
+        }
+        const ggml_tensor * in = nullptr;
+        if (!ew_node_ok(cgraph->nodes[j], prev, &in, &other)) {
+            break;
+        }
+        // view nodes between the two must not view an intermediate of the chain (which the fused kernel never writes)
+        bool views_ok = true;
+        for (int q = last + 1; q < j && views_ok; ++q) {
+            const ggml_tensor * v = cgraph->nodes[q];
+            if (!hc_is_view_op(v)) { continue; }
+            for (int c = 0; c < cnt; ++c) {
+                if (hc_root(v) == cgraph->nodes[idx[c]]) { views_ok = false; }
+            }
+        }
+        if (!views_ok) {
+            break;
+        }
+        idx[cnt] = j; others[cnt] = other; ++cnt;
+        last = j;
+    }
+    if (cnt < 2) {
+        return 0;
+    }
+    ggml_tensor * out = cgraph->nodes[last];
+    if (!ggml_is_contiguous(out)) {
+        return 0;
+    }
+    // the fused kernel writes `out` while reading in0 and every src1: they must not overlap, except an exact
+    // in-place elementwise alias of in0 (same address, same strides, which ggml-alloc produces for in-place ops)
+    const bool inplace = out->data == in0->data && ggml_is_contiguous(in0) && ggml_are_same_shape(in0, out);
+    if (!inplace && !hc_disjoint(out, in0)) {
+        return 0;
+    }
+    for (int c = 0; c < cnt; ++c) {
+        if (others[c] && !hc_disjoint(out, others[c])) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_ew_chain ch = {};
+    ch.n    = cnt;
+    ch.src0 = (const char *) in0->data;
+    ch.dst  = (float *) out->data;
+    for (int d = 0; d < 4; ++d) {
+        ch.nb0[d] = in0->nb[d];
+        ch.ne[d]  = out->ne[d];
+    }
+    for (int c = 0; c < cnt; ++c) {
+        const ggml_tensor * t = cgraph->nodes[idx[c]];
+        ggml_cuda_ew_op & o = ch.ops[c];
+        o.op = t->op;
+        if (t->op == GGML_OP_UNARY) {
+            o.unary = ggml_get_unary_op(t);
+        } else if (t->op == GGML_OP_SCALE) {
+            o.s = hc_param(t, 0);
+            o.b = hc_param(t, 1);
+        } else if (others[c]) {
+            o.src1 = (const char *) others[c]->data;
+            for (int d = 0; d < 4; ++d) {
+                o.ne1[d] = others[c]->ne[d];
+                o.nb1[d] = others[c]->nb[d];
+            }
+        }
+    }
+    ggml_cuda_op_ew_chain(*cuda_ctx, ch);
+    return last - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4626,6 +4767,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    {
+        const int skip = ggml_cuda_try_fuse_ewchain(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
     }
 
     return 0;

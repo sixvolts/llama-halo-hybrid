@@ -22,7 +22,7 @@ void ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx) {
     ctx.q8_side.clear();
     ctx.q8_arena_used = 0;
     if (ctx.q8_arena == nullptr && !q8_side_disabled()) {
-        ctx.q8_arena_size = 8u << 20;   // plenty: a decode step needs ~0.5 MB
+        ctx.q8_arena_size = 32u << 20;  // a 3-token verify step registers ~10 activations per layer at ~35 KB each
         ggml_cuda_set_device(ctx.device);
         if (cudaMalloc(&ctx.q8_arena, ctx.q8_arena_size) != cudaSuccess) {
             ctx.q8_arena = nullptr; ctx.q8_arena_size = 0;
@@ -42,12 +42,27 @@ block_q8_1 * ggml_cuda_q8_side_reserve(ggml_backend_cuda_context & ctx, const gg
     }
     ctx.q8_arena_used = off + bytes;
     char * q8 = ctx.q8_arena + off;
-    ctx.q8_side[dst->data] = { dst, q8, n };
+    ctx.q8_side[dst->data] = { dst, q8, n, 1 };
+    return (block_q8_1 *) q8;
+}
+
+block_q8_1 * ggml_cuda_q8_side_reserve_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t ne0_padded) {
+    if (q8_side_disabled() || ctx.q8_arena == nullptr || ne0_padded % QK8_1 != 0 || ne1 < 1 || ne1 > 8) {
+        return nullptr;
+    }
+    const size_t bytes = (size_t) (ne0_padded / QK8_1) * ne1 * sizeof(block_q8_1);
+    const size_t off   = (ctx.q8_arena_used + 255) & ~(size_t) 255;
+    if (off + bytes > ctx.q8_arena_size) {
+        return nullptr;
+    }
+    ctx.q8_arena_used = off + bytes;
+    char * q8 = ctx.q8_arena + off;
+    ctx.q8_side[t->data] = { t, q8, ne0, ne1 };
     return (block_q8_1 *) q8;
 }
 
 const char * ggml_cuda_q8_side_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
-    if (q8_side_disabled() || src1->type != GGML_TYPE_F32 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+    if (q8_side_disabled() || src1->type != GGML_TYPE_F32 || src1->ne[1] > 8 || src1->ne[2] != 1 || src1->ne[3] != 1) {
         return nullptr;
     }
     const auto it = ctx.q8_side.find(src1->data);
@@ -55,8 +70,12 @@ const char * ggml_cuda_q8_side_find(ggml_backend_cuda_context & ctx, const ggml_
         return nullptr;
     }
     const auto & e = it->second;
-    const bool same = src1 == e.prod || src1->view_src == e.prod;
-    if (!same || src1->ne[0] != e.ne0 || !ggml_is_contiguous(src1)) {
+    // the same tensor object, or views of the same producer at the same offset: a later tensor that ggml-alloc
+    // places at the same address is a different object and does not match
+    const ggml_tensor * r0 = src1->view_src   ? src1->view_src   : src1;
+    const ggml_tensor * r1 = e.prod->view_src ? e.prod->view_src : e.prod;
+    const bool same = (src1 == e.prod) || (r0 == r1 && src1->view_offs == e.prod->view_offs);
+    if (!same || src1->ne[0] != e.ne0 || src1->ne[1] != e.ne1 || !ggml_is_contiguous(src1)) {
         return nullptr;
     }
     return e.q8;

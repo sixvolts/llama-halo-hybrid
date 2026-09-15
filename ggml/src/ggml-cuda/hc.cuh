@@ -38,6 +38,9 @@ const char * ggml_cuda_q8_side_find (ggml_backend_cuda_context & ctx, const ggml
 
 // reserve a q8_1 side buffer for `dst` (a single row of n elements); nullptr if not applicable
 block_q8_1 * ggml_cuda_q8_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t n);
+// consumer-side variant: `t` is the f32 activation a GEMV is about to quantize itself ([ne0, ne1], ne1 <= 8, rows
+// padded to ne0_padded); the next GEMV on the same tensor finds the copy instead of re-quantizing it
+block_q8_1 * ggml_cuda_q8_side_reserve_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t ne0_padded);
 
 // quantise the value this thread just produced, exactly as quantize_q8_1 does: 32 consecutive
 // elements form a block; requires n % 32 == 0 and every lane of the 32-lane group active

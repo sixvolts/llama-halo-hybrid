@@ -3447,6 +3447,92 @@ struct test_scale : public test_case {
     }
 };
 
+// halo-hybrid: element-wise chains the CUDA backend fuses into one launch (ewchain.cu); the CPU reference runs
+// them unfused. mode "hc": a strided view of the hc mixer output -> mul(scale) -> add(base) -> sigmoid -> scale_bias;
+// "kda": add(bias) -> mul(per-head) -> scale(-1) -> sigmoid -> scale; "mean": add of four stream views -> scale
+struct test_ew_chain : public test_case {
+    const std::string mode;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR2(mode, nt) + ",ewchain";
+    }
+
+    test_ew_chain(std::string mode, int64_t nt) : mode(mode), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = nullptr;
+        if (mode == "hc") {
+            const int64_t hc = 4;
+            ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, nt);
+            ggml_set_name(mixes, "mixes");
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+            ggml_set_name(scale, "scale");
+            ggml_tensor * base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+            ggml_set_name(base, "base");
+            ggml_tensor * s1 = ggml_view_1d(ctx, scale, 1, sizeof(float));
+            ggml_tensor * b1 = ggml_view_1d(ctx, base, hc, hc*sizeof(float));
+            ggml_tensor * po = ggml_view_2d(ctx, mixes, hc, nt, mixes->nb[1], hc*sizeof(float));
+            po = ggml_mul(ctx, po, s1);
+            po = ggml_add(ctx, po, b1);
+            po = ggml_sigmoid(ctx, po);
+            out = ggml_scale_bias(ctx, po, 2.0f, 1e-6f);
+        } else if (mode == "kda") {
+            const int64_t hd = 128, nh = 64;
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd*nh, nt);
+            ggml_set_name(x, "x");
+            ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd*nh);
+            ggml_set_name(b, "b");
+            ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(a, "a");
+            ggml_tensor * g = ggml_add(ctx, x, b);
+            g = ggml_reshape_3d(ctx, g, hd, nh, nt);
+            g = ggml_mul(ctx, g, ggml_reshape_3d(ctx, a, 1, nh, 1));
+            g = ggml_sigmoid(ctx, ggml_scale(ctx, g, -1.0f));
+            out = ggml_scale(ctx, g, 0.5f);
+        } else {
+            const int64_t ne = 256, hc = 4;
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne, hc, nt);
+            ggml_set_name(x, "x");
+            ggml_tensor * acc = ggml_view_2d(ctx, x, ne, nt, x->nb[2], 0);
+            for (int64_t c = 1; c < hc; ++c) {
+                acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, ne, nt, x->nb[2], c*x->nb[1]));
+            }
+            out = ggml_scale(ctx, acc, 1.0f/hc);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// halo-hybrid: two GEMVs on the same f32 activation at decode/verify widths (the q8_1 copy is made once)
+struct test_mul_mat_shared : public test_case {
+    const ggml_type type;
+    const int64_t m, n, k;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, m, n, k) + ",shared";
+    }
+
+    test_mul_mat_shared(ggml_type type, int64_t m, int64_t n, int64_t k) : type(type), m(m), n(n), k(k) {}
+
+    double max_nmse_err() override {
+        return 5e-4;   // quantized GEMV against the CPU reference, as test_mul_mat
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(b, "b");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a, x), ggml_mul_mat(ctx, b, x));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SCALE + GGML_UNARY_OP_TANH + GGML_OP_SCALE
 struct test_softcap : public test_case {
     const ggml_type type;
@@ -8898,6 +8984,18 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // halo-hybrid: fused element-wise chains and the shared-activation GEMV quantize (ewchain.cu, mmvq q8 side copies)
+    for (int64_t nt : {1, 3, 17}) {
+        test_cases.emplace_back(new test_ew_chain("hc",   nt));
+        test_cases.emplace_back(new test_ew_chain("kda",  nt));
+        test_cases.emplace_back(new test_ew_chain("mean", nt));
+    }
+    for (int64_t n : {1, 3, 8}) {
+        test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 256, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 256, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 256, n, 1536));   // rows padded to 2048
+    }
 
     // GLM-5.3-Flash shapes at prefill widths, correctness of the RDNA3.5 MMQ configs (TBO_GLM_EVAL=1)
     if (getenv("TBO_GLM_EVAL") != nullptr) {

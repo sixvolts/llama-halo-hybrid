@@ -341,6 +341,23 @@ Numerics: activations in f16 (the same as ggml's f16 GEMM path), f32 accumulatio
 pass on both parts. Dense q8_0 is 13% of mainframe's prefill lane, so the two-host effect is ~2% at 13K; the kernel
 matters for an APU-only box and is the reference structure for the expert GEMMs.
 
+**Decode step budget and per-layer launch count (2026-09-15):** one two-host decode step is 127 ms for ~2.7 tokens
+(draft n-max 2): mainframe's 20 layers compute 58 ms of it (one hipGraphLaunch replaying 1744 kernels; isolated
+kernel floor ~46 ms), gibson's 25 layers ~35 ms over 45 splits, the three draft llama_decode calls and the logits/
+sampling syncs ~15 ms, split boundaries and RPC serialization the rest. HIP graphs are in use on both hosts and the
+CPU profile is all GPU-wait spin, so the overhead is ~6 us of hardware dispatch gap per graph node times ~60 (gibson)
+/ 87 (mainframe) kernels per layer. Two node-count reductions (`ewchain.cu`, `GGML_CUDA_NO_EWCHAIN=1` /
+`GGML_CUDA_NO_Q8_SIDE=1` disable): (1) a generic element-wise chain fusion (MUL/ADD/SUB/DIV with a broadcast operand,
+SCALE, sigmoid/silu/exp/neg/relu/tanh/abs, SQR, SQRT; each node consuming the previous, intermediates single-use, no
+output/input overlap) that folds the two hyper-connection gate chains per mixer (mul, add, sigmoid, scale: 8 launches),
+the KDA gate (add, mul, scale, sigmoid, scale) and the hc mean into one launch each; (2) the GEMV path quantizes an
+activation once per graph at decode/verify widths (ne1 <= 8) and registers it in the q8 side arena, so the six KDA
+projections (q/k/v/f_a/g_a/beta) and the five DSA projections that read the same normed input stop re-running
+quantize_q8_1 each. Also on this pass: the RPC server never sees GRAPH_RECOMPUTE at decode because two distinct
+graphs (58 ms and 89 us) alternate on the one last_graph_uid slot per device (a per-uid store would save 1-2 ms;
+not done). Gibson-only A/B (mainframe still on dedecad89): step 127.6 -> 126.2 ms, 3K 372 / 18.5 -> 378 / 19.6, 13K
+517 / 20.5 -> 518 / 20.6, greedy text and acceptance identical.
+
 Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
 state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
 
