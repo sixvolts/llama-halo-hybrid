@@ -357,6 +357,9 @@ quantize_q8_1 each. Also on this pass: the RPC server never sees GRAPH_RECOMPUTE
 graphs (58 ms and 89 us) alternate on the one last_graph_uid slot per device (a per-uid store would save 1-2 ms;
 not done). Gibson-only A/B (mainframe still on dedecad89): step 127.6 -> 126.2 ms, 3K 372 / 18.5 -> 378 / 19.6, 13K
 517 / 20.5 -> 518 / 20.6, greedy text and acceptance identical.
+Both hosts on 45be1a617 (prod22): 3K 375 / 19.6, 13K 517 / 20.4, 26K 503 / 20.7, 300-token decode 22.1 tok/s, step
+126.7 ms: about 1 ms per step, at the noise floor end-to-end; the dense-GEMM kernel does not show at 13K/26K either
+(mainframe's lane is bounded by the expert GEMMs and attention there).
 
 Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
 state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
