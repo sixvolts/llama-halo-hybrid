@@ -1,23 +1,51 @@
-I've had a Strix Halo board for about a year and been playing around with it for various projects when it's not just being a beefy linux machine. I ordered the 128GB Framework Desktop board pre-panic and I'm very grateful for that. I also grabbed an R9700 Pro AI card late last year for another machine, thinking it would be fun to compare the two. I ended up parting out the machine the R9700 was in for something else and wondered what might be possible with the R9700 in the Strix Halo machine.  On the Framework desktop board, there's an x4 4.0 slot hanging out. I already had an x4 extension cable so I could mount a 25G card in it, but a GPU would fit just fine too. I have my board in a Fractal Design case instead of the framework shell (bought the bare board), so I had plenty of room for the card and my power supply had the new 12V connector. Even with today's pricing, a Framework Strix Halo 128GB board and an R9700 is about ~5k all in, so similar price to a DGX spark but with a little more RAM (~160GB, obv with caveats), and it's a regular 16-core ryzen PC instead of the tacky gold box. 
+# llama.cpp for Strix Halo, with and without a GPU next to it
+
+I've had a Strix Halo board for about a year and been playing around with it for various projects when it's not
+just being a beefy linux machine. I ordered the 128GB Framework Desktop board pre-panic and I'm very grateful for
+that. I also grabbed an R9700 Pro AI card late last year for another machine, thinking it would be fun to compare
+the two. I ended up parting out the machine the R9700 was in for something else and wondered what might be possible
+with the R9700 in the Strix Halo machine. On the Framework desktop board, there's an x4 4.0 slot hanging out. I
+already had an x4 extension cable so I could mount a 25G card in it, but a GPU would fit just fine too. I have my
+board in a Fractal Design case instead of the framework shell (bought the bare board), so I had plenty of room for
+the card and my power supply had the new 12V connector. Even with today's pricing, a Framework Strix Halo 128GB
+board and an R9700 is about ~5k all in, so similar price to a DGX spark but with a little more RAM (~160GB, obv
+with caveats), and it's a regular 16-core ryzen PC instead of the tacky gold box.
 
 ![The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU](docs/halo-hybrid/build.jpeg)
 
-So, the kicker is that it works. 49 tok/s, 682 tok/s prefill at 32K - double the stock 24 tok/s and 2.5x prefill on Qwen-3.5-122b. 
+So, the kicker is that it works. The model this tree is built around is **Qwen3.8-Flash-Next** (unsloth
+UD-Q4_K_XL, 111 GB): on the Strix Halo plus the R9700 it decodes at **45 tok/s** (52 greedy) with the model's own
+MTP draft head and prefills at **~1,500 tok/s**, where stock llama.cpp on the same layout does 27-28 tok/s. The
+same tree also runs the 200 GB GLM-5.3-Flash across two of these boxes over a 100G link. (The setup was put
+together on Qwen3.5-122B, 24 → 49 tok/s; 3.8 came out the week it was working, and the numbers below are 3.8's.)
 
-Getting this working was a little bit of a mind-bender, so wanted to share with people. Here's how it works. We can't just slap part of the model on the R9700 and expect it to be good though. It's actually worse if you try to do that in most cases. First, we need to place the parts of the model that benefit from the different parts of the hardware. So, with a big MoE model like this, we have a bunch of data that only gets touched for some tokens and those routed experts need to get put on the Strix in the bigger unified memory pool. It works out to about 62GB of the 71GB model, but we might only read 2GB of it per token. The dense parts of the model are about ~4GB and since they get touched for every token, we can put that on the R9700 where we have more compute and memory bandwidth. So we put KV cache, the dense part of the model, and critically, the MTP drafter on the R9700. We can stuff the remaining VRAM on the R9700 with as many layers as fix, which in my setup was 14. This all works because only about 12KB of data per token needs to cross that narrow x4 4.0 link, so as long as the latency isn't bad, it doesn't matter. Trying to do something like Tensor Parallelism across these two would not work well because of that bottleneck. 
+Here's how it works. We can't just slap part of the model on the R9700 and expect it to be good though. It's
+actually worse if you try to do that in most cases. First, we need to place the parts of the model that benefit
+from the different parts of the hardware. So, with a big MoE model like this, we have a bunch of data that only
+gets touched for some tokens and those routed experts need to get put on the Strix in the bigger unified memory
+pool. Most of the model is experts, but we might only read a couple of GB of it per token. The dense parts of the
+model get touched for every token, so we put them on the R9700 where we have more compute and memory bandwidth:
+KV cache, the dense trunk, and critically, the MTP drafter. We can stuff the remaining VRAM on the R9700 with as
+many whole expert layers as fit. This all works because only a few KB of data per token needs to cross that narrow
+x4 4.0 link, so as long as the latency isn't bad, it doesn't matter. Trying to do something like Tensor Parallelism
+across these two would not work well because of that bottleneck.
 
-Here's part of the config:
+The launch line for that layout:
 
-llama-server -m Qwen3.5-122B-A10B-Opus-Reasoning-Q4_K_XL.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -ngl 999 -fa on --jinja --load-mode none \
-  -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
-  -c 32768 -ub 4096 -b 4096 \
-  -md mtp-draft-out-q4_K.gguf --spec-type draft-mtp -devd ROCm0 \
-  --spec-draft-n-max 4 --spec-draft-p-min 0.5
+```
+LLAMA_PREFILL_LANES=2 \
+llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --load-mode none -np 1 \
+  -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU' \
+  -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 \
+  --spec-type draft-mtp --spec-draft-n-max 2 \
+  --host 0.0.0.0 --port 8080
+```
 
-I kept going on tuning, and tried to reduce the number of kernel launches, which seemed to be holding back performance. I wasn't hitting anywhere near the right numbers per the theoretical bandwidth for each device. I made some updates to llama to make this work, linked on github below. The variant of the model I was using is also linked below, which is a fine tune that I requantized and grafted on an MTP head for my use on a different project.
-
-https://huggingface.co/SixVolts/Qwen3.5-122B-A10B-Opus-Reasoning-MTP-GGUF
+I kept going on tuning, and tried to reduce the number of kernel launches, which seemed to be holding back
+performance. I wasn't hitting anywhere near the right numbers per the theoretical bandwidth for each device. The
+kernel and scheduler changes that came out of that are listed in [HALO-HYBRID.md](HALO-HYBRID.md), and every one
+of them is measured on the iGPU alone as well, because the tree has to stay useful on a Strix Halo with no card.
 
 ## Which configuration?
 
@@ -33,12 +61,12 @@ the [cookbook](docs/halo-hybrid/COOKBOOK.md); the kernel and scheduler changes b
 | [Two Strix Halos + one R9700 on the head node](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node) | GLM-5.3-Flash | production | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K |
 | [Two Strix Halos + one R9700 on each](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each) | GLM-5.3-Flash | planned, card ordered | estimate 23-25 tok/s |
 
-## Qwen3.8-Flash-Next on one box with the R9700
+## Qwen3.8-Flash-Next: one box, with or without the card
 
-Same idea as above with a newer model: dense trunk, KV cache and the draft head on the R9700, the routed experts
-of most layers on the Strix, the n-gram table in host RAM. Stock llama.cpp decodes at 27-28 tok/s on this layout;
-this tree does ~45 (52 greedy) and prefills at ~1,500 tok/s. Launch line, the hybrid-N table for different
-context budgets and the per-stream numbers: [cookbook, recipe 2](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700).
+The hybrid-N table for different context budgets, the per-stream numbers with and without the draft head, and the
+iGPU-only baseline are in the cookbook: [recipe 1](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) (no
+card) and [recipe 2](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) (with the R9700). The draft head is
+the `shared-Q8_0` file in the unsloth repo's `MTP/` folder; it borrows the target's embeddings and lm head.
 
 ## GLM-5.3-Flash across two Strix Halo boxes
 

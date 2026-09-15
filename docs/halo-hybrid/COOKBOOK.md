@@ -6,7 +6,7 @@ everywhere; only the device list changes.
 
 | # | Hardware | Status | Best numbers here | Recipe |
 |---|---|---|---|---|
-| 1 | One Strix Halo, nothing else | runs | Qwen3.5-122B UD-Q4_K_XL: 24 tok/s (stock llama.cpp, the same number this tree's gfx1151 kernels start from) | [1](#1-one-strix-halo-by-itself) |
+| 1 | One Strix Halo, nothing else | measured | Qwen3.8-Flash-Next: 26 tok/s serial, 34 greedy / 30 sampled with the MTP head; prefill 700 tok/s at 4.9K, 590 at 20K | [1](#1-one-strix-halo-by-itself) |
 | 2 | One Strix Halo + one R9700 | production (Qwen3.8-Flash-Next) | 45 tok/s decode (52 greedy), ~1,500 tok/s prefill | [2](#2-one-strix-halo--one-r9700) |
 | 3 | Two Strix Halos over RDMA, no dGPU | derived, not measured | see 4 minus the R9700 | [3](#3-two-strix-halos-over-rdma) |
 | 4 | Two Strix Halos + one R9700 on the head node | production (GLM-5.3-Flash, 200 GB) | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K | [4](#4-two-strix-halos--one-r9700-on-the-head-node) |
@@ -49,42 +49,39 @@ if there is no R9700. ROCm 7.2 is what this tree is built and tested with.
 
 ## 1. One Strix Halo by itself
 
-No dGPU: one device, no overrides. The tree's gfx1151 work (RDNA3.5 MMQ tile configs, the 32-wave Gated-DeltaNet
-recurrence, WMMA flash attention for head sizes 256 and 512, the sparse DSA attention path, the dequantize-once q8_0
-WMMA GEMM, per-layer launch fusion) all applies to this box, and the "APU-only" goal of the fork is that every
-change is measured on the iGPU too.
+No dGPU: one device, no placement overrides. The tree's gfx1151 work (RDNA3.5 MMQ tile configs, the 32-wave
+Gated-DeltaNet recurrence, WMMA flash attention for head sizes 256 and 512, the sparse DSA attention path, the
+dequantize-once q8_0 WMMA GEMM, per-layer launch fusion) all applies to this box; every change in the tree is
+measured on the iGPU too.
+
+Qwen3.8-Flash-Next, single stream, 8K context, draft head on the same device:
 
 ```
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'
-llama-server -m model.gguf --fit off -fa on -ngl 999 --load-mode none \
-  -c 32768 -b 4096 -ub 1024 -np 1 \
-  -md draft.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max 2 \
+LLAMA_PREFILL_LANES=2 \
+llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  -dev ROCm0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --load-mode none -np 1 \
+  -ot 'per_layer_token_embd=CPU' \
+  -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max 2 \
   --host 0.0.0.0 --port 8080
 ```
 
-Qwen3.5-122B-A10B UD-Q4_K_XL (71 GB) fits with room to spare, Qwen3.8-Flash-Next UD-Q4_K_XL (111 GB) at moderate context;
-GLM-5.3-Flash (200 GB) does not, which is what recipes 3-5 are for. The single-box numbers in this tree's notes
-are the starting points the hybrid layouts are compared against (24.3 tok/s on Qwen3.5-122B); a fresh single-box
-measurement of the current kernels is on the list.
+(`ROCm0` is the iGPU when it is the only ROCm device.) Measured on this tree (same prompt and sampler as recipe 2's
+table; the R9700 was present but idle):
+
+| | prefill tok/s | decode greedy | decode, model-card sampler |
+|---|---|---|---|
+| no draft head | (short-prompt harness) | 26.3 | 26.2 |
+| MTP head, n-max 2 | (short-prompt harness) | 33.9 | 29.9 |
+| MTP head + `LLAMA_PREFILL_LANES=2` | 700 at 4.9K, 590 at 20K (cold and warm alike) | 34.7 | 30.4 |
+
+The 111 GB model plus the 2.6 GB head leaves room for 8-16K of context on a 128 GB box; Qwen3.5-122B (71 GB) fits
+with room to spare; GLM-5.3-Flash (200 GB) does not, which is what recipes 3-5 are for.
 
 ## 2. One Strix Halo + one R9700
 
-The original build of this fork (the story at the top of the README). Dense trunk, KV cache and the draft head
-on the R9700, routed experts of most layers on the Strix, a few whole expert layers on the card as VRAM allows.
-
-Qwen3.5-122B-A10B (the first model this ran):
-
-```
-llama-server -m Qwen3.5-122B-A10B-Opus-Reasoning-Q4_K_XL.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -ngl 999 -fa on --jinja --load-mode none \
-  -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
-  -c 32768 -ub 4096 -b 4096 \
-  -md mtp-draft-out-q4_K.gguf --spec-type draft-mtp -devd ROCm0 \
-  --spec-draft-n-max 4 --spec-draft-p-min 0.5
-```
-
-49 tok/s decode, 682 tok/s prefill at 32K (stock: 24 tok/s). Model with the grafted MTP head:
-https://huggingface.co/SixVolts/Qwen3.5-122B-A10B-Opus-Reasoning-MTP-GGUF
+Dense trunk, KV cache and the draft head on the R9700, routed experts of most layers on the Strix, a few whole
+expert layers on the card as VRAM allows. The launch line is in the README; the details:
 
 ### Qwen3.8-Flash-Next
 
@@ -146,6 +143,21 @@ column's first request of a fresh server is cold, warm numbers are 10–20% high
 | 4 | hybrid-12 | 1262 | 67.6 agg, 18.0 each | does not fit with the head |
 | 4 | hybrid-10 | 585 (single lane) | 47.8 agg, 12.7 each | 51.5 agg, 14.0 each |
 | 1 at 68K context | hybrid-12 / hybrid-10 | 413 (`-ub 1024`) / 306 (`-ub 512`) | 25.7 | **43.6** |
+
+### The original run: Qwen3.5-122B-A10B
+
+The layout was worked out on Qwen3.5-122B before 3.8 existed (24 tok/s stock → 49 with the grafted MTP head,
+682 tok/s prefill at 32K); the model with the head is at
+https://huggingface.co/SixVolts/Qwen3.5-122B-A10B-Opus-Reasoning-MTP-GGUF.
+
+```
+llama-server -m Qwen3.5-122B-A10B-Opus-Reasoning-Q4_K_XL.gguf \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -ngl 999 -fa on --jinja --load-mode none \
+  -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
+  -c 32768 -ub 4096 -b 4096 \
+  -md mtp-draft-out-q4_K.gguf --spec-type draft-mtp -devd ROCm0 \
+  --spec-draft-n-max 4 --spec-draft-p-min 0.5
+```
 
 ## 3. Two Strix Halos over RDMA
 
