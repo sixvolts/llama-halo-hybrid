@@ -19,79 +19,39 @@ I kept going on tuning, and tried to reduce the number of kernel launches, which
 
 https://huggingface.co/SixVolts/Qwen3.5-122B-A10B-Opus-Reasoning-MTP-GGUF
 
-## Qwen3.8-Flash-Next on the same box
+## Which configuration?
 
-New model, who dis. Same idea as above:
-dense trunk, KV cache and the draft head on the R9700, the routed experts of most layers on the Strix, the n-gram
-table in host RAM. This repo's `main` is upstream master plus the MTP work from unslothai/llama.cpp#144 and
-ggml-org#28118, plus the kernel and scheduler changes in [HALO-HYBRID.md](HALO-HYBRID.md). On this layout stock
-llama.cpp decodes at 27–28 tok/s; this branch does ~45 (52 greedy), and prefills at ~1,500 tok/s.
+The same tree runs five hardware shapes. Each row links to the launch line, the memory budget and the numbers in
+the [cookbook](docs/halo-hybrid/COOKBOOK.md); the kernel and scheduler changes behind them are in
+[HALO-HYBRID.md](HALO-HYBRID.md).
 
-Launch (single user, 8K context; ROCm0 is the R9700, ROCm1 the iGPU — check the device order in the startup log):
+| Hardware | Model it runs here | Status | Numbers |
+|---|---|---|---|
+| [One Strix Halo, nothing else](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) | anything up to ~115 GB | runs | the baseline the hybrids are measured against (24 tok/s on Qwen3.5-122B) |
+| [One Strix Halo + one R9700](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Qwen3.5-122B | production | 45 tok/s (52 greedy), ~1,500 tok/s prefill |
+| [Two Strix Halos over RDMA](docs/halo-hybrid/COOKBOOK.md#3-two-strix-halos-over-rdma) | GLM-5.3-Flash (200 GB) | derived, not measured | |
+| [Two Strix Halos + one R9700 on the head node](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node) | GLM-5.3-Flash | production | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K |
+| [Two Strix Halos + one R9700 on each](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each) | GLM-5.3-Flash | planned, card ordered | estimate 23-25 tok/s |
 
-```
-sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
+## Qwen3.8-Flash-Next on one box with the R9700
 
-LLAMA_PREFILL_LANES=2 \
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --load-mode none -np 1 \
-  -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU' \
-  -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 \
-  --spec-type draft-mtp --spec-draft-n-max 2 \
-  --host 0.0.0.0 --port 8080
-```
-
-* **Model:** `unsloth/Qwen3.8-Flash-Next-GGUF` UD-Q4_K_XL (four shards, 111 GB). Draft head: the `shared-Q8_0` file
-  in that repo's `MTP/` folder (2.6 GB); it borrows the target's embeddings and lm head, so `-devd ROCm0` is required.
-* **Layout:** `-ot` sends the routed experts of layers N–47 to the iGPU ("hybrid-N") and keeps the n-gram table in
-  host RAM. Each layer kept on the R9700 costs it ~1.4 GB, so pick N by what has to fit next to the 2.6 GB head:
-
-  | context | layout | `-ot` pattern |
-  |---|---|---|
-  | 1 slot, 8K | hybrid-14 | `blk\.(1[4-9]\|[2-4][0-9])` |
-  | 1–2 slots, 16K each | hybrid-12 | `blk\.(1[2-9]\|[2-4][0-9])` |
-  | 2 slots, 32K each | hybrid-11 | `blk\.(1[1-9]\|[2-4][0-9])` |
-  | 64K+ (sparse-attention gather turns on by itself) | hybrid-10 | `blk\.(1[0-9]\|[2-4][0-9])` |
-
-  Without the head, 4 slots at 32K fit at hybrid-12. `-ctk q8_0 -ctv q8_0` halves the KV cost (1.1 GB per 32K slot).
-* **Prefill:** `LLAMA_PREFILL_LANES=2` runs consecutive ubatches on two schedulers so the iGPU's expert GEMMs
-  overlap the R9700's attention; with the MoE GEMM tile fixes and the R9700's f32 matmul paths (all on by
-  default) warm prefill at 3.7K / 15K / 30K is **1503 / 1258 / 1025** tok/s at `-ub 1024` and 1626 / 1324 / 1049
-  at `-ub 2048`, from 676 / 616 / 540 on the single-lane branch. The second lane costs a second set of compute
-  buffers on the R9700 (0.75 GB at `-ub 1024`, 1.5 GB at 2048), so with the head use `-ub 1024`; `-b` must be at
-  least twice `-ub`. Details and the scheduler fixes it needed: HALO-HYBRID.md, "Two-lane prefill".
-* **Decode:** `--spec-draft-n-max 2` (3 is the same within noise, 4 is worse). Acceptance is ~0.70 greedy and
-  ~0.51 with the model-card sampler (temperature 1.0, top-p 0.95, top-k 20), which is the whole difference between
-  52 and 45 tok/s. The head only pays at one or two streams; for more users leave the `-md`/`--spec-*` lines out.
-* **API:** use `/v1/chat/completions` (a bare prompt on `/completion` stops after one token with this model). The
-  model thinks by default; `"chat_template_kwargs": {"enable_thinking": false}` turns it off per request.
-* **Memory:**  ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in
-  host RAM, 23–26 GB plus the head on the R9700. Drain caches before launching after big file activity.
-
-Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`,
-`LLAMA_PREFILL_LANES=2`; "agg" is the sum over streams, single-stream rows are the per-stream number; the prefill
-column's first request of a fresh server is cold, warm numbers are 10–20% higher):
-
-| streams | layout | prefill, agg tok/s | decode, no draft | decode, MTP n-max 2 |
-|---|---|---|---|---|
-| 1 | hybrid-12 | 1227 (16K prompt: 1264) | 35.4 | **45.6** (greedy ~52) |
-| 2 | hybrid-12 | 1157 | 50.7 agg, 26.8 each | 56.1 agg, 30.4 each |
-| 4 | hybrid-12 | 1262 | 67.6 agg, 18.0 each | does not fit with the head |
-| 4 | hybrid-10 | 585 (single lane) | 47.8 agg, 12.7 each | 51.5 agg, 14.0 each |
-| 1 at 68K context | hybrid-12 / hybrid-10 | 413 (`-ub 1024`) / 306 (`-ub 512`) | 25.7 | **43.6** |
-
-
+Same idea as above with a newer model: dense trunk, KV cache and the draft head on the R9700, the routed experts
+of most layers on the Strix, the n-gram table in host RAM. Stock llama.cpp decodes at 27-28 tok/s on this layout;
+this tree does ~45 (52 greedy) and prefills at ~1,500 tok/s. Launch line, the hybrid-N table for different
+context budgets and the per-stream numbers: [cookbook, recipe 2](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700).
 
 ## GLM-5.3-Flash across two Strix Halo boxes
 
-The GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB) runs split between two 128G Strix Halo boxes over a
-direct 100G link (Intel E810), using llama.cpp's RPC backend with RDMA, with an R9700 on the primary box. KV and the MTP draft head on
-the R9700, Layers 0–24 here (dense trunk, experts on the iGPU), layers 25–44 on the secondary box's unified memory. Single stream, 128K context: **20 tok/s decode**
-(19 at 16K) with the model's own MTP head at 0.85 acceptance, prefill ~250–300 tok/s; 14 tok/s without the head. It
-took two scheduler fixes, an RDMA transport fix and a loader fix, all on `main` (upstream's
-GLM-5.3-Flash PR is not merged yet); More details and the draft-head export are in
-[HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
+The 200 GB GLM-5.3-Flash (unsloth UD-Q4_K_XL) runs split between two 128 GB Strix Halo boxes over a direct 100G
+link (Intel E810) with llama.cpp's RPC backend over RDMA, with an R9700 on the head node: KV and the MTP draft
+head on the R9700, layers 0-24 on the head node (dense trunk on the card, experts on the iGPU), layers 25-44 on
+the second box's unified memory. Single stream, 128K context: 20.5 tok/s decode at 13K with the model's own MTP
+head (14 without it), 517 tok/s prefill. It took two scheduler fixes, an RDMA transport fix and a loader fix,
+all on `main` (upstream's GLM-5.3-Flash PR is not merged yet). Launch lines, the rpc-server unit and the
+operating rules: [cookbook, recipe 4](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node);
+the draft-head export and the fixes: [HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
 
+---
 
 # llama.cpp
 
