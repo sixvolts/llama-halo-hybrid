@@ -3460,6 +3460,8 @@ struct test_ew_chain : public test_case {
 
     test_ew_chain(std::string mode, int64_t nt) : mode(mode), nt(nt) {}
 
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = nullptr;
         if (mode == "hc") {
@@ -3519,6 +3521,8 @@ struct test_mul_mat_shared : public test_case {
     double max_nmse_err() override {
         return 5e-4;   // quantized GEMV against the CPU reference, as test_mul_mat
     }
+
+    bool run_whole_graph() override { return true; }   // the q8 side copy is shared only within one graph compute
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
