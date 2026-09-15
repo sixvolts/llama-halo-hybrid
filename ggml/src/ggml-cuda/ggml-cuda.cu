@@ -30,6 +30,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/sgemm-tile.cuh"
+#include "ggml-cuda/mmq-wmma.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1910,6 +1911,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // halo-hybrid: dense q8_0 at prefill widths on RDNA: dequantize-once f16 WMMA GEMM (mmq-wmma.cu)
+    if (GGML_CUDA_CC_IS_AMD(cc) && ggml_cuda_mul_mat_q8_0_wmma(ctx, src0, src1, dst)) {
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {

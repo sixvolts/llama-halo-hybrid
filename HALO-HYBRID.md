@@ -322,6 +322,25 @@ At 26K: **512 / 19.8** (was 484 / 21.2). The APU-side kernels move the two-host 
 
 At 26K: 513 / 20.3. Within noise of the row above, as the router's ~1% share predicts; the draft's acceptance on the same prompts moved (0.77 → 0.82 at 13K, 0.88 → 0.84 at 26K) because the router logits now sum in a different f32 order and near-tied expert choices flip, greedy output unchanged.
 
+**Dense q8_0 on RDNA3 WMMA with the weights dequantized once per K tile (`mmq-wmma.cu`, `GGML_CUDA_Q8_WMMA`):** MMQ keeps
+int8 weights in LDS and pays the block-scale arithmetic per output element every 32 K; on gfx1151 that loop and a plain
+f16 x f16 -> f32 WMMA loop with the q8_0 blocks expanded to f16 at the LDS store (one `v_perm` + one packed fma per pair,
+via the 0x6400 exponent trick) run at the same 28 TFLOPS on a 2048x4096x1024 GEMM (606 vs 608 us under rocprofv3): the
+f16 tile moves twice the LDS bytes per WMMA and MMQ spends the VALU instead. What the new kernel then wins is
+structural: a 64-deep K tile (one 128-byte run per row per tile, four WMMA slices per barrier) instead of MMQ's 32,
+one LDS buffer with register staging one tile ahead (36 KB at 128x128, 8 waves per WGP), and the activations read as
+f32 in-kernel so there is no quantize/convert pre-pass (MMQ's `quantize_mmq_q8_1` is 163 us per 1024x4096 block, a
+quarter of the 2048x4096 GEMM). At M*K > 16M the f32 activation tile (2 MB per n-tile, re-read by every m-tile) thrashes
+the 2 MB L2 and the kernel drops to 22 TFLOPS, so those shapes take a f16 pre-pass (0.1 ms). Isolated on gfx1151 at
+1024 tokens (us, MMQ -> new): 2048x4096 771 -> 652, 4096x2048 714 -> 593, 8192x4096 2660 -> 2316, 4096x8192 2786 ->
+2490, 1536x4096 532 -> 490, 512x4096 225 -> 194 (-8% to -17%). gfx1201 stays on MMQ (RDNA4's int8 WMMA rate is 2x its
+f16 rate; the new kernel ties there at best). Tried and dropped: 32-deep K tiles with two LDS buffers (the one-tile
+prefetch is shorter than the APU's memory latency: 733 us), a two-deep register prefetch (no gain over the 64-deep
+tile), 2-way split-K for the sub-4-wave grids (memset + atomics cost more than the 20% tail they recover), 96-row tiles.
+Numerics: activations in f16 (the same as ggml's f16 GEMM path), f32 accumulation; MUL_MAT q8_0 and the GLM eval shapes
+pass on both parts. Dense q8_0 is 13% of mainframe's prefill lane, so the two-host effect is ~2% at 13K; the kernel
+matters for an APU-only box and is the reference structure for the expert GEMMs.
+
 Context: 128K costs ~1.4 GB of KV per side (11 DSA layers with MLA-compressed KV; the KDA layers keep a fixed
 state), so the limit is the dense-attention scratch, not the cache. Mainframe peaks at 92 GB of its 120 GB GTT.
 
