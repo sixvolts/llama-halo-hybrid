@@ -764,7 +764,9 @@ static void pk_fill_tensor(pk_task & t, int slot, const ggml_tensor * x) {
 
 int ggml_cuda_persist_region(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i0) {
     static const int enable  = getenv("GGML_CUDA_PERSIST")     ? atoi(getenv("GGML_CUDA_PERSIST"))     : 0;
-    static const int min_len = getenv("GGML_CUDA_PERSIST_MIN") ? atoi(getenv("GGML_CUDA_PERSIST_MIN")) : 2;
+    // 4, not 2: short regions are the worst case for the resident kernel (Qwen3.8 decode 23.5 -> 24.0 tok/s going
+    // from 2 to 4, 25.0 at 16, against 26.0 with the path off entirely -- see PERSISTENT-DECODE.md stage 3)
+    static const int min_len = getenv("GGML_CUDA_PERSIST_MIN") ? atoi(getenv("GGML_CUDA_PERSIST_MIN")) : 4;
     if (!enable) {
         return 0;
     }
