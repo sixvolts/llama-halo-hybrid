@@ -55,7 +55,7 @@ and it is a decision, not a kernel.
 `rocm-smi --showuse` sampled through decode reports the iGPU busy **82.9%** of the time; the driver's own
 `gpu_busy_percent` reports **99%** over the same kind of window. They count different things: the second says a
 wave is alive, the first is closer to the shader engines being fed. Read together with the byte floor, the loss is
-not empty time between kernels but the tails and ramps of ~1,333 kernels, during which waves exist and the memory
+not empty time between kernels but the tails and ramps of ~2,400 kernels, during which waves exist and the memory
 pipe is underfed. Clocks are not the cause: sclk sits at 2.9 GHz and mclk at its 1000 MHz maximum throughout.
 
 | per token | ms | share |
@@ -64,7 +64,7 @@ pipe is underfed. Clocks are not the cause: sclk sits at 2.9 GHz and mclk at its
 | kernel time beyond the bytes (DeltaNet, attention, norms, topk, hc mixing) | ~3.3 | 9% |
 | GPU idle between kernels | ~6.6 | 17% |
 
-With ~1,333 kernels per token that idle is ~5 us per kernel boundary, which matches the boundary cost measured
+With ~2,400 kernels per token (counted from a hardware-counter run: 2,397 dispatches in one decode pass) that idle is ~2.8 us per kernel boundary, which matches the boundary cost measured
 directly for the persistent-decode work (a real graph node costs ~6 us against 1.74 us for an empty one).
 
 ## What the idle is NOT (all measured, not argued)
@@ -103,7 +103,7 @@ quantizes once for). Per token, on this model:
 | attn_q + attn_k + attn_v (12 attention layers) | 12 | 24 |
 | everything else | n=1, no group | 0 |
 
-**60 of ~1,333 launches, under 1% of the token.** The remaining GEMVs each read a different activation: the
+**60 of ~2,400 launches, under 1% of the token.** The remaining GEMVs each read a different activation: the
 hyper-connection down-projections, the shared expert, ssm_out, attn_output and the LM head are genuinely serial.
 
 ## Fewer kernels: the two exchange rates
@@ -169,7 +169,7 @@ tensor together, with the alias checks ggml-alloc's buffer reuse demands), not a
 - *Wider chain fusion*: the hyper-connection kernels (`k_hc_mix`, `k_hc_combine`, `k_scale_silu`) already replace
   ~1,000 ggml nodes with 277 launches per token, and `rms_norm` already writes its q8_1 copy.
 
-The honest remaining program is the one halogen ran: get from ~1,333 kernels per token to ~500 by folding norms,
+The honest remaining program is the one halogen ran: get from ~2,400 kernels per token to ~500 by folding norms,
 gates, the router and sampling into the projection kernels, at ~5 us of boundary each. Nothing smaller moves this
 model, and the draft head (MTP) remains worth more than all of it, since it amortises the whole 6.33 GB over 2-3
 tokens.
