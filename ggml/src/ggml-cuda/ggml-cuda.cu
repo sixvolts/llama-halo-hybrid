@@ -32,6 +32,7 @@
 #include "ggml-cuda/sgemm-tile.cuh"
 #include "ggml-cuda/mmq-wmma.cuh"
 #include "ggml-cuda/ewchain.cuh"
+#include "ggml-cuda/persist.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2472,6 +2473,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     }
 
     return true;
+}
+
+// halo-hybrid: the persistent-region verifier (persist.cu, GGML_CUDA_PERSIST_VERIFY=1) re-runs nodes on the normal path
+bool ggml_cuda_compute_forward_node(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    return ggml_cuda_compute_forward(ctx, dst);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -4919,6 +4925,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // halo-hybrid: a run of supported nodes as one resident kernel (persist.cu, GGML_CUDA_PERSIST=1)
+                {
+                    const int consumed = ggml_cuda_persist_region(*cuda_ctx, cgraph, i);
+                    if (consumed > 0) {
+                        i += consumed - 1;
+                        continue;
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -5070,6 +5085,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_persist_debug_after(*cuda_ctx);
 
     return GGML_STATUS_SUCCESS;
 }

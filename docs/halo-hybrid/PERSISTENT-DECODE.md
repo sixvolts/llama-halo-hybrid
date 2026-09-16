@@ -173,3 +173,78 @@ that device. The test now carries a host-settable abort flag and a 10 s watchdog
 and 1.15x / 1.9x on the launch-bound DAG, with a 1.8-2.5 us floor per task. Next: MMVQ's dot4 body and the
 activation-ingesting variant as `(task, item)` device functions with the grouped weight table, rms_norm and the
 element-wise chain as prologue/epilogue tasks, measured on Qwen3.8 iGPU-only serial decode against 26.2 tok/s.
+
+## Stage 2 (2026-09-16): op bodies inside the resident kernel, run on real graphs
+
+`ggml/src/ggml-cuda/persist.cu` (+ `persist.cuh`, hook in `ggml_cuda_graph_evaluate_and_capture`): a run of consecutive
+supported nodes is compiled into a task list and executed by one `pk_run` launch. Enabled with `GGML_CUDA_PERSIST=1`
+(off by default). Supported today: MUL_MAT with a quantized weight (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL/
+IQ4_XS, 1-4 activation columns; the q8_1 copy of the activation is its own task, shared by every GEMV that reads the
+same tensor), RMS_NORM, MUL/ADD/SUB/DIV with broadcast, SCALE, UNARY (sigmoid/silu/gelu/relu/exp/neg/abs/tanh), SQR,
+SQRT, CPY/CONT of f32, GLU (swiglu/geglu/reglu), GET_ROWS of f32/f16. Everything else ends the region and runs as
+before. Dependencies come from data flow plus memory-range hazards (RAW/WAW/WAR over ggml-alloc's recycled buffers),
+transitively reduced; counters are monotonic across launches (epochs, no per-launch reset) so a captured launch replays
+unchanged inside a hipGraph.
+
+**Tools that made it debuggable** (all env, all off by default): `GGML_CUDA_PERSIST_VERIFY=1` re-runs each region's
+nodes on the normal path from the saved inputs and reports the first mismatching last-writer with shapes;
+`GGML_CUDA_PERSIST_TRACE=n` prints block 0's wait/work timeline of the n-th execution of the first regions;
+`GGML_CUDA_PERSIST_DEBUG=1|2` reports timed-out regions (with counters) and region composition; `_OPS=<bitmask>`,
+`_MIN`, `_MAX`, `_SERIAL=1`, `_MMVQ=rpw,ku,w`, `_GRID` bisect op classes, region length, dependencies, the GEMV
+configuration and the grid. Bisection ran on Qwen3.5-4B Q4_K_M on the iGPU (3 s per run) instead of the 111 GB model.
+
+**What was wrong, in the order found:**
+
+1. *Host race, looked like a device deadlock.* The perf harness repeats one node ~8K times; the region cache was keyed
+   by the first node's tensor pointer, so 16 regions shared one entry and the last (shorter) one re-uploaded the task
+   list and zeroed the counters with synchronous null-stream copies while the previous region's kernel was still
+   running on ggml's non-blocking stream. Any extra sync (the debug path) hid it, which is why it looked graph-
+   dependent. Fix: key by (tensor, node index), drain the stream before a re-upload, and size the grid from the
+   occupancy calculator (the raw SM count is right on gfx1151 = 20 WGPs, but a 40-block launch of this kernel can
+   never be co-resident and hangs by construction).
+2. *Wrong output on real graphs, every op class correct alone.* The q8_1 activation copy was reused by data pointer;
+   ggml-alloc hands the same address to a different tensor later in the graph, so the second GEMV read a stale copy.
+   Fix: reuse only if no task since the quant wrote anything overlapping the source.
+3. *GEMVs at 120-150 GB/s inside the kernel, 210 GB/s for the identical loop as its own kernel.* The pointers come out
+   of the task struct, so the address-space inference gave up and the bodies compiled to `flat_load`/`flat_store`
+   (both wait counters, generic aperture checks). A global-address-space cast made opaque with an empty asm (a plain
+   generic->global->generic round trip is folded away) turned 3,291 flat loads into global loads: 108 -> 71 us for
+   9216x2560 Q4_K standalone, 84-93 -> 56-62 us in the model. Copying the task struct to LDS once per task (instead of
+   re-reading it from global memory in the loops) was worth another 15%.
+4. *Single-wave bodies on decode shapes.* RMS_NORM of one 2560-wide row on one wave took 12 us; a block-per-row mode
+   (all 32 waves, LDS reduce) takes 2.4 us. Element-wise items went from 8192 to 1024 elements (one per thread) so a
+   2560-element op spreads over three blocks and costs one latency (4.6 -> 1.8 us).
+
+**What did not help:** rows-per-wave / k-blocks-per-lane unrolling (`_MMVQ` configs), split-K across waves with an LDS
+reduction (slower: same total wave-iterations, more syncs), a cooperative "touch" prefetch of the weight group into L0
+(73 spills, no gain), non-inlined bodies. Before the address-space fix none of them moved the number, because the
+loop was issuing 1-3 flat loads per wait regardless of how many were independent. The standalone bandwidth test
+(`persist/bw.hip`) shows a resident 20x1024 grid streams 241 GB/s with a single 16-byte load per lane, the same as a
+1280x256 launch, so the resident shape itself is not a bandwidth limit; MMVQ's 16 waves/SIMD is not needed once the
+loads are global.
+
+**Where it stands on Qwen3.5-4B Q4_K_M (iGPU, greedy, 40 tokens):** baseline 63.7 tok/s; persistent regions 61.0
+(from 43 before fixes 3-4). The traced layer region (22 tasks, 392 us) is 345 us of GEMV at 200-220 GB/s (Q6_K ffn_down
+19.4 MB in 98 us) plus 16 small tasks at 1.1-2.4 us each; the graph path pays about the same per small node, and this
+dense model is 80% GEMV-bandwidth already, so parity is the expected ceiling here.
+
+**Qwen3.8-Flash-Next UD-Q4_K_XL, iGPU only (the stage-2 gate), 2026-09-16, build-tile, `-dev ROCm1 -c 8192`,
+`-ot per_layer_token_embd=CPU`, no draft:** serial decode 25.9 tok/s baseline vs 23.9 with `GGML_CUDA_PERSIST=1`
+(llama-server, 192-token greedy, sampled the same); prefill 111-124 vs 68-75 tok/s on the 60-token prompt; greedy text
+identical for 32 tokens in llama-completion, then a plausible divergence at ~500 characters (rms_norm/GEMV summation
+order). So the gate fails: correct, GEMV bodies at bandwidth, and still a net loss on the target model. The traced
+reason is graph shape, not kernel speed: the decode graph fragments into ~380 regions per token (median 4 tasks; the
+most common region is attention-norm -> mul -> quant -> one small GEMV) because MUL_MAT_ID (every expert GEMV), the
+Gated DeltaNet ops, flash attention, rope, concat and f16 copies all end a region. ~380 launches of a resident kernel
+replace ~1,400 graph nodes, but each region still pays a launch plus a first-task wake-up and a last-task retire
+(5-10 us), and inside a region every dependent small task costs ~2.4 us (1.7 work + 0.7 hop): the nine-op
+hyper-connection element-wise chains that `ewchain.cu` runs as ONE ~5 us kernel run as nine tasks (21 us), because
+the region path is matched before the fuser. Region caching is not the problem (363 distinct regions compiled once,
+none recompiled per token).
+
+**What it would take to win on Qwen3.8**, in order: (1) an element-wise *chain* task (reuse the ewchain matcher, one
+task per chain) so a region never spends 2.4 us per trivial op; (2) MUL_MAT_ID bodies (expert GEMVs with the routed
+ids: the same MMVQ loop with a per-row expert base pointer) so the MoE block joins the region; (3) the DeltaNet
+recurrence, attention and rope as bodies, at which point a layer is one region and the 380 launches become ~45.
+Each is a real piece of work; (1) is a day, (2) two, (3) a week. Until then the path stays off by default; the
+tooling (verify/trace/bisection) and the bodies are in the tree.
