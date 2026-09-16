@@ -1428,15 +1428,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
+    // resolve AUTO: a lazy tensor is always placed in a CPU buffer (llama_model_loader::lazy_read::buft) and is
+    // gathered on the host, so only the CPU device's mmap support decides whether on-demand reads are possible.
+    // Consulting every device (see #28160) disabled them on every iGPU, because an iGPU reports
+    // mmap_support = false so that the loader copies weights into its own memory instead of sharing the mapping -
+    // which says nothing about a tensor that stays on the host. On Strix Halo that silently made the 26.8 GiB
+    // per-layer embedding table of Qwen3.8-Flash-Next resident, a quarter of system RAM.
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
-        for (const auto & dev : devices) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
-                break;
-            }
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_dev_props cpu_props = {};
+        if (cpu_dev) {
+            ggml_backend_dev_get_props(cpu_dev, &cpu_props);
+        }
+        if (!cpu_dev || !cpu_props.caps.mmap_support) {
+            ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
         }
     }
 
