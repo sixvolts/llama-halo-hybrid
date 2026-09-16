@@ -242,9 +242,54 @@ hyper-connection element-wise chains that `ewchain.cu` runs as ONE ~5 us kernel 
 the region path is matched before the fuser. Region caching is not the problem (363 distinct regions compiled once,
 none recompiled per token).
 
-**What it would take to win on Qwen3.8**, in order: (1) an element-wise *chain* task (reuse the ewchain matcher, one
-task per chain) so a region never spends 2.4 us per trivial op; (2) MUL_MAT_ID bodies (expert GEMVs with the routed
-ids: the same MMVQ loop with a per-row expert base pointer) so the MoE block joins the region; (3) the DeltaNet
-recurrence, attention and rope as bodies, at which point a layer is one region and the 380 launches become ~45.
-Each is a real piece of work; (1) is a day, (2) two, (3) a week. Until then the path stays off by default; the
-tooling (verify/trace/bisection) and the bodies are in the tree.
+## Stage 3 (2026-09-16): the three obvious fixes, and why the approach still loses
+
+The three things the stage-2 write-up named as the way to win were all built and measured on Qwen3.8-Flash-Next
+UD-Q4_K_XL, iGPU only, serial greedy decode, 32 tokens (`llama-completion -dev ROCm1 -c 4096`):
+
+| build | decode | prefill |
+|---|---|---|
+| region path off | 26.0-26.1 tok/s | 102-142 tok/s |
+| + element-wise chain task | 23.3 | 69 |
+| + prefill size gate (`_NEL`, default 65536 elements) | 23.0 | 104-123 |
+| + MUL_MAT_ID (expert GEMV) bodies | 22.9 | 112 |
+| + fused {up, gate, GLU} task, trimmed GEMV instantiations | 23.5 | 111 |
+| same, regions of >= 4 nodes only (`_MIN=4`) | 24.0 | 123 |
+| same, regions of >= 16 nodes only (`_MIN=16`) | 25.0 | 123 |
+
+1. **The chain task** (one task per element-wise chain, the same `ggml_cuda_ewchain_match` the fuser uses, now shared
+   between them) matched 1,411 chains per compiled graph and was worth +2%. Without it the region path was *undoing*
+   the fusion the normal path already does, since `ggml_cuda_persist_region` is matched before `ggml_cuda_try_fuse`.
+2. **Expert GEMVs** (MUL_MAT_ID at decode width: `ids[channel]` only adds a block offset to the weight index, so the
+   body is the same GEMV) made it *worse* on their own: ggml fuses `{MUL_MAT_ID, MUL_MAT_ID, GLU}` into one
+   `mul_mat_vec_q` launch, and splitting that into three tasks costs more than the launches saved.
+3. **The fused triple** (one task computing both matrices and the GLU, matching ggml's own rule) recovered that and
+   more: +2.6% over the split version, and it is the configuration in the table's last rows.
+
+**The curve that settles it:** raising the minimum region length monotonically improves the result, 23.5 -> 24.0 ->
+25.0 tok/s at `_MIN` 2, 4, 16, with the limit at 26.0 (the path disabled). Every region length loses; using the path
+less loses less. This is not a missing-body problem, and adding DeltaNet/attention/rope bodies would not change it.
+
+**Why, measured:** the same q4_K GEMV (9216 rows x 2560, one column) runs at 62.4 us as a standalone kernel and
+72.6 us as a task inside `pk_run` (`docs/halo-hybrid/persist/gemv_bench.hip` vs `gemv_bench2.hip`, which compiles the
+REAL device half of persist.cu around a hand-built region). Same grid (20 blocks x 1024 threads), same math, same
+q8_1 input, same 8 waves per SIMD. The difference is the kernel itself: a resident kernel that contains every body
+allocates registers for the worst path (190 VGPRs, and any extra GEMV instantiation pushed it to 192 with spills),
+and its hot loop is scheduled accordingly - a disassembly histogram of loads issued between `s_waitcnt vmcnt` shows
+mostly 1-3 in `pk_run` where the standalone GEMV keeps 8-16 in flight. Decode on this hardware is 80% GEMV bandwidth,
+so a 16% penalty on that work is larger than the whole launch overhead the design removes: at ~380 regions per token
+the launches it saves are worth ~1 ms of a 38 ms token, and the bodies give back ~4 ms.
+
+A whole-run profile says the same thing a third way (rocprofv3, same 16-token decode, profiler overhead inflates the
+span for both so only busy time is comparable): the baseline spends 789 ms of GPU-busy time, of which 478 ms is
+`mul_mat_vec_q` over 8,682 launches; the region build spends 871 ms, of which 549 ms is `pk_run` over 6,621 launches.
+Same work, 10% more GPU time, 12,500 fewer launches.
+
+**Conclusion.** On gfx1151 with HIP graphs, a persistent megakernel is the wrong shape for llama.cpp decode. The
+launch overhead it removes is real but small; the cost of compiling every operator into one kernel is bigger and
+falls on exactly the work that dominates. The lever that does pay is the opposite one: fewer, *bigger*, specialised
+kernels (the ewchain fuser, quantize-once, ggml's own gate+GLU fusion), which is where `ewchain.cu` and the q8 side
+registry already went. The path stays in the tree, off by default, with `GGML_CUDA_PERSIST_MIN` documented: it is a
+working task-graph runtime and a measuring instrument (`_VERIFY`, `_TRACE`, `_OPS`, `_SERIAL`, `_MMVQ`, `_GRID`),
+and it is the right starting point if a future part changes the tradeoff (much higher launch cost, or a kernel small
+enough to keep its registers down).

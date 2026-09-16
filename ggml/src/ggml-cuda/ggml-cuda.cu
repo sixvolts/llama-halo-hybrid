@@ -3863,16 +3863,12 @@ static bool ew_node_ok(const ggml_tensor * t, const ggml_tensor * prev, const gg
     }
 }
 
-static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_NO_EWCHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_NO_EWCHAIN"));
-    if (disabled) {
-        return 0;
-    }
+bool ggml_cuda_ewchain_match(const ggml_cgraph * cgraph, int i, ggml_cuda_ew_match & m) {
     const int n = cgraph->n_nodes;
     const ggml_tensor * in0 = nullptr;
     const ggml_tensor * other = nullptr;
     if (!ew_node_ok(cgraph->nodes[i], nullptr, &in0, &other)) {
-        return 0;
+        return false;
     }
     int idx[GGML_CUDA_EW_MAX_OPS];
     const ggml_tensor * others[GGML_CUDA_EW_MAX_OPS];
@@ -3908,25 +3904,26 @@ static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml
         last = j;
     }
     if (cnt < 2) {
-        return 0;
+        return false;
     }
     ggml_tensor * out = cgraph->nodes[last];
     if (!ggml_is_contiguous(out)) {
-        return 0;
+        return false;
     }
     // the fused kernel writes `out` while reading in0 and every src1: they must not overlap, except an exact
     // in-place elementwise alias of in0 (same address, same strides, which ggml-alloc produces for in-place ops)
     const bool inplace = out->data == in0->data && ggml_is_contiguous(in0) && ggml_are_same_shape(in0, out);
     if (!inplace && !hc_disjoint(out, in0)) {
-        return 0;
+        return false;
     }
     for (int c = 0; c < cnt; ++c) {
         if (others[c] && !hc_disjoint(out, others[c])) {
-            return 0;
+            return false;
         }
     }
 
-    ggml_cuda_ew_chain ch = {};
+    m = {};
+    ggml_cuda_ew_chain & ch = m.ch;
     ch.n    = cnt;
     ch.src0 = (const char *) in0->data;
     ch.dst  = (float *) out->data;
@@ -3949,10 +3946,26 @@ static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml
                 o.ne1[d] = others[c]->ne[d];
                 o.nb1[d] = others[c]->nb[d];
             }
+            m.others[m.n_others++] = others[c];
         }
     }
-    ggml_cuda_op_ew_chain(*cuda_ctx, ch);
-    return last - i;
+    m.last = last;
+    m.in0  = in0;
+    m.out  = out;
+    return true;
+}
+
+static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_EWCHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_NO_EWCHAIN"));
+    if (disabled) {
+        return 0;
+    }
+    ggml_cuda_ew_match m;
+    if (!ggml_cuda_ewchain_match(cgraph, i, m)) {
+        return 0;
+    }
+    ggml_cuda_op_ew_chain(*cuda_ctx, m.ch);
+    return m.last - i;
 }
 
 // try and fuse nodes and return the number of nodes to skip
