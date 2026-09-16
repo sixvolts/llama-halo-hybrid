@@ -22,9 +22,41 @@ them. A streaming test with no math (`persist/bw.hip`) reaches 241 GB/s.
 So the floor is 6.33 GB / 223 GB/s = **28.4 ms**, and we run at 165 GB/s = **74% of DRAM**. Halogen's 35.6 tok/s on
 the same model is 225 GB/s, i.e. saturation: their whole advantage over this tree is the missing 26%.
 
+## Halogen is not saturating this hardware either
+
+Its weight file has a readable table (`HGN1`, 1,198 records of 160 bytes: name, dtype, dims, offset, size), so its
+bytes per token can be computed the same way. Excluding the gathers (embed_tokens, the 47.7 GiB FP8 n-gram table) and
+the MTP head:
+
+| halogen w4b, read every token | GiB |
+|---|---|
+| dense trunk (attention, DeltaNet, hyper-connections, shared expert) | 1.95 |
+| routed experts, 10 of 512 | 1.25 |
+| LM head | 0.33 |
+| router (f32) | 0.12 |
+| **total** | **3.65 GiB = 3.92 GB**, up to ~4.4 GB with the activation-aware overlay that replaces trunk tensors |
+
+At 35.6 tok/s that is **139-157 GB/s, 63-70% of the 223 GB/s ceiling**, against this tree's 166 GB/s (74%). The
+trunk tensors both engines read every token are 8.50 bits per weight here (q8_0) and 4.50 there:
+
+| tensor | this tree | halogen |
+|---|---|---|
+| linear-attention qkv, 36 layers | 8.50 bpw | 4.50 bpw |
+| linear-attention out, 36 layers | 8.50 | 4.50 |
+| LM head | 8.50 | 4.50 |
+
+So the 1.37x is bytes, all of it: 6.33 GB per token against ~4 GB. This tree moves those bytes at least as
+efficiently. The q8_0 trunk is 4.49 GiB of our 5.89 GiB and is the UD-Q4_K_XL choice for quality; at halogen's byte
+count and our efficiency the same box would decode at ~42 tok/s. That is the actual size of what the format costs,
+and it is a decision, not a kernel.
+
 ## Where the 26% goes
 
-`rocm-smi --showuse` sampled through decode: the iGPU is busy **82.9%** of the time (mean of 39 samples, max 99%).
+`rocm-smi --showuse` sampled through decode reports the iGPU busy **82.9%** of the time; the driver's own
+`gpu_busy_percent` reports **99%** over the same kind of window. They count different things: the second says a
+wave is alive, the first is closer to the shader engines being fed. Read together with the byte floor, the loss is
+not empty time between kernels but the tails and ramps of ~1,333 kernels, during which waves exist and the memory
+pipe is underfed. Clocks are not the cause: sclk sits at 2.9 GHz and mclk at its 1000 MHz maximum throughout.
 
 | per token | ms | share |
 |---|---|---|
@@ -47,6 +79,12 @@ directly for the persistent-decode work (a real graph node costs ~6 us against 1
 So it is not CPU launch cost, not the host-side embedding gather, and not a missing chance to overlap branches. It is
 the per-dispatch cost the hardware pays between dependent kernels, and the only lever on it is fewer dependent
 kernels - without paying for that in register pressure, which is what killed the megakernel.
+
+Two more candidates measured on the standalone cold GEMV (`persist/gemv_bench3.hip`, 8 matrices cycled so nothing
+is cached): **rows per workgroup** 1/2/4/8/16 with one wave per row all give 225 GB/s on 9216x2560 q4_K, so
+workgroup dispatch pressure is not a limiter; **non-temporal weight loads** are worse, 216 vs 225 on the large
+shapes and 145 vs 237 on the 640-row shape. An isolated cold GEMV reaches 218-237 GB/s; the loss is around the
+kernels, not in them.
 
 One tuning knob looked mis-set and is not: gfx1151 falls through `get_device_table_id()` to the RDNA2 MMVQ table,
 which has no branch in `calc_nwarps` and so gives **one wave per row**, where RDNA3 and RDNA4 parts get eight for the
