@@ -1438,6 +1438,210 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// halo-hybrid: ONE launch for several GEMVs that read the same activation (q/k/v, qkv+gate, the shared expert's
+// gate/up, the per-layer-embedding key/value pair). The caller has already quantized the activation once; this also
+// removes the per-matrix dispatch and lets the combined row space fill the GPU in a single ramp. One wave per row,
+// which is what gfx1151 wants (see docs/halo-hybrid/APU-DECODE-BUDGET.md); the entry a row belongs to is found by a
+// short scan over the prefix sums, all of it block-uniform.
+#define MMVQ_GROUP_MAX 8
+
+struct mmvq_group_args {
+    const void * vx[MMVQ_GROUP_MAX];
+    float *      dst[MMVQ_GROUP_MAX];
+    int32_t      stride_row[MMVQ_GROUP_MAX];       // weight row stride, in blocks (f32 entries: in floats)
+    int32_t      stride_col_dst[MMVQ_GROUP_MAX];   // dst column stride, in floats
+    int32_t      row_end[MMVQ_GROUP_MAX];          // exclusive prefix sums of the row counts
+    int32_t      n;
+    uint32_t     f32_mask;                         // entries whose weights are f32: dot the f32 activation instead
+    const float * vy_f32;                          // the unquantized activation, for those entries
+    int32_t      stride_col_y_f32;
+};
+
+template <ggml_type type, int ncols_dst>
+__global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+mul_mat_vec_q_group(const mmvq_group_args a, const void * __restrict__ vy,
+                    const uint32_t ncols_x, const uint32_t stride_col_y) {
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    const int row_g = blockIdx.x;
+    int e = 0;
+#pragma unroll
+    for (int k = 1; k < MMVQ_GROUP_MAX; ++k) {
+        if (k < a.n && row_g >= a.row_end[k - 1]) {
+            e = k;
+        }
+    }
+    const int row = row_g - (e == 0 ? 0 : a.row_end[e - 1]);
+
+    const int tid = threadIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    if (a.f32_mask & (1u << e)) {   // block-uniform: this entry's weights are f32, dot the f32 activation
+        float acc[ncols_dst];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            acc[j] = 0.0f;
+        }
+        const float * w = (const float *) a.vx[e] + (int64_t) row * a.stride_row[e];
+        const bool vec4 = (ncols_x % 4 == 0) && (((uintptr_t) w | (uintptr_t) a.vy_f32) % 16 == 0) &&
+                          (a.stride_col_y_f32 % 4 == 0);
+        if (vec4) {
+            const int n4 = (int) ncols_x / 4;
+            for (int c4 = tid; c4 < n4; c4 += warp_size) {
+                const float4 wv = ((const float4 *) w)[c4];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float4 yv = ((const float4 *) (a.vy_f32 + j*a.stride_col_y_f32))[c4];
+                    acc[j] += wv.x*yv.x + wv.y*yv.y + wv.z*yv.z + wv.w*yv.w;
+                }
+            }
+        } else {
+            for (int col = tid; col < (int) ncols_x; col += warp_size) {
+                const float wv = w[col];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    acc[j] += wv * a.vy_f32[j*a.stride_col_y_f32 + col];
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            acc[j] = warp_reduce_sum<warp_size>(acc[j]);
+            if (tid == 0) {
+                a.dst[e][j*a.stride_col_dst[e] + row] = acc[j];
+            }
+        }
+        return;
+    }
+
+    float tmp[ncols_dst];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j] = 0.0f;
+    }
+    const int kqs = vdr * (tid % (qi/vdr));
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp[j] += vec_dot_q_cuda(a.vx[e], &y[j*stride_col_y + kby], row*a.stride_row[e] + kbx, kqs);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
+        if (tid == 0) {
+            a.dst[e][j*a.stride_col_dst[e] + row] = tmp[j];
+        }
+    }
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_group_ncols(const mmvq_group_args & a, const void * vy, int64_t ncols_x,
+                                      int64_t stride_col_y, int64_t ncols_dst, int rows, int warp_size, cudaStream_t stream) {
+    const dim3 block_nums(rows, 1, 1);
+    const dim3 block_dims(warp_size, 1, 1);
+    switch (ncols_dst) {
+        case 1: mul_mat_vec_q_group<type, 1><<<block_nums, block_dims, 0, stream>>>(a, vy, ncols_x, stride_col_y); break;
+        case 2: mul_mat_vec_q_group<type, 2><<<block_nums, block_dims, 0, stream>>>(a, vy, ncols_x, stride_col_y); break;
+        case 3: mul_mat_vec_q_group<type, 3><<<block_nums, block_dims, 0, stream>>>(a, vy, ncols_x, stride_col_y); break;
+        case 4: mul_mat_vec_q_group<type, 4><<<block_nums, block_dims, 0, stream>>>(a, vy, ncols_x, stride_col_y); break;
+        default: GGML_ABORT("mul_mat_vec_q_group: ncols_dst %d", (int) ncols_dst);
+    }
+}
+
+// true when the group ran; the caller falls back to one launch per matrix otherwise
+bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n,
+                                   const ggml_tensor * src1, const char * src1_q8_1) {
+    static const bool disabled = getenv("GGML_CUDA_NO_GEMV_GROUP") != nullptr && std::atoi(getenv("GGML_CUDA_NO_GEMV_GROUP"));
+    if (disabled || n < 2 || n > MMVQ_GROUP_MAX || !src1_q8_1) {
+        return false;
+    }
+    ggml_type type = GGML_TYPE_COUNT;              // the one quantized type of the group (f32 entries ride along)
+    for (int k = 0; k < n; ++k) {
+        const ggml_type t = nodes[k]->src[0]->type;
+        if (t == GGML_TYPE_F32) {
+            continue;
+        }
+        if (type != GGML_TYPE_COUNT && t != type) {
+            return false;
+        }
+        type = t;
+    }
+    if (type == GGML_TYPE_COUNT) {
+        return false;                              // all-f32 groups keep the existing mul_mat_vec_f path
+    }
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    if (ne11 < 1 || ne11 > 4 || ne10 % ggml_blck_size(type) != 0) {
+        return false;
+    }
+    mmvq_group_args a{};
+    a.n = n;
+    int rows = 0;
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * w = nodes[k]->src[0];
+        const ggml_tensor * d = nodes[k];
+        const bool is_f32 = w->type == GGML_TYPE_F32;
+        if ((!is_f32 && w->type != type) || w->ne[0] != ne10 || !ggml_is_contiguous(w)) {
+            return false;
+        }
+        if (is_f32) {
+            if (!ggml_is_contiguous(src1) || src1->nb[0] != sizeof(float)) {
+                return false;
+            }
+            // OFF by default, and the measurements say it should stay off while a row is one wave: mul_mat_vec_f
+            // gives an f32 matrix 8 warps per row, this kernel gives it one, and no f32 matrix in Qwen3.8 is tall
+            // enough to make that back. The hyper-connection inject (4 rows, K=10240) cost 7.6 ms per token when
+            // merged; the DeltaNet beta (48 rows, K=2560) cost 0.1 ms. Raising the cap is only worth it once f32
+            // members use the whole block instead of one wave.
+            // the detector decides whether f32 members are admitted at all (see ggml-cuda.cu); refusing here would
+            // cost the whole group, quantized members included
+            a.f32_mask |= 1u << k;
+        }
+        if (d->type != GGML_TYPE_F32 || d->nb[0] != sizeof(float) || d->ne[1] != ne11 || d->ne[2] != 1 || d->ne[3] != 1) {
+            return false;
+        }
+        if (w->ne[1] > INT32_MAX/2) {
+            return false;
+        }
+        a.vx[k]             = w->data;
+        a.dst[k]            = (float *) d->data;
+        a.stride_row[k]     = (int32_t) (w->nb[1] / ggml_type_size(w->type));
+        a.stride_col_dst[k] = (int32_t) (d->nb[1] / sizeof(float));
+        rows               += (int32_t) w->ne[1];
+        a.row_end[k]        = rows;
+    }
+    const int64_t ne10_padded  = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t stride_col_y = ne10_padded / QK8_1;
+    a.vy_f32           = (const float *) src1->data;
+    a.stride_col_y_f32 = (int32_t) (src1->nb[1] / sizeof(float));
+
+    ggml_cuda_set_device(ctx.device);
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    switch (type) {
+        case GGML_TYPE_Q4_0: mul_mat_vec_q_group_ncols<GGML_TYPE_Q4_0>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_Q4_1: mul_mat_vec_q_group_ncols<GGML_TYPE_Q4_1>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_Q5_0: mul_mat_vec_q_group_ncols<GGML_TYPE_Q5_0>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_Q5_1: mul_mat_vec_q_group_ncols<GGML_TYPE_Q5_1>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_Q8_0: mul_mat_vec_q_group_ncols<GGML_TYPE_Q8_0>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_Q4_K: mul_mat_vec_q_group_ncols<GGML_TYPE_Q4_K>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_Q5_K: mul_mat_vec_q_group_ncols<GGML_TYPE_Q5_K>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_Q6_K: mul_mat_vec_q_group_ncols<GGML_TYPE_Q6_K>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_IQ4_NL: mul_mat_vec_q_group_ncols<GGML_TYPE_IQ4_NL>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        case GGML_TYPE_IQ4_XS: mul_mat_vec_q_group_ncols<GGML_TYPE_IQ4_XS>(a, src1_q8_1, ne10, stride_col_y, ne11, rows, warp_size, ctx.stream()); break;
+        default: return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, const char * src1_q8_1_pre) {

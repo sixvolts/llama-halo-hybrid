@@ -58,3 +58,5 @@ static __device__ __forceinline__ void q8_side_store(block_q8_1 * q8, const int6
         q8[ib].ds = make_half2(d, sum);
     }
 }
+
+void ggml_cuda_pad_kernels(ggml_backend_cuda_context & ctx, int n);   // measurement aid, see hc.cu

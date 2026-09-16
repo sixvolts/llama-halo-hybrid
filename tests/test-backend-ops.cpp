@@ -3511,12 +3511,15 @@ struct test_ew_chain : public test_case {
 struct test_mul_mat_shared : public test_case {
     const ggml_type type;
     const int64_t m, n, k;
+    const int n_mat;        // how many matrices read the same activation
+    const bool with_f32;    // append an f32 matrix, as the hyper-connection inject does
 
     std::string vars() override {
-        return VARS_TO_STR4(type, m, n, k) + ",shared";
+        return VARS_TO_STR4(type, m, n, k) + "," + VARS_TO_STR2(n_mat, with_f32) + ",shared";
     }
 
-    test_mul_mat_shared(ggml_type type, int64_t m, int64_t n, int64_t k) : type(type), m(m), n(n), k(k) {}
+    test_mul_mat_shared(ggml_type type, int64_t m, int64_t n, int64_t k, int n_mat = 2, bool with_f32 = false)
+        : type(type), m(m), n(n), k(k), n_mat(n_mat), with_f32(with_f32) {}
 
     double max_nmse_err() override {
         return 5e-4;   // quantized GEMV against the CPU reference, as test_mul_mat
@@ -3525,13 +3528,23 @@ struct test_mul_mat_shared : public test_case {
     bool run_whole_graph() override { return true; }   // the q8 side copy is shared only within one graph compute
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
-        ggml_set_name(a, "a");
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, type, k, m);
-        ggml_set_name(b, "b");
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_set_name(x, "x");
-        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a, x), ggml_mul_mat(ctx, b, x));
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < n_mat; ++i) {
+            // different row counts, like a real group (qkv is 4x the gate, the inject is 4 rows of many thousands)
+            const int64_t rows = m / (i + 1) >= 1 ? m / (i + 1) : 1;
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, rows);
+            ggml_set_name(w, (std::string("w") + std::to_string(i)).c_str());
+            ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+            ggml_tensor * s = ggml_sum_rows(ctx, y);          // collapse the differing row counts
+            out = out ? ggml_add(ctx, out, s) : s;
+        }
+        if (with_f32) {
+            ggml_tensor * wf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 4);
+            ggml_set_name(wf, "wf32");
+            out = ggml_add(ctx, out, ggml_sum_rows(ctx, ggml_mul_mat(ctx, wf, x)));
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -8999,6 +9012,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 256, n, 4096));
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 256, n, 4096));
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 256, n, 1536));   // rows padded to 2048
+        // grouped GEMV: several matrices of different heights, with and without an f32 member
+        for (int n_mat : {2, 3, 5}) {
+            test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 320, n, 2560, n_mat));
+            test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 320, n, 2560, n_mat, true));
+            test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 640, n, 2560, n_mat, true));
+        }
     }
 
     // GLM-5.3-Flash shapes at prefill widths, correctness of the RDNA3.5 MMQ configs (TBO_GLM_EVAL=1)

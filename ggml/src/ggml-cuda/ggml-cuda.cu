@@ -4153,15 +4153,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
         const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
         const ggml_tensor * src1 = node->src[1];
-        auto eligible = [&](const ggml_tensor * t) {
+        auto eligible = [&](const ggml_tensor * t, bool leader) {
             const ggml_tensor * w = t->src[0];
-            return t->op == GGML_OP_MUL_MAT && t->src[1] == src1 && t->type == GGML_TYPE_F32 &&
-                   ggml_is_quantized(w->type) && w->ne[2] == 1 && w->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-                   w->buffer && ggml_backend_buft_is_cuda(w->buffer->buft) &&
+            if (t->op != GGML_OP_MUL_MAT || t->src[1] != src1 || t->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (w->ne[2] != 1 || w->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+                return false;
+            }
+            if (!w->buffer || !ggml_backend_buft_is_cuda(w->buffer->buft)) {
+                return false;
+            }
+            // An f32 matrix (the hyper-connection inject, the DeltaNet alpha/beta) can ride along in the grouped
+            // kernel, which dots it against the unquantized activation, but that is OFF by default: a row there is
+            // one wave where mul_mat_vec_f gives it 8 warps, and no f32 matrix in these models has the rows to make
+            // that back (the inject, 4 rows of K=10240, cost 7.6 ms per token). The member must be excluded HERE and
+            // not in the launcher: a group the launcher refuses falls back to one launch per matrix and loses the
+            // quantized merges too.
+            if (w->type == GGML_TYPE_F32) {
+                static const int64_t f32_rows = getenv("GGML_CUDA_GEMV_GROUP_F32ROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_F32ROWS")) : INT64_MAX;
+                return !leader && w->ne[0] == src1->ne[0] && w->ne[1] >= f32_rows;
+            }
+            return ggml_is_quantized(w->type) &&
                    ggml_cuda_should_use_mmvq(w->type, cc, src1->ne[1]) &&
                    !ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb, src1->ne[1], false);
         };
-        if (eligible(node)) {
+        if (eligible(node, true)) {
             int idx[8];
             int n = 1;
             idx[0] = i;
@@ -4170,7 +4187,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE) {
                     continue; // reshapes between the matmuls are free
                 }
-                if (!eligible(t)) {
+                if (!eligible(t, false)) {
                     break;
                 }
                 // (gate, up, GLU) is handled by the fused GLU path; do not split that triple
@@ -4206,9 +4223,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             ne10, src1->nb[1]/ts_src1, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, ne10_padded, ne11, 1, 1, stream);
                     pre = src1_q8_1.get();
                 }
+                ggml_tensor * group[8];
                 for (int k = 0; k < n; ++k) {
-                    ggml_tensor * t = cgraph->nodes[idx[k]];
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, t->src[0], src1, nullptr, t, nullptr, pre);
+                    group[k] = cgraph->nodes[idx[k]];
+                }
+                // one launch for the whole group when the weights share a type; otherwise one per matrix as before
+                if (!ggml_cuda_mul_mat_vec_q_group(*cuda_ctx, group, n, src1, pre)) {
+                    for (int k = 0; k < n; ++k) {
+                        if (group[k]->src[0]->type == GGML_TYPE_F32) {
+                            ggml_cuda_compute_forward_node(*cuda_ctx, group[k]);   // f32 matrix: its own path
+                        } else {
+                            ggml_cuda_mul_mat_vec_q(*cuda_ctx, group[k]->src[0], src1, nullptr, group[k], nullptr, pre);
+                        }
+                    }
                 }
                 return idx[n - 1] - i;
             }
@@ -5057,6 +5084,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_q8_side_reset(*cuda_ctx);   // per-graph registry of producer-side q8_1 activation copies
+
+    {   // halo-hybrid: GGML_CUDA_PAD_KERNELS=<n> appends n empty dependent kernels to every graph. The slope of
+        // tok/s against n is the marginal cost of one kernel boundary in the real decode loop, which is what any
+        // "fuse to fewer kernels" plan is actually buying.
+        static const int pad = getenv("GGML_CUDA_PAD_KERNELS") ? atoi(getenv("GGML_CUDA_PAD_KERNELS")) : 0;
+        if (pad > 0) {
+            ggml_cuda_pad_kernels(*cuda_ctx, pad);
+        }
+    }
+
+    {   // halo-hybrid: GGML_CUDA_DUMP_GRAPH=<n> prints the n-th graph's node list once (op, shapes, sources), which
+        // is how the per-layer kernel inventory is counted
+        static const int dump = getenv("GGML_CUDA_DUMP_GRAPH") ? atoi(getenv("GGML_CUDA_DUMP_GRAPH")) : 0;
+        static int seen = 0;
+        if (dump && ++seen == dump) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * n = cgraph->nodes[i];
+                char srcs[256]; srcs[0] = 0;
+                for (int j = 0; j < GGML_MAX_SRC && n->src[j]; ++j) {
+                    char one[64];
+                    snprintf(one, sizeof(one), "%s%s[%s]", j ? "," : "", n->src[j]->name, ggml_type_name(n->src[j]->type));
+                    strncat(srcs, one, sizeof(srcs) - strlen(srcs) - 1);
+                }
+                GGML_LOG_WARN("gnode %4d %-14s %-22s %5lldx%-5lld <- %s\n", i, ggml_op_name(n->op), n->name,
+                    (long long) n->ne[0], (long long) n->ne[1], srcs);
+            }
+        }
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

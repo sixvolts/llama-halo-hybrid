@@ -228,3 +228,18 @@ void ggml_cuda_op_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int64_t n = ggml_nelements(dst);
     k_gdn_gate<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data, (const float *) a->data, (float *) dst->data, n, x->ne[0]);
 }
+
+// halo-hybrid: measurement aid (GGML_CUDA_PAD_KERNELS). An empty dependent kernel: it touches one float so the
+// compiler keeps it, and it runs on the compute stream so every instance pays a full dispatch boundary.
+static __global__ void k_pad_noop(float * p) {
+    if (threadIdx.x == 0 && blockIdx.x == 0 && p) { *p = *p; }
+}
+
+void ggml_cuda_pad_kernels(ggml_backend_cuda_context & ctx, int n) {
+    static float * dummy = nullptr;
+    if (!dummy) { CUDA_CHECK(cudaMalloc((void **) &dummy, sizeof(float))); CUDA_CHECK(cudaMemset(dummy, 0, sizeof(float))); }
+    for (int i = 0; i < n; ++i) {
+        k_pad_noop<<<1, 32, 0, ctx.stream()>>>(dummy);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
