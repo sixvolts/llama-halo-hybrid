@@ -75,6 +75,22 @@ table; the R9700 was present but idle):
 | MTP head, n-max 2 | (short-prompt harness) | 33.9 | 29.9 |
 | MTP head + `LLAMA_PREFILL_LANES=2` | 700 at 4.9K, 590 at 20K (cold and warm alike) | 34.7 | 30.4 |
 
+Same box, same HTTP bench tool (halogen's `halogen-bench.py`, tg128 = mean over its ten prompt shapes, pp = cold
+prefill), this tree on the iGPU against halogen-flash-server 0.11.1 on its own 4-bit checkpoint (2026-09-16):
+
+| | this tree, iGPU only | halogen 0.11.1, iGPU only |
+|---|---|---|
+| decode, serial | 26.2 tok/s | 35.6 |
+| decode, MTP head | ~40 (36.8-41.8) | 43.5 (35.8-53.4) |
+| prefill 2K / 8K | 714-757 / 684-722 tok/s | 932 / 1,361 |
+| prefill, 4.9K record prompt, cold | 700 | 1,110 |
+
+Halogen's engine is gfx1151-only and runs ~500 kernels per token against our ~1,400; its GEMVs read bf16 activations
+directly (no quantize pass), its sampler and MTP acceptance run on the GPU, and the n-gram table is on the device.
+Its GGUF mode does not accept K-quants, so this is engine-plus-format against engine-plus-format, not the same weights.
+Upstream's multi-stream graph optimisation (`GGML_CUDA_GRAPH_OPT=1`) measured no difference here. The launch-count
+analysis and the persistent-kernel plan that follows from it: [PERSISTENT-DECODE.md](PERSISTENT-DECODE.md).
+
 The 111 GB model plus the 2.6 GB head leaves room for 8-16K of context on a 128 GB box; Qwen3.5-122B (71 GB) fits
 with room to spare; GLM-5.3-Flash (200 GB) does not, which is what recipes 3-5 are for.
 
