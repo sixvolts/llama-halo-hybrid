@@ -11131,6 +11131,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         return test_cases;
     }
 
+    // Qwen3.8-Flash-Next UD-Q4_K_XL, every GEMV a decode token reads (halo-hybrid, single box): n_embd 2560,
+    // 48 layers, 512 experts / 10 used, expert width 640, hyper-connection width 320 x 10240, vocab 248320.
+    // A token reads 6.33 GB of weights, so each of these should run at the APU's GEMV bandwidth (~215 GB/s);
+    // divide the reported us/run into the matrix bytes to see which shapes fall short.
+    if (getenv("TBO_Q38") != nullptr) {
+        for (int64_t n : {1, 2, 3}) {
+            // dense q8_0 projections, per layer
+            for (auto [m, k] : std::vector<std::pair<int64_t,int64_t>>{
+                    {10240, 2560},   // attn_qkv (36 layers), ple_key
+                    {12288, 2560},   // attn_q (12 layers)
+                    { 6144, 2560},   // attn_gate (36)
+                    { 2560, 6144},   // ssm_out (36), attn_output (12)
+                    {10240,  320},   // hc_attn_up / hc_ffn_up (48 each): short K
+                    {  320, 10240},  // hc_attn_down / hc_ffn_down (48 each): few rows
+                    {  640, 2560},   // shared expert gate/up (48)
+                    { 2560,  640},   // shared expert down (48)
+                    {248320, 2560}}) {   // the LM head: 0.63 GiB, 10% of the token
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+            // the f32 router (ffn_gate_inp [2560 x 512], 48 layers = 4% of the token's bytes, unquantized)
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, n, 2560, {1, 1}, {1, 1}));
+            // routed experts: 10 of 512, gate/up q4_K (k=2560), down q5_1 (k=640)
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,   640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+        }
+        return test_cases;
+    }
+
     // GLM-5.3-Flash UD-Q4_K_XL (halo-hybrid two-host): 288 experts, 8 used, expert width 2048, n_embd 4096
     if (getenv("TBO_GLM") != nullptr) {
         // elementwise / memory-bound kernels at a 1024-token ubatch (mainframe's profile: rms_norm, cpy, the KDA

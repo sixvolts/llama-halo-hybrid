@@ -1,3 +1,4 @@
+#define GGML_CUDA_MMVQ_RDNA35 0
 #include "mmvq.cuh"
 #include "hc.cuh"
 #include "quantize.cuh"
@@ -109,7 +110,15 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA4;
 #elif defined(RDNA3_0)
     return MMVQ_PARAMETERS_RDNA3_0;
-#elif defined(RDNA2) || defined(RDNA3_5)
+#elif defined(RDNA3_5)
+    // halo-hybrid: gfx1151 fell through the RDNA2 table to nwarps = 1 (one wave per row). GGML_CUDA_MMVQ_RDNA35
+    // picks the table at build time so the choice can be measured on the real model: 0 = RDNA2 (upstream), 1 = RDNA3_0.
+#if defined(GGML_CUDA_MMVQ_RDNA35) && GGML_CUDA_MMVQ_RDNA35 == 1
+    return MMVQ_PARAMETERS_RDNA3_0;
+#else
+    return MMVQ_PARAMETERS_RDNA2;
+#endif
+#elif defined(RDNA2)
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
@@ -129,7 +138,14 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
         return MMVQ_PARAMETERS_RDNA3_0;
     }
-    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+#if defined(GGML_CUDA_MMVQ_RDNA35) && GGML_CUDA_MMVQ_RDNA35 == 1
+        return MMVQ_PARAMETERS_RDNA3_0;
+#else
+        return MMVQ_PARAMETERS_RDNA2;
+#endif
+    }
+    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
         return MMVQ_PARAMETERS_RDNA2;
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -1520,6 +1536,15 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
+        {   // halo-hybrid: GGML_CUDA_GEMV_GROUPS=1 names any activation that still needs a standalone quantize launch
+            // (none during decode on Qwen3.8: the producer-side q8_1 registry and the shared-activation group cover it)
+            static const int who = getenv("GGML_CUDA_GEMV_GROUPS") ? atoi(getenv("GGML_CUDA_GEMV_GROUPS")) : 0;
+            if (who) {
+                GGML_LOG_WARN("q8-quantize: %s <- %s (%s) ne %lld x %lld, consumer %s\n",
+                    src1->name, src1->src[0] ? src1->src[0]->name : "-", ggml_op_name(src1->op),
+                    (long long) ne10, (long long) ne11, dst->name);
+            }
+        }
         quantize_row_q8_1_cuda(src1_d, nullptr, q8, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         src1_q8_1_d = q8;
     }

@@ -4182,6 +4182,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
                 idx[n++] = j;
             }
+            {   // halo-hybrid: GGML_CUDA_GEMV_GROUPS=1 reports how many consecutive GEMVs share this activation, i.e. how
+                // many launches a grouped GEMV kernel would replace with one
+                static const int who = getenv("GGML_CUDA_GEMV_GROUPS") ? atoi(getenv("GGML_CUDA_GEMV_GROUPS")) : 0;
+                if (who) {
+                    std::string names;
+                    for (int k = 0; k < n; ++k) { names += " "; names += cgraph->nodes[idx[k]]->src[0]->name; }
+                    GGML_LOG_WARN("gemv-group: n=%d src1=%s rows=%lld k=%lld ->%s\n", n, src1->name,
+                        (long long) node->ne[0], (long long) src1->ne[0], names.c_str());
+                }
+            }
             if (n >= 2) {
                 cudaStream_t stream = cuda_ctx->stream();
                 const int64_t ne10 = src1->ne[0];
