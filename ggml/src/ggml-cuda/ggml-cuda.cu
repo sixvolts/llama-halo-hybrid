@@ -4172,9 +4172,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // quantized merges too.
             if (w->type == GGML_TYPE_F32) {
                 // on by default now that an f32 member gets a whole block per row (GGML_CUDA_GEMV_GROUP_F32ROWS=<n>
-                // admits only members with at least n rows; set it huge to exclude them)
+                // admits only members with at least n rows; set it huge to exclude them). An f32 matrix may also
+                // lead (the MoE router precedes the shared expert's gate/up); the launcher still needs a quantized
+                // member somewhere in the group, and falls back to the plain paths otherwise.
                 static const int64_t f32_rows = getenv("GGML_CUDA_GEMV_GROUP_F32ROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_F32ROWS")) : 0;
-                return !leader && w->ne[0] == src1->ne[0] && w->ne[1] >= f32_rows;
+                GGML_UNUSED(leader);
+                return w->ne[0] == src1->ne[0] && w->ne[1] >= f32_rows;
             }
             return ggml_is_quantized(w->type) &&
                    ggml_cuda_should_use_mmvq(w->type, cc, src1->ne[1]) &&
@@ -4192,14 +4195,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (!eligible(t, false)) {
                     break;
                 }
-                // (gate, up, GLU) is handled by the fused GLU path; do not split that triple
+                // a (gate, up, GLU) triple joins as ONE pair member, represented by its GLU node: the kernel dots
+                // both rows in the same wave and applies the GLU on the way out. Anything else next to a GLU is
+                // left to the dedicated fused path.
+                static const bool no_pair = getenv("GGML_CUDA_NO_GEMV_PAIR") != nullptr;
+                if (!no_pair && j + 2 < cgraph->n_nodes && cgraph->nodes[j + 2]->op == GGML_OP_GLU && eligible(cgraph->nodes[j + 1], false) &&
+                    cgraph->nodes[j + 2]->src[0] == t && cgraph->nodes[j + 2]->src[1] == cgraph->nodes[j + 1] &&
+                    ggml_is_quantized(t->src[0]->type) && cgraph->nodes[j + 1]->src[0]->type == t->src[0]->type &&
+                    ggml_get_op_params_i32(cgraph->nodes[j + 2], 1) == 0 &&
+                    (ggml_get_glu_op(cgraph->nodes[j + 2]) == GGML_GLU_OP_SWIGLU || ggml_get_glu_op(cgraph->nodes[j + 2]) == GGML_GLU_OP_GEGLU)) {
+                    idx[n++] = j + 2;
+                    j += 2;
+                    continue;
+                }
                 if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_GLU) {
-                    if (n >= 2 && idx[n - 1] == j - 1) {
-                        n--;
-                    }
                     break;
                 }
                 idx[n++] = j;
+            }
+            // the leader itself may be the gate of a triple: only when it started the run
+            if (n == 1 && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+                n = 0;   // let the fused path have it (the loop above broke on the GLU)
             }
             {   // halo-hybrid: GGML_CUDA_GEMV_GROUPS=1 reports how many consecutive GEMVs share this activation, i.e. how
                 // many launches a grouped GEMV kernel would replace with one
@@ -4211,7 +4227,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         (long long) node->ne[0], (long long) src1->ne[0], names.c_str());
                 }
             }
-            if (n >= 2) {
+            bool has_q = false;   // an all-f32 run has nothing to quantize for; leave it to mul_mat_vec_f
+            for (int k = 0; k < n; ++k) {
+                const ggml_tensor * mm = cgraph->nodes[idx[k]]->op == GGML_OP_GLU ? cgraph->nodes[idx[k]]->src[0] : cgraph->nodes[idx[k]];
+                has_q |= ggml_is_quantized(mm->src[0]->type);
+            }
+            if (n >= 2 && has_q) {
                 cudaStream_t stream = cuda_ctx->stream();
                 const int64_t ne10 = src1->ne[0];
                 const int64_t ne11 = src1->ne[1];
@@ -4221,7 +4242,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const char * pre = ggml_cuda_q8_side_find(*cuda_ctx, src1);   // producer-side q8_1 copy, if any
                 if (!pre) {
                     src1_q8_1.alloc(ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-                    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), node->src[0]->type,
+                    ggml_type qtype = GGML_TYPE_F32;   // any quantized member's type: the q8_1 layout is the same for all of them
+                    for (int k = 0; k < n && qtype == GGML_TYPE_F32; ++k) {
+                        const ggml_tensor * mm = cgraph->nodes[idx[k]]->op == GGML_OP_GLU ? cgraph->nodes[idx[k]]->src[0] : cgraph->nodes[idx[k]];
+                        qtype = mm->src[0]->type;
+                    }
+                    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), qtype,
                             ne10, src1->nb[1]/ts_src1, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, ne10_padded, ne11, 1, 1, stream);
                     pre = src1_q8_1.get();
                 }
@@ -4232,7 +4258,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // one launch for the whole group when the weights share a type; otherwise one per matrix as before
                 if (!ggml_cuda_mul_mat_vec_q_group(*cuda_ctx, group, n, src1, pre)) {
                     for (int k = 0; k < n; ++k) {
-                        if (group[k]->src[0]->type == GGML_TYPE_F32) {
+                        if (group[k]->op == GGML_OP_GLU) {   // the pair: gate, up, then the GLU node itself
+                            ggml_cuda_mul_mat_vec_q(*cuda_ctx, group[k]->src[0]->src[0], src1, nullptr, group[k]->src[0], nullptr, pre);
+                            ggml_cuda_mul_mat_vec_q(*cuda_ctx, group[k]->src[1]->src[0], src1, nullptr, group[k]->src[1], nullptr, pre);
+                            ggml_cuda_compute_forward_node(*cuda_ctx, group[k]);
+                        } else if (group[k]->src[0]->type == GGML_TYPE_F32) {
                             ggml_cuda_compute_forward_node(*cuda_ctx, group[k]);   // f32 matrix: its own path
                         } else {
                             ggml_cuda_mul_mat_vec_q(*cuda_ctx, group[k]->src[0], src1, nullptr, group[k], nullptr, pre);
@@ -5219,6 +5249,59 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
             }
             i += match.node_count - 1;
+        }
+    }
+
+    // halo-hybrid: hoist GEMVs that read the same activation next to each other so the grouped GEMV (see the
+    // MUL_MAT group in ggml_cuda_compute_forward_group) sees them as one run. Qwen3.8 puts a sigmoid between the
+    // DeltaNet beta and alpha projections, and the shared expert's gate/up/GLU (plus its 1-row gate) 37 nodes after
+    // the router that reads the same vector. Moving a node EARLIER is always dependency-safe when its inputs are a
+    // weight and the anchor's own activation; this runs before allocation, so lifetimes follow the new order.
+    // Decode only (activation of at most 4 columns). GGML_CUDA_NO_GEMV_HOIST=1 disables it.
+    static const bool no_hoist = getenv("GGML_CUDA_NO_GEMV_HOIST") != nullptr;
+    if (!disable_fusion && !no_hoist && !cuda_ctx->mmvq_group_disabled) {
+        auto is_weight_gemv = [&](const ggml_tensor * t) {
+            if (t->op != GGML_OP_MUL_MAT || !t->src[0] || !t->src[1] || t->type != GGML_TYPE_F32) return false;
+            const ggml_tensor * w = t->src[0], * x = t->src[1];
+            if (w->op != GGML_OP_NONE || !w->buffer || !ggml_backend_buft_is_cuda(w->buffer->buft)) return false;   // a stored weight, not a computed tensor
+            if (w->ne[2] != 1 || w->ne[3] != 1 || x->type != GGML_TYPE_F32 || x->ne[1] > 4 || x->ne[2] != 1 || x->ne[3] != 1) return false;
+            return ggml_is_quantized(w->type) || w->type == GGML_TYPE_F32;
+        };
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * anchor = cgraph->nodes[i];
+            if (!is_weight_gemv(anchor)) {
+                continue;
+            }
+            const ggml_tensor * x = anchor->src[1];
+            // end of the run already adjacent to the anchor (reshapes between GEMVs are free, as in the detector)
+            int last = i;
+            for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+                const ggml_tensor * t = cgraph->nodes[j];
+                if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE) continue;
+                if (is_weight_gemv(t) && t->src[1] == x) { last = j; continue; }
+                if (t->op == GGML_OP_GLU && j >= 2 && t->src[0] == cgraph->nodes[j-2] && t->src[1] == cgraph->nodes[j-1] && last == j-1) { last = j; continue; }
+                break;
+            }
+            // pull later GEMVs on the same activation up to just after the run
+            for (int j = last + 1; j < cgraph->n_nodes; ++j) {
+                ggml_tensor * t = cgraph->nodes[j];
+                if (!is_weight_gemv(t) || t->src[1] != x) {
+                    continue;
+                }
+                int len = 1;   // a (gate, up, GLU) triple moves together so the fused GLU path still sees it
+                if (j + 2 < cgraph->n_nodes && is_weight_gemv(cgraph->nodes[j+1]) && cgraph->nodes[j+1]->src[1] == x &&
+                    cgraph->nodes[j+2]->op == GGML_OP_GLU && cgraph->nodes[j+2]->src[0] == t && cgraph->nodes[j+2]->src[1] == cgraph->nodes[j+1]) {
+                    len = 3;
+                } else if (j + 1 < cgraph->n_nodes && cgraph->nodes[j+1]->op == GGML_OP_GLU && cgraph->nodes[j+1]->src[0] == t) {
+                    continue;   // half of a fused pair we did not recognise; leave it
+                }
+                // the GLU triple's own outputs must not be read by anything between last+1 and j (they are not: those
+                // nodes precede it in the original order), and its inputs are x and weights: safe to rotate up
+                std::rotate(cgraph->nodes + last + 1, cgraph->nodes + j, cgraph->nodes + j + len);
+                last += len;
+                j = last;
+            }
+            i = last;
         }
     }
 

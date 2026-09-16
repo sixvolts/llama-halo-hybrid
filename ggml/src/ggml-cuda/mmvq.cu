@@ -1460,6 +1460,9 @@ struct mmvq_group_args {
     int32_t      block_end[MMVQ_GROUP_MAX];        // exclusive prefix sums of the block counts
     int32_t      n;
     uint32_t     f32_mask;                         // members whose weights are f32: dot the f32 activation instead
+    uint32_t     glu_mask;                         // members that are a (gate, up) pair: vx is the gate, vx2 the up
+    const void * vx2[MMVQ_GROUP_MAX];
+    int32_t      glu_op;                           // ggml_glu_op of the pairs (all pairs in a group share it)
     const float * vy_f32;                          // the unquantized activation, for those members
     int32_t      stride_col_y_f32;
 };
@@ -1554,6 +1557,31 @@ mul_mat_vec_q_group(const mmvq_group_args a, const void * __restrict__ vy,
         tmp[j] = 0.0f;
     }
     const int kqs = vdr * (lane % (qi/vdr));
+    if (a.glu_mask & (1u << e)) {   // a (gate, up) pair: both rows in this wave, the GLU applied on the way out
+        float tmp2[ncols_dst];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp2[j] = 0.0f;
+        }
+        for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                tmp[j]  += vec_dot_q_cuda(a.vx[e],  &y[j*stride_col_y + kby], row*a.stride_row[e] + kbx, kqs);
+                tmp2[j] += vec_dot_q_cuda(a.vx2[e], &y[j*stride_col_y + kby], row*a.stride_row[e] + kbx, kqs);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp[j]  = warp_reduce_sum<warp_size>(tmp[j]);
+            tmp2[j] = warp_reduce_sum<warp_size>(tmp2[j]);
+            if (lane == 0) {
+                const float g = a.glu_op == GGML_GLU_OP_GEGLU ? ggml_cuda_op_gelu_single(tmp[j]) : ggml_cuda_op_silu_single(tmp[j]);
+                a.dst[e][j*a.stride_col_dst[e] + row] = g * tmp2[j];
+            }
+        }
+        return;
+    }
     for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
 #pragma unroll
@@ -1593,7 +1621,9 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
     }
     ggml_type type = GGML_TYPE_COUNT;              // the one quantized type of the group (f32 entries ride along)
     for (int k = 0; k < n; ++k) {
-        const ggml_type t = nodes[k]->src[0]->type;
+        // a GLU node stands for its (gate, up) pair, both quantized alike (the detector checked the shape)
+        const ggml_tensor * mm = nodes[k]->op == GGML_OP_GLU ? nodes[k]->src[0] : nodes[k];
+        const ggml_type t = mm->src[0]->type;
         if (t == GGML_TYPE_F32) {
             continue;
         }
@@ -1614,8 +1644,24 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
     a.n = n;
     int blocks = 0;
     for (int k = 0; k < n; ++k) {
-        const ggml_tensor * w = nodes[k]->src[0];
         const ggml_tensor * d = nodes[k];
+        const ggml_tensor * mm = d;
+        if (d->op == GGML_OP_GLU) {
+            const ggml_tensor * gate = d->src[0], * up = d->src[1];
+            const ggml_glu_op op = ggml_get_glu_op(d);
+            if ((op != GGML_GLU_OP_SWIGLU && op != GGML_GLU_OP_GEGLU) || ggml_get_op_params_i32(d, 1) != 0 ||
+                gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT || gate->src[1] != src1 || up->src[1] != src1 ||
+                up->src[0]->type != gate->src[0]->type || !ggml_is_contiguous(up->src[0]) ||
+                up->src[0]->ne[0] != gate->src[0]->ne[0] || up->src[0]->ne[1] != gate->src[0]->ne[1] ||
+                up->src[0]->nb[1] != gate->src[0]->nb[1] || (a.glu_mask && a.glu_op != (int32_t) op)) {
+                return false;
+            }
+            mm = gate;
+            a.glu_mask |= 1u << k;
+            a.glu_op    = (int32_t) op;
+            a.vx2[k]    = up->src[0]->data;
+        }
+        const ggml_tensor * w = mm->src[0];
         const bool is_f32 = w->type == GGML_TYPE_F32;
         if ((!is_f32 && w->type != type) || w->ne[0] != ne10 || !ggml_is_contiguous(w)) {
             return false;

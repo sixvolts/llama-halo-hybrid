@@ -3513,13 +3513,14 @@ struct test_mul_mat_shared : public test_case {
     const int64_t m, n, k;
     const int n_mat;        // how many matrices read the same activation
     const bool with_f32;    // append an f32 matrix, as the hyper-connection inject does
+    const bool moe_shape;   // f32 leader (the router), then a (gate, up, swiglu) pair, then a 1-row f32 gate
 
     std::string vars() override {
-        return VARS_TO_STR4(type, m, n, k) + "," + VARS_TO_STR2(n_mat, with_f32) + ",shared";
+        return VARS_TO_STR4(type, m, n, k) + "," + VARS_TO_STR3(n_mat, with_f32, moe_shape) + ",shared";
     }
 
-    test_mul_mat_shared(ggml_type type, int64_t m, int64_t n, int64_t k, int n_mat = 2, bool with_f32 = false)
-        : type(type), m(m), n(n), k(k), n_mat(n_mat), with_f32(with_f32) {}
+    test_mul_mat_shared(ggml_type type, int64_t m, int64_t n, int64_t k, int n_mat = 2, bool with_f32 = false, bool moe_shape = false)
+        : type(type), m(m), n(n), k(k), n_mat(n_mat), with_f32(with_f32), moe_shape(moe_shape) {}
 
     double max_nmse_err() override {
         return 5e-4;   // quantized GEMV against the CPU reference, as test_mul_mat
@@ -3531,6 +3532,22 @@ struct test_mul_mat_shared : public test_case {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_set_name(x, "x");
         ggml_tensor * out = nullptr;
+        if (moe_shape) {
+            ggml_tensor * wr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 512);
+            ggml_set_name(wr, "router");
+            out = ggml_mul_mat(ctx, wr, x);
+            ggml_tensor * wg = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_set_name(wg, "gate");
+            ggml_set_name(wu, "up");
+            ggml_tensor * glu = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, wg, x), ggml_mul_mat(ctx, wu, x));
+            out = ggml_concat(ctx, out, glu, 0);
+            ggml_tensor * ws = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+            ggml_set_name(ws, "shexp_gate");
+            out = ggml_concat(ctx, out, ggml_mul_mat(ctx, ws, x), 0);
+            ggml_set_name(out, "out");
+            return out;
+        }
         for (int i = 0; i < n_mat; ++i) {
             // different row counts, like a real group (qkv is 4x the gate, the inject is 4 rows of many thousands)
             const int64_t rows = m / (i + 1) >= 1 ? m / (i + 1) : 1;
@@ -9019,6 +9036,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 320, n, 2560, n_mat, true));
             test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 640, n, 2560, n_mat, true));
         }
+        test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 640, n, 2560, 1, false, true));   // router + shexp gate/up/GLU + gate
+        test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 640, n, 2560, 1, false, true));
     }
 
     // GLM-5.3-Flash shapes at prefill widths, correctness of the RDNA3.5 MMQ configs (TBO_GLM_EVAL=1)
