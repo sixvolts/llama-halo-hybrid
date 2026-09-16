@@ -4171,7 +4171,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // not in the launcher: a group the launcher refuses falls back to one launch per matrix and loses the
             // quantized merges too.
             if (w->type == GGML_TYPE_F32) {
-                static const int64_t f32_rows = getenv("GGML_CUDA_GEMV_GROUP_F32ROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_F32ROWS")) : INT64_MAX;
+                // on by default now that an f32 member gets a whole block per row (GGML_CUDA_GEMV_GROUP_F32ROWS=<n>
+                // admits only members with at least n rows; set it huge to exclude them)
+                static const int64_t f32_rows = getenv("GGML_CUDA_GEMV_GROUP_F32ROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_F32ROWS")) : 0;
                 return !leader && w->ne[0] == src1->ne[0] && w->ne[1] >= f32_rows;
             }
             return ggml_is_quantized(w->type) &&

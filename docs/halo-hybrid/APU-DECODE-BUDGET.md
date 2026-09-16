@@ -55,7 +55,7 @@ and it is a decision, not a kernel.
 `rocm-smi --showuse` sampled through decode reports the iGPU busy **82.9%** of the time; the driver's own
 `gpu_busy_percent` reports **99%** over the same kind of window. They count different things: the second says a
 wave is alive, the first is closer to the shader engines being fed. Read together with the byte floor, the loss is
-not empty time between kernels but the tails and ramps of ~2,400 kernels, during which waves exist and the memory
+not empty time between kernels but the tails and ramps of ~2,250 kernels, during which waves exist and the memory
 pipe is underfed. Clocks are not the cause: sclk sits at 2.9 GHz and mclk at its 1000 MHz maximum throughout.
 
 | per token | ms | share |
@@ -64,8 +64,40 @@ pipe is underfed. Clocks are not the cause: sclk sits at 2.9 GHz and mclk at its
 | kernel time beyond the bytes (DeltaNet, attention, norms, topk, hc mixing) | ~3.3 | 9% |
 | GPU idle between kernels | ~6.6 | 17% |
 
-With ~2,400 kernels per token (counted from a hardware-counter run: 2,397 dispatches in one decode pass) that idle is ~2.8 us per kernel boundary, which matches the boundary cost measured
+With 2,247 kernels per steady-state token (inventory below) that idle is ~2.9 us per kernel boundary, which matches the boundary cost measured
 directly for the persistent-decode work (a real graph node costs ~6 us against 1.74 us for an empty one).
+
+## The steady-state token, dispatch by dispatch
+
+A hardware-counter pass (`rocprofv3 --pmc FETCH_SIZE`, two tokens, prompt "Hi") gives the exact launch list. The
+first token of a sequence is **2,397** dispatches; every later token is **2,247**. The 150 extra are llama.cpp's
+`build_rs`: on the first token of a sequence it zeroes and gathers the recurrent state of every SSM layer
+(`scale_f32` + `k_get_rows_float` per layer, plus the conv-state equivalents). Steady-state decode never runs them,
+so the earlier "~2,400" over-counted by 7%.
+
+Steady-state, per token, with the bytes each class fetched (FETCH_SIZE calibrated on the LM head, which
+under-reports 1.93x on this GPU):
+
+| dispatches | class | MB | what |
+|---|---|---|---|
+| 437 | `mul_mat_vec_q` | 3,894 | trunk, expert and shared-expert projections |
+| 48 | `mul_mat_vec_q_group` | 2,038 | the grouped qkv / qkv+gate launches |
+| 300 | `mul_mat_vec_f` | 337 | router (48), hc inject (96), DeltaNet alpha/beta (72), indexer q/k (24, bf16), rest |
+| 36 | `gated_delta_net` | 111 | reads the recurrent state once |
+| 184 | `rms_norm_f32` | 10 | |
+| 385 | `k_scale_silu` 97, `k_hc_mix` 97, `k_hc_combine` 95, `k_mul_sigmoid` 96 | ~20 | hyper-connection mixing and the output gate |
+| 97 | `quantize_q8_1` | | the GLU outputs (expert and shared) |
+| 125 | `__amd_rocclr_copyBuffer*` | | CPY nodes lowered to blits: conv/KV/state bookkeeping |
+| 53 + 48 + 37 + 24 | `cpy_scalar`, `k_set_rows`, `concat_cont`, `fill` | | more bookkeeping |
+| 48 × 3 | `topk_moe`, `moe_weighted_reduction`, `rope_multi` | | |
+| 36 × 3 | `ssm_conv`, `l2_norm`, `k_gdn_gate` | | the DeltaNet chain around the recurrence |
+| 64 + 51 + 28 + 27 | `k_bin_bcast`, `unary_op_kernel`, `k_ew_chain`, `k_get_rows_float` | | |
+| 12 × 3 | `argsort`, `flash_attn_tile`, `flash_attn_combine` | | the 12 attention layers |
+| **2,247** | | **6,453** | floor 6,330 |
+
+The 785 GEMV-class dispatches carry **97%** of the bytes; the model fetches only 2% above its weight floor, so there
+is no traffic to remove. The other 1,462 launches carry 3% of the bytes and all of the boundary cost: at the measured
+4-5 us each that is the whole 6.6 ms. Which is why the program below is about removing launches, not bytes.
 
 ## What the idle is NOT (all measured, not argued)
 
@@ -103,7 +135,7 @@ quantizes once for). Per token, on this model:
 | attn_q + attn_k + attn_v (12 attention layers) | 12 | 24 |
 | everything else | n=1, no group | 0 |
 
-**60 of ~2,400 launches, under 1% of the token.** The remaining GEMVs each read a different activation: the
+**60 of ~2,250 launches, under 1% of the token.** The remaining GEMVs each read a different activation: the
 hyper-connection down-projections, the shared expert, ssm_out, attn_output and the LM head are genuinely serial.
 
 ## Fewer kernels: the two exchange rates
@@ -169,7 +201,7 @@ tensor together, with the alias checks ggml-alloc's buffer reuse demands), not a
 - *Wider chain fusion*: the hyper-connection kernels (`k_hc_mix`, `k_hc_combine`, `k_scale_silu`) already replace
   ~1,000 ggml nodes with 277 launches per token, and `rms_norm` already writes its q8_1 copy.
 
-The honest remaining program is the one halogen ran: get from ~2,400 kernels per token to ~500 by folding norms,
+The honest remaining program is the one halogen ran: get from ~2,250 kernels per token to ~500 by folding norms,
 gates, the router and sampling into the projection kernels, at ~5 us of boundary each. Nothing smaller moves this
 model, and the draft head (MTP) remains worth more than all of it, since it amortises the whole 6.33 GB over 2-3
 tokens.

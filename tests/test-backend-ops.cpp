@@ -3537,13 +3537,14 @@ struct test_mul_mat_shared : public test_case {
             ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, rows);
             ggml_set_name(w, (std::string("w") + std::to_string(i)).c_str());
             ggml_tensor * y = ggml_mul_mat(ctx, w, x);
-            ggml_tensor * s = ggml_sum_rows(ctx, y);          // collapse the differing row counts
-            out = out ? ggml_add(ctx, out, s) : s;
+            // every output element is compared: collapsing a member with sum_rows made the check a single
+            // scalar per column, whose NMSE blows up whenever the random dot products nearly cancel
+            out = out ? ggml_concat(ctx, out, y, 0) : y;
         }
         if (with_f32) {
             ggml_tensor * wf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 4);
             ggml_set_name(wf, "wf32");
-            out = ggml_add(ctx, out, ggml_sum_rows(ctx, ggml_mul_mat(ctx, wf, x)));
+            out = ggml_concat(ctx, out, ggml_mul_mat(ctx, wf, x), 0);
         }
         ggml_set_name(out, "out");
         return out;
