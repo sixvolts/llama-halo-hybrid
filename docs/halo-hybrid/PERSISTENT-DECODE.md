@@ -126,3 +126,50 @@ win of ~5 ms per step on GLM.
 Four to six weeks of work with measurable gates at each stage, all in `ggml-cuda` behind an env switch, no model
 changes. Stage 1 is cheap and decides whether the coherence and scheduling primitives behave on RDNA the way the
 microbenchmark says; nothing after it should start until that test passes at size.
+
+## Stage 1 result (2026-09-16): the primitives work, at one workgroup per WGP
+
+`docs/halo-hybrid/persist/pk_test.hip` (build: `hipcc --offload-arch=gfx1151 --offload-arch=gfx1201 -O2 -DPK_SLEEP=8`;
+run: `pk_test <floats per row> <rows per task> <layers> <blocks per CU, or -N blocks> <mode 1|2|3> <groups> <block size>`).
+A synthetic decode-shaped DAG (per layer: norm, four independent GEMV-like tasks, a fan-in sum; 6 tasks per layer),
+every task reading and writing activation-sized rows, checked against a CPU reference, run as one cooperative
+kernel and as one kernel per task in a replayed hipGraph. Results, best of 20, `tick` = per task:
+
+| DAG | gfx1151 persistent | gfx1151 hipGraph | gfx1201 persistent | gfx1201 hipGraph |
+|---|---|---|---|---|
+| 961 tasks, 32 rows x 16 KB (launch-bound) | 4.52 us | 5.20 us | 3.32 us | 6.43 us |
+| 241 tasks, 256 rows x 16 KB, 4 MB per task (bandwidth-bound) | 26.2 us | 31.6 us | 10.3 us | 19.3 us |
+| scheduling floor, no work | 1.84 us | (empty node 1.74) | 2.51 us | (empty node 3.36) |
+
+Checksums match the CPU reference exactly (max rel err 1e-6, f32 summation order) on both parts, so release/acquire
+at agent scope is sufficient for producer/consumer visibility inside one kernel on RDNA3.5 and RDNA4.
+
+What it took to get there, each one measured as a wall before it was fixed:
+
+1. **Every loop condition must be wave-uniform.** A `break` on a per-lane value (the abort flag read by all lanes,
+   a shared-memory broadcast the compiler cannot prove uniform) makes the structurizer turn the loop into exec-mask
+   bookkeeping and the schedule falls apart (-O0 worked, -O1/-O2 stalled). Read by lane 0, `readfirstlane`, then branch.
+2. **The wave is the wrong scheduling unit; the workgroup is right, and it should be the whole WGP.** Per-wave
+   claims cost one returning same-address atomic each (~45 ns serialized): 512 waves discovering an empty task cost
+   23 us. Per-block static striding (item = blockIdx, += gridDim) needs no claim at all; one retire atomic per block.
+3. **Pollers must be few.** Wake-up latency after a release grows with the number of polling blocks: 40 pollers see it
+   within 0.3-7 us, 160 pollers within 12-40 us, regardless of sleep length, two-level polling, or acquire vs relaxed
+   loads. One 1024-thread block per WGP gives full wave occupancy with one poller per WGP: that is the configuration
+   in the table. More blocks per WGP are always slower.
+4. **One cache line per task state** (padded to 128 B); adjacent tasks' atomics otherwise invalidate the polled word.
+5. **Items must be balanced against the grid.** 64 rows over 20 blocks is 4 rounds with a 20%-full tail and the APU
+   lost to the graph (36 vs 29 us); 256 rows is 13 rounds and it wins (26 vs 32). Real GEMVs have thousands of rows.
+6. The body needs its own memory-level parallelism (8 loads in flight per lane); a wave-per-row loop was
+   latency-bound at 14 us per 32 KB row.
+
+Not needed after all: release/acquire variants (fence-based vs builtin atomics measure the same), spin backoff length,
+group-level polling hierarchies (no effect once there is one poller per WGP).
+
+Operational: a timed-out foreground test is backgrounded by the tool harness, not killed; the first stalled run spun
+at full occupancy on the iGPU for 42 minutes and stalled production decode and every new process's first copy on
+that device. The test now carries a host-settable abort flag and a 10 s watchdog on its first launch.
+
+**Stage 2 go.** The scheduler is 1.2x (iGPU) to 1.9x (R9700) ahead of the graph on balanced bandwidth-bound tasks
+and 1.15x / 1.9x on the launch-bound DAG, with a 1.8-2.5 us floor per task. Next: MMVQ's dot4 body and the
+activation-ingesting variant as `(task, item)` device functions with the grouped weight table, rms_norm and the
+element-wise chain as prologue/epilogue tasks, measured on Qwen3.8 iGPU-only serial decode against 26.2 tok/s.
