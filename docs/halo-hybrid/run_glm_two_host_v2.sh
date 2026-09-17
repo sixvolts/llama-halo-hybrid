@@ -1,6 +1,24 @@
 #!/bin/bash
 # GLM-5.3-Flash UD-Q4_K_XL across gibson + mainframe, layout v2: FOUR devices, now that mainframe has an R9700.
-# UNTESTED - written 2026-09-17 before either host ran it. v1 (run_glm.sh) is untouched and remains production.
+#
+# ============================================================================================================
+# MEASURED 2026-09-17 AND REJECTED. v2 is less than HALF the speed of v1. Do not ship it; kept as a record.
+#
+#                      prefill 3K    decode 3K     prefill 13K   decode 13K    draft acc
+#   v1 (3 devices)      375 t/s      20.55 t/s      517 t/s      20.56 t/s     0.81 / 0.86
+#   v2 (4 devices RR=6) 265 t/s       9.25 t/s      302 t/s       8.81 t/s     0.82 / 0.81
+#
+# Identical prompts (probe_ctx.py 135,540), draft head on both, no diagnostic env, back to back, same build.
+# Decode is 55% down and prefill 30-40% down. The extra device on the remote side costs far more than the
+# layers it absorbs are worth: per token the path becomes gibson R9700 -> gibson APU -> RPC -> mainframe R9700
+# -> mainframe APU, adding a crossing on the side whose host link is Gen3 x4 (3.6 GB/s measured, half of
+# gibson's), and mainframe's card can only hold 6 of ~22 remote layers anyway at 4.19 GiB/layer against
+# 31.86 GiB usable. "Minimise crossings, not bytes" was the right principle and v2 violates it by construction.
+#
+# The card is better left idle in this workload than used this way. If the second R9700 is to earn its place it
+# needs a layout that does not add a crossing - e.g. giving it whole contiguous work that ends on it, rather
+# than inserting it mid-chain.
+# ============================================================================================================
 #
 # Why this is not "mirror gibson on the far side":
 #   The obvious v2 is dense trunk + KV on each R9700 with routed experts on each APU. That is wrong here. Per
