@@ -10,13 +10,19 @@ shift $(( $# < 3 ? $# : 3 ))
 BIN=${BIN:-/home/sixvolts/llama.cpp/build-hip/bin}
 M=/home/sixvolts/models/glm-5.3-flash/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
 RPC=10.100.100.2:50052
+# WHICH remote device holds the remote share. Installing an R9700 in mainframe re-ordered its devices: the
+# rpc-server now exports ROCm0=R9700 (32.6 GiB) and ROCm1=APU (122.9 GiB), so the APU that used to be RPC0 is
+# RPC1. This layout wants the APU, and pointing it at RPC0 asks a 32 GiB card to hold the whole ~89 GiB remote
+# share - which is exactly how this broke on 2026-09-17, silently, because nothing else about the layout changed.
+# Set REMOTE_APU=RPC0 if mainframe is ever back to exporting its APU alone.
+REMOTE_APU=${REMOTE_APU:-RPC1}
 # layer il goes to the first device whose cumulative split exceeds il/(n_layer_all+1) = il/47, so a
 # denominator of 47 puts exactly layers 0..LOCAL-1 here (output lands remote and is pulled back by -ot)
 REMOTE=$((47 - LOCAL))
 # WHOLE_FROM=n: whole layers n..LOCAL-1 (attention, norms, hc mixers, KV cache, experts) on the APU instead of only
 # their routed experts, so a decode step alternates devices 3 times instead of ~45 (device order ROCm0,ROCm1,RPC0)
-DEVS="ROCm0,RPC0,ROCm1"; TS="$LOCAL,$REMOTE,0"
-if [ -n "${WHOLE_FROM:-}" ]; then DEVS="ROCm0,ROCm1,RPC0"; TS="$WHOLE_FROM,$((LOCAL-WHOLE_FROM)),$REMOTE"; fi
+DEVS="ROCm0,$REMOTE_APU,ROCm1"; TS="$LOCAL,$REMOTE,0"
+if [ -n "${WHOLE_FROM:-}" ]; then DEVS="ROCm0,ROCm1,$REMOTE_APU"; TS="$WHOLE_FROM,$((LOCAL-WHOLE_FROM)),$REMOTE"; fi
 # experts of layers 3..5 stay on the R9700 (3 x 4.4 GB), 6..LOCAL-1 go to the APU; the MTP draft block gets the rest
 APU_FROM=${APU_FROM:-6}
 APU_LAYERS="([${APU_FROM}-9]|1[0-9]|2[0-$((LOCAL-1 > 29 ? 9 : LOCAL-1-20))])"
@@ -28,7 +34,7 @@ LOCAL_LAYERS="([0-9]|1[0-9]|2[0-$((LOCAL-1-20))])"
 if [ "$LOCAL" -le 20 ]; then LOCAL_LAYERS="([0-9]|1[0-$((LOCAL-1-10))])"; fi
 REMOTE_LAYERS="(2[$((LOCAL-20))-9]|[34][0-9])"
 SSMA=""
-if [ "${PIN_SSM_A:-0}" = 1 ]; then SSMA="blk\.${LOCAL_LAYERS}\.ssm_a=ROCm0,blk\.${REMOTE_LAYERS}\.ssm_a=RPC0[$RPC],"; fi
+if [ "${PIN_SSM_A:-0}" = 1 ]; then SSMA="blk\.${LOCAL_LAYERS}\.ssm_a=ROCm0,blk\.${REMOTE_LAYERS}\.ssm_a=${REMOTE_APU}[$RPC],"; fi
 OT="blk\.${APU_LAYERS}\.ffn_(gate|up|down)_exps=ROCm1,${SSMA}^output\.weight$=ROCm0,^output_norm\.weight$=ROCm0,^token_embd\.weight$=CPU"
 LOG=/home/sixvolts/bench/glm/$TAG.log
 echo "layout: local layers 0..$((LOCAL-1)) (dev $DEVS ts $TS), APU experts $APU_LAYERS, ctx $CTX" | tee $LOG

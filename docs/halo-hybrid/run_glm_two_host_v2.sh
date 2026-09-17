@@ -88,7 +88,11 @@ if [ "${MCP:-1}" = 1 ] && [ -f /home/sixvolts/llama-tools/mcp-servers.json ]; th
   MCPARGS="--mcp-servers-config /home/sixvolts/llama-tools/mcp-servers.json"
 fi
 DRAFTARGS=""
-if [ "${DRAFT:-0}" = 1 ]; then DRAFTARGS="-md /home/sixvolts/models/glm-5.3-flash/MTP/GLM-5.3-Flash-mtp-UD-Q4_K_XL.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max ${NMAX:-2}"; fi
+# DRAFT_DEV: which device holds the MTP draft head. ROCm0 (the R9700) is the v1 default; ROCm1 (the APU) is
+# under investigation because blk.45.indexer.proj.weight (f32 [4096,32] x f32 [4096,n]) aborts with
+# "no kernel image is available for execution on the device" on gfx1201 in this layout.
+DRAFT_DEV=${DRAFT_DEV:-ROCm0}
+if [ "${DRAFT:-0}" = 1 ]; then DRAFTARGS="-md /home/sixvolts/models/glm-5.3-flash/MTP/GLM-5.3-Flash-mtp-UD-Q4_K_XL.gguf -devd $DRAFT_DEV -ngld 999 --spec-type draft-mtp --spec-draft-n-max ${NMAX:-2}"; fi
 exec env GGML_RPC_DEBUG=1 LLAMA_ASYNC_INPUTS=${LLAMA_ASYNC_INPUTS:-1} $BIN/llama-server -m "$M" --rpc $RPC $DRAFTARGS $MCPARGS \
   -dev "$DEVS" -ts $TS --fit off -fa on -ngl 999 \
   -c $CTX -b 4096 -ub 1024 --load-mode none -np 1 -t 16 \

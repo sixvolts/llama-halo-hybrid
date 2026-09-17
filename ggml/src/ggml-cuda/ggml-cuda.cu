@@ -1836,6 +1836,25 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // halo-hybrid: GGML_CUDA_TRACE_MM=<substring> logs the dispatch decision for matching weights. Added while
+    // chasing a "no kernel image" on gfx1201 that only appears with whole-layer placement plus a draft head.
+    {
+        static const char * trace = getenv("GGML_CUDA_TRACE_MM");
+        if (trace && src0->name[0] && strstr(src0->name, trace)) {
+            const int dev_now = ggml_cuda_get_device();
+            const int cc_now  = ggml_cuda_info().devices[dev_now].cc;
+            const int cc_ctx  = ggml_cuda_info().devices[ctx.device].cc;
+            GGML_LOG_ERROR("TRACE_MM %s: ctx.device=%d cc_ctx=%d | current_device=%d cc_now=%d | %s x %s "
+                           "ne00=%lld ne01=%lld ne11=%lld | mmf=%d mmvq=%d mmq=%d\n",
+                src0->name, ctx.device, cc_ctx, dev_now, cc_now,
+                ggml_type_name(src0->type), ggml_type_name(src1->type),
+                (long long) ne00, (long long) ne01, (long long) ne11,
+                (int) ggml_cuda_should_use_mmf(src0->type, cc_ctx, ggml_cuda_info().devices[ctx.device].warp_size, src0->ne, src0->nb, ne11, false),
+                (int) ggml_cuda_should_use_mmvq(src0->type, cc_ctx, ne11),
+                (int) ggml_cuda_should_use_mmq(src0->type, cc_ctx, ne11, 0));
+        }
+    }
+
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
@@ -2480,7 +2499,19 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
+        // halo-hybrid: name the tensor, not just the op. "MUL_MAT failed" on a 46-layer two-host graph is not
+        // actionable; the shapes and types are what identify which projection and which dispatch path.
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
+        GGML_LOG_ERROR("  dst  %s type=%s ne=[%lld %lld %lld %lld] buft=%s\n", dst->name, ggml_type_name(dst->type),
+            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+            dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "none");
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            const ggml_tensor * s = dst->src[si];
+            if (!s) continue;
+            GGML_LOG_ERROR("  src%d %s type=%s ne=[%lld %lld %lld %lld] nb0=%zu cont=%d buft=%s\n", si, s->name,
+                ggml_type_name(s->type), (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3],
+                s->nb[0], (int) ggml_is_contiguous(s), s->buffer ? ggml_backend_buffer_name(s->buffer) : "none");
+        }
         CUDA_CHECK(err);
     }
 

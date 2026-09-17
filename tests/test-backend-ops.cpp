@@ -9080,6 +9080,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
             }
         }
+        // halo-hybrid: the MTP draft head's lightning-indexer projection, f32 x f32 at the odd batch widths
+        // speculation produces. n=9 is what crashed layout v2 on gfx1201 with "no kernel image"; the suite's
+        // usual n values never generate it.
+        for (int64_t n_mtp : {1, 5, 8, 9, 10, 11, 12, 16, 17}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, n_mtp, 4096, {1, 1}, {1, 1}));
+        }
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1, 1, false, true));
         for (int64_t T : {17, 1024}) {
             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, T, 1, 1, false, true, 3));
