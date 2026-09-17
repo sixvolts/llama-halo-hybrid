@@ -4,7 +4,9 @@
 # R9700 and the rest on the APU), layers LOCAL..44 (+ the MTP block 45) on mainframe's APU, output head on the R9700.
 # usage: run_glm.sh <tag> [LOCAL=25] [ctx=131072] [extra llama-server args...]
 export PATH=/opt/rocm/bin:$PATH
-TAG=${1:-glm}; LOCAL=${2:-25}; CTX=${3:-131072}; shift 3 2>/dev/null
+TAG=${1:-glm}; LOCAL=${2:-25}; CTX=${3:-131072}
+# a failed `shift 3` shifts NOTHING, so with fewer than three args the tag leaks into llama-server's argv
+shift $(( $# < 3 ? $# : 3 ))
 BIN=${BIN:-/home/sixvolts/llama.cpp/build-hip/bin}
 M=/home/sixvolts/models/glm-5.3-flash/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
 RPC=10.100.100.2:50052

@@ -18,7 +18,13 @@
 #   inter-host 3.46 GB/s (Gen3 x4, does not retrain)
 # usage: run_glm_v2.sh <tag> [LOCAL=25] [ctx=131072] [extra llama-server args...]
 export PATH=/opt/rocm/bin:$PATH
-TAG=${1:-glmv2}; LOCAL=${2:-25}; CTX=${3:-131072}; shift 3 2>/dev/null
+TAG=${1:-glmv2}; LOCAL=${2:-25}; CTX=${3:-131072}
+# a failed `shift 3` shifts NOTHING, so with fewer than three arguments the tag leaks into llama-server's argv
+# (measured: `run_glm_two_host_v2.sh mytag` passed a stray positional "mytag" to the server). v1 has the same
+# line and is only safe because chain_hb.sh always passes three.
+shift $(( $# < 3 ? $# : 3 ))
+# gibson-side paths: this script drives BOTH hosts from gibson. On mainframe the binaries are elsewhere
+# (~/llama-halo-hybrid/build-rpc/bin), so override BIN if you ever run it from there.
 BIN=${BIN:-/home/sixvolts/llama.cpp/build-hip/bin}
 M=/home/sixvolts/models/glm-5.3-flash/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
 RPC=10.100.100.2:50052
@@ -33,10 +39,29 @@ RR=${RR:-12}
 DEVS="ROCm0,ROCm1,RPC0,RPC1"
 TS="$WHOLE_FROM,$((LOCAL-WHOLE_FROM)),$RR,$((REMOTE-RR))"
 # ssm_a: the loader maps it to GGML_OP_SSM_SCAN, the HIP backend declines that shape, so it lands on the host and
-# every split re-copies it with a device sync. Pin it next to its layer (v1 keeps this behind PIN_SSM_A=1).
+# every split re-copies it with a device sync. Pin it next to its layer. PIN_SSM_A defaults to 0 to match v1's
+# production behaviour, but v2 has four devices and therefore more splits than v1, so this is MORE likely to pay
+# here, not less - worth trying 1 early. Explicit layer alternations rather than character-class ranges, because
+# ranges like 2[0-4] are what make these regexes wrong when a boundary moves.
 # -ot device names: plain RPCn in -dev, bracketed RPCn[endpoint] in -ot (ggml-rpc names devices at two sites and
 # they disagree: line 1121 bracketed, line 2375 bare).
-OT="^output\.weight$=ROCm0,^output_norm\.weight$=ROCm0,^token_embd\.weight$=CPU"
+range_re() {   # range_re lo hi -> (lo|lo+1|...|hi), empty string if the range is empty
+    local lo=$1 hi=$2 out="" i
+    [ "$lo" -gt "$hi" ] && return 0
+    for ((i=lo; i<=hi; i++)); do out="$out|$i"; done
+    printf '(%s)' "${out#|}"
+}
+LAST=45          # layers 0..44 plus the MTP block at 45
+SSMA=""
+if [ "${PIN_SSM_A:-0}" = 1 ]; then
+    for spec in "0:$((WHOLE_FROM-1)):ROCm0" "$WHOLE_FROM:$((LOCAL-1)):ROCm1" \
+                "$LOCAL:$((LOCAL+RR-1)):RPC0[$RPC]" "$((LOCAL+RR)):$LAST:RPC1[$RPC]"; do
+        lo=${spec%%:*}; rest=${spec#*:}; hi=${rest%%:*}; dev=${rest#*:}
+        re=$(range_re "$lo" "$hi")
+        [ -n "$re" ] && SSMA="${SSMA}blk\.${re}\.ssm_a=${dev},"
+    done
+fi
+OT="${SSMA}^output\.weight$=ROCm0,^output_norm\.weight$=ROCm0,^token_embd\.weight$=CPU"
 LOG=/home/sixvolts/bench/glm/$TAG.log
 echo "layout v2: gibson 0..$((WHOLE_FROM-1)) R9700 | $WHOLE_FROM..$((LOCAL-1)) APU | mainframe $LOCAL..$((LOCAL+RR-1)) R9700 | $((LOCAL+RR))..45 APU" | tee $LOG
 echo "  dev $DEVS  ts $TS  ctx $CTX" | tee -a $LOG
