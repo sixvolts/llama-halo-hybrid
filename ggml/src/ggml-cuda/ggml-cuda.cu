@@ -61,6 +61,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/hc.cuh"
+#include "ggml-cuda/f32act.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
@@ -1911,6 +1912,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (GGML_CUDA_CC_IS_AMD(cc) && ggml_cuda_mul_mat_f32_tile(ctx, src0, src1, dst)) {
         return;
     }
+    // halo-hybrid: a short-K q8_0 GEMV whose activation has no q8_1 side copy dots the f32 activation directly
+    //     (f32act.cu) instead of paying a quantize launch for it (GGML_CUDA_F32ACT_K=0 disables)
+    if (GGML_CUDA_CC_IS_AMD(cc) && ne11 <= 4 && !ggml_cuda_q8_side_find(ctx, src1) &&
+            ggml_cuda_mul_mat_vec_q8_f32act(ctx, src0, src1, dst, nullptr)) {
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -1975,6 +1982,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                // halo-hybrid: the expert down-projection at decode width eats the f32 GLU output (f32act.cu)
+                //     instead of quantizing the selected rows in a launch of their own
+                if (GGML_CUDA_CC_IS_AMD(cc) && ggml_cuda_mul_mat_id_vec_q8_f32act(ctx, src0, src1, ids, dst)) {
+                    return;
+                }
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
@@ -3645,6 +3657,23 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
         if (j < n && hc_unary(cgraph->nodes[j], GGML_UNARY_OP_SILU) && cgraph->nodes[j]->src[0] == node &&
                 hc_uses1(cgraph, i) && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
                 ggml_is_contiguous(cgraph->nodes[j]) && hc_views_belong(cgraph, i, j, { node })) {
+            // halo-hybrid: when the SILU's only reader is a short-K q8_0 GEMV, that GEMV applies scale+silu to the
+            // activation itself (f32act.cu) and neither the element-wise kernel nor a q8_1 copy is needed
+            const int k = hc_next(cgraph, j + 1);
+            if (k < n && cgraph->nodes[k]->op == GGML_OP_MUL_MAT && cgraph->nodes[k]->src[1] == cgraph->nodes[j] &&
+                    hc_uses1(cgraph, j) && hc_views_belong(cgraph, j, k, { cgraph->nodes[j] })) {
+                ggml_cuda_f32act_prologue pro;
+                memcpy(&pro.scale, (const float *) node->op_params + 0, sizeof(float));
+                memcpy(&pro.bias,  (const float *) node->op_params + 1, sizeof(float));
+                pro.silu = true;
+                // the GEMV reads the SCALE's input; the activation view keeps the SILU node's shape
+                ggml_tensor act = *cgraph->nodes[j];
+                act.data = node->src[0]->data;
+                for (int q = 0; q < 4; ++q) { act.nb[q] = node->src[0]->nb[q]; }
+                if (ggml_cuda_mul_mat_vec_q8_f32act(*cuda_ctx, cgraph->nodes[k]->src[0], &act, cgraph->nodes[k], &pro)) {
+                    return k - i;
+                }
+            }
             ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[j]);
             return j - i;
         }

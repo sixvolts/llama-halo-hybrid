@@ -3568,6 +3568,33 @@ struct test_mul_mat_shared : public test_case {
     }
 };
 
+// halo-hybrid: SCALE -> SILU -> MUL_MAT(q8_0) on a short activation: the GEMV applies the prologue itself (f32act.cu)
+struct test_scale_silu_mm : public test_case {
+    const ggml_type type;
+    const int64_t m, n, k;
+    const float scale, bias;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, m, n, k) + "," + VARS_TO_STR2(scale, bias) + ",scale_silu_mm";
+    }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+
+    test_scale_silu_mm(ggml_type type, int64_t m, int64_t n, int64_t k, float scale = 0.7f, float bias = 0.1f)
+        : type(type), m(m), n(n), k(k), scale(scale), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * a = ggml_silu(ctx, ggml_scale_bias(ctx, x, scale, bias));
+        ggml_tensor * out = ggml_mul_mat(ctx, w, a);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SCALE + GGML_UNARY_OP_TANH + GGML_OP_SCALE
 struct test_softcap : public test_case {
     const ggml_type type;
@@ -9035,6 +9062,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 320, n, 2560, n_mat));
             test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 320, n, 2560, n_mat, true));
             test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 640, n, 2560, n_mat, true));
+        }
+        for (int64_t k : {320, 640}) {
+            test_cases.emplace_back(new test_scale_silu_mm(GGML_TYPE_Q8_0, 10240, n, k));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n, k, {1, 1}, {1, 1}));   // f32-activation GEMV, no prologue
         }
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 640, n, 2560, 1, false, true));   // router + shexp gate/up/GLU + gate
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 640, n, 2560, 1, false, true));
