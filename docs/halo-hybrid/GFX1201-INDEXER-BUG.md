@@ -57,6 +57,66 @@ split schedule, not at any kernel. Next suspect: inter-split event/copy handling
 in the device list, where `00766acf5` on branch glm53-flash (gate split events on the async-copy capability) is
 not present on main in the same form.
 
+## The two hosts do not run the same validation logic (mainframe, 2026-09-17)
+
+Worth knowing before reasoning from "it works on one side and not the other", because it is a confound in every
+such comparison:
+
+**`uid` is never transmitted over the RPC wire.** The graph message is
+`| device | n_nodes | nodes[] | n_tensors | tensors[] |`; `uid` appears in ggml-rpc.cpp only on the client side.
+The server rebuilds the graph with `ggml_new_graph_custom` into a fresh per-call context, and ggml.c initialises
+`uid` to 0. So in `ggml_cuda_graph_update_required`:
+
+```c
+if (cgraph->uid != 0 && cgraph->uid == graph->uid) { /* reuse, skip revalidation */ return false; }
+```
+
+the fast path **can fire on the client and can never fire on the rpc-server**. The server always falls through to
+the `node_props` comparison. Identical workload, different validation path per host.
+
+**And `ggml_cuda_graph_get_key` is weak, most so on the server.** It seeds from `(uintptr_t) cgraph->nodes[0]` - a
+raw pointer into a context that is `ggml_init`-ed and freed on every graph_compute call on the server, so the
+allocator returns the same addresses repeatedly and the seed is close to a constant. It then mixes only
+`n_nodes` and the **first and last** node's `ne`; interior structure is never hashed. Two structurally different
+splits with equal n_nodes and equal endpoint shapes collide, returning a cached `ggml_cuda_graph` whose instance
+was captured from a different graph. On the server the `node_props` comparison is the only remaining guard.
+
+Both are latent bugs independent of this abort. NOTE the counter-evidence for this abort specifically: gibson
+crashes locally with `GGML_CUDA_DISABLE_GRAPHS=1` set on gibson (v2nograph, RR=0), and also with graphs enabled
+(v1whole, v1trace) - same tensor, same error - so gibson's own graph path is excluded for gibson-side failures.
+
+## The cleanest isolation (2026-09-17, graphs disabled on BOTH hosts, verified binaries)
+
+One trace, one run, the only variable is the device:
+
+```
+blk.7,11,15,19,23.indexer.proj  ctx.device=1 gfx1151  f32xf32 ne00=4096 ne01=32 ne11=9  mmf=0 mmvq=0 mmq=0  -> OK
+blk.45.indexer.proj             ctx.device=0 gfx1201  f32xf32 ne00=4096 ne01=32 ne11=9  mmf=0 mmvq=0 mmq=0  -> ABORT
+```
+
+Same shape, same batch width, same dispatch path (all gates decline -> `ggml_cuda_mul_mat_cublas` ->
+`cublasSgemm(OP_T, OP_N, 32, 9, 4096)`). It succeeds on gfx1151 and fails on gfx1201 **in the same process**, and
+succeeds on gfx1201 **standalone**. So the fault is in process state, not in the call, the shape, or the kernel.
+
+Standalone variations that all SUCCEED on gfx1201 and therefore do not reproduce it: plain sgemm at n in
+{1,2,9,16}; with `hipblasSetMathMode(HIPBLAS_TF32_TENSOR_OP_MATH)` (which returns NOT_SUPPORTED, status 7, on both
+devices); with the handle created on the other device and used across; with the APU's rocBLAS warmed first and
+with the R9700's warmed first. Graphs disabled on both hosts simultaneously does not help either - that was run
+with the drop-in live on the rpc-server and verified in its running process.
+
+`ne11` is not the discriminator: the surviving gfx1151 calls are at ne11=9 too, the same as the failing one.
+(`should_use_mmvf` returns `ne11 <= 8` for f32 on AMD, so at ne11=9 mmvf declines and the fall-through to cuBLAS
+is real; at ne11<=8 the op goes to `mul_mat_vec_f` instead and the trace's mmf/mmvq/mmq zeros would be
+misleading - TRACE_MM should print the mmvf result too, not yet added.)
+
+## Next steps, in order
+
+1. Catch it under rocgdb at the failing `cublasSgemm` and inspect the handle, its stream and its device binding
+   against a surviving gfx1151 call in the same process.
+2. Failing that, replicate llama.cpp's handle setup more faithfully standalone - multiple handles per device
+   (GGML_CUDA_MAX_STREAMS), the fork's virtual-device indirection, and the exact stream each call uses.
+3. `--spec-draft-n-max 1` to see whether the draft width at the failing site moves the op off this path at all.
+
 ## Workaround
 
 Do not combine `WHOLE_FROM` with the draft head. Production (`chain_hb.sh` -> no WHOLE_FROM) is unaffected and
