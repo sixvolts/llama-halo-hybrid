@@ -1664,6 +1664,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 ne23,
                 cu_compute_type,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        // halo-hybrid: same handled-rocBLAS-error clear as the other three GEMM entry points above. This is the
+        // pointer-array path, taken when the batch is not uniformly strided; it has the same lazy Tensile load
+        // underneath and would fail the same way. Note the CUDA_CHECK above is a check, not a clear, so a handled
+        // error left by THIS call would surface at the end of ggml_cuda_compute_forward, which is the original bug.
+        (void) cudaGetLastError();
     }
 
     // Convert output back to F32 if needed
