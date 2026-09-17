@@ -11,6 +11,9 @@
 # Crossings per token, by construction: ROCm0 -> ROCm1 -> RPC0 -> RPC1, three, plus the output-head pull-back.
 #
 # Device notes measured 2026-09-17 (see memory: mainframe-r9700, two-host-link-ceiling):
+# Per-device buffers actually observed at RR=6, ctx 131072 (gibson's view, all four devices):
+#   ROCm0 model 14551 MiB   ROCm1 model 83711 MiB   RPC0 model 26067 MiB   RPC1 model 61108 MiB
+#   compute 1577 / 1835 / 1545 / 1826 MiB, KV 2464 MiB total, load 210 s
 #   ROCm0 gibson R9700  30.5 GiB, host link Gen4 x4, 6.90 GB/s
 #   ROCm1 gibson APU   108   GiB, on package
 #   RPC0  mainframe R9700 32.6 GiB, host link Gen3 x4, 3.61 GB/s  <- half of gibson's; load is ~2x slower, expected
@@ -31,10 +34,18 @@ RPC=10.100.100.2:50052
 REMOTE=$((47 - LOCAL))                 # denominator 47 = n_layer_all + 1, as v1
 # gibson: WHOLE_FROM whole layers on the R9700, the rest of the local layers whole on the APU
 WHOLE_FROM=${WHOLE_FROM:-6}
-# mainframe: RR whole layers on its R9700, the rest whole on its APU. RR is a GUESS pending the first run --
-# GLM averages ~2.4 GB/layer, so 12 layers is ~29 GB against 32.6 GiB, before this layer range's KV. Read the
-# per-device buffer sizes llama-server prints on load and retune; too high fails to allocate, too low wastes the card.
-RR=${RR:-12}
+# mainframe: RR whole layers on its R9700, the rest whole on its APU.
+# MEASURED 2026-09-17, do not re-derive this by dividing the model size by the layer count (that was the original
+# error here, and it was off by ~1.8x): the cost is the routed experts and nothing else. From the GGUF, per MoE
+# layer, ffn_down_exps 1.568 + ffn_gate_exps 1.272 + ffn_up_exps 1.272 = **4.11 GiB of expert weights**, and the
+# whole model is 186.0 GiB over 46 blocks of which 3 are leading dense. KV is negligible by comparison: 2.4 GiB
+# TOTAL at ctx 131072 across every device (only 11 layers carry a cache, and it is K-only), so trading context
+# for layers buys nothing -- RR is bounded by weights.
+# Measured on mainframe's R9700 (31.86 GiB usable, NOT the 32624 MiB --list-devices advertises):
+#   RR=12  asked 50.90 GiB  -> cudaMalloc failed, no spill, clean refusal
+#   RR=6   model 25.46 GiB + KV 0.22 + compute 1.51 = 27.19 GiB committed, 4.67 GiB spare   <- default
+#   RR=7   projects to 31.50 GiB, i.e. 0.36 GiB of margin: fits on paper, not worth the risk untested
+RR=${RR:-6}
 [ "$RR" -gt "$REMOTE" ] && RR=$REMOTE
 DEVS="ROCm0,ROCm1,RPC0,RPC1"
 TS="$WHOLE_FROM,$((LOCAL-WHOLE_FROM)),$RR,$((REMOTE-RR))"
