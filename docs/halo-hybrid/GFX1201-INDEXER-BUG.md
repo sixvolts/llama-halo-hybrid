@@ -117,7 +117,67 @@ misleading - TRACE_MM should print the mmvf result too, not yet added.)
    (GGML_CUDA_MAX_STREAMS), the fork's virtual-device indirection, and the exact stream each call uses.
 3. `--spec-draft-n-max 1` to see whether the draft width at the failing site moves the op off this path at all.
 
-## Workaround
+## RESOLVED 2026-09-17 (52f240cf7) - the matmul was succeeding
+
+An `AMD_LOG_LEVEL=3` trace, read in order, shows the whole thing:
+
+```
+Error: Cannot Find Global Var Sizes
+Error: Cannot create kernels.
+hipModuleLoadData: Returned hipErrorNoBinaryForGpu        <- lazy Tensile load FAILS
+hipExtModuleLaunchKernel ... ShaderName : Cijk_Alik_Bljk_SB_MT128x64x12...
+hipExtModuleLaunchKernel: Returned hipSuccess             <- fallback runs, GEMM SUCCEEDS
+hipGetLastError ( )                                       <- ggml checks
+-> ggml_cuda_compute_forward: MUL_MAT failed
+```
+
+rocBLAS loads Tensile modules lazily. On gfx1201 a first-choice load returns hipErrorNoBinaryForGpu, rocBLAS
+HANDLES it by falling back to another solution, that kernel launches and returns success - and the unqualified
+`cudaGetLastError()` at the end of `ggml_cuda_compute_forward` picks up the surviving sticky error and aborts an
+op that computed correctly. gfx1201 hits it and gfx1151 does not because gfx1201's rocBLAS ships 56 Tensile files
+against gfx1151's 96, so first-choice loads miss and fall back far more often.
+
+Fix: `(void) cudaGetLastError();` immediately after each cuBLAS GEMM, where CUBLAS_CHECK has already validated the
+outcome. **Clearing at the start of `ggml_cuda_compute_forward` does NOT work** - measured, it aborts identically,
+because the load happens *during* the call. A blanket clear would also discard genuine async errors from the
+preceding op, which HIP reports at the next synchronising call.
+
+### Numbers in this document are NOT performance results
+
+The verification run measured prefill 330 t/s and decode 15.52 t/s, and **that is a correctness result only**. It
+ran with `HIP_LAUNCH_BLOCKING=1` (serialises every launch), `GGML_CUDA_TRACE_MM` (a log write per matching op) and
+`GGML_CUDA_DISABLE_GRAPHS=1`. Comparing it with production's 20.06/20.50 tok/s would read as a 24% regression and
+would be meaningless. The same applies to other figures recorded while chasing this: v1work 14.50 t/s and v1order
+18.73 t/s were also taken under diagnostic env. The only clean baseline in this investigation is **v1 at
+20.06 / 20.50 tok/s decode, 375 / 497 t/s prefill** at 3K / 13K prompts.
+
+### Still open
+
+Why the module load fails on gfx1201 at all. A fallback is a *different kernel* with different accumulation
+order, so if gfx1201 falls back on a meaningful fraction of GEMMs that is a difference in what the two cards
+compute, not only in how fast. Nothing measured so far compares numerics across them. Suggested shape: same
+prompt at temp 0 on the R9700 and on an APU, diffing **logits** rather than text - text can agree while numerics
+diverge, and divergence that only appears under sampling is the worst kind to find late.
+
+### How this was found, and the instrument lesson
+
+Nine call parameters were closed by measurement before the answer arrived: function (Sgemm vs Ex, settled by
+ne12/ne13), shape, batch width, leading dimension, pointer alignment, device, architecture, handle binding,
+VRAM pressure. None was causal. **When every call parameter is covered and nothing reproduces, the trigger is
+process state; change instrument rather than write repro number eight.**
+
+Two qualifiers on that rule, both learned the hard way here:
+- **A negative is only as strong as the instrument's reach.** Several standalone repros could not have reached
+  the mechanism - a fresh process has a different set of Tensile modules resident - so they produced negatives
+  indistinguishable from real ones. "Closed by measurement" needs the instrument named beside it.
+- **Summarise from the whole artifact, not the tail.** Two wrong summaries were published here from truncated
+  output (`tail -4` hid blk.3; a trimmed trace hid the `hipSuccess` line), and both were recovered only because
+  later evidence happened not to fit.
+
+The 56-vs-96 Tensile file gap was the first instinct of the session and was dropped after an unsorted `comm`
+produced contradictory output. It was the right signal, read wrongly.
+
+## Workaround (no longer needed, kept for the record)
 
 Do not combine `WHOLE_FROM` with the draft head. Production (`chain_hb.sh` -> no WHOLE_FROM) is unaffected and
 measures 20.06 / 20.50 tok/s decode at 3K / 13K prompts.
