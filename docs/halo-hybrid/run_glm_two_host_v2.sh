@@ -15,9 +15,15 @@
 # gibson's), and mainframe's card can only hold 6 of ~22 remote layers anyway at 4.19 GiB/layer against
 # 31.86 GiB usable. "Minimise crossings, not bytes" was the right principle and v2 violates it by construction.
 #
-# The card is better left idle in this workload than used this way. If the second R9700 is to earn its place it
-# needs a layout that does not add a crossing - e.g. giving it whole contiguous work that ends on it, rather
-# than inserting it mid-chain.
+# The card is better left idle in this workload than used this way. The constraint to design against:
+# **the R9700 must be a layout's ENDPOINT, not a waypoint.** RR is not the lever - do not spend an evening
+# tuning it; no value of RR fixes a layout that inserts a crossing.
+#
+# Post-mortem worth keeping, because the tidy version is wrong: this is not "known constraints were ignored".
+# The three facts arrived hours apart from different investigations, and two of them - the 4.19 GiB/layer
+# ceiling and mainframe's 3.6 GB/s host link - were measured AFTER this layout was drafted. Nothing forced a
+# re-check of the design once they landed. The fix is procedural: when a measurement lands that bears on a
+# drafted-but-unrun design, re-derive the design before running it.
 # ============================================================================================================
 #
 # Why this is not "mirror gibson on the far side":
