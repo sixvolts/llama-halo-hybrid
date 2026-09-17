@@ -43,8 +43,14 @@ WHOLE_FROM=${WHOLE_FROM:-6}
 # for layers buys nothing -- RR is bounded by weights.
 # Measured on mainframe's R9700 (31.86 GiB usable, NOT the 32624 MiB --list-devices advertises):
 #   RR=12  asked 50.90 GiB  -> cudaMalloc failed, no spill, clean refusal
-#   RR=6   model 25.46 GiB + KV 0.22 + compute 1.51 = 27.19 GiB committed, 4.67 GiB spare   <- default
-#   RR=7   projects to 31.50 GiB, i.e. 0.36 GiB of margin: fits on paper, not worth the risk untested
+#   RR=6   27.59 GiB PEAK committed, 4.27 GiB spare   <- default, the operating point
+#   RR=7   31.78 GiB peak against a 31.86 ceiling = 80 MiB of headroom: do not ship it
+# SAMPLE THE PEAK, NOT THE STEADY STATE. Weight residency at RR=6 settles at 25.74 GiB, but graph warmup
+# transiently adds ~1.85 GiB (measured on mainframe: peak 27.59, steady 25.74, gone after teardown). Sampling
+# after load looks like 6.1 GiB spare when the run actually had 4.3. A two-point fit over RR=6 and the failed
+# RR=12 gives slope 4.193 GiB/layer, intercept 0.58 GiB, which matches the GGUF's 4.11 GiB/layer of routed
+# experts; the warmup 1.85 GiB is a separate, roughly fixed cost on top and is what rules RR=7 out. That margin
+# is also what a draft head or a larger batch would eat, so keep it.
 RR=${RR:-6}
 [ "$RR" -gt "$REMOTE" ] && RR=$REMOTE
 DEVS="ROCm0,ROCm1,RPC0,RPC1"
