@@ -1568,6 +1568,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                     (const float *) alpha, (const float *) src0_ptr, s01,
                                            (const float *) src1_ptr, s11,
                     (const float *) beta,  (float       *)  dst_ptr, ne0));
+        // halo-hybrid: rocBLAS loads Tensile modules lazily, and on gfx1201 a first-choice load can return
+        // hipErrorNoBinaryForGpu ("Cannot Find Global Var Sizes / Cannot create kernels" in an AMD_LOG_LEVEL=3
+        // trace). rocBLAS HANDLES that by falling back to another solution, which launches and returns success -
+        // but HIP's sticky per-thread error survives, and the cudaGetLastError() at the end of
+        // ggml_cuda_compute_forward would attribute it to this op and abort a matmul that computed correctly.
+        // CUBLAS_CHECK above has already validated the real outcome, so discard the handled error here.
+        // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
+        // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
+        // (56 files against 96), so first-choice loads miss and fall back far more often.
+        // See docs/halo-hybrid/GFX1201-INDEXER-BUG.md.
+        (void) cudaGetLastError();
     } else if (ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1577,6 +1588,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                     beta,   dst_ptr, cu_data_type,   ne0,
                     cu_compute_type,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        // halo-hybrid: rocBLAS loads Tensile modules lazily, and on gfx1201 a first-choice load can return
+        // hipErrorNoBinaryForGpu ("Cannot Find Global Var Sizes / Cannot create kernels" in an AMD_LOG_LEVEL=3
+        // trace). rocBLAS HANDLES that by falling back to another solution, which launches and returns success -
+        // but HIP's sticky per-thread error survives, and the cudaGetLastError() at the end of
+        // ggml_cuda_compute_forward would attribute it to this op and abort a matmul that computed correctly.
+        // CUBLAS_CHECK above has already validated the real outcome, so discard the handled error here.
+        // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
+        // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
+        // (56 files against 96), so first-choice loads miss and fall back far more often.
+        // See docs/halo-hybrid/GFX1201-INDEXER-BUG.md.
+        (void) cudaGetLastError();
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
@@ -1593,6 +1615,17 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 ne12*ne13,
                 cu_compute_type,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        // halo-hybrid: rocBLAS loads Tensile modules lazily, and on gfx1201 a first-choice load can return
+        // hipErrorNoBinaryForGpu ("Cannot Find Global Var Sizes / Cannot create kernels" in an AMD_LOG_LEVEL=3
+        // trace). rocBLAS HANDLES that by falling back to another solution, which launches and returns success -
+        // but HIP's sticky per-thread error survives, and the cudaGetLastError() at the end of
+        // ggml_cuda_compute_forward would attribute it to this op and abort a matmul that computed correctly.
+        // CUBLAS_CHECK above has already validated the real outcome, so discard the handled error here.
+        // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
+        // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
+        // (56 files against 96), so first-choice loads miss and fall back far more often.
+        // See docs/halo-hybrid/GFX1201-INDEXER-BUG.md.
+        (void) cudaGetLastError();
     } else {
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
@@ -1845,10 +1878,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const int cc_now  = ggml_cuda_info().devices[dev_now].cc;
             const int cc_ctx  = ggml_cuda_info().devices[ctx.device].cc;
             GGML_LOG_ERROR("TRACE_MM %s: ctx.device=%d cc_ctx=%d | current_device=%d cc_now=%d | %s x %s "
-                           "ne00=%lld ne01=%lld ne11=%lld | mmf=%d mmvq=%d mmq=%d\n",
+                           "ne00=%lld ne01=%lld ne11=%lld | a0=%d a1=%d s01=%lld s11=%lld | mmf=%d mmvq=%d mmq=%d\n",
                 src0->name, ctx.device, cc_ctx, dev_now, cc_now,
                 ggml_type_name(src0->type), ggml_type_name(src1->type),
                 (long long) ne00, (long long) ne01, (long long) ne11,
+                (int) ((uintptr_t) src0->data % 256), (int) ((uintptr_t) src1->data % 256),
+                (long long) (src0->nb[1]/ggml_type_size(src0->type)), (long long) (src1->nb[1]/sizeof(float)),
                 (int) ggml_cuda_should_use_mmf(src0->type, cc_ctx, ggml_cuda_info().devices[ctx.device].warp_size, src0->ne, src0->nb, ne11, false),
                 (int) ggml_cuda_should_use_mmvq(src0->type, cc_ctx, ne11),
                 (int) ggml_cuda_should_use_mmq(src0->type, cc_ctx, ne11, 0));
@@ -2502,15 +2537,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         // halo-hybrid: name the tensor, not just the op. "MUL_MAT failed" on a 46-layer two-host graph is not
         // actionable; the shapes and types are what identify which projection and which dispatch path.
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
-        GGML_LOG_ERROR("  dst  %s type=%s ne=[%lld %lld %lld %lld] buft=%s\n", dst->name, ggml_type_name(dst->type),
+        GGML_LOG_ERROR("  dst  %s type=%s ne=[%lld %lld %lld %lld] nb=[%zu %zu] data=%p align=%d buft=%s\n",
+            dst->name, ggml_type_name(dst->type),
             (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+            dst->nb[0], dst->nb[1], dst->data, (int) ((uintptr_t) dst->data % 256),
             dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "none");
         for (int si = 0; si < GGML_MAX_SRC; ++si) {
             const ggml_tensor * s = dst->src[si];
             if (!s) continue;
-            GGML_LOG_ERROR("  src%d %s type=%s ne=[%lld %lld %lld %lld] nb0=%zu cont=%d buft=%s\n", si, s->name,
-                ggml_type_name(s->type), (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3],
-                s->nb[0], (int) ggml_is_contiguous(s), s->buffer ? ggml_backend_buffer_name(s->buffer) : "none");
+            GGML_LOG_ERROR("  src%d %s type=%s ne=[%lld %lld %lld %lld] nb=[%zu %zu %zu] cont=%d data=%p align=%d view=%d buft=%s\n",
+                si, s->name, ggml_type_name(s->type),
+                (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3],
+                s->nb[0], s->nb[1], s->nb[2], (int) ggml_is_contiguous(s),
+                s->data, (int) ((uintptr_t) s->data % 256), s->view_src ? 1 : 0,
+                s->buffer ? ggml_backend_buffer_name(s->buffer) : "none");
         }
         CUDA_CHECK(err);
     }
