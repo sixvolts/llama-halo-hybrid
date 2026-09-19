@@ -316,10 +316,13 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 1, 128,  64)
 
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 4,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 2, 128,  64)
+    // D=576/DV=512 (DeepSeek MLA) on RDNA2: occupancy 2-4 demands resident blocks that
+    // exceed the wave32 VGPR budget (query returns 0 -> abort). occupancy=1 fits; the
+    // heaviest 576 kernel is ~62 KB LDS (1 block/wg in 64 KB). RDNA3/4 use WMMA.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 1, 128,  64)
 
     return 0;
 }
@@ -1176,6 +1179,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     // query returns 0 -> abort). Cap to cols_per_block<=8 (with ncols2<=2 from
     // switch_ncols2) so only the light-LDS kernels are used. RDNA3/4 use WMMA.
     const bool rdna_d128 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 128;
+    // D=576/DV=512 (DeepSeek MLA) on RDNA2: cols_per_block=32 (kernel <512,8,4>) still
+    // fails the occupancy query at occ=1; cap to cols_per_block<=16 (the <=16 kernels fit).
+    const bool rdna576 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 576;
 
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
@@ -1195,7 +1201,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     if constexpr (DKQ <= 256)
 #endif // GGML_USE_HIP
     {
-        if (!rdna512 && !rdna_d128 && Q->ne[1] > 16/ncols2) {
+        if (!rdna512 && !rdna_d128 && !rdna576 && Q->ne[1] > 16/ncols2) {
             constexpr int cols_per_block = 32;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
