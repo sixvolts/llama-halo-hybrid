@@ -290,19 +290,27 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128, 16, 256, 5,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128, 32, 256, 3,  64,  64)
 
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 8,  32,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 6,  32, 256)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
+    // RDNA2 (gfx1030, no WMMA) reaches this tile path for D=256; the RDNA3/4-tuned
+    // occupancy 3-8 is infeasible on wave32 (occupancy query returns 0 -> abort at
+    // fattn-common GGML_ASSERT(max_blocks_per_sm > 0)). Drop occupancy to 1 (and the
+    // ncols=32 nbatch_fa 64->32) so one block always fits. RDNA3/4 use WMMA and never
+    // reach here. See also the ncols2<=2 cap for RDNA D=256 in switch_ncols2.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 1,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 1,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 1,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 1,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 1,  32, 128)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2, 128,  64)
 
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 4,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 2, 128,  64)
+    // D=512 (Gemma global attention) on RDNA2/gfx1030: DV=512 accumulators blow the
+    // wave32 VGPR budget at occupancy>1, so force occupancy=1 here; switch_ncols1 also
+    // caps cols_per_block<=8 for RDNA D=512 so the accumulator set fits.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 1, 128,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
@@ -1155,6 +1163,12 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
     constexpr size_t nbytes_shared = 0;
 
+    // RDNA2 (gfx1030, no WMMA) runs the D=512 global-attention tile kernel. At
+    // cols_per_block 16/32 the DV=512 accumulators exceed the wave32 VGPR budget
+    // (occupancy query returns 0 -> abort); the ncols2<=2 kernels that would help are
+    // not instantiated for DV=512, so force cols_per_block<=8 here. RDNA3/4 use WMMA.
+    const bool rdna512 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 512;
+
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
         if (Q->ne[1] > 32/ncols2) {
@@ -1173,7 +1187,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     if constexpr (DKQ <= 256)
 #endif // GGML_USE_HIP
     {
-        if (Q->ne[1] > 16/ncols2) {
+        if (!rdna512 && Q->ne[1] > 16/ncols2) {
             constexpr int cols_per_block = 32;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1185,7 +1199,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (ncols2 <= 16) {
-        if (Q->ne[1] > 8/ncols2) {
+        if (!rdna512 && Q->ne[1] > 8/ncols2) {
             constexpr int cols_per_block = 16;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1248,9 +1262,16 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
 
     // On NVIDIA (Pascal and older) the GQA optimizations seem to be detrimental in some cases.
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
-    const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    const int device_cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(device_cc);
     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // RDNA2 (gfx1030, no WMMA) runs the D=256 tile kernel; its ncols2>=4 variants carry
+    // 4+ DV=256 accumulators per thread and overflow the wave32 VGPR budget (occupancy
+    // query returns 0 -> abort). Cap ncols2<=2 for RDNA D=256 (2-head GQA chunks). GCN
+    // (wave64) fits the wider kernels; RDNA3/4 use WMMA and never reach this path.
+    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA(device_cc) && DKQ == 256;
 
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
@@ -1296,12 +1317,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
-        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+        if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 8 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
             return;
         }
 
-        if (use_gqa_opt && gqa_ratio % 4 == 0) {
+        if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 4 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
             return;
         }
