@@ -5,7 +5,7 @@ just being a beefy linux machine. I also grabbed an R9700 Pro AI card late last 
 it would be fun to compare the two. I ended up parting out the machine the R9700 was in for something else and 
 wondered what might be possible with the R9700 in the Strix Halo machine. On the Framework desktop board, there's 
 an x4 4.0 slot hanging out. I already had an x4 extension cable so I could mount a 25G card in it, but a GPU 
-would fit just fine too. I have my board in a Fractal Design case instead of the framework shell (bought the bare 
+would fit just fine too. I have my board in open air case instead of the framework shell (bought the bare 
 board), so I had plenty of room for the card and my power supply had the new 12V connector. Even with today's 
 pricing, a Framework Strix Halo 128GB board and an R9700 is about ~5k all in, so similar price to a DGX spark 
 but with a little more RAM (~160GB, obv with caveats), and it's a regular 16-core ryzen PC instead of the tacky gold box.
