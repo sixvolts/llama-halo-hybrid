@@ -1182,6 +1182,10 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     // D=576/DV=512 (DeepSeek MLA) on RDNA2: cols_per_block=32 (kernel <512,8,4>) still
     // fails the occupancy query at occ=1; cap to cols_per_block<=16 (the <=16 kernels fit).
     const bool rdna576 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 576;
+    // D=256 MHA/odd-GQA (ncols2==1) on RDNA2: cols_per_block=32 is the heavy <256,32,1>
+    // kernel (occupancy query returns 0). Cap to cols_per_block<=16; the GQA ncols2>=2
+    // path keeps the working cols_per_block=32 (<256,16,2>) tile. cols_per_block<=8.
+    const bool rdna256_mha = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 256 && ncols2 == 1;
 
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
@@ -1201,7 +1205,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     if constexpr (DKQ <= 256)
 #endif // GGML_USE_HIP
     {
-        if (!rdna512 && !rdna_d128 && !rdna576 && Q->ne[1] > 16/ncols2) {
+        if (!rdna512 && !rdna_d128 && !rdna576 && !rdna256_mha && Q->ne[1] > 16/ncols2) {
             constexpr int cols_per_block = 32;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1213,7 +1217,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (ncols2 <= 16) {
-        if (!rdna512 && !rdna_d128 && Q->ne[1] > 8/ncols2) {
+        if (!rdna512 && !rdna_d128 && !rdna256_mha && Q->ne[1] > 8/ncols2) {
             constexpr int cols_per_block = 16;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
