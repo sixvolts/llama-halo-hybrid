@@ -277,12 +277,16 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 32, 256, 2,  32,  56)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 64, 256, 2,  32,  56)
 
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 8,  32,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 8,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 8,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 3, 128, 128)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 3, 128,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 64, 256, 3,  64,  64)
+    // RDNA2 (gfx1030, wave32) also overflows at D=128: cols_per_block 16/32/64 with
+    // occupancy 3 (and the occ=8 small-col rows) exceed the per-block register budget
+    // so cudaOccupancyMaxActiveBlocksPerMultiprocessor returns 0 (abort). Drop occupancy
+    // to 1. Found via test-backend-ops FLASH_ATTN_EXT on V620; RDNA3/4 use WMMA.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 1,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 1, 128, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 1, 128,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 64, 256, 1,  64,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128,  2,  64, 8,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128,  4, 128, 6,  32,  64)
@@ -1168,10 +1172,14 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     // (occupancy query returns 0 -> abort); the ncols2<=2 kernels that would help are
     // not instantiated for DV=512, so force cols_per_block<=8 here. RDNA3/4 use WMMA.
     const bool rdna512 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 512;
+    // RDNA2 (gfx1030) D=128: cols_per_block 16/32/64 need 33-43 KB LDS (occupancy
+    // query returns 0 -> abort). Cap to cols_per_block<=8 (with ncols2<=2 from
+    // switch_ncols2) so only the light-LDS kernels are used. RDNA3/4 use WMMA.
+    const bool rdna_d128 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 128;
 
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
-        if (Q->ne[1] > 32/ncols2) {
+        if (!rdna_d128 && Q->ne[1] > 32/ncols2) {
             constexpr int cols_per_block = 64;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1187,7 +1195,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     if constexpr (DKQ <= 256)
 #endif // GGML_USE_HIP
     {
-        if (!rdna512 && Q->ne[1] > 16/ncols2) {
+        if (!rdna512 && !rdna_d128 && Q->ne[1] > 16/ncols2) {
             constexpr int cols_per_block = 32;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1199,7 +1207,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (ncols2 <= 16) {
-        if (!rdna512 && Q->ne[1] > 8/ncols2) {
+        if (!rdna512 && !rdna_d128 && Q->ne[1] > 8/ncols2) {
             constexpr int cols_per_block = 16;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -1271,7 +1279,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     // 4+ DV=256 accumulators per thread and overflow the wave32 VGPR budget (occupancy
     // query returns 0 -> abort). Cap ncols2<=2 for RDNA D=256 (2-head GQA chunks). GCN
     // (wave64) fits the wider kernels; RDNA3/4 use WMMA and never reach this path.
-    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA(device_cc) && DKQ == 256;
+    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA(device_cc) && (DKQ == 256 || DKQ == 128);
 
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
