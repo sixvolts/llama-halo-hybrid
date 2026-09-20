@@ -135,22 +135,13 @@ APU 16*(da+ea) = 40.36:
   -> the card is 1.70x SLOWER on dense and 6.7x FASTER on experts.
 Every placement, per layer: dense APU + experts CARD 0.962 (best); whole on CARD 1.442; whole on APU 2.522; dense
 CARD + experts APU 3.002 (the plan's placement: the WORST, 19% worse than not using the card).
-So the card's decode value is expert bandwidth ONLY, and the right placement is the INVERSE of the plan's: experts on
-the card, dense (and KV) on the APU. It is VRAM-capped: ~7 expert layers (4.08 GB each, ~28.6 GB + the server's
-compute buffer). Reachable lane: 7 x 0.962 + 14 x 2.522 = 42.0 ms vs v2c's 8.65 + 40.36 = 49.0, i.e. ~7 ms/step
-of compute saved, minus 14 local crossings at ~0.1 ms = ~5.6 ms net (~4.5%: 21.9 -> ~22.9 t/s). On today's
-transport those 14 crossings are 14 client round trips at ~2.1 ms = 29 ms, a net LOSS, which is why v2c (whole
-layers, 2 calls, one on RECOMPUTE) sits at the ceiling of what the current wire can extract from the card. The
-server sched is what makes the inverse placement reachable; that, plus the N-node shape, is its case.
-Prefill is different (compute-bound), but the card's dense prefill kernels are the weak ones (v3c 373 vs v2c 530
-t/s), so dense-on-card loses there too until the gfx1201 prefill kernels improve.
-What this does NOT change: the server-sched design is still the N-node architecture (local scheduling per node,
-one crossing per slice boundary, placement expressible per node); it just should not be sold as a two-node decode
-win. What moves decode toward 25 t/s on these numbers: kernel COUNT on the dense path on BOTH hosts (~60 kernels
-per layer; gibson 25 layers + mainframe 21 layers of ~0.7-1.1 ms each = ~35 ms/step of launch-bound work; hipfire
-runs ~15 launches per layer), gibson's 70 ms share (host loop ~9 ms, three draft decodes ~6 ms, 45 local splits ~10
-ms), and tokens per step (draft depth). Step 0.5 stays: cheap, and any multi-split layout (including the server
-sched's own composite graph) needs it.
+What the numbers mean, physics first: the card's DRAM floor for a layer's dense weights (170.7 MiB) is 0.28 ms
+against the APU's 0.69, so the intended placement - KV and dense on the card, experts on the APU - is the right one
+physically, by a margin of ~0.4 ms per layer. The card measuring 1.17 ms today is a SOFTWARE gap of ~0.9 ms per
+layer: small GEMVs that mmvq's wave-per-row mapping cannot drive to bandwidth on a 64-CU part (shexp 8.5 MB at
+35%, f_b/g_b 1 MB at 10%, hc_fn 0.4 MB at 2%) and ~40-50 tiny launches per layer. Both are fixable in the kernels
+and the graph, and both are general to this card. They are optimisation work that follows the design, not a reason
+to change it. The decision on the design is the user's; the plan below is that design, built end to end first.
 
 ## VRAM budget on the card (must be checked on paper before code)
 Measured today (client-split v3c, KM=5, ctx 131072, ub 1024, two prefill lanes): weights 24420 MiB; client compute
@@ -162,11 +153,14 @@ scratch is lazily backed; compute buffers allocate LAST at load, so an underesti
 surfaces as a load-time OOM three minutes in, not as a planning error (1425 MiB of headroom at KM=5 absorbs at most
 a 79% underestimate). Mainframe can read exact free VRAM under v2c and v3c before the code lands. Later recovery: a lazily-backed scratch buft so the client's 3.7 GB is not real memory.
 
-## Attribution (so the measured win is credited to the right cause)
-37 -> 2 calls recovers ~17 ms/token of v3c's penalty, i.e. it repairs v3c to roughly v1/v2c territory; it does NOT
-by itself beat v2c, which already pays 2 crossings. The case for the design is the PLACEMENT: KV and the dense
-parts of all 21 remote layers on the card instead of 6, worth the ~15 ms/step kernel arithmetic above. The A/B
-that proves it is v3 (server sched) vs v2c at equal KM, not v3 vs v3c.
+## Measured facts the build is judged against (Phase 0, 2026-09-20)
+- v3c step 146.5 ms: card 25.9 (dense x21 + experts x5), APU 29.3 (experts x16), inter-call gaps 17.6, gibson 72.7.
+- v2c step 123.4 ms: card 8.7 (6 whole layers), APU 40.4 (16 whole layers, on RECOMPUTE), round trips 4.35, gibson 69.9.
+- Per layer at n=3: APU dense 0.69 / experts 1.83; card dense 1.17 / experts 0.27; DRAM floors 0.28 (card) / 0.69 (APU).
+- Card dense composition (in situ, no profiler): ~0.4 ms GEMVs at 70-92% of bandwidth, ~0.2 ms small GEMVs at
+  2-35%, ~0.3-0.4 ms in ~40-50 tiny launches. Kernel work targets: small-GEMV mapping on gfx1201, launch fusion.
+- The V3 build removes the 37-call chain (~26 ms/step in v3c). Its first measurement is v3 vs v3c at KM=4/5; its
+  end state after the optimisation phase is judged against the physics: card dense toward 0.28 + launches.
 
 ## Risks, named
 - Server sched placing ops badly: `op_offload` / CPU fallback must be off; verify with GGML_SCHED_DEBUG on the
@@ -190,14 +184,29 @@ that proves it is v3 (server sched) vs v2c at equal KM, not v3 vs v3c.
   v2c (21.9) and the kernel bound (~24.5). Server-side GGML_SCHED_DEBUG once to confirm placement.
 - After step 2: same, expect ~24-25. Then a KM sweep and hybrid fill of the card's remaining VRAM.
 
-## Sequencing
-0. Phase 0 baseline (one v3 run, one v2c run; ~30 min).
-1. Client composite device + extra buft + output flagging + wire flag; server sched mode. TCP only. ~2 days.
-2. Stored graph + sched reuse (RECOMPUTE by id). ~1 day.
-3. KM sweep / hybrid fill on the card. Then the kernel items from the hipfire review (mmvq scheduling barrier,
-   scalar block headers, accumulator chains; router softmax+topk fusion; gfx12-native FA fragments), each A/B'd.
-4. Later: host loop (GPU-side sampling/acceptance), retained PM4 replay (hipfire Redline, +6-7% over hipGraph on
-   gfx1201 by their measurement).
+## Sequencing (the user's order: build V3 end to end, then optimise)
+Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
+  1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,
+      supports_buft true for all of them, scratch hint on the composite compute buffer, boundary-output flag from
+      the scheduler, GRAPH_COMPUTE mode flag (protocol minor bump, hello-gated). Default placement rule
+      (dense+KV -> device 0, `ffn_*_exps` -> device 1) with `-ot` as the override.
+  1b. Server: per-connection ggml_backend_sched over all local backends; unpin scratch intermediates; sched
+      compute; copy flagged outputs back. GGML_SCHED_DEBUG on the server once to prove no weight is ever copied.
+  1c. Gates: builds on both parts; greedy_ref.sh token identity (a828e28289899da6); v3 KM=4 3-rep in the harness
+      with mainframe's uprobes (expect 2 calls/token per node, the 17.6 + 9.5 ms of per-call cost gone).
+Phase 2 - end to end:
+  2a. Step 0.5 (multi-slot uid cache + uid in RECOMPUTE) so the composite graph rides RECOMPUTE like v2c's APU lane.
+  2b. Prefill through the server sched (ub 1024; the two-lane pipeline's single-remote-device assumptions listed
+      and fixed as needed), KM sweep within VRAM, production candidate decision.
+  2c. N-node readiness: the placement rule and buft naming exercised with a second endpoint on paper (or gibson's
+      own rpc-server as a fake third node) so nothing is two-node-shaped.
+Phase 3 - optimisation, on the V3 layout, judged against the physics (card dense floor 0.28 ms/layer):
+  3a. Small-GEMV mapping on gfx1201 (split-K / rows-per-wave for M or K under ~10 MB of weights; hc_fn, shexp,
+      f_b/g_b first) - general to the card.
+  3b. Launch fusion on the dense path (hc pre/comb/post chains, quantize-once for wo/down/f_b/g_b, KDA concats,
+      router softmax+topk) - both hosts.
+  3c. Gibson's share (host loop, draft decodes, local split gaps) and tokens per step (draft depth).
+  3d. hipfire-derived micro-optimisations in mmvq (scheduling barrier, scalar block headers, accumulator chains).
 
 Naming from here: "v3" = this (server sched, intended placement, N-node shape). The old client-split layout is
 "v3c"; what runs today is v2c.
