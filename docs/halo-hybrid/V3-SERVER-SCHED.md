@@ -69,8 +69,11 @@ at the right layer; it removes the remaining per-token marshalling (~1 ms wire +
 Measured today (client-split v3c, KM=5, ctx 131072, ub 1024, two prefill lanes): weights 24420 MiB; client compute
 buffer 1833 MiB x 2 lanes = 3666; KV 640 + 480 + RS 193 = 1313. New: the server sched's own compute buffer on
 device 0, ~1800 MiB (one, sized for the largest graph). Total ~31.2 GB of 32.6 -> too tight at KM=5; KM=4 frees
-~4.1 GB (one whole expert layer) and is the step-1 configuration. Mainframe can read exact free VRAM under v2c and
-v3c before the code lands. Later recovery: a lazily-backed scratch buft so the client's 3.7 GB is not real memory.
+~4.1 GB (one whole expert layer) and is the step-1 configuration. The client-scratch term scales with ub: ub=2048 doubles it to 7332 and overruns
+the card by ~2.2 GB at KM=5 (and leaves 5.6% at KM=4), so under this design -ub is not a prefill knob until the
+scratch is lazily backed; compute buffers allocate LAST at load, so an underestimate of the server-sched buffer
+surfaces as a load-time OOM three minutes in, not as a planning error (1425 MiB of headroom at KM=5 absorbs at most
+a 79% underestimate). Mainframe can read exact free VRAM under v2c and v3c before the code lands. Later recovery: a lazily-backed scratch buft so the client's 3.7 GB is not real memory.
 
 ## Attribution (so the measured win is credited to the right cause)
 37 -> 2 calls recovers ~17 ms/token of v3c's penalty, i.e. it repairs v3c to roughly v1/v2c territory; it does NOT
