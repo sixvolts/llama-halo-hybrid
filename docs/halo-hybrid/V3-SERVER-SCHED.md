@@ -127,20 +127,21 @@ KM is a ~0.8% knob, not a tuning axis.
 ## Phase 0 closed (v2c re-run with both probes, 32 steps, 101.7% accounted) - and what it says about placement
 Per v2c decode step: CALL dev0 (KDA-state split) 0.07 ms + CALL dev0 (6 whole layers) 8.65 ms + RECOMP dev1 (16
 whole layers) 40.36 ms + two client round trips 4.35 ms + gibson's share 69.92 ms = 123.35 vs 121.25 measured.
-Per-layer decode costs at n=3 that follow from the two budgets:
-  APU whole layer (dense+experts)      2.52 ms   (40.36 / 16)
-  APU experts only                     1.83 ms   (v3c dev1 29.34 / 16)
-  APU dense only                       0.69 ms   (2.52 - 1.83)
-  card whole layer                     1.44 ms   (8.65 / 6)
-  card dense only                     ~1.06 ms   (v3c: 25.90 = 21 x dense + 5 x expert, expert ~0.73)
-  card experts only                   ~0.73 ms
-So at decode shape the card is SLOWER than the APU on the dense part of a layer (1.06 vs 0.69: launch-bound work at
-1.65x the per-boundary cost) and 2.5x faster on the experts. Splitting a layer as "dense on card, experts on APU"
-costs 1.06 + 1.83 = 2.89 ms + crossings, MORE than the whole layer on the APU (2.52). The intended placement
-therefore LOSES at decode on kernel grounds alone, independent of the transport; what the card is worth at decode is
-its expert bandwidth, and that is VRAM-capped: ~7 expert layers x 4.08 GB, ~1.1 ms/step each, ~7-8 ms/step total
-whether as whole layers (v2c, 6 x 1.08 = 6.5 ms) or as experts-only with dense on the APU (7 x 1.1 = 7.7 ms minus
-~1.4 ms of local crossings). The two-node decode ceiling from mainframe's card is therefore ~v2c + 1-2 ms.
+Per-layer decode costs at n=3, solved EXACTLY from the two budgets (four equations, four unknowns, no assumed
+bandwidth ratio; mainframe's solve): v3c card 21*dc + 5*ec = 25.90, APU 16*ea = 29.34; v2c card 6*(dc+ec) = 8.65,
+APU 16*(da+ea) = 40.36:
+  APU   dense 0.689   experts 1.834   whole 2.522 ms/layer
+  CARD  dense 1.168   experts 0.273   whole 1.442 ms/layer
+  -> the card is 1.70x SLOWER on dense and 6.7x FASTER on experts.
+Every placement, per layer: dense APU + experts CARD 0.962 (best); whole on CARD 1.442; whole on APU 2.522; dense
+CARD + experts APU 3.002 (the plan's placement: the WORST, 19% worse than not using the card).
+So the card's decode value is expert bandwidth ONLY, and the right placement is the INVERSE of the plan's: experts on
+the card, dense (and KV) on the APU. It is VRAM-capped: ~7 expert layers (4.08 GB each, ~28.6 GB + the server's
+compute buffer). Reachable lane: 7 x 0.962 + 14 x 2.522 = 42.0 ms vs v2c's 8.65 + 40.36 = 49.0, i.e. ~7 ms/step
+of compute saved, minus 14 local crossings at ~0.1 ms = ~5.6 ms net (~4.5%: 21.9 -> ~22.9 t/s). On today's
+transport those 14 crossings are 14 client round trips at ~2.1 ms = 29 ms, a net LOSS, which is why v2c (whole
+layers, 2 calls, one on RECOMPUTE) sits at the ceiling of what the current wire can extract from the card. The
+server sched is what makes the inverse placement reachable; that, plus the N-node shape, is its case.
 Prefill is different (compute-bound), but the card's dense prefill kernels are the weak ones (v3c 373 vs v2c 530
 t/s), so dense-on-card loses there too until the gfx1201 prefill kernels improve.
 What this does NOT change: the server-sched design is still the N-node architecture (local scheduling per node,
