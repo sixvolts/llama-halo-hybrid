@@ -22,6 +22,32 @@ Kernel-level expectation once the per-split cost is gone: dense+attention of 21 
 (APU) to ~0.4 ms (card) = ~15 ms/step, 5 expert layers at ~2.5x = ~3 ms -> step ~110 ms -> ~24.5 t/s at 2.7
 tokens/step. That is the ~25 expected from the second card.
 
+## Topology this must serve: N hybrid nodes, not two
+The head node (gibson) divides the model into contiguous per-node slices of layers. Each node is a hybrid pair
+(or more devices); it loads the KV and dense parts of its slice onto its dGPU and the routed experts onto its APU,
+and everything inside the slice runs locally between those devices through the node's own scheduler. Nodes
+coordinate only where the computation crosses a slice boundary, and those crossings are tuned to be as few as
+possible. For layer-sequential decode the minimum is one crossing per slice boundary per token (N for N remote
+nodes, plus the return to the head); prefill can pipeline ubatches through the slices.
+
+Consequences for the design below, so nothing is built two-node-shaped:
+- One composite device per ENDPOINT (`RPC<k>[host:port]`), any number of endpoints; each composite exposes one
+  extra buffer type per additional server device (`RPC<k>[..]#1`, `#2`, ...) so placement stays expressible with
+  `-ts` (layers per node) and `-ot` (expert regexes per node's APU buft). The head's own pair is just the local
+  backends. A default placement rule ("dense+KV -> device 0, `ffn_*_exps` -> device 1 for every remote node")
+  should exist so N nodes do not need N hand-written regexes; the regex path stays as the override.
+- Each rpc-server instance runs one ggml_backend_sched over ALL its local devices; a node with two dGPUs and an
+  APU needs nothing new. Stored-graph reuse (step 2) is per node.
+- Cross-node traffic per token is the hidden state at the slice boundary (n_tokens x n_embd x 4 B) in and out of
+  each node, plus the draft/verify interplay which stays on the head. No node talks to another node; the head
+  drives all of them, and each endpoint has its own dispatcher thread, so the N nodes' load phases and their
+  per-token graph sends overlap naturally.
+- Prefill: today's "rolling two-lane pipeline across the remote device" is written for ONE remote device
+  (remote-fetch, "last remote split", lane count 2). For N nodes it becomes a chain of N+1 stages with ubatches
+  in flight across them; this is a follow-on item after step 2, and the single-remote-device assumptions in
+  src/llama-context.cpp must be found and listed before then.
+- Per-node VRAM budgets (below) are per node; KM (expert layers on the card) becomes a per-node knob.
+
 ## Design
 One composite device per endpoint on the client; one ggml_backend_sched per connection on the server.
 
@@ -112,5 +138,5 @@ that proves it is v3 (server sched) vs v2c at equal KM, not v3 vs v3c.
 4. Later: host loop (GPU-side sampling/acceptance), retained PM4 replay (hipfire Redline, +6-7% over hipGraph on
    gfx1201 by their measurement).
 
-Naming from here: "v3" = this (server sched, intended placement). The old client-split layout is "v3c"; what runs
-today is v2c.
+Naming from here: "v3" = this (server sched, intended placement, N-node shape). The old client-split layout is
+"v3c"; what runs today is v2c.
