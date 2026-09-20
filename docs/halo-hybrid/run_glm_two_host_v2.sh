@@ -24,6 +24,19 @@
 # cross-checked on v2c (1 crossing => ~all B). Both from the same unimplemented hook.
 # THE LEVER: implement cpy_tensor_async(_nowait) for the RPC backend. Falsify B=overlap first: v3 at KM=2
 # (same crossings, less R9700 compute) must shrink B. KM=4 vs KM=5 is within noise (free 4 GiB on mainframe).
+#
+# RPC ASYNC COPY (773e1047c + d52a65cea + 5375a20c3, proto 7.1): validated token-identical on a fixed prompt, then
+# A/B on the same binary, 3 reps, health-gated both ends:
+#                     3K pf  3K dec  13K pf  13K dec
+#   v1                  442   20.40    513    20.56
+#   v3 pre-fix (KM=5)   352   17.84    352    18.70
+#   v3 POST-fix (KM=5)  356   18.20    356    19.24      <- correct, but only +1% pf / +2-3% dec
+# The blocking COPY_TENSOR was ~8% of the A term (1.6 of ~19 ms per crossing per chunk). KM=2 falsifier showed B
+# (63%) is dense-prefill KERNEL efficiency on gfx1201 (APU beats the R9700 2.46x on identical fp32 SGEMM).
+# The remaining ~17 ms/crossing/chunk: GRAPH_RECOMPUTE is DEAD BY CONSTRUCTION - sched_split_graph assigns a
+# fresh uid to every split on every call (ggml-backend.cpp:1765), so the client's reuse test never passes and
+# every split re-serialises + the server re-deserialises its subgraph every ubatch. Fix #2 candidate: stable
+# split identity + per-identity stored graphs. MEASURE FIRST (server-side timing of deserialise vs compute).
 # ============================================================================================================
 #
 # Why this is not "mirror gibson on the far side":
