@@ -15,6 +15,15 @@
 # a confound; use run_glm_v2c.sh for a clean whole-layer test. Findings: decode cost is a FIXED per-device RPC
 # overhead (crossing count is irrelevant at 16 KB activations - v3's 20 crossings beat v2c's 1); prefill cost is
 # per-SYNC (crossings x n_ubatch chunks), NOT bandwidth (~5% of the gap). Next lever: raise -ub for v3.
+#
+# -ub A/B (KM=4, health-gated, numcheck matched): ub1024 -> 344 t/s @13K, ub2048 -> 366 (+6%), decode flat. So
+# chunking is a MINOR lever. Two-point fit of v3's 13K gap: A = 18.9 ms/crossing/chunk (37%) + B = 8.29 s
+# chunk-INDEPENDENT (63%). MECHANISM (ggml-rpc.cpp:1078 `.cpy_tensor_async = NULL`): every RPC0->RPC1 crossing
+# hits ggml_backend_tensor_copy_async's fallback = synchronize(src) + synchronize(dst) + blocking copy. A = the
+# three round-trips; B = the LOST OVERLAP from draining both devices (compute serialises instead of max()),
+# cross-checked on v2c (1 crossing => ~all B). Both from the same unimplemented hook.
+# THE LEVER: implement cpy_tensor_async(_nowait) for the RPC backend. Falsify B=overlap first: v3 at KM=2
+# (same crossings, less R9700 compute) must shrink B. KM=4 vs KM=5 is within noise (free 4 GiB on mainframe).
 # ============================================================================================================
 #
 # Why this is not "mirror gibson on the far side":
