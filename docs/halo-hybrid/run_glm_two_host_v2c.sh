@@ -19,6 +19,9 @@
 # host link is not in the decode path. UNTESTED until this loads and the A/B runs.
 # usage: run_glm_v3.sh <tag> [ctx=131072] [extra args...]
 export PATH=/opt/rocm/bin:$PATH
+# 2026-09-20: TCP by default. Mainframe's E810 RoCE engine faults (LCE_QP_CATASTROPHIC) under RDMA; TCP measured equal to RDMA
+# on v1 and v3 (health-gated 3-rep A/B). Set GGML_RPC_NO_RDMA= (empty) to try RDMA again.
+export GGML_RPC_NO_RDMA=${GGML_RPC_NO_RDMA-1}
 TAG=${1:-glmv3}; CTX=${2:-131072}; shift 2 2>/dev/null; shift $(( $# < 0 ? 0 : 0 ))
 BIN=${BIN:-/home/sixvolts/llama.cpp/build-hip/bin}
 M=/home/sixvolts/models/glm-5.3-flash/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf

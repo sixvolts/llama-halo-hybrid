@@ -25,5 +25,27 @@ a828e28289899da6. Neither draft acceptance nor a numerics check can see an RPC o
 
 ## What it bought
 +1% prefill, +2-3% decode on v3. Correct, small, kept. The blocking copy was ~8% of the per-crossing cost.
-The dominant cost is per-split graph re-serialisation: `GRAPH_RECOMPUTE` can never fire because
-`ggml_backend_sched_split_graph` regenerates every split's uid on every call. See run_glm_two_host_v2.sh.
+
+## Graph re-serialisation is NOT the residual (measured 2026-09-20, falsified)
+`GRAPH_RECOMPUTE` can never fire (`ggml_backend_sched_split_graph` regenerates every split's uid on every
+call), so every split re-sends its graph each ubatch. The candidate "fix #2" (stable split identity +
+per-identity stored graphs, a second wire change) was gated on the server-side deserialise cost being ~17 ms.
+Mainframe's rpc-server was instrumented locally (uncommitted, `GGML_RPC_TIMING=1`, per-call recv/deserialise/
+compute/reply on 5375a20c3, wire untouched) and run under v3 KM=5 ub1024, 3275 graph_compute calls on the
+R9700 device and 2889 on the APU device:
+
+| dev | avg nodes | avg tensors | avg bytes | ms recv | ms deserialise | ms compute | ms reply |
+|-----|-----------|-------------|-----------|---------|----------------|------------|----------|
+| RPC0 (R9700) | 169 | 1828 | 542 K | 0.228 | 0.195 | 5.72 | 0.020 |
+| RPC1 (APU)   |  21 |   28 |   8 K | 0.021 | 0.004 | 7.72 | 0.021 |
+
+- deserialise is 0.16-0.21 ms across the whole run while compute swings 1.4-12.2 ms (RPC0) / 1.9-15.9 ms (RPC1)
+  with the prefill/decode phases; the graph message is pure metadata (~300 B/tensor, constant), so it cannot
+  scale with ub. Marshalling + transport on the server is < 0.45 ms per call. Fix #2 is dead; do not build it.
+- recv is bandwidth-shaped: ~18 us fixed + payload at ~2.65 GB/s.
+- Where the ~19 ms per-crossing cost (from the -ub two-point fit) actually lives, given the server accounts for
+  ~4 ms of it at decode shape: the client side (serialize_graph, the single-worker dispatcher queue, the
+  scheduler's per-split synchronize) and the structural serialisation - the dispatcher waits for each
+  GRAPH_COMPUTE reply and the server is SINGLE-THREADED (`rpc_serve_client` runs inline from the accept loop,
+  one client at a time), so dev1's graph cannot start until dev0's compute has finished. The per-crossing cost
+  is largely "the other device's compute"; no transport change touches that. Next measurement is client-side.

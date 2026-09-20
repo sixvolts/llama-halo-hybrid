@@ -26,7 +26,10 @@ gib_health(){ # gibson R9700: temps (tolerate D3 EBUSY), AER, fault signatures �
   j=$(cat $HW/temp2_input 2>/dev/null); j=${j:+$((j/1000))C}; j=${j:-D3}
   aer="$(grep -cvE ' 0$' /sys/bus/pci/devices/0000:c4:00.0/aer_dev_correctable 2>/dev/null)/$(grep -cvE ' 0$' /sys/bus/pci/devices/0000:c4:00.0/aer_dev_fatal 2>/dev/null)"
   faults=$((sudo -n dmesg 2>/dev/null||dmesg) | grep -cE 'sync flood|device lost from bus|SMU is in hanged|GPU reset')
-  echo "junction=$j aer=$aer faults=$faults up=$(cut -d. -f1 /proc/uptime)s"
+  # E810 RoCE: abnormal async events (QP faults, present as "Remote RPC server crashed") + sender-side retransmits
+  nic_ae=$((sudo -n dmesg 2>/dev/null||dmesg) | grep -c 'abnormal ae_id')
+  retx=$(cat /sys/class/infiniband/rocep192s0/ports/1/hw_counters/RetransSegs 2>/dev/null)
+  echo "junction=$j aer=$aer faults=$faults nic_ae=$nic_ae retx=${retx:-?} up=$(cut -d. -f1 /proc/uptime)s"
 }
 wait_health(){ # $1 tag $2 log ; returns 1 on load failure
   for i in $(seq 1 900); do
@@ -47,7 +50,7 @@ stop
 for L in $LAYOUTS; do
   tag=p2_${L}${SUFFIX:-}; log=$G/$tag.log
   say ""; say "##### $L  $(date '+%T')"
-  say "  gibson before: $(gib_health)"; f0=$((sudo -n dmesg 2>/dev/null||dmesg) | grep -cE 'sync flood|device lost from bus|SMU is in hanged')
+  say "  gibson before: $(gib_health)"; f0=$((sudo -n dmesg 2>/dev/null||dmesg) | grep -cE 'sync flood|device lost from bus|SMU is in hanged'); a0=$((sudo -n dmesg 2>/dev/null||dmesg) | grep -c 'abnormal ae_id')
   /home/sixvolts/bench/drain_pool.sh >/dev/null
   launch $L $tag || continue
   if ! wait_health $L $log; then say "  $L: INVALID (load)"; stop; continue; fi
@@ -73,6 +76,7 @@ for L in $LAYOUTS; do
   f1=$((sudo -n dmesg 2>/dev/null||dmesg) | grep -cE 'sync flood|device lost from bus|SMU is in hanged')
   say "  gibson after:  $(gib_health)"
   [ "$f1" -gt "$f0" ] && say "  $L: INVALID — gibson fault signature appeared during run" 
+  a1=$((sudo -n dmesg 2>/dev/null||dmesg) | grep -c 'abnormal ae_id'); [ "$a1" -gt "$a0" ] && say "  $L: NIC — E810 RoCE async event during run (see dmesg 'abnormal ae_id')"
   grep -qa 'Remote RPC server crashed' $log && say "  $L: INVALID — remote RPC crashed (check mainframe card)"
 done
 say ""; say "=== SUMMARY (mean of reps; INVALID layouts excluded by inspection)"
