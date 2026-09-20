@@ -204,6 +204,13 @@ server busy 36%. RECOMPUTE fired 0 of 700 times: the composite receives TWO spli
 strictly alternate (303 M->T / 304 T->M / 0 M->M) through the client's one-slot uid cache, so every token is a fresh
 split on the server - step 0.5 (a 2+ slot cache, or merging the tiny split client-side) is the fix and its ceiling is
 measured next (mainframe's gc-decomp.bt: alloc vs compute vs rest per MODEL call; client sched trace for serialise).
+Step 0.5 SIZED AND DROPPED (2026-09-20 23:14, mainframe's nested uprobes on graph_compute / sched_alloc_graph /
+sched_graph_compute, probe-2 decode, 39 MODEL calls): MODEL total med 46.22 ms = alloc (reset+split+galloc of 3182
+nodes) 0.650 + compute 44.60 + rest (deserialise + boundary copies + sync) 0.82; TINY 0.097 total. Worst case for
+what RECOMPUTE could recover: alloc + all of rest + TINY + the client's 0.7 ms submit = ~2.3 ms of a 130 ms step
+(1.7%, ~+0.4 t/s) - below the harness noise floor (22.16 vs 22.34 between identical configs). Not worth building;
+the 64-entry HIP-graph cache cap goes with it (replay measured at ~0.36 ms). Where the time is: gibson 80.9 ms (62%),
+mainframe GPU compute 44.6 (34%, carrying the ~20 ms dense software gap of Phase 0), everything else 3.9.
 A/B with GGML_CUDA_DISABLE_GRAPHS=1 on the server: 396 / 22.34 and 494 / 21.91 vs 394 / 22.16 and 492 / 21.87 - a
 null: HIP-graph replay contributes nothing to the server's decode while every token re-splits (warmup never
 completes); the 64-entry per-device graph cache (common.cuh max_cuda_graphs) is moot until RECOMPUTE fires and must
@@ -220,7 +227,7 @@ Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1c. Gates: builds on both parts; greedy_ref.sh token identity (a828e28289899da6); v3 KM=4 3-rep in the harness
       with mainframe's uprobes (expect 2 calls/token per node, the 17.6 + 9.5 ms of per-call cost gone).
 Phase 2 - end to end:
-  2a. Step 0.5 (multi-slot uid cache + uid in RECOMPUTE) so the composite graph rides RECOMPUTE like v2c's APU lane.
+  2a. Step 0.5 - DROPPED after measurement (see above): the per-token re-split is 0.65 ms on the server.
   2b. Prefill through the server sched (ub 1024; the two-lane pipeline's single-remote-device assumptions listed
       and fixed as needed), KM sweep within VRAM, production candidate decision.
   2c. N-node readiness: the placement rule and buft naming exercised with a second endpoint on paper (or gibson's
