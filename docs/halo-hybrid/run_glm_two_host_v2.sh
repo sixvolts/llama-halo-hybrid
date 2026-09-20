@@ -2,28 +2,19 @@
 # GLM-5.3-Flash UD-Q4_K_XL across gibson + mainframe, layout v2: FOUR devices, now that mainframe has an R9700.
 #
 # ============================================================================================================
-# MEASURED 2026-09-17 AND REJECTED. v2 is less than HALF the speed of v1. Do not ship it; kept as a record.
+# 2026-09-17 "MEASURED AND REJECTED at half of v1" WAS INVALID: measured while mainframe's R9700 SMU was hung
+# (throttled clocks). The GECC-off crashes on gibson were ALSO config, not the card. Superseded by:
 #
-#                      prefill 3K    decode 3K     prefill 13K   decode 13K    draft acc
-#   v1 (3 devices)      375 t/s      20.55 t/s      517 t/s      20.56 t/s     0.81 / 0.86
-#   v2 (4 devices RR=6) 265 t/s       9.25 t/s      302 t/s       8.81 t/s     0.82 / 0.81
-#
-# Identical prompts (probe_ctx.py 135,540), draft head on both, no diagnostic env, back to back, same build.
-# Decode is 55% down and prefill 30-40% down. The extra device on the remote side costs far more than the
-# layers it absorbs are worth: per token the path becomes gibson R9700 -> gibson APU -> RPC -> mainframe R9700
-# -> mainframe APU, adding a crossing on the side whose host link is Gen3 x4 (3.6 GB/s measured, half of
-# gibson's), and mainframe's card can only hold 6 of ~22 remote layers anyway at 4.19 GiB/layer against
-# 31.86 GiB usable. "Minimise crossings, not bytes" was the right principle and v2 violates it by construction.
-#
-# The card is better left idle in this workload than used this way. The constraint to design against:
-# **the R9700 must be a layout's ENDPOINT, not a waypoint.** RR is not the lever - do not spend an evening
-# tuning it; no value of RR fixes a layout that inserts a crossing.
-#
-# Post-mortem worth keeping, because the tidy version is wrong: this is not "known constraints were ignored".
-# The three facts arrived hours apart from different investigations, and two of them - the 4.19 GiB/layer
-# ceiling and mainframe's 3.6 GB/s host link - were measured AFTER this layout was drafted. Nothing forced a
-# re-check of the design once they landed. The fix is procedural: when a measurement lands that bears on a
-# drafted-but-unrun design, re-derive the design before running it.
+# PHASE 2, 2026-09-20 - first VALID four-device numbers (health-gated both ends, numcheck bit-stable, no faults).
+# Settled means (reps 2-3):        3K pf  3K dec  13K pf  13K dec
+#   v1  (mainframe R9700 idle)      466   20.68    529    20.12
+#   v2c (this file's idea, CLEAN:    430   13.73    472    13.28   <- run_glm_v2c.sh: gibson identical to v1, mf WHOLE layers
+#        gibson unchanged)
+#   v3  (dense-split, run_glm_v3.sh) 352   17.84    352    18.70
+# Neither beats v1; v1 stays production. THE ORIGINAL v2 IN THIS FILE ALSO CHANGED GIBSON'S LAYOUT (WHOLE_FROM) -
+# a confound; use run_glm_v2c.sh for a clean whole-layer test. Findings: decode cost is a FIXED per-device RPC
+# overhead (crossing count is irrelevant at 16 KB activations - v3's 20 crossings beat v2c's 1); prefill cost is
+# per-SYNC (crossings x n_ubatch chunks), NOT bandwidth (~5% of the gap). Next lever: raise -ub for v3.
 # ============================================================================================================
 #
 # Why this is not "mirror gibson on the far side":
