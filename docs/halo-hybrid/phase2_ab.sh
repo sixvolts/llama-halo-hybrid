@@ -5,11 +5,11 @@
 # usage: phase2_ab.sh [layouts...]   default: v1 v2c v3     env: REMOTE_APU (v1, default RPC1), RR, KM, EXPECT_HEAD
 G=/home/sixvolts/bench/glm; LOG=$G/phase2${SUFFIX:-}.log; SRC=/home/sixvolts/llama.cpp
 LAYOUTS=${@:-v1 v2c v3}; export LLAMA_PREFILL_LANES=2 DRAFT=1
-REMOTE_APU=${REMOTE_APU:-RPC1}; RR=${RR:-6}; KM=${KM:-5}; EXPECT_HEAD=${EXPECT_HEAD:-5375a20c3}
+REMOTE_APU=${REMOTE_APU:-RPC1}; RR=${RR:-6}; KM=${KM:-5}; EXPECT_HEAD=${EXPECT_HEAD:-3c6600e04}
 : > $LOG; say(){ echo "$*" | tee -a $LOG; }
 say "=== PHASE 2  $(date '+%F %T')  layouts=[$LAYOUTS]  REMOTE_APU=$REMOTE_APU RR=$RR KM=$KM UB=${UB:-1024} SUFFIX=${SUFFIX:-}"
 # ---- artifact gate: refuse to measure a stale or wrong build
-head=$(git -C $SRC log --format=%h -1); stale=$(find $SRC/ggml/src $SRC/src -newer $SRC/build-hip/bin/libggml-hip.so.0 \( -name '*.cu' -o -name '*.cpp' -o -name '*.cuh' \) 2>/dev/null | wc -l)
+head=$(git -C $SRC log --format=%h -1); stale=$(find $SRC/ggml/src $SRC/src -newer $SRC/build-hip/bin/llama-server \( -name '*.cu' -o -name '*.cpp' -o -name '*.cuh' \) 2>/dev/null | wc -l)
 say "artifact: HEAD=$head stale_sources=$stale dirty=$(git -C $SRC status --short | grep -vc rocprof)"
 src_diff=$(git -C $SRC diff --name-only $EXPECT_HEAD HEAD 2>/dev/null | grep -cE '^(ggml/|src/|common/|tools/|examples/|CMakeLists|cmake/)')
 [ "$src_diff" -eq 0 ] || { say "ABORT: $src_diff compiled-source files differ between binary commit $EXPECT_HEAD and HEAD $head (rebuild BOTH hosts)"; exit 1; }

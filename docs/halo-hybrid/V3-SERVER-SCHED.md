@@ -184,6 +184,21 @@ a 79% underestimate). Mainframe can read exact free VRAM under v2c and v3c befor
   v2c (21.9) and the kernel bound (~24.5). Server-side GGML_SCHED_DEBUG once to confirm placement.
 - After step 2: same, expect ~24-25. Then a KM sweep and hybrid fill of the card's remaining VRAM.
 
+## Phase 1 result (2026-09-20 23:04, commits 13742baf4 + 3c6600e04, TCP, health-gated 3 reps)
+| layout, 12760-token prompt | prefill | decode | | 3148-token prompt | prefill | decode |
+|---|---|---|---|---|---|---|
+| v1 (card idle) | 523 | 20.99 | | | 446 | 20.17 |
+| v2c RR=6 (whole layers) | 530 | 21.89 | | | 445 | 21.58 |
+| v3c KM=5 (client-split) | 373 | 18.43 | | | 364 | 18.02 |
+| **v3s KM=4 (server sched, intended placement)** | **492** | **21.87** | | | **394** | **22.16** |
+Gates: greedy a828e28289899da6 (token-identical), placement proof 0 violations over 12,907 dump lines (65 splits per
+graph: 33 card / 32 APU / 0 CPU), VRAM peak 20660 MiB on the card, no NIC events. v3c -> v3s recovers the ~26 ms/step
+of per-call cost; the remaining gap to v2c on prefill is the card's dense prefill kernels, and the card's dense decode
+software gap (Phase 0: 1.17 vs floor 0.28 ms/layer) is untouched - both Phase 3. Two server-side lessons from the build:
+a fresh graph needs an explicit sched reset+alloc, a RECOMPUTE must reuse the plan (the sched mutates sources when it
+splits), and every non-node deserialised tensor must be a leaf whatever its op (GLM reaches KV/state through views).
+A small-model smoke test (docs/halo-hybrid/smoke_v3s.sh) proved the mechanics but not the GLM-size leaf case.
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,

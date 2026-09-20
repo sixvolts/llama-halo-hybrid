@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fixed-prompt greedy generation for wire-change correctness. usage: greedy_ref.sh <tag> <layout v1|v3> [KM]
+# Fixed-prompt greedy generation for wire-change correctness. usage: greedy_ref.sh <tag> <layout v1|v3|v3s> [KM]
 # Output goes to ~/bench/glm/greedy_<tag>.txt for diff against another build. Deterministic prompt, temp 0.
 G=/home/sixvolts/bench/glm; TAG=$1; L=$2; KM=${3:-4}
 exec 9>/run/lock/llamabench.lock; flock 9
@@ -7,7 +7,8 @@ pgrep -x llama-server | while read p; do kill $p; done; sleep 4
 /home/sixvolts/bench/drain_pool.sh >/dev/null
 export LLAMA_PREFILL_LANES=2 DRAFT=1
 case $L in v1) APU_FROM=5 REMOTE_APU=RPC1 $G/run_glm.sh g_$TAG 25 131072 -b 32768 9>&- & ;;
-           v3) KM=$KM $G/run_glm_v3.sh g_$TAG 131072 -b 32768 -ub 1024 9>&- & ;; esac
+           v3) KM=$KM $G/run_glm_v3.sh g_$TAG 131072 -b 32768 -ub 1024 9>&- & ;;
+           v3s) KM=$KM $G/run_glm_v3s.sh g_$TAG 131072 -b 32768 -ub 1024 9>&- & ;; esac
 for i in $(seq 1 900); do curl -s -m2 http://127.0.0.1:8081/health 2>/dev/null | grep -q '"status":"ok"' && break; sleep 1; done
 echo "loaded ${i}s" > $G/greedy_$TAG.txt
 P=$(python3 -c "print(('The ledger records that in each year the clerk noted the harvest, the tithe, the names of the newly born and the names of the dead. ' * 40) + 'Summarise the ledger in exactly three sentences.')")
