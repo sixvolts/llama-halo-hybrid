@@ -105,6 +105,25 @@ the deserialised graph and its sched allocation per (device set, id) and re-runs
 split or galloc (needs a sched entry point that skips alloc when the graph object is unchanged). This is fix #2
 at the right layer; it removes the remaining per-token marshalling (~1 ms wire + ~1 ms deser + ~1-2 ms split/alloc).
 
+## GRAPH_RECOMPUTE is alive, and v2c is already using it (Phase 0, 2026-09-20)
+Mainframe's uprobe on rpc_server::graph_compute saw, per v2c decode step, two dev0 calls (the 6-node KDA-state
+split, ~60 us, and the 940-node whole-layer split, ~8.4 ms) and NO dev1 call at all, while dev1 did show 1-second
+calls during prefill. The APU's decode graph is served by rpc_server::graph_recompute (a different function):
+llama's graph reuse (src/llama-context.cpp:1489) skips ggml_backend_sched_alloc_graph, so the splits and their uids
+are NOT regenerated for a reused graph, and the client's `last_graph_uid == cgraph->uid` check passes for any RPC
+device that receives exactly ONE split per token. v2c's APU is that case; v1's APU and v3c's two devices alternate
+2+ splits per token through a ONE-slot cache and never match. So "GRAPH_RECOMPUTE can never fire" (RPC-ASYNC-COPY.md,
+memory) was wrong: the cache is one slot deep, not the uids unstable. It also explains part of v2c beating v1: its
+APU lane pays no marshalling.
+Cheap consequence (step 0.5, ~60 lines, protocol minor bump): a per-device uid cache of K slots on the client and
+per-(device, uid) stored graphs on the server, with the uid in the RECOMPUTE request. Every split of every layout
+then becomes a RECOMPUTE after its first token: no serialise, no 542 KB send, no deserialise - the ~9.5 ms of
+marshalling and the serialise share of the 17.6 ms of gaps go, leaving the round trips (~37 x RTT + dispatcher wait,
+est. 4-7 ms). It does not replace the server sched (which removes the round trips and is the N-node shape); it is
+the same win at the wire level for ~1/10 of the work, and with it the server-sched design needs no step 2.
+KM ceiling: moving one expert layer APU -> card is worth ~1.1 ms/step and only one more fits (KM=6, 4080 MiB), so
+KM is a ~0.8% knob, not a tuning axis.
+
 ## VRAM budget on the card (must be checked on paper before code)
 Measured today (client-split v3c, KM=5, ctx 131072, ub 1024, two prefill lanes): weights 24420 MiB; client compute
 buffer 1833 MiB x 2 lanes = 3666; KV 640 + 480 + RS 193 = 1313. New: the server sched's own compute buffer on

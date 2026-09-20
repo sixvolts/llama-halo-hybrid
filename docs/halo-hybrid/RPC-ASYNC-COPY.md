@@ -27,8 +27,9 @@ a828e28289899da6. Neither draft acceptance nor a numerics check can see an RPC o
 +1% prefill, +2-3% decode on v3. Correct, small, kept. The blocking copy was ~8% of the per-crossing cost.
 
 ## Graph re-serialisation is NOT the residual (measured 2026-09-20, falsified)
-`GRAPH_RECOMPUTE` can never fire (`ggml_backend_sched_split_graph` regenerates every split's uid on every
-call), so every split re-sends its graph each ubatch. The candidate "fix #2" (stable split identity +
+`GRAPH_RECOMPUTE` fires only when a device receives exactly one split per token: uids ARE stable under llama's
+graph reuse (alloc_graph is skipped), but the client cache is one slot per device, so alternating splits never
+match (corrected 2026-09-20 by Phase 0 of V3-SERVER-SCHED.md; v2c's APU lane already runs on RECOMPUTE). The candidate "fix #2" (stable split identity +
 per-identity stored graphs, a second wire change) was gated on the server-side deserialise cost being ~17 ms.
 Mainframe's rpc-server was instrumented locally (uncommitted, `GGML_RPC_TIMING=1`, per-call recv/deserialise/
 compute/reply on 5375a20c3, wire untouched) and run under v3 KM=5 ub1024, 3275 graph_compute calls on the
