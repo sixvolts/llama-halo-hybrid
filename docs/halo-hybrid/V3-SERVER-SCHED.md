@@ -198,6 +198,16 @@ software gap (Phase 0: 1.17 vs floor 0.28 ms/layer) is untouched - both Phase 3.
 a fresh graph needs an explicit sched reset+alloc, a RECOMPUTE must reuse the plan (the sched mutates sources when it
 splits), and every non-node deserialised tensor must be a leaf whatever its op (GLM reaches KV/state through views).
 A small-model smoke test (docs/halo-hybrid/smoke_v3s.sh) proved the mechanics but not the GLM-size leaf case.
+Per-step budget of the gate (mainframe uprobes, 700 calls): MODEL graph 46.4 ms (p25-p75 45.3-47.6) + TINY KDA-state
+graph 0.1 ms + gaps 2.8 ms + gibson 80.9 ms = 130 ms at ~2.9 tokens/step (MTP n-max 2, acceptance 0.77) = 22 t/s;
+server busy 36%. RECOMPUTE fired 0 of 700 times: the composite receives TWO splits per token (MODEL + TINY) that
+strictly alternate (303 M->T / 304 T->M / 0 M->M) through the client's one-slot uid cache, so every token is a fresh
+split on the server - step 0.5 (a 2+ slot cache, or merging the tiny split client-side) is the fix and its ceiling is
+measured next (mainframe's gc-decomp.bt: alloc vs compute vs rest per MODEL call; client sched trace for serialise).
+A/B with GGML_CUDA_DISABLE_GRAPHS=1 on the server: 396 / 22.34 and 494 / 21.91 vs 394 / 22.16 and 492 / 21.87 - a
+null: HIP-graph replay contributes nothing to the server's decode while every token re-splits (warmup never
+completes); the 64-entry per-device graph cache (common.cuh max_cuda_graphs) is moot until RECOMPUTE fires and must
+be re-checked then (33 + 32 live keys per token per device against a 64-entry LRU).
 
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
