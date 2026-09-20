@@ -2830,6 +2830,10 @@ static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     auto mix = [&key](uint64_t v) {
         key = (key ^ v) * 0x100000001b3ull;
     };
+    auto mix_str = [&mix](const char * s) {
+        // tensor names live in char[GGML_MAX_NAME] and ggml_set_name always NUL-terminates
+        for (; *s; ++s) { mix((uint64_t) (unsigned char) *s); }
+    };
 
     mix(cgraph->n_nodes);
 
@@ -2837,6 +2841,18 @@ static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
         mix(cgraph->nodes[0]->ne[d]);
         mix(cgraph->nodes[cgraph->n_nodes - 1]->ne[d]);
     }
+
+    // halo-hybrid: the address of nodes[0] does not separate graphs on the rpc-server, which rebuilds every
+    // graph in one persistent per-device arena from offset zero. Structurally identical per-layer splits
+    // (the four-device GLM layouts send ~20 of them per token to one device) then share a key, every call
+    // sees the previous layer's node properties, and the device never leaves warmup: permanent direct
+    // execution instead of graph replay. Node names carry the layer index ("attn_norm-25"), so mixing the
+    // first and last node's op and name separates them. Local backends already had distinct addresses;
+    // for them this is a no-op.
+    mix((uint64_t) cgraph->nodes[0]->op);
+    mix((uint64_t) cgraph->nodes[cgraph->n_nodes - 1]->op);
+    mix_str(cgraph->nodes[0]->name);
+    mix_str(cgraph->nodes[cgraph->n_nodes - 1]->name);
 
     return key;
 }
