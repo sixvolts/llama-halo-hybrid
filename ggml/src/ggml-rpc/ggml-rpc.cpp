@@ -1208,6 +1208,7 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool copy_tensor_async(const rpc_msg_copy_tensor_req & request);
     ggml_backend_t backend_for_buffer(ggml_backend_buffer_t buffer) const;
+    void sync_backend_for(ggml_backend_buffer_t buffer) const;
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
@@ -1404,6 +1405,7 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
 
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 ", value: %u\n",
             __func__, (void *) tensor->buffer, tensor->data, request.offset, request.size, request.value);
+    sync_backend_for(tensor->buffer);
     ggml_backend_tensor_memset(tensor, request.value, request.offset, request.size);
     return true;
 }
@@ -1506,6 +1508,7 @@ bool rpc_server::set_tensor(const uint8_t * input, size_t input_size) {
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
+    sync_backend_for(tensor->buffer);
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
 }
@@ -1567,6 +1570,7 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
+    sync_backend_for(tensor->buffer);
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
     response.result = 1;
     return true;
@@ -1638,6 +1642,7 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
 
     response.resize(request.size, 0);
+    sync_backend_for(tensor->buffer);
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
     return true;
 }
@@ -1679,6 +1684,8 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     LOG_DBG("[%s] src->buffer: %p, dst->buffer: %p\n",
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
+    sync_backend_for(src->buffer);
+    sync_backend_for(dst->buffer);
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
     return true;
 }
@@ -1691,6 +1698,22 @@ ggml_backend_t rpc_server::backend_for_buffer(ggml_backend_buffer_t buffer) cons
         }
     }
     return nullptr;
+}
+
+// halo-hybrid: drain the device that owns `buffer` before any HOST-side access to its data.
+// Historically every reply was preceded by a blocking graph_compute, so all device work was complete and
+// get/set/memset could touch tensor memory unsynchronized. copy_tensor_async is the first command that
+// replies with device work still in flight, on the backend's NON-blocking stream - which cudaStreamPerThread
+// (used by the CUDA buffer get/set) does not synchronize with. A GET_TENSOR on a copy destination could
+// therefore read stale bytes with no error anywhere. Syncing the owning backend here makes the invariant
+// enforced instead of assumed: a pending copy is on src's stream (drained directly) and dst's stream carries
+// an event-wait on it (drained transitively). Cost is a no-op stream sync when the device is idle, which is
+// the common case because the server is serial. Raised in review by the mainframe session.
+void rpc_server::sync_backend_for(ggml_backend_buffer_t buffer) const {
+    ggml_backend_t b = backend_for_buffer(buffer);
+    if (b != nullptr) {
+        ggml_backend_synchronize(b);
+    }
 }
 
 // halo-hybrid: async same-server cross-device copy (see ggml_backend_rpc_cpy_tensor_async on the client).
