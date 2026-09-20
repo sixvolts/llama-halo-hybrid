@@ -1921,12 +1921,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
         sg.graph = graph;
         sg.sched_mode = true;
         sg.outs.clear();
-        // leafs: every deserialised tensor that is not a graph node
+        // leafs: every deserialised tensor that is not a node of this graph, WHATEVER its op. The client sends a
+        // split's nodes plus everything they read; a source that is not a node here was produced elsewhere (a
+        // weight, an input the client copied in, a view of the KV or recurrent-state cache, an intermediate of an
+        // earlier split) and arrives with its data already in place - the scheduler must see it as an assigned
+        // leaf or split_graph asserts on it (GLM's slice reaches KV and state through view ops; found on the
+        // first GLM-size graph after a small-model smoke test whose sources were all plain weights).
         std::unordered_set<ggml_tensor *> node_set(graph->nodes, graph->nodes + n_nodes);
         graph->n_leafs = 0;
         for (auto & kv : tensor_map) {
             ggml_tensor * t = kv.second;
-            if (t && t->op == GGML_OP_NONE && node_set.find(t) == node_set.end()) {
+            if (t && node_set.find(t) == node_set.end()) {
                 GGML_ASSERT(graph->n_leafs < graph->size);
                 graph->leafs[graph->n_leafs++] = t;
             }
@@ -1937,6 +1942,31 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
         // through views of the cache); views of unpinned tensors follow their source. Nodes the client will read
         // back (GGML_TENSOR_FLAG_BOUNDARY from its scheduler, or GGML_TENSOR_FLAG_OUTPUT) are unpinned too and
         // copied back to the client's address after compute, so the producer is never forced onto one device.
+        // tensors that live in NO server buffer (client-side CPU tensors that the client's scheduler assigned to
+        // this backend only as views/reshapes, whose real consumers read the client-made copies): their data is a
+        // client host pointer that means nothing here. Clear it so the sched allocates them on its CPU backend,
+        // and refuse loudly if a real op would consume one.
+        int n_foreign = 0;
+        for (auto & kv : tensor_map) {
+            ggml_tensor * t = kv.second;
+            if (t && t->buffer == nullptr && (t->view_src == nullptr || t->view_src->buffer == nullptr)) {
+                t->data = nullptr;
+                n_foreign++;
+            }
+        }
+        for (uint32_t i = 0; i < n_nodes; i++) {
+            ggml_tensor * t = graph->nodes[i];
+            if (t == nullptr || t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
+                continue;
+            }
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                ggml_tensor * src = t->src[j];
+                if (src && src->buffer == nullptr && (src->view_src == nullptr || src->view_src->buffer == nullptr) && node_set.find(src) == node_set.end()) {
+                    GGML_LOG_ERROR("[%s] node %s (%s) reads %s which lives in no server buffer\n", __func__, t->name, ggml_op_name(t->op), src->name);
+                    return false;
+                }
+            }
+        }
         std::unordered_set<ggml_tensor *> unpinned;
         for (uint32_t i = 0; i < n_nodes; i++) {
             ggml_tensor * t = graph->nodes[i];
@@ -2007,6 +2037,7 @@ bool rpc_server::run_sched_graph(stored_graph & sg, bool fresh) {
         };
         fprintf(stderr, "=== RPC SCHED DEBUG: %d nodes, %d leafs, %d splits, %zu boundary outputs ===\n", sg.graph->n_nodes, sg.graph->n_leafs,
                 ggml_backend_sched_get_n_splits(sched), sg.outs.size());
+        for (const boundary_out & o : sg.outs) { show("OUT ", o.tensor); }
         for (int i = 0; i < sg.graph->n_nodes && i < 4; i++) {
             const ggml_tensor * n = sg.graph->nodes[i];
             show("NODE", n);
