@@ -4988,6 +4988,68 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// halo-hybrid: GGML_CUDA_TIME_OPS=1 (use with GGML_CUDA_DISABLE_GRAPHS=1): hipEvent pairs around every launch of
+// the direct evaluation path, accumulated per device and per op class (op, and for matmuls the weight type and
+// shape), dumped to stderr every 200 graphs. Tracer-free in-situ kernel time: rocprofv3's per-dispatch completion
+// handling inflates sub-100 us kernels several-fold (a 50 us GEMV read 391 us under it on gfx1201), events on
+// the compute stream do not. Host cost ~2 us per node, so never use it for a throughput number.
+#if defined(GGML_USE_HIP)
+#define ggml_cuda_optimer_elapsed hipEventElapsedTime
+#define ggml_cuda_optimer_create  hipEventCreate
+#else
+#define ggml_cuda_optimer_elapsed cudaEventElapsedTime
+#define ggml_cuda_optimer_create  cudaEventCreate
+#endif
+struct ggml_cuda_optimer {
+    struct acc { uint64_t n = 0; double us = 0; };
+    std::map<std::string, acc> by_key;
+    std::vector<cudaEvent_t> ev;      // pairs
+    std::vector<std::string> keys;    // key per pair in this graph
+    size_t used = 0;
+    uint64_t graphs = 0;
+    static bool enabled() { static const bool e = getenv("GGML_CUDA_TIME_OPS") != nullptr; return e; }
+    cudaEvent_t next_event() {
+        if (used >= ev.size()) { cudaEvent_t e; CUDA_CHECK(ggml_cuda_optimer_create(&e)); ev.push_back(e); }
+        return ev[used++];
+    }
+    void begin(cudaStream_t st, const std::string & key) { keys.push_back(key); CUDA_CHECK(cudaEventRecord(next_event(), st)); }
+    void end(cudaStream_t st) { CUDA_CHECK(cudaEventRecord(next_event(), st)); }
+    void flush(int device) {
+        if (used == 0) return;
+        CUDA_CHECK(cudaEventSynchronize(ev[used - 1]));
+        for (size_t i = 0; i < keys.size(); i++) {
+            float ms = 0; CUDA_CHECK(ggml_cuda_optimer_elapsed(&ms, ev[2*i], ev[2*i + 1]));
+            acc & a = by_key[keys[i]]; a.n++; a.us += ms * 1000.0;
+        }
+        used = 0; keys.clear(); graphs++;
+        if (graphs % 200 == 0) {
+            std::vector<std::pair<std::string, acc>> v(by_key.begin(), by_key.end());
+            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
+            double tot = 0; uint64_t n = 0; for (auto & e : v) { tot += e.second.us; n += e.second.n; }
+            fprintf(stderr, "\n=== OPTIMER dev %d after %llu graphs: %llu launches, %.1f ms total (%.3f ms/graph)\n",
+                    device, (unsigned long long) graphs, (unsigned long long) n, tot / 1000.0, tot / 1000.0 / graphs);
+            for (size_t i = 0; i < v.size() && i < 40; i++) {
+                fprintf(stderr, "OPTIMER dev %d %-64s n=%8llu  %9.2f ms  mean %8.2f us\n", device, v[i].first.c_str(),
+                        (unsigned long long) v[i].second.n, v[i].second.us / 1000.0, v[i].second.us / v[i].second.n);
+            }
+            fflush(stderr);
+        }
+    }
+};
+static ggml_cuda_optimer & ggml_cuda_optimer_for(int device) { static ggml_cuda_optimer t[GGML_CUDA_MAX_DEVICES]; return t[device]; }
+static std::string ggml_cuda_optimer_key(const ggml_tensor * node, int n_fused) {
+    std::string k = ggml_op_name(node->op);
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        char b[96]; snprintf(b, sizeof(b), " %s %lldx%lld n=%lld", ggml_type_name(node->src[0]->type),
+                 (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1], (long long) node->src[1]->ne[1]);
+        k += b;
+    } else if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_CONCAT || node->op == GGML_OP_CPY) {
+        char b[64]; snprintf(b, sizeof(b), " %lldx%lld", (long long) node->ne[0], (long long) node->ne[1]); k += b;
+    }
+    if (n_fused > 0) { k += " +fused" + std::to_string(n_fused); }
+    return k;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5137,9 +5199,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                const bool optimer_on = ggml_cuda_optimer::enabled() && !use_cuda_graph;
+                if (optimer_on) { ggml_cuda_optimer_for(cuda_ctx->device).begin(cuda_ctx->stream(), ggml_cuda_optimer_key(node, 0)); }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (optimer_on) { auto & t = ggml_cuda_optimer_for(cuda_ctx->device); t.keys.back() = ggml_cuda_optimer_key(node, nodes_to_skip); t.end(cuda_ctx->stream()); }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5171,6 +5236,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (optimer_on) { ggml_cuda_optimer_for(cuda_ctx->device).end(cuda_ctx->stream()); }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5195,6 +5261,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
+            if (ggml_cuda_optimer::enabled()) { ggml_cuda_optimer_for(cuda_ctx->device).flush(cuda_ctx->device); }
         }
     }
 
