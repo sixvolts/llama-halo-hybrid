@@ -77,6 +77,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    RPC_CMD_COPY_TENSOR_ASYNC, // halo-hybrid: same-server cross-device copy, enqueued async on the server, empty reply
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -1068,6 +1069,35 @@ static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_eve
     GGML_UNUSED(event);
 }
 
+// halo-hybrid: async same-server cross-device copy.
+// Without this hook the scheduler's fallback for an RPC0->RPC1 input is synchronize(src) + synchronize(dst) + a
+// BLOCKING RPC_CMD_COPY_TENSOR round-trip whose server side does a synchronous D2D copy. On the four-device
+// GLM layout that measured ~19 ms per crossing per ubatch (37% of v3's prefill gap and most of its decode gap),
+// and because the dispatcher is one socket / one queue / one worker for every device behind an endpoint, the
+// blocking send is head-of-line blocking for BOTH devices. Here the request goes out via send_async with the
+// GRAPH_COMPUTE empty-reply convention, so nothing blocks and the shared queue never stalls. Ordering is safe:
+// the per-connection command stream delivers this after the graph that produced src, and the server enqueues
+// the copy on the device streams with an event chain (see rpc_server::copy_tensor_async).
+static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_rpc(backend_src) || !ggml_backend_is_rpc(backend_dst)) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_rpc(src->buffer) || !ggml_backend_buffer_is_rpc(dst->buffer)) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *) src->buffer->context;
+    ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *) dst->buffer->context;
+    if (src_ctx->dispatcher != dst_ctx->dispatcher) {
+        return false; // different servers: the sync path stages through the client
+    }
+    auto request = std::make_shared<rpc_msg_copy_tensor_req>();
+    request->src = serialize_tensor(src);
+    request->dst = serialize_tensor(dst);
+    static uint8_t copy_done; // empty reply target, same convention as graph_done
+    src_ctx->dispatcher->send_async(RPC_CMD_COPY_TENSOR_ASYNC, request, sizeof(*request), &copy_done, 0);
+    return true;
+}
+
 static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_name                = */ ggml_backend_rpc_name,
     /* .free                    = */ ggml_backend_rpc_free,
@@ -1075,7 +1105,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_rpc_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
@@ -1171,6 +1201,8 @@ public:
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+    bool copy_tensor_async(const rpc_msg_copy_tensor_req & request);
+    ggml_backend_t backend_for_buffer(ggml_backend_buffer_t buffer) const;
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
@@ -1646,6 +1678,57 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     return true;
 }
 
+ggml_backend_t rpc_server::backend_for_buffer(ggml_backend_buffer_t buffer) const {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+    for (ggml_backend_t b : backends) {
+        if (ggml_backend_get_device(b) == dev) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
+// halo-hybrid: async same-server cross-device copy (see ggml_backend_rpc_cpy_tensor_async on the client).
+// Both endpoints of the copy are LOCAL backends here, so this goes through their real cpy_tensor_async - on
+// HIP with peer access that is an event-chained hipMemcpyPeerAsync on the device streams (wait_dst=true: the
+// copy waits for dst's prior work, dst's next compute waits for the copy) and this thread never blocks. If the
+// local backends decline (no peer access), ggml_backend_tensor_copy_async falls back to a LOCAL sync copy, which
+// is still no network round-trip. Later graph_compute / GET_TENSOR on these devices wait on the same streams,
+// so a stale read is not possible by construction.
+bool rpc_server::copy_tensor_async(const rpc_msg_copy_tensor_req & request) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * src = deserialize_tensor(ctx, &request.src);
+    ggml_tensor * dst = deserialize_tensor(ctx, &request.dst);
+    if (src == nullptr || dst == nullptr || src->buffer == nullptr || dst->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensors\n", __func__);
+        return false;
+    }
+    uint64_t src_size   = (uint64_t) ggml_nbytes(src);
+    uint64_t dst_data   = (uint64_t) dst->data;
+    uint64_t dst_base   = (uint64_t) ggml_backend_buffer_get_base(dst->buffer);
+    uint64_t dst_buf_sz = (uint64_t) ggml_backend_buffer_get_size(dst->buffer);
+    if (dst_data + src_size > dst_base + dst_buf_sz) {
+        GGML_LOG_ERROR("[%s] out-of-bounds write in rpc_server::copy_tensor_async\n", __func__);
+        return false;
+    }
+    ggml_backend_t bs = backend_for_buffer(src->buffer);
+    ggml_backend_t bd = backend_for_buffer(dst->buffer);
+    if (bs == nullptr || bd == nullptr) {
+        GGML_LOG_ERROR("[%s] no backend for buffer (src %p dst %p)\n", __func__, (void *) src->buffer, (void *) dst->buffer);
+        return false;
+    }
+    ggml_backend_tensor_copy_async(bs, bd, src, dst);
+    return true;
+}
+
 ggml_tensor * rpc_server::create_node(uint64_t id,
                                       struct ggml_context * ctx,
                                       const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
@@ -2052,6 +2135,21 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_COPY_TENSOR_ASYNC: {
+                rpc_msg_copy_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.copy_tensor_async(request)) {
+                    return;
+                }
+                // halo-hybrid: empty reply, see ggml_backend_rpc_cpy_tensor_async
+                static const uint8_t done = 0;
+                if (!send_msg(sock, &done, 0)) {
                     return;
                 }
                 break;
