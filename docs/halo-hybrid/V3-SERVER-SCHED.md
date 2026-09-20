@@ -18,9 +18,23 @@ the dispatcher's reply wait, TCP round trip) - Phase 0's gap_us measures it; if 
 with no unknowns. Both halves are per-call, so 37 -> 2 calls removes both; step 2 removes the last 2. Fix #2
 ("stable split identity so GRAPH_RECOMPUTE fires") was dismissed this morning on a per-CALL cost of 0.2 ms; the
 right denominator is per token (37 calls). Dispatch (HIP-graph boundaries, 2.87 vs 1.74 us) is ~0.5 ms of it.
-Kernel-level expectation once the per-split cost is gone: dense+attention of 21 layers at n=3 move from ~1.1 ms
-(APU) to ~0.4 ms (card) = ~15 ms/step, 5 expert layers at ~2.5x = ~3 ms -> step ~110 ms -> ~24.5 t/s at 2.7
-tokens/step. That is the ~25 expected from the second card.
+Phase 0 (2026-09-20 19:38, mainframe uprobes on rpc_server::graph_compute per device + client sched trace,
+v3c KM=5 probe-2 decode, 35.6 steps): per step dev0 (R9700) compute 25.90 ms over 18.2 calls (median 1.11 ms) =
+dense of ALL 21 layers + experts of 5; dev1 (APU) compute 29.34 ms over 16.0 calls (median 1.86 ms) = experts of
+16; inter-call gaps 17.64 ms (33 per step, median 416 us); one big gap per step 72.71 ms (gibson's layers 0-24 +
+3 draft decodes + host loop). Total 145.58 vs measured 146.50 ms/step: 99.4% accounted. Two corrections to the
+expectation that follow from it:
+1. The per-call tax is ~27 ms/step (17.6 ms of gaps outside the calls + ~9.5 ms of marshalling inside them),
+   larger than v3c's whole 17.9 ms deficit; 37 -> 2 calls is worth ~26 ms/step: v3c 146.5 -> ~120 ms -> ~22.5 t/s.
+2. Dense work at n=3 is LAUNCH-bound, not bandwidth-bound: the card's dense-per-layer cost (~1.1-1.4 ms) is what
+   the APU also spends, so card 25.9 + APU 29.3 = 55.2 ms against v1's 58 ms with everything on the APU. The
+   "dense on the card is worth ~15 ms" arithmetic earlier in this section was wrong; the card buys on the
+   bandwidth-bound EXPERT GEMVs only (~1.1 ms per expert layer moved, i.e. the KM knob), and within a layer dense
+   and experts run sequentially, so the lane is the sum whatever the split. The dense number moves only with
+   kernel COUNT per layer (fusion), on both hosts.
+So the honest expectation for steps 1-2 is ~22.5 t/s at 2.7 tokens/step (v2c is 21.9); the road from there to
+25 is kernel count on the dense path (both hosts), gibson's 72.7 ms share (host loop, draft calls, split gaps)
+and tokens per step (draft depth).
 
 ## Topology this must serve: N hybrid nodes, not two
 The head node (gibson) divides the model into contiguous per-node slices of layers. Each node is a hybrid pair
