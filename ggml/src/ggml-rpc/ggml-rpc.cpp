@@ -345,7 +345,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint32_t & server_minor) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -360,6 +360,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
+    server_minor = response.minor; // halo-hybrid: gates capabilities added after proto 7.0 (see cpy_tensor_async)
     sock->update_caps(response.conn_caps);
     return true;
 }
@@ -406,6 +407,7 @@ private:
 
 class rpc_dispatcher {
 public:
+    uint32_t server_minor = 0; // negotiated protocol minor of the peer, set in start()
     rpc_dispatcher() {
     }
 
@@ -563,7 +565,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock)) {
+    if (!negotiate_hello(sock, server_minor)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -1089,6 +1091,9 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *) dst->buffer->context;
     if (src_ctx->dispatcher != dst_ctx->dispatcher) {
         return false; // different servers: the sync path stages through the client
+    }
+    if (src_ctx->dispatcher->server_minor < 1) {
+        return false; // server predates RPC_CMD_COPY_TENSOR_ASYNC (proto 7.1): fall back rather than send an unknown command
     }
     auto request = std::make_shared<rpc_msg_copy_tensor_req>();
     request->src = serialize_tensor(src);
