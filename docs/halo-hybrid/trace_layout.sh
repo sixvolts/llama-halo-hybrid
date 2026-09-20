@@ -11,6 +11,7 @@ case $L in
   v1)  APU_FROM=5 REMOTE_APU=${REMOTE_APU:-RPC1} $G/run_glm.sh $TAG 25 131072 -b 32768 9>&- & ;;
   v2c) RR=${RR:-6} $G/run_glm_v2c.sh $TAG 131072 -b 32768 9>&- & ;;
   v3)  KM=${KM:-5} $G/run_glm_v3.sh $TAG 131072 -b 32768 -ub ${UB:-1024} 9>&- & ;;
+  v3s) KM=${KM:-4} $G/run_glm_v3s.sh $TAG 131072 -b 32768 -ub ${UB:-1024} 9>&- & ;;
 esac
 for i in $(seq 1 900); do
   curl -s -m2 http://127.0.0.1:8081/health 2>/dev/null | grep -q '"status":"ok"' && { echo "loaded ${i}s" | tee -a $OUT; break; }

@@ -16,7 +16,7 @@ src_diff=$(git -C $SRC diff --name-only $EXPECT_HEAD HEAD 2>/dev/null | grep -cE
 say "build gate: binary commit $EXPECT_HEAD, HEAD $head, compiled-source diff 0 -> wire-safe"
 [ "$stale" -eq 0 ] || { say "ABORT: $stale sources newer than binary (rebuild first)"; exit 1; }
 # ---- launcher pin: the exact scripts this number was produced under
-for f in run_glm.sh run_glm_v2c.sh run_glm_v3.sh probe_ctx.py; do say "launcher $f sha256=$(sha256sum $G/$f | cut -c1-16)"; done
+for f in run_glm.sh run_glm_v2c.sh run_glm_v3.sh run_glm_v3s.sh probe_ctx.py; do say "launcher $f sha256=$(sha256sum $G/$f | cut -c1-16)"; done
 # ---- diagnostic env must be absent for any quoted number
 for v in HIP_LAUNCH_BLOCKING AMD_LOG_LEVEL GGML_CUDA_TRACE_MM GGML_CUDA_DISABLE_GRAPHS; do [ -n "${!v}" ] && { say "ABORT: diagnostic env $v set"; exit 1; }; done
 exec 9>/run/lock/llamabench.lock; flock 9
@@ -43,6 +43,7 @@ launch(){ # $1 layout $2 tag
     v1)  APU_FROM=5 REMOTE_APU=$REMOTE_APU $G/run_glm.sh     $2 25 131072 -b 32768 9>&- & ;;
     v2c) RR=$RR                          $G/run_glm_v2c.sh $2 131072    -b 32768 9>&- & ;;
     v3)  KM=$KM                          $G/run_glm_v3.sh  $2 131072    -b 32768 -ub ${UB:-1024} 9>&- & ;;
+    v3s) KM=$KM                          $G/run_glm_v3s.sh $2 131072    -b 32768 -ub ${UB:-1024} 9>&- & ;;
     *) say "unknown layout $1"; return 1 ;;
   esac
 }
@@ -56,7 +57,7 @@ for L in $LAYOUTS; do
   if ! wait_health $L $log; then say "  $L: INVALID (load)"; stop; continue; fi
   say "  split (verify it landed as designed):"; grep -aE 'model buffer size|KV buffer size' $log | grep -E 'RPC|ROCm' | sed -E 's/^[0-9.]+ [A-Z] +/    /' | head -8 | tee -a $LOG >/dev/null
   mb=$(grep -aoE 'RPC0\[[^]]+\] model buffer size = +[0-9]+' $log | grep -oE '[0-9]+$'); mb=${mb:-0}
-  case $L in v1) exp=0 ;; v2c) exp=$((RR*4345)) ;; v3) exp=$((3990+KM*4080)) ;; esac
+  case $L in v1) exp=0 ;; v2c) exp=$((RR*4345)) ;; v3|v3s) exp=$((3990+KM*4080)) ;; esac
   # calibration point logged for EVERY run, pass or fail - the 3990+KM*4080 model is fit on only KM=4,5 (zero
   # residual DOF); any other KM is extrapolation until real points accumulate here. grep CALIB to refit.
   say "  CALIB layout=$L KM=$KM RR=$RR observed_rpc0_model_mib=$mb expected=$exp resid=$((mb-exp))"

@@ -665,6 +665,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_BOUNDARY = 32, // halo-hybrid: read by another backend's split (a scheduler split input); a remote scheduler must keep it addressable
     };
 
     enum ggml_tri_type {

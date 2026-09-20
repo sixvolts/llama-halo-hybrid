@@ -1537,6 +1537,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             ggml_backend_sched_split_inputs_grow(split);
                         }
                         split->inputs[n_inputs] = src;
+                        // halo-hybrid: the producing backend may be an rpc-server running its own scheduler; it must
+                        // keep this tensor at the address the client will read it from (see rpc_server::graph_compute)
+                        src->flags |= GGML_TENSOR_FLAG_BOUNDARY;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }

@@ -259,6 +259,14 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // halo-hybrid: a composite RPC device exposes its server's other devices as extra buffer types
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto get_extra = reg ? (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+        if (get_extra) {
+            for (auto ** extra = get_extra(dev); extra && *extra; ++extra) {
+                buft_list[ggml_backend_buft_name(*extra)] = *extra;
+            }
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
