@@ -10,8 +10,12 @@ split the work locally, the way gibson's R9700/APU pair already does. What runs 
 The client-side scheduler treats each rpc-server device as its own backend, so the intended placement becomes
 ~37 splits per token (21 dense on the card, 16 expert on the APU), each a GRAPH_COMPUTE round trip. Mainframe's
 per-call server timing: recv 0.23 ms (542 KB graph payload) + deserialise 0.20 + reply 0.02 = ~0.45 ms, plus the
-client's serialise and the dispatcher's wait per call. 37 x ~0.5 ms = ~15-18 ms per token, which IS the measured
-penalty: client-split v3 KM=5 decodes at 18.4 t/s (146.5 ms/step) vs v1 21.0 (128.6) vs v2c 21.9 (123.3). Fix #2
+client's serialise and the dispatcher's wait per call. Per token at the observed 53/47 call split (mainframe's correction: the APU's 28-tensor
+graphs cost 0.045 ms/call, not 0.444): 19.7 x 0.444 + 17.3 x 0.045 = 9.5 ms of SERVER-side marshalling, 53% of
+v3c's measured 17.9 ms/step penalty (v3c KM=5 decodes at 18.4 t/s = 146.5 ms/step vs v1 21.0 = 128.6 vs v2c 21.9
+= 123.3). The other 8.4 ms is expected to be the CLIENT-side per-call cost (serialise_graph of ~1800 records x 20,
+the dispatcher's reply wait, TCP round trip) - Phase 0's gap_us measures it; if it sums to ~8 ms the budget closes
+with no unknowns. Both halves are per-call, so 37 -> 2 calls removes both; step 2 removes the last 2. Fix #2
 ("stable split identity so GRAPH_RECOMPUTE fires") was dismissed this morning on a per-CALL cost of 0.2 ms; the
 right denominator is per token (37 calls). Dispatch (HIP-graph boundaries, 2.87 vs 1.74 us) is ~0.5 ms of it.
 Kernel-level expectation once the per-split cost is gone: dense+attention of 21 layers at n=3 move from ~1.1 ms
@@ -60,6 +64,19 @@ pinned data pointers); if it equals the last id sent, send RECOMPUTE(id) instead
 the deserialised graph and its sched allocation per (device set, id) and re-runs compute without deserialise,
 split or galloc (needs a sched entry point that skips alloc when the graph object is unchanged). This is fix #2
 at the right layer; it removes the remaining per-token marshalling (~1 ms wire + ~1 ms deser + ~1-2 ms split/alloc).
+
+## VRAM budget on the card (must be checked on paper before code)
+Measured today (client-split v3c, KM=5, ctx 131072, ub 1024, two prefill lanes): weights 24420 MiB; client compute
+buffer 1833 MiB x 2 lanes = 3666; KV 640 + 480 + RS 193 = 1313. New: the server sched's own compute buffer on
+device 0, ~1800 MiB (one, sized for the largest graph). Total ~31.2 GB of 32.6 -> too tight at KM=5; KM=4 frees
+~4.1 GB (one whole expert layer) and is the step-1 configuration. Mainframe can read exact free VRAM under v2c and
+v3c before the code lands. Later recovery: a lazily-backed scratch buft so the client's 3.7 GB is not real memory.
+
+## Attribution (so the measured win is credited to the right cause)
+37 -> 2 calls recovers ~17 ms/token of v3c's penalty, i.e. it repairs v3c to roughly v1/v2c territory; it does NOT
+by itself beat v2c, which already pays 2 crossings. The case for the design is the PLACEMENT: KV and the dense
+parts of all 21 remote layers on the card instead of 6, worth the ~15 ms/step kernel arithmetic above. The A/B
+that proves it is v3 (server sched) vs v2c at equal KM, not v3 vs v3c.
 
 ## Risks, named
 - Server sched placing ops badly: `op_offload` / CPU fallback must be off; verify with GGML_SCHED_DEBUG on the
