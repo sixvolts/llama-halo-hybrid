@@ -124,6 +124,33 @@ the same win at the wire level for ~1/10 of the work, and with it the server-sch
 KM ceiling: moving one expert layer APU -> card is worth ~1.1 ms/step and only one more fits (KM=6, 4080 MiB), so
 KM is a ~0.8% knob, not a tuning axis.
 
+## Phase 0 closed (v2c re-run with both probes, 32 steps, 101.7% accounted) - and what it says about placement
+Per v2c decode step: CALL dev0 (KDA-state split) 0.07 ms + CALL dev0 (6 whole layers) 8.65 ms + RECOMP dev1 (16
+whole layers) 40.36 ms + two client round trips 4.35 ms + gibson's share 69.92 ms = 123.35 vs 121.25 measured.
+Per-layer decode costs at n=3 that follow from the two budgets:
+  APU whole layer (dense+experts)      2.52 ms   (40.36 / 16)
+  APU experts only                     1.83 ms   (v3c dev1 29.34 / 16)
+  APU dense only                       0.69 ms   (2.52 - 1.83)
+  card whole layer                     1.44 ms   (8.65 / 6)
+  card dense only                     ~1.06 ms   (v3c: 25.90 = 21 x dense + 5 x expert, expert ~0.73)
+  card experts only                   ~0.73 ms
+So at decode shape the card is SLOWER than the APU on the dense part of a layer (1.06 vs 0.69: launch-bound work at
+1.65x the per-boundary cost) and 2.5x faster on the experts. Splitting a layer as "dense on card, experts on APU"
+costs 1.06 + 1.83 = 2.89 ms + crossings, MORE than the whole layer on the APU (2.52). The intended placement
+therefore LOSES at decode on kernel grounds alone, independent of the transport; what the card is worth at decode is
+its expert bandwidth, and that is VRAM-capped: ~7 expert layers x 4.08 GB, ~1.1 ms/step each, ~7-8 ms/step total
+whether as whole layers (v2c, 6 x 1.08 = 6.5 ms) or as experts-only with dense on the APU (7 x 1.1 = 7.7 ms minus
+~1.4 ms of local crossings). The two-node decode ceiling from mainframe's card is therefore ~v2c + 1-2 ms.
+Prefill is different (compute-bound), but the card's dense prefill kernels are the weak ones (v3c 373 vs v2c 530
+t/s), so dense-on-card loses there too until the gfx1201 prefill kernels improve.
+What this does NOT change: the server-sched design is still the N-node architecture (local scheduling per node,
+one crossing per slice boundary, placement expressible per node); it just should not be sold as a two-node decode
+win. What moves decode toward 25 t/s on these numbers: kernel COUNT on the dense path on BOTH hosts (~60 kernels
+per layer; gibson 25 layers + mainframe 21 layers of ~0.7-1.1 ms each = ~35 ms/step of launch-bound work; hipfire
+runs ~15 launches per layer), gibson's 70 ms share (host loop ~9 ms, three draft decodes ~6 ms, 45 local splits ~10
+ms), and tokens per step (draft depth). Step 0.5 stays: cheap, and any multi-split layout (including the server
+sched's own composite graph) needs it.
+
 ## VRAM budget on the card (must be checked on paper before code)
 Measured today (client-split v3c, KM=5, ctx 131072, ub 1024, two prefill lanes): weights 24420 MiB; client compute
 buffer 1833 MiB x 2 lanes = 3666; KV 640 + 480 + RS 193 = 1313. New: the server sched's own compute buffer on
