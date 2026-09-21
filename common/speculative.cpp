@@ -1124,6 +1124,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // halo-hybrid: LLAMA_SPEC_TRACE=1 times the prompt-feature injection per target batch (the drafter runs it
+        //     synchronously between target batches, so this is dead time for the two-lane prefill pipeline)
+        static const bool trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
+        const int64_t t_proc0 = trace ? ggml_time_us() : 0;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1174,6 +1179,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return false;
                 }
             }
+        }
+
+        if (trace) {
+            LOG_INF("spec-trace: dflash inject %d tokens (pos %d..%d) in %.1f ms\n", n_tokens,
+                    (int) batch_in.pos[0], (int) batch_in.pos[n_tokens - 1], (ggml_time_us() - t_proc0) / 1000.0);
         }
 
         return true;
