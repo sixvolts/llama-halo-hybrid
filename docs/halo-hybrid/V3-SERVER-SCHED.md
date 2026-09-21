@@ -216,6 +216,21 @@ null: HIP-graph replay contributes nothing to the server's decode while every to
 completes); the 64-entry per-device graph cache (common.cuh max_cuda_graphs) is moot until RECOMPUTE fires and must
 be re-checked then (33 + 32 live keys per token per device against a 64-entry LRU).
 
+## KM / ubatch sweep (2026-09-20 23:46 - 00:07, v3s, TCP, 3 reps each, mainframe VRAM sampled every 2 s)
+| config | prefill 3148 | decode 3148 | prefill 12760 | decode 12760 | card VRAM peak |
+|---|---|---|---|---|---|
+| KM=4 ub512 | 374 | 22.20 | 445 | 22.69 | (sampled, see mainframe) |
+| KM=4 ub1024 (Phase 1 baseline) | 394 | 22.16 | 492 | 21.87 | 20660 MiB |
+| KM=4 ub2048 | 356 | 22.97 | 479 | 23.21 | 30463 MiB (93%) |
+| KM=5 ub1024 | 404 | 22.11 | 508 | 22.07 | 30435 MiB (93%) |
+| KM=5 ub2048 | OOM at load: cudaMalloc of the 3667 MiB client lane buffer failed at 25059 MiB used (7.5 GB nominally free - a contiguous-block limit; the config needs ~34 GB in total anyway) | | | | |
+Readings: prefill is best at KM=5 ub1024 (+3% over the baseline); ub2048 does not help prefill here (the two-lane
+pipeline finding from 09-13 holds). Decode varies with ub at fixed KM (21.87 / 22.69 / 23.21 for ub 1024 / 512 / 2048)
+by more than the harness noise floor (~0.3) although decode should not depend on ubatch - unexplained, wants a
+back-to-back ub1024 vs ub2048 A/B at regroup before anything is built on it. KM's decode effect is ~+0.2 t/s (as
+Phase 0's ~1.1 ms/layer predicted). VRAM: KM=5 and ub2048 each consume the card's headroom; both together do not fit
+until the client's scratch stops being real memory on the card (the lazily-backed scratch buft from the design).
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,
