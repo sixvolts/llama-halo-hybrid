@@ -225,9 +225,12 @@ be re-checked then (33 + 32 live keys per token per device against a 64-entry LR
 | KM=5 ub1024 | 404 | 22.11 | 508 | 22.07 | 30435 MiB (93%) |
 | KM=5 ub2048 | OOM at load: cudaMalloc of the 3667 MiB client lane buffer failed at 25059 MiB used (7.5 GB nominally free - a contiguous-block limit; the config needs ~34 GB in total anyway) | | | | |
 Readings: prefill is best at KM=5 ub1024 (+3% over the baseline); ub2048 does not help prefill here (the two-lane
-pipeline finding from 09-13 holds). Decode varies with ub at fixed KM (21.87 / 22.69 / 23.21 for ub 1024 / 512 / 2048)
-by more than the harness noise floor (~0.3) although decode should not depend on ubatch - unexplained, wants a
-back-to-back ub1024 vs ub2048 A/B at regroup before anything is built on it. KM's decode effect is ~+0.2 t/s (as
+pipeline finding from 09-13 holds). Decode "varies with ub" (21.87 / 22.69 / 23.21 for ub 1024 / 512 / 2048) is NOT a decode
+effect: mainframe's step period is flat across configs (111.6-114.1 ms, 2.3%) and MODEL compute 43.5-44.7 ms, while
+per-rep draft acceptance tracks the t/s exactly (acc 0.77 -> 21.0-22.0, 0.82-0.86 -> 23.0-23.6, 0.88 -> 24.0). A
+different prefill ubatch changes the f32 summation order of the router GEMM, near-tied experts flip, the generated
+text differs, and MTP acceptance moves - the same mechanism recorded on 2026-09-13. Compare decode across configs by
+step period or at equal acceptance, not by t/s alone; the harness should print tokens/step. KM's decode effect is ~+0.2 t/s (as
 Phase 0's ~1.1 ms/layer predicted). VRAM: KM=5 and ub2048 each consume the card's headroom; both together do not fit
 until the client's scratch stops being real memory on the card (the lazily-backed scratch buft from the design).
 
