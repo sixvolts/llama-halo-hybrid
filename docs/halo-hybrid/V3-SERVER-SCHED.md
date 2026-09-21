@@ -250,6 +250,45 @@ driver, not mlock), so "pinned" is by design, not measured. MODEL call: KM=6 com
 the slice on the card), alloc unchanged at 0.68. Prefill call KM=5 ub2048 3313 ms vs KM=6 ub1024 1636 ms.
 Production candidate: v3s KM=6 ub1024 for prefill (523), with 1.5 GB of card headroom; KM=5 ub1024 (508) keeps ~5 GB.
 
+## Phase 3a result: the card's "small GEMV" gap was one table entry (2026-09-21, commit dad9e8d71)
+Root cause, from the Phase 0 rocprofv3 trace grouped by launch geometry: upstream mmvq.cu's RDNA4 table returns
+nwarps=8 only at ncols_dst=1. With the MTP draft the verify width is n=3, so EVERY Q8_0 dense GEMV of a decode step
+on the card launched ONE 32-thread wave per row - 24x16384 (hc_fn) as a 64-trip serial DRAM-latency chain on 24 of
+the part's 2048 wave slots, 2048x4096 (shared expert) as 2048 waves each walking 16 trips. That is the "2-35% of
+bandwidth" of Phase 0; it is not a general un-tuned-kernel problem.
+
+Second finding on the way: **gfx1201 has a dispatch cliff** when a launch's total wave count lands within a few of
+its 2048 wave slots (32 WGP x 4 SIMD32 x 16; HIP reports WGPs as multiProcessorCount). K-independent, 2-5x:
+2048 rows x 1 wave 19.5 us vs 2032 rows 9.8; 256 blocks x 8 warps 19.7 us vs 252 blocks 3.7. The production
+2048-row shared-expert GEMV sat exactly on it. The APU (1280 slots) shows no cliff. The mmvq launcher now steps any
+shape that would land there to the other launch; the grouped-GEMV and MoE kernels are not guarded yet.
+
+Change (`GGML_CUDA_MMVQ_NO_WIDE=1` restores upstream): on RDNA4 at n=2..4, 8-warp blocks (split-K over the block,
+LDS reduction) when the 8-way split still gives each warp a full trip (K >= 2048 for q8_0) and the matrix is under
+2^25 weights; upstream launch otherwise. Two variants measured and dropped: a rows-per-block launch for K=128
+(f_b/g_b: no gain in situ, 15.9 -> 16.5 us) and wide for short K (256x512 / 512x256 lost 1.3-2.1x: idle warps plus
+the reduction).
+
+In situ, gibson's card, v3s KM=5 ub1024 decode, op timer (GGML_CUDA_TIME_OPS, graphs off), upstream -> wide:
+| GEMV (K x rows, n=3) | per layer | upstream us | wide us |
+|---|---|---|---|
+| 16384x24 hc_fn | 1 | 30.8 | 14.9 |
+| 4096x2048 shared-expert down | 1 | 39.1 | 28.6 |
+| 2048x4096 shared-expert gate/up | 1 | 38.7 | 27.8 |
+| 128x8192 f_b/g_b, 8192x4096 wo, 4096x12288 qkv, 12288x4096, 154880 head | - | unchanged (within 1%) | |
+Card time per graph 7.37 -> 7.33 ms (mixed prefill+decode graphs). Step period, 3 reps x 2 ctx, gibson only on the
+new kernel (mainframe still on 37cdac384): 115.7 -> 114.5 ms/step (first wide run 113.8); ~1 ms of the 130, i.e.
+~38 us x 25 local layers, as the per-op numbers predict. Mainframe's 22 card layers should add about the same once
+it rebuilds. Isolated (test-backend-ops perf, MALL-warm, grouping off): 24x16384 15.7 -> 4.5 us, 2048x4096
+19.9 -> 11.8, 4096x2048 24.5 -> 14.8, 4096x4096 27.5 -> 21.2, 2048x1024 20.3 -> 7.8 (the cliff).
+Greedy gate (v3s KM=4, greedy_ref.sh): text sha a828e28289899da6, identical to the reference even though the
+8-way split changes the f32 summation order; 106/106 draft tokens accepted as before.
+
+What this leaves of the 0.9 ms/layer software gap (Phase 0: card dense 1.17 vs floor 0.28): the small GEMVs were
+~0.2 ms/layer and are now ~0.16 (the remaining shortfall on 2048-row shapes is 28 us vs a 14 us floor: 16384 one-trip
+waves over 2048 slots is 8 rounds of DRAM latency plus a reduction each; a 4-warp or 2-rows-per-block variant is the
+next thing to try there). The larger piece is the ~40-50 launches per layer (3b).
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,
