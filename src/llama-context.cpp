@@ -426,6 +426,22 @@ llama_context::llama_context(
                 }
             }
 
+            // halo-hybrid V3: a composite RPC device exposes a scratch buffer type for the scheduler's compute
+            // buffer; the server places it on its roomiest device and schedules the graph itself, so the card never
+            // pays for intermediates it does not hold
+            {
+                auto * dev = ggml_backend_get_device(backend.get());
+                auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                using scratch_fn_t = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+                auto scratch_fn = reg ? (scratch_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_scratch_buffer_type") : nullptr;
+                if (scratch_fn) {
+                    auto * scratch = scratch_fn(dev);
+                    if (scratch) {
+                        LLAMA_LOG_INFO("%s: %s compute buffer -> %s\n", __func__, ggml_backend_name(backend.get()), ggml_backend_buft_name(scratch));
+                        buft = scratch;
+                    }
+                }
+            }
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);

@@ -233,7 +233,15 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+    // halo-hybrid V3 (proto 7.3): the head's scheduler allocates a compute buffer for the composite device sized for
+    // the whole remote slice at ub tokens, times the prefill lanes - but the server's own scheduler allocates its
+    // intermediates itself and touches that buffer only for the split's inputs and boundary outputs. A scratch
+    // buffer type asks the server to place it on its roomiest device instead of device 0 (the card).
+    bool        scratch = false;
 };
+
+// ALLOC_BUFFER: high bit of the device field asks for scratch placement (proto 7.3)
+#define RPC_ALLOC_SCRATCH 0x80000000u
 
 static bool ggml_backend_rpc_composite_enabled(); // halo-hybrid V3, defined with the device interface
 
@@ -810,11 +818,14 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     auto request = std::make_shared<rpc_msg_alloc_buffer_req>();
+    auto dispatcher = get_dispatcher(buft_ctx->endpoint);
     request->device = buft_ctx->device;
+    if (buft_ctx->scratch && dispatcher->server_minor >= 3) {
+        request->device |= RPC_ALLOC_SCRATCH;
+    }
     request->size = size;
     rpc_msg_alloc_buffer_rsp response;
 
-    auto dispatcher = get_dispatcher(buft_ctx->endpoint);
     dispatcher->send(RPC_CMD_ALLOC_BUFFER, request, sizeof(*request), &response, sizeof(response));
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
@@ -1163,6 +1174,45 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     return buft;
 }
 
+// halo-hybrid V3: the scratch buffer type of an endpoint (composite mode). Same endpoint/device 0 as the default
+// buft (so supports_buft and the buffer interface are unchanged), distinct name, and allocations ask the server for
+// scratch placement. Exposed to llama through the registry proc address "ggml_backend_dev_scratch_buffer_type".
+ggml_backend_buffer_type_t ggml_backend_rpc_scratch_buffer_type(const char * endpoint) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::string buft_name = "RPC0[" + std::string(endpoint) + "]#scratch";
+    static std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_map;
+    auto it = buft_map.find(buft_name);
+    if (it != buft_map.end()) {
+        return it->second;
+    }
+    auto dispatcher = get_dispatcher(endpoint);
+    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
+        /* .endpoint  = */ endpoint,
+        /* .device    = */ 0,
+        /* .name      = */ buft_name,
+        /* .alignment = */ get_alignment(dispatcher, 0),
+        /* .max_size  = */ get_max_size(dispatcher, 0),
+        /* .scratch   = */ true,
+    };
+    auto reg = ggml_backend_rpc_add_server(endpoint);
+    ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
+        /* .iface   = */ ggml_backend_rpc_buffer_type_interface,
+        /* .device  = */ ggml_backend_reg_dev_get(reg, 0),
+        /* .context = */ buft_ctx
+    };
+    buft_map[buft_name] = buft;
+    return buft;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_rpc_device_scratch_buffer_type(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    if (!ctx->composite) {
+        return nullptr;
+    }
+    return ggml_backend_rpc_scratch_buffer_type(ctx->endpoint.c_str());
+}
+
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
     auto dispatcher = get_dispatcher(endpoint);
@@ -1317,11 +1367,28 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
 }
 
 bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response) {
-    uint32_t dev_id = request.device;
+    const bool scratch = (request.device & RPC_ALLOC_SCRATCH) != 0;
+    uint32_t dev_id = request.device & ~RPC_ALLOC_SCRATCH;
     if (dev_id >= backends.size()) {
         return false;
     }
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (scratch) {
+        // halo-hybrid V3: the client's scratch holds only the split's inputs and boundary outputs, so it goes to
+        // PINNED HOST memory rather than the card. Not to the other device: the CUDA backend refuses an op whose
+        // sources sit in a CUDA buffer of another device (ggml_backend_cuda_device_supports_op), and a KV-cache
+        // write pre-allocated on the card reads its index input from the scratch - a host buffer is exempt from
+        // that rule and the server's scheduler copies what each device needs.
+        buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backends[dev_id]));
+        static bool announced = false;
+        if (!announced) {
+            GGML_LOG_INFO("[%s] scratch buffers go to %s\n", __func__, buft ? ggml_backend_buft_name(buft) : "the device (no host buffer type)");
+            announced = true;
+        }
+    }
+    if (buft == nullptr) {
+        buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+    }
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
     response.remote_ptr = 0;
     response.remote_size = 0;
@@ -2679,6 +2746,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         return (void *)ggml_backend_rpc_device_get_extra_bufts;
+    }
+    if (std::strcmp(name, "ggml_backend_dev_scratch_buffer_type") == 0) {
+        return (void *)ggml_backend_rpc_device_scratch_buffer_type;
     }
     return NULL;
 
