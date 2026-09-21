@@ -5054,9 +5054,15 @@ static ggml_cuda_optimer & ggml_cuda_optimer_for(int device) { static ggml_cuda_
 static std::string ggml_cuda_optimer_key(const ggml_tensor * node, int n_fused) {
     std::string k = ggml_op_name(node->op);
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
-        char b[96]; snprintf(b, sizeof(b), " %s %lldx%lld n=%lld", ggml_type_name(node->src[0]->type),
+        char b[160]; snprintf(b, sizeof(b), " %s %lldx%lld n=%lld", ggml_type_name(node->src[0]->type),
                  (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1], (long long) node->src[1]->ne[1]);
         k += b;
+        static const bool names = getenv("GGML_CUDA_TIME_OPS_NAMES") != nullptr;
+        if (names) {   // weight name with the layer number stripped, so the classes still merge across layers
+            std::string nm = node->src[0]->name; size_t p0 = nm.find("blk."); 
+            if (p0 != std::string::npos) { size_t p1 = nm.find('.', p0 + 4); if (p1 != std::string::npos) { nm = nm.substr(p1 + 1); } }
+            k += " [" + nm + "]";
+        }
     } else if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_CONCAT || node->op == GGML_OP_CPY) {
         char b[64]; snprintf(b, sizeof(b), " %lldx%lld", (long long) node->ne[0], (long long) node->ne[1]); k += b;
     }

@@ -305,6 +305,30 @@ What this leaves of the 0.9 ms/layer software gap (Phase 0: card dense 1.17 vs f
 waves over 2048 slots is 8 rounds of DRAM latency plus a reduction each; a 4-warp or 2-rows-per-block variant is the
 next thing to try there). The larger piece is the ~40-50 launches per layer (3b).
 
+## Phase 3b, step 1: the decode launch inventory and two kernel fixes (2026-09-21, commit 5261729cc)
+Inventory (op timer with decode/prefill-tagged keys, gibson's card, v3s KM=6, graphs off so the per-launch cost is
+inflated; ~1514 launches and 37 ms per step on the card): MUL_MAT 300 launches / 17.8 ms; the remaining ~1200
+launches are element-wise and small ops (RMS_NORM 163, MUL 153, CONT 98, GET_ROWS 74, ADD 67, UNARY 67, CPY 65, the
+three DSV4 hyper-connection kernels 160, L2_NORM 41, SET_ROWS 38, GLU 30) at 8-13 us each under the timer. Under HIP
+graph replay these cost far less than the timer shows (the ewchain pass measured ~1 ms per ~320 nodes removed on
+2026-09-15), so launch fusion proper (3b) is worth ~2-3 ms per step on gibson, not the 12 ms the timer suggests.
+Bigger single items the inventory exposed:
+- The draft steps run the full 154880 x 4096 q8_0 head at n=1 twice per step (2.1 x 1.09 ms) plus once at n=3:
+  3.4 ms of the step, bandwidth-bound (91%). A lower-precision head for the draft is a model-side lever (3c).
+- CONCAT 6x24576 (the KDA conv-state concat, 19 per step) at 61.6 us: the generic kernel launched one 256-thread
+  block per row for the 3 state columns. Row kernel: 10.0 us in situ (~1 ms per step). Same fix covers the
+  single-token concat that hit per-element 64-bit index math (19 us).
+- The shared-expert gate/up pair and the following add at n=3 went to the fused MMQ path because upstream fuses
+  into mul_mat_vec_q only at n=1. Lifted to n <= 4. Trap found on the way: the fused ADD operand at n > 1 is a
+  [rows, n] tensor (the shared-expert output added to the routed-expert sum), not a [rows] bias; indexing it per
+  row passed every test (test biases are [rows,1]) and produced a different greedy text with draft acceptance
+  0.44 in situ. The device fusion args now carry the operand's column stride and the test has bias_per_token
+  cases. Gain is small (the fused down+add 33.9 us vs 27.8 + an 8 us add); the large 4096x8192 "+fused5" class
+  (201 us, 19 per step) is the fork's grouped GEMV launch, not MMQ - what it covers is being checked with named
+  timer keys before deciding whether it is at bandwidth.
+Result, v3s KM=6 ub1024, gibson only on this build (mainframe on 1f8b0c194): 111.1 -> 110.1 ms/step, greedy text
+identical (a828e28289899da6), prefill unchanged.
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,
