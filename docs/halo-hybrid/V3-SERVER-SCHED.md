@@ -368,7 +368,7 @@ mainframe's compute term. The remaining launch-fusion items (hc_post into the ne
 softmax+topk) are each worth well under 1 ms. Gibson's own share of the step (~65-70 ms of ~108 by mainframe's
 client-idle measure) is 3c and is where the step is.
 
-## Targets set 2026-09-21 (the user's): decode 28-30 tok/s, prefill 800 tok/s, on v3s KM=6 ub1024
+## Targets set 2026-09-21 (the user's, revised after the 3c decomposition): decode 27 tok/s, prefill 800 tok/s, on v3s KM=6 ub1024
 Baseline at the time: decode 23-24.6 t/s (108 ms/step, 2.5-2.7 tok/step), prefill 530 t/s at 12.7K.
 Decode budget (median step at 13K, sched trace 09:10): 96 ms blocked in the verify graph (mainframe busy 42;
 gibson's 25 layers + APU experts + 45 split gaps 54), 1.2 ms launch work, 9.5 ms host chain (three sequential
@@ -380,6 +380,68 @@ APU expert floor; sweep: n-max 2/3/4 = 108/143/143 ms/step, 2.6/3.1/3.5 tok/step
 Prefill: mainframe's 13K prefill is 94.6% GPU busy; expert GEMM 37% at ~17% of gfx1151's int8 peak, flash
 attention 13.5%, dense GEMM 13%, MoE reduce/quantize 9%, element-wise remainder. 800 = 1.5x = roughly double the
 expert-GEMM efficiency at 1024-token batches plus attention; kernel work on the APUs, the design unchanged.
+
+## Phase 3c, measurements (2026-09-21, 09:10-10:48, v3s KM=6 both hosts on 919c2ade9+)
+Same-session A/Bs, 2 reps x 2 ctx unless noted; ms/step at 3K / 13K:
+| lever | result | verdict |
+|---|---|---|
+| draft depth n-max 3 / 4 | 108 -> 143 ms/step, 2.6 -> 3.1 / 3.5 tok/step; +17 ms per extra draft token (APU expert reads) | n-max 4 wins only past ~10K ctx (+9% there); policy item |
+| target backend sampling (-bs) | 107-114 vs 107-110; prefill -5..7% | no |
+| token_embd on the card (640 MB VRAM) | 107.1-110.2 vs 106.2-109.8 | no |
+| draft head as Q4_0 in the MTP file (blk.45.nextn.shared_head_head, 348 MB, gguf-py Q4_0; Q4_K needs the C++ quantizer) | 105.4-108.1 vs 107.1-110.2, acceptance unchanged | **yes, -1.5 to -2 ms; launcher default** |
+| HIP graphs off on gibson | +0.5 ms | replay is worth ~0.5 ms here; mainframe's eager splits cost the same, no launch-gap item (its interior GPU busy 97.7% by the amdgpu counter) |
+Host chain per step (LLAMA_SPEC_TRACE, medians at 13K): ingest decode 1.09, draft-0 decode 0.67 + 2.37 wait, draft-1
+decode 0.17 + ~2.4 wait, target sample+accept 0.45, bookkeeping ~2. Merging the ingest into the first draft graph is
+blocked by the draft's recurrent-state checkpoint (saved after ingest, restored after drafting): the merged graph
+would never materialise the post-ingest state. Mainframe's 40 ms MODEL compute is kernel floors, not gaps.
+
+## Prefill scoping, step 1: the lane balance is a free lever (2026-09-21 11:04-11:18)
+The scheduler trace of a 12.7K prefill shows, per 1024-token ubatch, gibson's lane thread blocked ~1.3 s in the
+send to mainframe (its server still on the previous ubatch) plus ~0.3 s in the fetch wait; mainframe measures its
+lane at 1.665 s per ubatch, 96.3% busy, cadence 1.73 s -> 592 t/s steady state, the observed 530 being head and
+tail. Mainframe's call is 99.6% compute: nothing structural to remove there. So the split (25 gibson / 22
+mainframe since V3) leaves gibson's lane short and the knob costs nothing: launcher `LOCAL=<n>` (layers 0..n-1 on
+gibson, KM expert layers on mainframe's card counted from n).
+| LOCAL | prefill 12.7K (cold first probe) | prefill 25.8K | decode ms/step | gibson card model MiB | mainframe card MiB |
+|---|---|---|---|---|---|
+| 25 | 482 | 521 | 109.6 / 107.8 | 13554 | 28596 |
+| 26 | 502 | 547 | 111.1 / 110.5 | 13724 | 28426 |
+| 27 | 526 | 577 | 109.7 / 106.4 | 13895 | 28255 |
+| 28 | 506 | 551 | 111.0 / 108.5 | 14053 | 28097 |
+| 29 | 505 | 542 | 110.0 / 108.7 | 14223 | 27926 |
+| 30 | 104 (host paging: 108 of 122 GB used) | 474 | 183.6 / 115.1 | 14394 | 27756 |
+Knee at 27: +11% prefill at 25.8K, +9% at 12.7K, decode unchanged, no quality effect (placement only). **LOCAL=27
+is the production layout from here (launcher default), with KM=6 ub1024.** At 28+ gibson's lane is the long one;
+30 pages the host. Mainframe's card headroom grows ~340 MiB at 27 (KM=7 there would need ~4 GB, so no).
+
+## Phase 3c wrap-up (2026-09-21)
+Kept: Q4_0 draft head (-1.5..2 ms/step), lane balance 27/20 (prefill +9-11%, decode flat), draft-depth policy
+(env-gated, off: +12% at 13K but -2..4% at 26K on the probe text). Ruled out with numbers: target backend sampling,
+token_embd on the card, HIP-graph replay (0.5 ms), launch gaps on mainframe (97.7% interior busy), ingest/draft
+merge (checkpoint order). Step budget now: ~106-108 ms of which ~65-70 is kernel floor (APU expert reads at n=3,
+card dense), ~9 host chain, the rest crossings. Decode stands at 23-25 t/s at n-max 2 (26+ at 13K with n-max 4);
+27 needs a physics change (fewer routed experts or lower expert quant on the APUs), which is the user's call.
+
+## Prefill scoping for 800 t/s (2026-09-21)
+Steady state after the rebalance: cadence set by the longer lane (~1.5 s per 1024-token ubatch at 27/20), i.e.
+~650 t/s peak, 577 observed at 25.8K. 800 needs the long lane at ~1.2 s per ubatch. Mainframe's lane is 99.6%
+kernel time; its 13K profile (rocprofv3 2026-09-13, shares sound, durations not): expert GEMM 37% (MMQ q4_K/q5_K
+at J=32, ~17% of gfx1151's int8 peak at n=1024), flash attention 13.5% (dense (4,8) tiles for kv<10K, sparse
+(1,32) above), dense q8_0 GEMM 13%, MoE reduce/ids/quantize 9% (quantize_mmq_q8_1 5%, moe_weighted_reduction
+2.6% at ~60 GB/s), element-wise 19% (part removed since: conv-state concat, hc prologue), GDN 5%, indexer 2.6%.
+Candidate work, in order of yield per effort:
+  P1. Expert GEMM on gfx1151: MMQ q4_K/q5_K at J=32 is the 37%; the RDNA3.5 WMMA path is whitelisted for q4_K
+      J=16/32/48 and q5_K J=32 with activation prefetch (8.47 ms per 1.36 GB call at n=1024). Targets: J=64 tiles
+      with the register-staged prefetch (LDS 64 KiB per CU limits residency to 1-2 blocks), a q5_K weight-tile
+      stage, and the moe reduce/quantize pass folded (9%). A 30% gain on this class is ~0.2 s per ubatch.
+  P2. Attention: dense FA at (4,8) for kv<10K and sparse (1,32) above; the sparse tile's DKQ=512 spills (256 VGPRs);
+      a 16-column config that does not spill or K/V tile sharing across a query group (see sparse-fa notes).
+  P3. Element-wise remainder and the quantize_mmq_q8_1 layout kernel (5%): fusion into producers.
+  P4. Dense q8_0 GEMM 13%: MMQ J=128 at 22-26 TFLOPS on gfx1151; modest headroom.
+  P5. The card lanes: mainframe's card runs dense + KM expert layers; its dense GEMM efficiency (rocBLAS f16
+      fallthrough at 6.7% of peak is 1.2% of time) is not the lever; the card is not the long lane.
+Reaching 800 is P1 + P2 landing most of their estimates plus the balance re-tuned after each (the knee moves as
+mainframe's lane shortens).
 
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
