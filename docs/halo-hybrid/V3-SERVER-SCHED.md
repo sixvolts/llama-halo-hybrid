@@ -293,8 +293,12 @@ Both hosts on 1f8b0c194 (mainframe rebuilt 05:24, its own isolated A/B reproduce
 | v3s KM=6 ub1024 | 113.8 (01:10 batch) | 111.1 | 522 (523 before) |
 -2.7 ms/step at both KMs, i.e. ~1.3 ms per host, in line with the per-op prediction (0.8-1.0 ms per host) plus
 noise; prefill unchanged (ub=1024 GEMMs run on MMQ, not mmvq). Mainframe's decomp-trace MODEL compute median at
-KM=6 (baseline 42.88 +/- 0.25 ms, prediction ~42.1) is the pre-registered acceptance number and is reported in its
-session log. Best decode so far: KM=6 ub1024 at 111.1 ms/step, 23.08 t/s at 3148 ctx.
+KM=6 was the pre-registered acceptance number (baseline 42.88 +/- 0.25 ms, prediction ~42.1): measured 41.81 ms
+(n=250, +/-0.24), -1.07 ms, with alloc (0.684 -> 0.694) and rest (0.790 -> 0.796) unchanged, so the change is
+isolated to the compute term. Its MODEL-to-MODEL step delta (-2.53 ms) matches the harness's (-2.70) to 0.17 ms.
+The in-situ gain is ~0.3 ms larger than the isolated shape A/B predicted (22 layers x 35.3 us = 0.78): isolated
+per-shape numbers UNDER-predict the in-situ effect of removing serial latency chains from a 3182-node graph, which
+is the right direction to size 3b with. Best decode so far: KM=6 ub1024 at 111.1 ms/step, 23.08 t/s at 3148 ctx.
 
 What this leaves of the 0.9 ms/layer software gap (Phase 0: card dense 1.17 vs floor 0.28): the small GEMVs were
 ~0.2 ms/layer and are now ~0.16 (the remaining shortfall on 2048-row shapes is 28 us vs a 14 us floor: 16384 one-trip
