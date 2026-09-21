@@ -889,8 +889,8 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
     //     prefetch, so Q5_K keeps J=32 activation-only.
     return (type == GGML_TYPE_Q8_0    && (J == 48 || J == 128) && !fallback) ||
            (type == GGML_TYPE_Q6_K    &&  J == 32)              ||
-           (type == GGML_TYPE_Q5_K    &&  J == 32)              ||
-           (type == GGML_TYPE_Q4_K    && (J == 16 || J == 32 || J == 48)) ||
+           (type == GGML_TYPE_Q5_K    && (J == 32 || J == 64))  ||
+           (type == GGML_TYPE_Q4_K    && (J == 16 || J == 32 || J == 48 || J == 64)) ||
            (type == GGML_TYPE_IQ2_S   &&  J == 128)             ||
            (type == GGML_TYPE_IQ3_XXS &&  J == 128);
 #else
