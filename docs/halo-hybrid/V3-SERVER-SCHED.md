@@ -284,6 +284,18 @@ it rebuilds. Isolated (test-backend-ops perf, MALL-warm, grouping off): 24x16384
 Greedy gate (v3s KM=4, greedy_ref.sh): text sha a828e28289899da6, identical to the reference even though the
 8-way split changes the f32 summation order; 106/106 draft tokens accepted as before.
 
+Both hosts on 1f8b0c194 (mainframe rebuilt 05:24, its own isolated A/B reproduced all four predicted shapes:
+24x16384 17.1 -> 5.3 us, 2048x4096 22.8 -> 11.9, 2048x1024 23.2 -> 7.8, 12288x4096 unchanged), harness-gated
+3 reps x 2 ctx, 05:27-05:38:
+| config | ms/step before (7.3, upstream launch) | ms/step after | prefill 12760 tok |
+|---|---|---|---|
+| v3s KM=5 ub1024 | 115.7 (gibson-only A/B, same morning) | 113.0 | 505 (508 before) |
+| v3s KM=6 ub1024 | 113.8 (01:10 batch) | 111.1 | 522 (523 before) |
+-2.7 ms/step at both KMs, i.e. ~1.3 ms per host, in line with the per-op prediction (0.8-1.0 ms per host) plus
+noise; prefill unchanged (ub=1024 GEMMs run on MMQ, not mmvq). Mainframe's decomp-trace MODEL compute median at
+KM=6 (baseline 42.88 +/- 0.25 ms, prediction ~42.1) is the pre-registered acceptance number and is reported in its
+session log. Best decode so far: KM=6 ub1024 at 111.1 ms/step, 23.08 t/s at 3148 ctx.
+
 What this leaves of the 0.9 ms/layer software gap (Phase 0: card dense 1.17 vs floor 0.28): the small GEMVs were
 ~0.2 ms/layer and are now ~0.16 (the remaining shortfall on 2048-row shapes is 28 us vs a 14 us floor: 16384 one-trip
 waves over 2048 slots is 8 rounds of DRAM latency plus a reduction each; a 4-warp or 2-rows-per-block variant is the
