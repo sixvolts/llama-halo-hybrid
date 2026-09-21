@@ -10082,6 +10082,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 #if 1
+
     // GLM-5.3-Flash shapes (halo-hybrid bisect): 288 experts / 8 used, q4_K / q5_K / q6_K experts, q8_0 trunk
     if (getenv("TBO_GLM_SHAPES") != nullptr) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
@@ -11196,6 +11197,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // halo-hybrid: arbitrary dense q8_0 GEMV/GEMM shapes for kernel work, TBO_MMV_SHAPES="m:k[:n],m:k[:n],..." (n defaults to 3)
+    if (const char * env = getenv("TBO_MMV_SHAPES")) {
+        std::string spec(env);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
+            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+            int64_t m = 0, k = 0, n = 3;
+            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &m, &k, &n) >= 2 && m > 0 && k > 0) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        return test_cases;
+    }
 
     // Qwen3.8-Flash-Next attention on the R9700: 24 q heads over 2 kv heads, D=256, QSA selects ~8K cells per query
     if (getenv("TBO_Q38_FA") != nullptr) {

@@ -485,7 +485,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
         // pressure and lookup table contention at higher thread counts.
-        if (ncols_dst == 1) {
+        // halo-hybrid: the same 8-warp block for ncols_dst 2..4 when the host asks for it (small_k or
+        // halve_iters tag). Upstream launches ONE wave per row there, which on a 128-SIMD part leaves
+        // short-M GEMVs (24..2048 rows) as serial latency chains at 2-35% of DRAM bandwidth; decode with
+        // an MTP draft runs at n=3, so every dense GEMV of a decode step took that path.
+        if (ncols_dst == 1 || (ncols_dst <= 4 && halve_iters)) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
@@ -606,6 +610,16 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 // (150 GB/s, one 256-thread block per row doing one loop trip) to 7 us (490 GB/s), and the
 // large-K shapes are unchanged within 1%. Measured -6% per decoded token on Qwen3.8-Flash-Next.
 // GGML_CUDA_MMVQ_NO_SMALLK=1 restores the upstream behaviour.
+// halo-hybrid: 8-warp blocks for ncols_dst 2..4 on RDNA4 (see calc_nwarps). GGML_CUDA_MMVQ_NO_WIDE=1 restores
+// the upstream one-wave-per-row launch for A/B.
+static bool ggml_cuda_mmvq_rdna4_wide() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_MMVQ_NO_WIDE");
+        return env == nullptr || atoi(env) == 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_mmvq_rdna4_small_k() {
     static const bool enabled = []() {
         const char * env = getenv("GGML_CUDA_MMVQ_NO_SMALLK");
@@ -1224,29 +1238,69 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 launch(std::false_type{}, std::false_type{});
             }
         } break;
-        case 2: {
-            constexpr int c_ncols_dst = 2;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
-        } break;
-        case 3: {
-            constexpr int c_ncols_dst = 3;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
-        } break;
+        case 2:
+        case 3:
         case 4: {
-            constexpr int c_ncols_dst = 4;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
+            // halo-hybrid: RDNA4 gets the 8-warp block here too (split-K over the block, or rows-per-block for
+            // short K); every other table keeps upstream's launch. Tag types keep the flags compile-time.
+            const bool rdna4_wide = table_id == MMVQ_PARAMETERS_RDNA4 && ggml_cuda_mmvq_rdna4_wide();
+            const auto launch_n = [&](auto ncols_tag) {
+                static constexpr int c_ncols_dst = decltype(ncols_tag)::value;
+                const auto launch = [&](auto small_k_tag, auto wide_tag) {
+                    // Types the RDNA4 table does not promote would compile a second, identical kernel.
+                    constexpr bool c_promoted = calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, true) > 1;
+                    constexpr bool c_small_k  = decltype(small_k_tag)::value && c_promoted;
+                    constexpr bool c_wide     = decltype(wide_tag)::value && c_promoted;
+                    const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                                  nsamples_dst, warp_size, table_id, c_small_k, c_wide);
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_wide>(
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                        stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                        stream);
+                };
+                if (rdna4_wide && calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, true) > 1) {
+                    // wide (8 warps, 1 row/block) when the 8-way K split still gives every warp a full trip and
+                    // the matrix is under 2^25 weights; otherwise upstream (1 wave, 1 row). In situ on the R9700
+                    // (v3s decode, n=3, op timer): 24x16384 30.8 -> 14.8 us, 2048x4096 39.1 -> 28.6,
+                    // 4096x2048 38.7 -> 27.8; >= 2^25 weights unchanged (enough waves, reduction costs 3-5%);
+                    // K=256/512 shapes LOST 1.3-2.1x under wide (idle warps + reduction) and K=128 gained nothing
+                    // from a rows-per-block variant, so short K keeps the upstream launch.
+                    // gfx1201 has a dispatch cliff when a launch's wave count lands within a few of the part's
+                    // 2048 wave slots (32 WGP x 4 SIMD32 x 16): 2048x4096 at one wave per row took 19.5 us where
+                    // 2032 rows took 9.8, and 256 rows x 8 warps took 19.7 where 252 took 3.7. The APU (1280
+                    // slots) has no such cliff. A shape that would land there takes the other launch.
+                    // HIP reports RDNA WGPs as multiProcessorCount (32 on gfx1201): 4 SIMD32 x 16 waves each.
+                    const int64_t slots    = (int64_t) ggml_cuda_info().devices[device].nsm * 64;
+                    const int64_t launches = (int64_t) nchannels_dst * nsamples_dst;
+                    const auto on_cliff = [&](int64_t waves) { return waves >= slots - 12 && waves <= slots + 3; };
+                    const bool long_k = blocks_per_row_x >= 8 * blocks_per_iter_1warp;
+                    const bool big    = (int64_t) nrows_x * ncols_x >= (1 << 25);
+                    const int64_t w_wide = (int64_t) nrows_x * 8 * launches;
+                    const int64_t w_up   = (int64_t) nrows_x * launches;
+                    bool wide = long_k && !big;
+                    if (wide ? on_cliff(w_wide) : on_cliff(w_up)) {
+                        wide = !wide;
+                    }
+                    static const bool dbg = getenv("GGML_CUDA_MMVQ_DEBUG") != nullptr;
+                    if (dbg) {
+                        fprintf(stderr, "mmvq rdna4: rows=%d K=%d n=%d ch*s=%lld long_k=%d big=%d -> %s\n",
+                            nrows_x, ncols_x, c_ncols_dst, (long long) launches, long_k, big, wide ? "wide" : "upstream");
+                    }
+                    if (wide) {
+                        launch(std::false_type{}, std::true_type{});
+                    } else {
+                        launch(std::false_type{}, std::false_type{});
+                    }
+                } else {
+                    launch(std::false_type{}, std::false_type{});
+                }
+            };
+            switch (ncols_dst) {
+                case 2: launch_n(std::integral_constant<int, 2>{}); break;
+                case 3: launch_n(std::integral_constant<int, 3>{}); break;
+                default: launch_n(std::integral_constant<int, 4>{}); break;
+            }
         } break;
         case 5: {
             constexpr int c_ncols_dst = 5;

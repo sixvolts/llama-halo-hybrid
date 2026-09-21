@@ -5028,7 +5028,8 @@ struct ggml_cuda_optimer {
             double tot = 0; uint64_t n = 0; for (auto & e : v) { tot += e.second.us; n += e.second.n; }
             fprintf(stderr, "\n=== OPTIMER dev %d after %llu graphs: %llu launches, %.1f ms total (%.3f ms/graph)\n",
                     device, (unsigned long long) graphs, (unsigned long long) n, tot / 1000.0, tot / 1000.0 / graphs);
-            for (size_t i = 0; i < v.size() && i < 40; i++) {
+            static const size_t top = getenv("GGML_CUDA_TIME_OPS_TOP") ? (size_t) atoi(getenv("GGML_CUDA_TIME_OPS_TOP")) : 40;
+            for (size_t i = 0; i < v.size() && i < top; i++) {
                 fprintf(stderr, "OPTIMER dev %d %-64s n=%8llu  %9.2f ms  mean %8.2f us\n", device, v[i].first.c_str(),
                         (unsigned long long) v[i].second.n, v[i].second.us / 1000.0, v[i].second.us / v[i].second.n);
             }
