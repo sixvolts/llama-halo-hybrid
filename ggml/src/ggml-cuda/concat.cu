@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "concat.cuh"
 
 #include <stdint.h>
@@ -146,7 +147,8 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 #define CONCAT_TRANSPOSE_TILE 32
 template <typename T>
 static __global__ void __launch_bounds__(CONCAT_TRANSPOSE_TILE*8) concat_transpose_dim0(
-        const char * __restrict__ src1, char * __restrict__ dst,
+        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
         const int64_t ne10, const int64_t ne11, const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
         const int64_t ne00, const int64_t ne2, const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
     __shared__ T tile[CONCAT_TRANSPOSE_TILE][CONCAT_TRANSPOSE_TILE + 1];
@@ -155,37 +157,81 @@ static __global__ void __launch_bounds__(CONCAT_TRANSPOSE_TILE*8) concat_transpo
     const int64_t i2 = blockIdx.z % ne2;
     // blockIdx.x walks ne11, the dimension that is contiguous in src1: consecutive blocks then stream the same
     //     32 source rows chunk by chunk (open DRAM pages, full lines) instead of touching 32 new rows each.
-    //     The column tiles are shifted by ne00 so that each tile's 32 destination elements start on a tile-aligned
-    //     column of dst (the conv-state concat puts d_conv-1 = 3 columns in front): full lines per warp write,
-    //     no partial lines left for a neighbouring block to complete
-    const int64_t i1_0 = int64_t(blockIdx.x) * CONCAT_TRANSPOSE_TILE;                                  // along ne11 (rows of dst)
-    const int64_t i0_0 = int64_t(blockIdx.y) * CONCAT_TRANSPOSE_TILE - ne00 % CONCAT_TRANSPOSE_TILE; // along ne10 (columns of dst after ne00)
+    //     blockIdx.y walks the destination columns from 0, tile-aligned, so each warp writes full lines. Columns
+    //     below ne00 come from src0 (the d_conv-1 = 3 state columns in front; contiguous rows of ne00 elements), the
+    //     rest from the transposed src1. Covering src0 here is what removes the generic kernel's launch of ne11
+    //     blocks that each copied ne00 elements (24576 blocks for 3 elements each: 62 us per KDA layer at decode).
+    const int64_t i1_0 = int64_t(blockIdx.x) * CONCAT_TRANSPOSE_TILE;   // along ne11 (rows of dst)
+    const int64_t c_0  = int64_t(blockIdx.y) * CONCAT_TRANSPOSE_TILE;   // dst column
+    const int64_t ne0  = ne00 + ne10;
 
-    const char * s = src1 + i3*nb13 + i2*nb12;
-    // read: for each i0 (strided in src1), ne11 consecutive elements are contiguous
+    const char * s0 = src0 + i3*nb03 + i2*nb02;
+    const char * s1 = src1 + i3*nb13 + i2*nb12;
+    // read: for each column (strided in src1), ne11 consecutive elements are contiguous
 #pragma unroll
     for (int r = threadIdx.y; r < CONCAT_TRANSPOSE_TILE; r += blockDim.y) {
-        const int64_t i0 = i0_0 + r;
+        const int64_t c  = c_0 + r;
         const int64_t i1 = i1_0 + threadIdx.x;
-        if (i0 >= 0 && i0 < ne10 && i1 < ne11) {
-            tile[r][threadIdx.x] = *(const T *)(s + i0*nb10 + i1*nb11);
+        if (c < ne0 && i1 < ne11) {
+            tile[r][threadIdx.x] = c < ne00 ? *(const T *)(s0 + c*nb00 + i1*nb01)
+                                            : *(const T *)(s1 + (c - ne00)*nb10 + i1*nb11);
         }
     }
     __syncthreads();
-    // write: dst rows i1, columns ne00 + i0 contiguous
+    // write: dst rows i1, columns contiguous
     char * d = dst + i3*nb3 + i2*nb2;
 #pragma unroll
     for (int r = threadIdx.y; r < CONCAT_TRANSPOSE_TILE; r += blockDim.y) {
         const int64_t i1 = i1_0 + r;
-        const int64_t i0 = i0_0 + threadIdx.x;
-        if (i0 >= 0 && i0 < ne10 && i1 < ne11) {
-            *(T *)(d + i1*nb1 + (ne00 + i0)*nb0) = tile[threadIdx.x][r];
+        const int64_t c  = c_0 + threadIdx.x;
+        if (c < ne0 && i1 < ne11) {
+            *(T *)(d + i1*nb1 + c*nb0) = tile[threadIdx.x][r];
         }
+    }
+}
+
+// halo-hybrid: the same concat at decode (ne0 = d_conv-1 + n_tokens <= 16 columns): one thread per destination row
+//     writes its ne0 contiguous elements; neighbouring threads are neighbouring rows, so every src1 column read and
+//     every dst row write coalesces across the warp. 24576 rows x 6 columns: one launch of 96 blocks.
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_dim0_rows(
+        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst,
+        const int64_t ne00, const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const int64_t ne10, const int64_t ne11, const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne2, const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    const int64_t i1 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i1 >= ne11) {
+        return;
+    }
+    const int64_t i3 = blockIdx.y / ne2;
+    const int64_t i2 = blockIdx.y % ne2;
+    const char * s0 = src0 + i3*nb03 + i2*nb02 + i1*nb01;
+    const char * s1 = src1 + i3*nb13 + i2*nb12 + i1*nb11;
+    char       * d  = dst  + i3*nb3  + i2*nb2  + i1*nb1;
+    for (int64_t c = 0; c < ne00; c++) {
+        *(T *)(d + c*nb0) = *(const T *)(s0 + c*nb00);
+    }
+    for (int64_t c = 0; c < ne10; c++) {
+        *(T *)(d + (ne00 + c)*nb0) = *(const T *)(s1 + c*nb10);
     }
 }
 
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    // halo-hybrid: dim-0 concat with few columns (the KDA conv-state concat at decode: 3 state columns + n_tokens),
+    //     any strides: one thread per destination row. The contiguous-path kernel below is one thread per element
+    //     with 64-bit index math (19 us for 4 x 16384 on gfx1201); the row kernel is 3.5 us.
+    static const bool no_rows = getenv("GGML_CUDA_NO_CONCAT_ROWS") != nullptr;
+    if (!no_rows && dim == 0 && dst->ne[0] <= 32 && dst->nb[0] == ggml_type_size(dst->type) && src0->ne[1] == src1->ne[1] &&
+            src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3]) {
+        dim3 grid((src1->ne[1] + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, dst->ne[2] * dst->ne[3], 1);
+        concat_dim0_rows<T><<<grid, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->ne[0], src1->ne[1], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[2], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+        return;
+    }
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
@@ -208,20 +254,20 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
-        // transposed second operand along dim 0: tile the src1 part, leave the (small, first) src0 part to the
-        //     generic kernel by bounding its loop at ne00
+        // transposed second operand along dim 0 (the conv-state concat): one tiled kernel covers both operands
         const bool src1_transposed = dim == 0 && src1->nb[1] == ggml_type_size(src1->type) && src1->nb[0] > src1->nb[1] &&
-            dst->nb[0] == ggml_type_size(dst->type) && src1->ne[0] > 1 && src1->ne[1] > 1;
-        const int64_t ne0_generic = src1_transposed ? src0->ne[0] : dst->ne[0];
+            dst->nb[0] == ggml_type_size(dst->type) && src1->ne[1] > 1 && src0->ne[1] == src1->ne[1];
         if (src1_transposed) {
             dim3 block(CONCAT_TRANSPOSE_TILE, 8, 1);
             dim3 grid((src1->ne[1] + CONCAT_TRANSPOSE_TILE - 1) / CONCAT_TRANSPOSE_TILE,
-                      (src1->ne[0] + src0->ne[0] % CONCAT_TRANSPOSE_TILE + CONCAT_TRANSPOSE_TILE - 1) / CONCAT_TRANSPOSE_TILE,
+                      (src0->ne[0] + src1->ne[0] + CONCAT_TRANSPOSE_TILE - 1) / CONCAT_TRANSPOSE_TILE,
                       dst->ne[2] * dst->ne[3]);
             concat_transpose_dim0<T><<<grid, block, 0, stream>>>(
-                (const char *) src1->data, (char *) dst->data,
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
                 src1->ne[0], src1->ne[1], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
                 src0->ne[0], dst->ne[2], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            return;
         }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
@@ -232,7 +278,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
                 src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
                 src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
-                ne0_generic, dst->ne[1], dst->ne[2], dst->ne[3],
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
                 dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
         };
         switch (dim) {

@@ -717,14 +717,14 @@ static __global__ void mul_mat_vec_q(
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
+                    x_biases[j] = x_bias[j * fusion.x_bias_stride_col + threadIdx.x];
                 }
             }
             if (use_gate_bias) {
                 gate_bias = gate_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
+                    gate_biases[j] = gate_bias[j * fusion.gate_bias_stride_col + threadIdx.x];
                 }
             }
             if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1053,7 +1053,9 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    // halo-hybrid: fused gate/up + GLU up to 4 columns (the verify batch of an MTP draft); see
+    // ggml_cuda_should_fuse_mul_mat_vec_q for why
+    if constexpr (c_ncols_dst <= 4) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
@@ -1064,7 +1066,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=4");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
@@ -1795,7 +1797,9 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // halo-hybrid: up to 4 columns (the kernel's epilogue is generic over ncols_dst; a fused ADD operand is
+        // either a [rows] bias or a [rows, n_tokens] tensor, see x_bias_stride_col)
+        GGML_ASSERT(  ids || dst->ne[1] <= 4);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1804,7 +1808,9 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
+            GGML_ASSERT( ids || fusion->x_bias->ne[1] == 1 || fusion->x_bias->ne[1] == dst->ne[1]);
             fusion_local.x_bias = fusion->x_bias->data;
+            fusion_local.x_bias_stride_col = (!ids && fusion->x_bias->ne[1] > 1) ? (uint32_t) (fusion->x_bias->nb[1] / sizeof(float)) : 0;
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
@@ -1814,7 +1820,9 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
+            GGML_ASSERT( ids || fusion->gate_bias->ne[1] == 1 || fusion->gate_bias->ne[1] == dst->ne[1]);
             fusion_local.gate_bias = fusion->gate_bias->data;
+            fusion_local.gate_bias_stride_col = (!ids && fusion->gate_bias->ne[1] > 1) ? (uint32_t) (fusion->gate_bias->nb[1] / sizeof(float)) : 0;
         }
         if (fusion->x_scale) {
             GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);

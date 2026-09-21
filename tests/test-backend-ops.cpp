@@ -7041,18 +7041,20 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
 
+    const bool bias_per_token;   // halo-hybrid: the fused ADD operand is [rows, m] (a residual-style add), not [rows, 1]
+
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool bias_per_token = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), bias_per_token(bias_per_token) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims) + (bias_per_token ? ",bias_per_token=1" : "");
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7116,7 +7118,7 @@ struct test_mul_mat_vec_fusion : public test_case {
                     ffn_up = build_lane_scale_dense(ctx, ffn_up);
                 }
                 if (with_bias) {
-                    std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], 1, channels, samples };
+                    std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], bias_per_token ? m : 1, channels, samples };
                     ggml_tensor * up_bias = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias_ne.data());
                     ffn_up = ggml_add(ctx, ffn_up, up_bias);
                 }
@@ -7129,7 +7131,7 @@ struct test_mul_mat_vec_fusion : public test_case {
                     ffn_gate = build_lane_scale_dense(ctx, ffn_gate);
                 }
                 if (with_bias) {
-                    std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], 1, channels, samples };
+                    std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], bias_per_token ? m : 1, channels, samples };
                     ggml_tensor * gate_bias = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias_ne.data());
                     ffn_gate = ggml_add(ctx, ffn_gate, gate_bias);
                 }
@@ -11044,9 +11046,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 32, 256,
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
                                 // multi-token batches (spec decoding)
-                                for (int64_t m_batch : { 2, 4, 8 }) {
+                                for (int64_t m_batch : { 2, 3, 4, 8 }) {
                                     test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
                                         use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
+                                    // halo-hybrid: long K takes the 8-warp split-K launch on RDNA4 (K >= 2048); a fused
+                                    // ADD operand at n > 1 is a [rows, n] tensor in real graphs, so cover that too
+                                    if (!use_id && m_batch <= 4) {
+                                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 64, 4096,
+                                            use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
+                                        if (with_bias) {
+                                            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 64, 4096,
+                                                use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}, true));
+                                            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
+                                                use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}, true));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -11198,6 +11212,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // halo-hybrid: fused gate/up + SwiGLU GEMV shapes, TBO_MMV_FUSION_SHAPES="m:k[:n],..." (q8_0 x f32, n defaults to 3)
+    if (const char * env = getenv("TBO_MMV_FUSION_SHAPES")) {
+        std::string spec(env);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
+            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+            int64_t m = 0, k = 0, n = 3;
+            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &m, &k, &n) >= 2 && m > 0 && k > 0) {
+                // ctor order is (n_tokens, rows, k)
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n, m, k,
+                    false, 1, 1, false, false, true, false, {1, 1}));
+            }
+        }
+        return test_cases;
+    }
+    // halo-hybrid: conv-state concat shapes, TBO_CONCAT_T="a0:C:ntok,..." (f32)
+    if (const char * env = getenv("TBO_CONCAT_T")) {
+        std::string spec(env);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
+            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+            int64_t a0 = 0, c = 0, nt = 3;
+            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &a0, &c, &nt) >= 2 && a0 > 0 && c > 0) {
+                test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F32, {a0, c, 1, 1}, nt));
+            }
+        }
+        return test_cases;
+    }
     // halo-hybrid: arbitrary dense q8_0 GEMV/GEMM shapes for kernel work, TBO_MMV_SHAPES="m:k[:n],m:k[:n],..." (n defaults to 3)
     if (const char * env = getenv("TBO_MMV_SHAPES")) {
         std::string spec(env);

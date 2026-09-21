@@ -1630,6 +1630,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // halo-hybrid: element stride between the token columns of a fused ADD operand (0 = a [rows] bias broadcast
+    // over the columns; the operand of a residual-style add is [rows, n_tokens]). Used by mul_mat_vec_q at n > 1.
+    uint32_t x_bias_stride_col = 0;
+    uint32_t gate_bias_stride_col = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

@@ -1859,8 +1859,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // halo-hybrid: upstream fuses gate/up + GLU into mul_mat_vec_q only at ncols_dst = 1 and otherwise hands the
+    // pair to the fused MMQ path, which at a 3-token verify batch read the 71 MB pair at ~350 GB/s on gfx1201
+    // (201 us vs 2 x 74 us for the plain GEMVs). The mmvq kernel's fused epilogue is generic over ncols_dst, so
+    // allow it up to 4 columns. GGML_CUDA_MMVQ_FUSE_N1=1 restores the upstream rule.
+    static const bool fuse_n1_only = getenv("GGML_CUDA_MMVQ_FUSE_N1") != nullptr && atoi(getenv("GGML_CUDA_MMVQ_FUSE_N1")) != 0;
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && (fuse_n1_only || dst->ne[1] > 4)) {
         return false;
     }
 
@@ -5012,7 +5016,16 @@ struct ggml_cuda_optimer {
         if (used >= ev.size()) { cudaEvent_t e; CUDA_CHECK(ggml_cuda_optimer_create(&e)); ev.push_back(e); }
         return ev[used++];
     }
-    void begin(cudaStream_t st, const std::string & key) { keys.push_back(key); CUDA_CHECK(cudaEventRecord(next_event(), st)); }
+    std::string tag;                  // "D " decode / "P " prefill, from the graph's widest MUL_MAT activation
+    void begin(cudaStream_t st, const std::string & key) { keys.push_back(tag + key); CUDA_CHECK(cudaEventRecord(next_event(), st)); }
+    void set_tag(const ggml_cgraph * cgraph) {
+        int64_t n = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * t = cgraph->nodes[i];
+            if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && t->src[1]) { n = std::max(n, t->src[1]->ne[1]); }
+        }
+        tag = n <= 8 ? "D " : "P ";
+    }
     void end(cudaStream_t st) { CUDA_CHECK(cudaEventRecord(next_event(), st)); }
     void flush(int device) {
         if (used == 0) return;
@@ -5149,6 +5162,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            if (ggml_cuda_optimer::enabled() && !use_cuda_graph) { ggml_cuda_optimer_for(cuda_ctx->device).set_tag(cgraph); }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -5205,7 +5219,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
-                    if (optimer_on) { auto & t = ggml_cuda_optimer_for(cuda_ctx->device); t.keys.back() = ggml_cuda_optimer_key(node, nodes_to_skip); t.end(cuda_ctx->stream()); }
+                    if (optimer_on) { auto & t = ggml_cuda_optimer_for(cuda_ctx->device); t.keys.back() = t.tag + ggml_cuda_optimer_key(node, nodes_to_skip); t.end(cuda_ctx->stream()); }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
