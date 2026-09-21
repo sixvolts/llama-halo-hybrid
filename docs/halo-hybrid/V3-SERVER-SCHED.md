@@ -410,9 +410,18 @@ gibson, KM expert layers on mainframe's card counted from n).
 | 28 | 506 | 551 | 111.0 / 108.5 | 14053 | 28097 |
 | 29 | 505 | 542 | 110.0 / 108.7 | 14223 | 27926 |
 | 30 | 104 (host paging: 108 of 122 GB used) | 474 | 183.6 / 115.1 | 14394 | 27756 |
-Knee at 27: +11% prefill at 25.8K, +9% at 12.7K, decode unchanged, no quality effect (placement only). **LOCAL=27
+Knee at 27: +11% prefill at 25.8K, +9% at 12.7K, decode unchanged, no quality effect (placement only). Mainframe's
+per-ubatch call / idle gap at 25.8K (its uprobe trace): LOCAL 25 1691-1706 / 83-86 ms, 26 1612 / 85, 27 1507 / 81,
+28 1393 / 289, 29 1295 / 433, 30 1199 / 614 - the crossover is sharp: at 27 mainframe is still binding by a hair, at
+28 it idles a third of each ubatch waiting for gibson. Its decode MODEL compute fell 40.39 -> 30.26 ms with the two
+layers moved while decode t/s stayed flat (gibson absorbed exactly that work). **LOCAL=27
 is the production layout from here (launcher default), with KM=6 ub1024.** At 28+ gibson's lane is the long one;
 30 pages the host. Mainframe's card headroom grows ~340 MiB at 27 (KM=7 there would need ~4 GB, so no).
+
+**Production number, v3s LOCAL=27 KM=6 ub1024, both hosts on 919c2ade9 (gibson +client-only commits), harness-gated
+3 reps (11:34-11:48):** 3K prefill 443 (480 warm) / decode 25.3 t/s at 103-106 ms/step; 12.7K prefill 577 (586
+warm) / decode 25.9 t/s at 104-105 ms/step, 2.74 tok/step. From the day's start (113.8 ms/step, 23 t/s, 530
+prefill): decode +12%, prefill +9%.
 
 ## Phase 3c wrap-up (2026-09-21)
 Kept: Q4_0 draft head (-1.5..2 ms/step), lane balance 27/20 (prefill +9-11%, decode flat), draft-depth policy
