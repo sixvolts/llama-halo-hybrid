@@ -489,6 +489,18 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // halve_iters tag). Upstream launches ONE wave per row there, which on a 128-SIMD part leaves
         // short-M GEMVs (24..2048 rows) as serial latency chains at 2-35% of DRAM bandwidth; decode with
         // an MTP draft runs at n=3, so every dense GEMV of a decode step took that path.
+        // The small_k tag at ncols_dst 2..4 is the TALL launch instead: 32 warps per block for a handful of rows
+        // over a long K (hc_fn 24 x 16384: 24 blocks x 8 warps = 192 waves, 8 dependent DRAM trips each, 15-18 us
+        // in situ; 32 warps make it 2 trips).
+        if (ncols_dst != 1 && ncols_dst <= 4 && small_k) {
+            switch (type) {
+                case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_NL:
+                    return 32;
+                default:
+                    return 1;
+            }
+        }
         if (ncols_dst == 1 || (ncols_dst <= 4 && halve_iters)) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
@@ -1251,7 +1263,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 const auto launch = [&](auto small_k_tag, auto wide_tag) {
                     // Types the RDNA4 table does not promote would compile a second, identical kernel.
                     constexpr bool c_promoted = calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, true) > 1;
-                    constexpr bool c_small_k  = decltype(small_k_tag)::value && c_promoted;
+                    constexpr bool c_small_k  = decltype(small_k_tag)::value && c_promoted;   // = tall on RDNA4
                     constexpr bool c_wide     = decltype(wide_tag)::value && c_promoted;
                     const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                                   nsamples_dst, warp_size, table_id, c_small_k, c_wide);
@@ -1284,12 +1296,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     if (wide ? on_cliff(w_wide) : on_cliff(w_up)) {
                         wide = !wide;
                     }
+                    // tall: <= 64 rows over K >= 8192 (q8_0), 32 warps split the K loop 4x deeper than wide
+                    static const bool no_tall = getenv("GGML_CUDA_MMVQ_NO_TALL") != nullptr;
+                    const bool tall = !no_tall && wide && nrows_x <= 64 && blocks_per_row_x >= 32 * blocks_per_iter_1warp &&
+                        calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, true, false) > 1 && !on_cliff((int64_t) nrows_x * 32 * launches);
                     static const bool dbg = getenv("GGML_CUDA_MMVQ_DEBUG") != nullptr;
                     if (dbg) {
                         fprintf(stderr, "mmvq rdna4: rows=%d K=%d n=%d ch*s=%lld long_k=%d big=%d -> %s\n",
-                            nrows_x, ncols_x, c_ncols_dst, (long long) launches, long_k, big, wide ? "wide" : "upstream");
+                            nrows_x, ncols_x, c_ncols_dst, (long long) launches, long_k, big, tall ? "tall" : wide ? "wide" : "upstream");
                     }
-                    if (wide) {
+                    if (tall) {
+                        launch(std::true_type{},  std::false_type{});
+                    } else if (wide) {
                         launch(std::false_type{}, std::true_type{});
                     } else {
                         launch(std::false_type{}, std::false_type{});
