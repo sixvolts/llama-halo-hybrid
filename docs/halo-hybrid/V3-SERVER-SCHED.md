@@ -242,7 +242,13 @@ until the client's scratch stops being real memory on the card (the lazily-backe
 Readings: ub2048 still buys nothing (prefill -3% vs KM=5 ub1024's 508, ms/step +3%); KM=6 gives the best v3s prefill
 (523, level with v2c's 530) and the card is now ~31 GB full with weights + KV + the server's own compute buffer; the
 client scratch no longer costs the card anything. Step period is flat at ~112-116 ms across KM 4/5/6 - KM's decode
-value is within noise, its value is prefill. Production candidate: v3s KM=6 ub1024.
+value is within noise, its value is prefill. Mainframe's samplers: card peak KM=5 ub2048 27422 MiB (5.2 GB headroom, previously could not allocate), KM=6 ub1024
+31075 MiB (95.2%, 1.5 GB headroom - tighter than KM=4 ub2048 was); host-memory delta on mainframe 6.7 GB at KM=6
+ub1024 (as predicted) but 14.8 GB at KM=5 ub2048 (double the two 3.67 GB lanes; RSS accounts for 9.8 GB of it -
+unexplained, do not assume "2x the lane size" for larger ubatches). VmLck stayed 0 (hipHostMalloc pins through the
+driver, not mlock), so "pinned" is by design, not measured. MODEL call: KM=6 compute 42.85 ms (lowest measured; more of
+the slice on the card), alloc unchanged at 0.68. Prefill call KM=5 ub2048 3313 ms vs KM=6 ub1024 1636 ms.
+Production candidate: v3s KM=6 ub1024 for prefill (523), with 1.5 GB of card headroom; KM=5 ub1024 (508) keeps ~5 GB.
 
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
