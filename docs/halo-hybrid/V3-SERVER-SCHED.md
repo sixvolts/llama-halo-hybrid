@@ -329,6 +329,18 @@ Bigger single items the inventory exposed:
 Result, v3s KM=6 ub1024, gibson only on this build (mainframe on 1f8b0c194): 111.1 -> 110.1 ms/step, greedy text
 identical (a828e28289899da6), prefill unchanged.
 
+Step 1 also added a 32-warp "tall" mmvq launch for <= 64 rows over K >= 8192 (d09a3ac7e; hc_fn 24x16384: isolated
+5.4 -> 4.4 us at n=3, 4.6 -> 3.4 at n=2; mainframe's card 4.56 -> 3.89, 32x32768 6.23 -> 4.61). Both hosts on
+d09a3ac7e, KM=6 ub1024, 3 reps x 2 ctx (08:03-08:09): **109.7 ms/step** (111.1 after 3a, 113.8 before it),
+prefill 530 t/s at 12760 tok. Two incidents worth the record: (1) with the op timer on (GGML_CUDA_TIME_OPS +
+GGML_CUDA_DISABLE_GRAPHS), the tall build stalled at load once on gibson - main thread spinning in a synchronize,
+GPU at 5%; graphs-off alone and the production configuration both load and run, and mainframe could not reproduce
+any combination in isolation. Timer runs use GGML_CUDA_MMVQ_NO_TALL=1 until that is understood. (2) A build of the
+next op that failed on ggml-rpc.h's op-count static assert had already relinked libggml-base/cpu with the new op
+mid-enum while libggml-hip/rpc kept the old ids; a queued load ran on that mix and was killed before its warm-up
+reached mainframe. The op now goes in appended last, as protocol 7.4 (minor is the field the handshake compares),
+and the HELLO reply carries GGML_OP_COUNT so a mismatched pair is refused.
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,
