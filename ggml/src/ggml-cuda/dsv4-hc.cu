@@ -292,3 +292,176 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
 }
+
+// halo-hybrid: the whole hyper-connection prologue of a sublayer in one launch, one 1024-thread block per token.
+//     Replaces rms_norm + the 24-row hc_fn GEMV + two gate chains + dsv4_hc_comb + dsv4_hc_pre (6 launches per
+//     mixer, 2 mixers per layer). The token's hc*n_embd activation stays in registers (16 per thread at n_embd
+//     4096); the 24 dot products are block-reduced; the 4x4 sinkhorn runs on one thread; the pre-mix accumulates
+//     the 4 streams through LDS in 4 ordered passes (no atomics, deterministic).
+#define DSV4_HC_MIX_THREADS 1024
+#define DSV4_HC_MIX_MAX_PER_THREAD 16
+
+template <bool WQ8>
+static __global__ void __launch_bounds__(DSV4_HC_MIX_THREADS) dsv4_hc_mix_f32(
+        const float * __restrict__ x, const void * __restrict__ w, const float * __restrict__ scale, const float * __restrict__ base,
+        float * __restrict__ dst,
+        const int n_embd, const int64_t sx1, const int64_t sx2, const int64_t ss0, const int64_t sb0, const int64_t sd1,
+        const float eps_norm, const float eps_hc, const int n_iter) {
+    constexpr int hc      = DSV4_HC;
+    constexpr int mix_dim = (2 + hc)*hc;
+    const int hc_dim = hc*n_embd;
+    const int nloc   = hc_dim / DSV4_HC_MIX_THREADS;   // elements per thread (host checks: exact, <= 16)
+    const int tid    = threadIdx.x;
+    const int lane   = tid % 32;
+    const int warp   = tid / 32;
+    const int it     = blockIdx.x;
+
+    extern __shared__ float smem[];
+    float * acc     = smem;                        // [n_embd]  pre-mix accumulator
+    float * red     = acc + n_embd;                // [32][mix_dim] per-warp partial dots
+    float * mixes   = red + 32*mix_dim;            // [mix_dim]
+    float * pre     = mixes + mix_dim;             // [hc]
+    float * redss   = pre + hc;                    // [32]
+
+    const float * xt = x + it*sx2;
+
+    // 1. the token's streams into registers
+    float xv[DSV4_HC_MIX_MAX_PER_THREAD];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < DSV4_HC_MIX_MAX_PER_THREAD; ++k) {
+        if (k < nloc) {
+            const int i = k*DSV4_HC_MIX_THREADS + tid;
+            const int h = i / n_embd, j = i - h*n_embd;
+            xv[k] = xt[j + h*sx1];
+            ss += xv[k]*xv[k];
+        }
+    }
+    // 2. rms
+    ss = warp_reduce_sum(ss);
+    if (lane == 0) { redss[warp] = ss; }
+    __syncthreads();
+    if (warp == 0) {
+        float v = lane < 32 ? redss[lane] : 0.0f;
+        v = warp_reduce_sum(v);
+        if (lane == 0) { redss[0] = v; }
+    }
+    __syncthreads();
+    const float rms_inv = rsqrtf(redss[0] / (float) hc_dim + eps_norm);
+
+    // 3. mixes = W . (x * rms_inv): each thread dots its elements against every row, block-reduce per row
+#pragma unroll 4
+    for (int r = 0; r < mix_dim; ++r) {
+        float part = 0.0f;
+        if constexpr (WQ8) {
+            const block_q8_0 * wr = (const block_q8_0 *) w + (int64_t) r * (hc_dim / QK8_0);
+#pragma unroll
+            for (int k = 0; k < DSV4_HC_MIX_MAX_PER_THREAD; ++k) {
+                if (k < nloc) {
+                    const int i = k*DSV4_HC_MIX_THREADS + tid;
+                    const block_q8_0 & b = wr[i / QK8_0];
+                    part += __half2float(b.d) * (float) b.qs[i % QK8_0] * xv[k];
+                }
+            }
+        } else {
+            const float * wr = (const float *) w + (int64_t) r * hc_dim;
+#pragma unroll
+            for (int k = 0; k < DSV4_HC_MIX_MAX_PER_THREAD; ++k) {
+                if (k < nloc) {
+                    part += wr[k*DSV4_HC_MIX_THREADS + tid] * xv[k];
+                }
+            }
+        }
+        part = warp_reduce_sum(part);
+        if (lane == 0) { red[warp*mix_dim + r] = part; }
+    }
+    __syncthreads();
+    if (tid < mix_dim) {
+        float v = 0.0f;
+        for (int wi = 0; wi < 32; ++wi) { v += red[wi*mix_dim + tid]; }
+        mixes[tid] = v * rms_inv;
+    }
+    __syncthreads();
+
+    // 4. gates and the 4x4 sinkhorn on one thread; post and comb go straight to dst
+    float * drow = dst + it*sd1;
+    if (tid == 0) {
+        const float scale_pre = scale[0], scale_post = scale[ss0], scale_comb = scale[2*ss0];
+        for (int h = 0; h < hc; ++h) {
+            pre[h] = 1.0f / (1.0f + expf(-(mixes[h]*scale_pre + base[h*sb0]))) + eps_hc;
+            drow[n_embd + h] = 2.0f / (1.0f + expf(-(mixes[hc + h]*scale_post + base[(hc + h)*sb0])));
+        }
+        float comb[hc*hc];
+        for (int isrc = 0; isrc < hc; ++isrc) {
+            float max = -INFINITY;
+            for (int idst = 0; idst < hc; ++idst) {
+                const int idx = idst + hc*isrc;
+                const float v = mixes[2*hc + idx]*scale_comb + base[(2*hc + idx)*sb0];
+                comb[idx] = v; max = fmaxf(max, v);
+            }
+            float sum = 0.0f;
+            for (int idst = 0; idst < hc; ++idst) { const int idx = idst + hc*isrc; const float v = expf(comb[idx] - max); comb[idx] = v; sum += v; }
+            const float inv_sum = 1.0f / sum;
+            for (int idst = 0; idst < hc; ++idst) { const int idx = idst + hc*isrc; comb[idx] = comb[idx]*inv_sum + eps_hc; }
+        }
+        dsv4_hc_comb_norm_cols(comb, eps_hc);
+        for (int i = 1; i < n_iter; ++i) { dsv4_hc_comb_norm_rows(comb, eps_hc); dsv4_hc_comb_norm_cols(comb, eps_hc); }
+        for (int idx = 0; idx < hc*hc; ++idx) { drow[n_embd + hc + idx] = comb[idx]; }
+    }
+    for (int j = tid; j < n_embd; j += DSV4_HC_MIX_THREADS) { acc[j] = 0.0f; }
+    __syncthreads();
+
+    // 5. out = sum_h pre[h] * x[:, h]: 4 ordered passes, each element of a pass is owned by exactly one thread
+    for (int h = 0; h < hc; ++h) {
+        const float ph = pre[h];
+#pragma unroll
+        for (int k = 0; k < DSV4_HC_MIX_MAX_PER_THREAD; ++k) {
+            if (k < nloc) {
+                const int i = k*DSV4_HC_MIX_THREADS + tid;
+                if (i / n_embd == h) { acc[i - h*n_embd] += ph * xv[k]; }
+            }
+        }
+        __syncthreads();
+    }
+    for (int j = tid; j < n_embd; j += DSV4_HC_MIX_THREADS) { drow[j] = acc[j]; }
+}
+
+void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * w     = dst->src[1];
+    const ggml_tensor * scale = dst->src[2];
+    const ggml_tensor * base  = dst->src[3];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const int     n_embd   = (int) x->ne[0];
+    const int     n_tokens = (int) x->ne[2];
+    const int     hc_dim   = DSV4_HC*n_embd;
+    GGML_ASSERT(x->ne[1] == DSV4_HC);
+    GGML_ASSERT(hc_dim % DSV4_HC_MIX_THREADS == 0 && hc_dim / DSV4_HC_MIX_THREADS <= DSV4_HC_MIX_MAX_PER_THREAD);
+
+    const float   eps_norm = ((const float *) dst->op_params)[0];
+    const float   eps_hc   = ((const float *) dst->op_params)[1];
+    const int32_t n_iter   = ggml_get_op_params_i32(dst, 2);
+
+    constexpr int mix_dim = (2 + DSV4_HC)*DSV4_HC;
+    const size_t smem = (n_embd + 32*mix_dim + mix_dim + DSV4_HC + 32) * sizeof(float);
+
+    cudaStream_t stream = ctx.stream();
+    const dim3 grid(n_tokens, 1, 1);
+    const dim3 block(DSV4_HC_MIX_THREADS, 1, 1);
+    if (w->type == GGML_TYPE_Q8_0) {
+        dsv4_hc_mix_f32<true><<<grid, block, smem, stream>>>(
+            (const float *) x->data, w->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
+            n_embd, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), scale->nb[0] / sizeof(float), base->nb[0] / sizeof(float),
+            dst->nb[1] / sizeof(float), eps_norm, eps_hc, n_iter);
+    } else {
+        dsv4_hc_mix_f32<false><<<grid, block, smem, stream>>>(
+            (const float *) x->data, w->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
+            n_embd, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), scale->nb[0] / sizeof(float), base->nb[0] / sizeof(float),
+            dst->nb[1] / sizeof(float), eps_norm, eps_hc, n_iter);
+    }
+}

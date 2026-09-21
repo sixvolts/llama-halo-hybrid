@@ -332,7 +332,10 @@ identical (a828e28289899da6), prefill unchanged.
 Step 1 also added a 32-warp "tall" mmvq launch for <= 64 rows over K >= 8192 (d09a3ac7e; hc_fn 24x16384: isolated
 5.4 -> 4.4 us at n=3, 4.6 -> 3.4 at n=2; mainframe's card 4.56 -> 3.89, 32x32768 6.23 -> 4.61). Both hosts on
 d09a3ac7e, KM=6 ub1024, 3 reps x 2 ctx (08:03-08:09): **109.7 ms/step** (111.1 after 3a, 113.8 before it),
-prefill 530 t/s at 12760 tok. Two incidents worth the record: (1) with the op timer on (GGML_CUDA_TIME_OPS +
+prefill 530 t/s at 12760 tok. Mainframe's decomp trace (same method as 3a): MODEL compute median 41.81 -> 40.87 ms
+(-0.94, CI +/-0.25, n=248), alloc unchanged, rest +0.05 (first non-compute move in the series; worth a glance if a
+later step touches copies/sync again); cumulative Phase 3 on its compute term 42.88 -> 40.87 (-4.7%). Its
+MODEL-to-MODEL step delta -1.98 vs the harness's -1.40. Two incidents worth the record: (1) with the op timer on (GGML_CUDA_TIME_OPS +
 GGML_CUDA_DISABLE_GRAPHS), the tall build stalled at load once on gibson - main thread spinning in a synchronize,
 GPU at 5%; graphs-off alone and the production configuration both load and run, and mainframe could not reproduce
 any combination in isolation. Timer runs use GGML_CUDA_MMVQ_NO_TALL=1 until that is understood. (2) A build of the

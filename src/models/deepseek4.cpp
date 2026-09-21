@@ -367,6 +367,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     GGML_ASSERT(hc == 4);
     GGML_ASSERT(hc_fn->ne[1] == hc_mix_dim);
 
+    // halo-hybrid: at decode the whole prologue is one op; post and comb are views into its result
+    if (cparams.fused_dsv4_hc_mix && il >= 0 && nt <= 8 && (hc_fn->type == GGML_TYPE_Q8_0 || hc_fn->type == GGML_TYPE_F32)) {
+        ggml_tensor * mix = ggml_dsv4_hc_mix(ctx0, x, hc_fn, hc_scale, hc_base, norm_rms_eps, hparams.dsv4_hc_eps,
+                (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+        cb(mix, "hc_mix", il);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_MIX, mix, il});
+        *post = ggml_view_2d(ctx0, mix, hc, nt, mix->nb[1], n_embd*sizeof(float));
+        *comb = ggml_view_3d(ctx0, mix, hc, hc, nt, hc*sizeof(float), mix->nb[1], (n_embd + hc)*sizeof(float));
+        cb(*post, "hc_post", il);
+        cb(*comb, "hc_comb", il);
+        return ggml_view_2d(ctx0, mix, n_embd, nt, mix->nb[1], 0);
+    }
+
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);

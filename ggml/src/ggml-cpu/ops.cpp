@@ -1,4 +1,5 @@
 #include "ops.h"
+#include <vector>
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -11305,6 +11306,136 @@ void ggml_compute_forward_dsv4_hc_pre(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+
+// ggml_compute_forward_dsv4_hc_mix (halo-hybrid): reference for the fused hyper-connection prologue
+
+void ggml_compute_forward_dsv4_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * hc_fn = dst->src[1];
+    const ggml_tensor * scale = dst->src[2];
+    const ggml_tensor * base  = dst->src[3];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    constexpr int64_t hc         = 4;
+    constexpr int64_t hc_mix_dim = (2 + hc)*hc;
+    const int64_t n_embd      = x->ne[0];
+    const int64_t n_tokens    = x->ne[2];
+    const int64_t hc_dim      = hc*n_embd;
+
+    GGML_ASSERT(x->ne[1] == hc);
+    GGML_ASSERT(hc_fn->ne[0] == hc_dim && hc_fn->ne[1] == hc_mix_dim);
+    GGML_ASSERT(dst->ne[0] == n_embd + hc + hc*hc && dst->ne[1] == n_tokens);
+
+    const float   eps_norm = ((const float *) dst->op_params)[0];
+    const float   eps_hc   = ((const float *) dst->op_params)[1];
+    const int32_t n_iter   = ggml_get_op_params_i32(dst, 2);
+
+    const size_t nbx1 = x->nb[1], nbx2 = x->nb[2];
+    const size_t nbs0 = scale->nb[0], nbb0 = base->nb[0];
+
+    const ggml_type_traits * traits = ggml_get_type_traits(hc_fn->type);
+    ggml_to_float_t to_float = hc_fn->type == GGML_TYPE_F32 ? nullptr : traits->to_float;
+    GGML_ASSERT(hc_fn->type == GGML_TYPE_F32 || to_float != nullptr);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dt  = (n_tokens + nth - 1) / nth;
+    const int64_t it0 = dt * ith;
+    const int64_t it1 = MIN(it0 + dt, n_tokens);
+
+    std::vector<float> xn(hc_dim), wrow(hc_dim);
+
+    for (int64_t it = it0; it < it1; ++it) {
+        // rms norm of the flattened streams
+        double ss = 0.0;
+        for (int64_t h = 0; h < hc; ++h) {
+            const float * xr = (const float *) ((const char *) x->data + h*nbx1 + it*nbx2);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                xn[h*n_embd + i] = xr[i];
+                ss += (double) xr[i] * xr[i];
+            }
+        }
+        const float rms_inv = 1.0f / sqrtf((float) (ss / hc_dim) + eps_norm);
+        for (int64_t i = 0; i < hc_dim; ++i) {
+            xn[i] *= rms_inv;
+        }
+
+        // mixes = hc_fn . xn
+        float mixes[hc_mix_dim];
+        for (int64_t r = 0; r < hc_mix_dim; ++r) {
+            const float * w;
+            if (to_float) {
+                to_float((const char *) hc_fn->data + r*hc_fn->nb[1], wrow.data(), hc_dim);
+                w = wrow.data();
+            } else {
+                w = (const float *) ((const char *) hc_fn->data + r*hc_fn->nb[1]);
+            }
+            double acc = 0.0;
+            for (int64_t i = 0; i < hc_dim; ++i) {
+                acc += (double) w[i] * xn[i];
+            }
+            mixes[r] = (float) acc;
+        }
+
+        const float scale_pre  = *(const float *) ((const char *) scale->data + 0*nbs0);
+        const float scale_post = *(const float *) ((const char *) scale->data + 1*nbs0);
+        const float scale_comb = *(const float *) ((const char *) scale->data + 2*nbs0);
+        auto basev = [&](int64_t i) { return *(const float *) ((const char *) base->data + i*nbb0); };
+        auto sigmoid = [](float v) { return 1.0f / (1.0f + expf(-v)); };
+
+        float * drow = (float *) ((char *) dst->data + it*dst->nb[1]);
+
+        float pre[hc];
+        for (int64_t h = 0; h < hc; ++h) {
+            pre[h] = sigmoid(mixes[h]*scale_pre + basev(h)) + eps_hc;
+            drow[n_embd + h] = 2.0f*sigmoid(mixes[hc + h]*scale_post + basev(hc + h));
+        }
+
+        float comb[hc*hc];
+        for (int64_t isrc = 0; isrc < hc; ++isrc) {
+            float max = -INFINITY;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                const float v = mixes[2*hc + idx]*scale_comb + basev(2*hc + idx);
+                comb[idx] = v;
+                max = MAX(max, v);
+            }
+            float sum = 0.0f;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                const float v = expf(comb[idx] - max);
+                comb[idx] = v;
+                sum += v;
+            }
+            const float inv_sum = 1.0f / sum;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                comb[idx] = comb[idx] * inv_sum + eps_hc;
+            }
+        }
+        ggml_dsv4_hc_comb_norm_cols(comb, eps_hc);
+        for (int32_t i = 1; i < n_iter; ++i) {
+            ggml_dsv4_hc_comb_norm_rows(comb, eps_hc);
+            ggml_dsv4_hc_comb_norm_cols(comb, eps_hc);
+        }
+        for (int64_t idx = 0; idx < hc*hc; ++idx) {
+            drow[n_embd + hc + idx] = comb[idx];
+        }
+
+        // out = sum_h pre[h] * x[:, h, t]  (raw x)
+        for (int64_t i = 0; i < n_embd; ++i) {
+            float sum = 0.0f;
+            for (int64_t h = 0; h < hc; ++h) {
+                sum += pre[h] * *(const float *) ((const char *) x->data + i*sizeof(float) + h*nbx1 + it*nbx2);
+            }
+            drow[i] = sum;
+        }
     }
 }
 

@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "DSV4_HC_MIX",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "dsv4_hc_mix(x, hc_fn, scale, base)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6576,6 +6580,49 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * hc_fn,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps_norm,
+        float                 eps_hc,
+        int32_t               n_iter) {
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type  == GGML_TYPE_F32);
+    GGML_ASSERT(n_iter > 0);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+
+    GGML_ASSERT(hc == 4);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(hc_fn->ne[0] == hc*n_embd);
+    GGML_ASSERT(hc_fn->ne[1] == (2 + hc)*hc);
+    GGML_ASSERT(ggml_is_contiguous(hc_fn));
+    GGML_ASSERT(scale->ne[0] >= 3);
+    GGML_ASSERT(base->ne[0] == (2 + hc)*hc);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + hc + hc*hc, n_tokens);
+
+    float   params_f[2] = { eps_norm, eps_hc };
+    int32_t params_i    = n_iter;
+    ggml_set_op_params(result, params_f, sizeof(params_f));
+    ggml_set_op_params_i32(result, 2, params_i);
+
+    result->op     = GGML_OP_DSV4_HC_MIX;
+    result->src[0] = x;
+    result->src[1] = hc_fn;
+    result->src[2] = scale;
+    result->src[3] = base;
 
     return result;
 }

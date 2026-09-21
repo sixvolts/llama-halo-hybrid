@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_DSV4_HC_MIX,   // halo-hybrid: appended last so the ids above stay wire-stable
+
         GGML_OP_COUNT,
     };
 
@@ -2716,6 +2718,26 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // halo-hybrid: the whole hyper-connection prologue of a sublayer as one op (decode, few tokens):
+    //   flat  = x[:, :, t] as a vector of hc*n_embd (stream-major)
+    //   xn    = rms_norm(flat, eps_norm)
+    //   mixes = hc_fn . xn                                 [(2 + hc)*hc]
+    //   pre   = sigmoid(mixes[0:hc]*scale[0] + base[0:hc]) + eps_hc
+    //   post  = 2*sigmoid(mixes[hc:2hc]*scale[1] + base[hc:2hc])
+    //   comb  = sinkhorn(mixes[2hc:]*scale[2] + base[2hc:], eps_hc, n_iter)   (as ggml_dsv4_hc_comb)
+    //   out   = sum_h pre[h]*x[:, h, t]                    (as ggml_dsv4_hc_pre)
+    // x [n_embd, hc, n_tokens] f32; hc_fn [hc*n_embd, (2+hc)*hc] (f32 or q8_0); scale [>=3]; base [(2+hc)*hc]
+    // result [n_embd + hc + hc*hc, n_tokens] f32: per token [out | post | comb(idst + hc*isrc)]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * hc_fn,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps_norm,
+            float                 eps_hc,
+            int32_t               n_iter);
 
     // custom operators
 

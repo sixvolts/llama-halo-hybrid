@@ -9,11 +9,15 @@ extern "C" {
 // 7: halo-hybrid wire (GRAPH_COMPUTE / GRAPH_RECOMPUTE return an empty reply that the client waits for); an upstream
 //    6.x peer would hang on the missing reply or desync on the extra one, so the handshake must reject the pairing
 #define RPC_PROTO_MAJOR_VERSION    7
-#define RPC_PROTO_MINOR_VERSION 3
+// 7.4: GGML_OP_DSV4_HC_MIX appended to the op enum (ids before it unchanged) and the HELLO reply carries
+//      GGML_OP_COUNT, which the client compares: a peer built with a different op table is refused at the
+//      handshake instead of executing shifted op ids (the patch field is never compared, so a patch bump alone
+//      would not have protected the pairing)
+#define RPC_PROTO_MINOR_VERSION 4
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

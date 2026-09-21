@@ -96,7 +96,7 @@ struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t op_count;   // halo-hybrid (7.4): GGML_OP_COUNT of the server build, 0 from older servers
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -374,6 +374,11 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint32_t & s
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
                        response.major, response.minor, response.patch);
+        return false;
+    }
+    if (response.minor >= 4 && response.op_count != (uint8_t) GGML_OP_COUNT) {
+        GGML_LOG_ERROR("RPC server op table mismatch: server GGML_OP_COUNT %d, client %d (rebuild both hosts on one commit)\n",
+                       response.op_count, (int) GGML_OP_COUNT);
         return false;
     }
 
@@ -1323,6 +1328,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    response.op_count = (uint8_t) GGML_OP_COUNT;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
