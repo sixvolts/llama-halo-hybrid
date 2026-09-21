@@ -1,5 +1,8 @@
 #include "llama-memory-hybrid.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-context.h"
@@ -86,6 +89,26 @@ llama_memory_hybrid::llama_memory_hybrid(
             nullptr, filter_idx, nullptr, nullptr);
     }()) {}
 
+// halo-hybrid: LLAMA_UBATCH_TAPER=1 shapes the ubatch sequence of a long prompt for the two-lane pipeline: a half
+// unit first (the second lane starts sooner), full units, and the remainder as two equal units so both lanes finish
+// together instead of one lane running the last full unit alone. Sizes never exceed n_ubatch (the reserved
+// compute buffers) and stay multiples of 64.
+static uint32_t llama_ubatch_taper(uint32_t n_ubatch, uint32_t n_total, uint32_t n_used) {
+    static const bool on = getenv("LLAMA_UBATCH_TAPER") != nullptr && atoi(getenv("LLAMA_UBATCH_TAPER")) != 0;
+    if (!on || n_total <= n_ubatch || n_ubatch < 256) {
+        return n_ubatch;
+    }
+    const uint32_t remaining = n_total - n_used;
+    auto round64 = [](uint32_t v) { return (v + 63) / 64 * 64; };
+    if (n_used == 0) {
+        return n_ubatch / 2;
+    }
+    if (remaining > n_ubatch && remaining <= 2*n_ubatch) {
+        return std::min(n_ubatch, round64((remaining + 1) / 2));
+    }
+    return n_ubatch;
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();
@@ -95,10 +118,11 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
 
         while (true) {
             llama_ubatch ubatch;
+            const uint32_t n_ub = llama_ubatch_taper(n_ubatch, balloc.get_n_tokens(), balloc.get_n_used());
 
             if (embd_all) {
                 // if all tokens are output, split by sequence
-                ubatch = balloc.split_seq(n_ubatch);
+                ubatch = balloc.split_seq(n_ub);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (mem_attn->get_n_stream() == 1);
@@ -108,7 +132,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ub, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
