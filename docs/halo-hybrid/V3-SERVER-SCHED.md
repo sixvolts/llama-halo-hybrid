@@ -234,6 +234,16 @@ step period or at equal acceptance, not by t/s alone; the harness should print t
 Phase 0's ~1.1 ms/layer predicted). VRAM: KM=5 and ub2048 each consume the card's headroom; both together do not fit
 until the client's scratch stops being real memory on the card (the lazily-backed scratch buft from the design).
 
+## With the scratch in host memory (28b6a3e5c, proto 7.3; 2026-09-21 01:10-01:21, 3 reps, tok/step and ms/step now printed)
+| config | prefill 3148 | prefill 12760 | decode 12760 (t/s @ tok/step) | ms/step | card VRAM (weights) |
+|---|---|---|---|---|---|
+| KM=5 ub2048 (previously OOM) | 364 | 492 | 23.56 @ 2.74 | 114-116 | 24420 MiB + KV + server compute |
+| **KM=6 ub1024** | 415 | **523** | 22.29 @ 2.59 | 112-115 | 28596 MiB + KV + server compute |
+Readings: ub2048 still buys nothing (prefill -3% vs KM=5 ub1024's 508, ms/step +3%); KM=6 gives the best v3s prefill
+(523, level with v2c's 530) and the card is now ~31 GB full with weights + KV + the server's own compute buffer; the
+client scratch no longer costs the card anything. Step period is flat at ~112-116 ms across KM 4/5/6 - KM's decode
+value is within noise, its value is prefill. Production candidate: v3s KM=6 ub1024.
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,

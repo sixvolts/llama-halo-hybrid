@@ -5,7 +5,7 @@
 # usage: phase2_ab.sh [layouts...]   default: v1 v2c v3     env: REMOTE_APU (v1, default RPC1), RR, KM, EXPECT_HEAD
 G=/home/sixvolts/bench/glm; LOG=$G/phase2${SUFFIX:-}.log; SRC=/home/sixvolts/llama.cpp
 LAYOUTS=${@:-v1 v2c v3}; export LLAMA_PREFILL_LANES=2 DRAFT=1
-REMOTE_APU=${REMOTE_APU:-RPC1}; RR=${RR:-6}; KM=${KM:-5}; EXPECT_HEAD=${EXPECT_HEAD:-3c6600e04}
+REMOTE_APU=${REMOTE_APU:-RPC1}; RR=${RR:-6}; KM=${KM:-5}; EXPECT_HEAD=${EXPECT_HEAD:-28b6a3e5c}
 : > $LOG; say(){ echo "$*" | tee -a $LOG; }
 say "=== PHASE 2  $(date '+%F %T')  layouts=[$LAYOUTS]  REMOTE_APU=$REMOTE_APU RR=$RR KM=$KM UB=${UB:-1024} SUFFIX=${SUFFIX:-}"
 # ---- artifact gate: refuse to measure a stale or wrong build
