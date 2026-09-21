@@ -402,8 +402,10 @@ static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, 
 // halo-hybrid: on the WMMA path a wave owns 16 rows, so 8 waves on a 64-row tile must split J into two wave
 //     groups of four (each group covers J/2 columns). Q8_0 J=128 used this first (halo-box); Q4_K/Q5_K J=32/64 now too.
 static constexpr __host__ __device__ bool ggml_cuda_mmq_split_j(int J, int I, int nwarps, bool fallback) {
-    return !fallback && I == 64 && nwarps == 8 && J % 32 == 0;
+    // I/16 row groups of 16 rows; twice that many waves means two J groups
+    return !fallback && I % 16 == 0 && nwarps == 2*(I/16) && J % 32 == 0;
 }
+static constexpr __host__ __device__ int ggml_cuda_mmq_row_groups(int I) { return I/16; }
 
 #define MMQ_DP4A_TXS_Q4_0    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_0   + I/QI4_0,     0}
 #define MMQ_DP4A_TXS_Q4_1    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_1   + I/QI4_1,     0}
@@ -524,8 +526,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     constexpr bool split_j      = ggml_cuda_mmq_split_j(J, I, nwarps, fallback);
     constexpr int j_group       = split_j ? J/2 : J;
 
-    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
-    const int warp_j = split_j ? threadIdx.y / 4 : 0;
+    const int warp_i = split_j ? threadIdx.y % ggml_cuda_mmq_row_groups(I) : threadIdx.y;
+    const int warp_j = split_j ? threadIdx.y / ggml_cuda_mmq_row_groups(I) : 0;
     const int i0 = (warp_i / ntx) * (ntx*tile_C::I);
 
     const bool y_scale_used = y_scale != nullptr;

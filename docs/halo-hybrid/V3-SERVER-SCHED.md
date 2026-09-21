@@ -505,6 +505,24 @@ layout and removes that 2-way conflict. Measured: bank-conflict stall 15.5% -> 7
 8.47 ms at n=1024; 923/923 + 2244/2244 pass). Kept (harmless, and the conflicts were not on the critical path), and
 it says the kernel is bound elsewhere: occupancy 31% with 4 syncs per K iteration is the next lead - an I=32 tile
 (half the LDS per block, 4 blocks per CU) needs the split-J mapping generalised to I/16 row groups.
+I=32 tiles (split-J generalised, 4 waves = 2 row groups x 2 J groups, 4 blocks per CU): correct, conflicts 5.6%, and
+slower at n=1024 (q4_K 9.36 vs 8.46, q5_K 10.76 vs 10.07): the doubled activation re-reads cost more than the
+occupancy buys. P1 table so far (q4_K 2048x4096 x288/8, n=1024, gfx1151, ms; all correctness-gated):
+| variant | ms | note |
+|---|---|---|
+| baseline J=32 I=64 4 waves | 8.46 | 63% of the weight-read floor |
+| I=128 | 9.15 | fewer activation re-reads, worse |
+| 8 waves (correct, split-J) | 9.20 | more waves per tile, worse |
+| J=64 whitelisted | 8.46 | +5% at n=2048 only, kept |
+| column-hint factor 0.5 | 10.20 | J=16, worse |
+| pitch 78 + 8-byte loads | 8.59 | conflicts 35.6%, worse |
+| store-order swap | 8.46 | conflicts 15.5 -> 7.9%, kept |
+| I=32 (4 blocks/CU) | 9.36 | occupancy up, worse |
+The tile/wave/pitch space is exhausted at n=1024; the kernel's remaining structure is the K loop with four barriers
+per 256-wide iteration at two blocks per CU. The next step, if P1 continues, is a rewrite of that loop (a two-stage
+LDS ring for the activation halves so loads overlap the second dot without a barrier pair), half a day for an
+unknown 5-10%. The alternatives are P2 (attention, 13.5% of the lane) and the pipeline tail (so ub=2048 can pay its
+-14% on the expert class per token).
 
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:

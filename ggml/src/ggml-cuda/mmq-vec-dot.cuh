@@ -158,8 +158,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     constexpr bool split_j      = ggml_cuda_mmq_split_j(J, I, nwarps, fallback);
     constexpr int j_group       = split_j ? J/2 : J;
 
-    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
-    const int warp_j = split_j ? threadIdx.y / 4 : 0;
+    const int warp_i = split_j ? threadIdx.y % ggml_cuda_mmq_row_groups(I) : threadIdx.y;
+    const int warp_j = split_j ? threadIdx.y / ggml_cuda_mmq_row_groups(I) : 0;
 
     y += (warp_j*j_group + (warp_i % ntx)*tile_C::J) * MMQ_TILE_Y_K;
 
@@ -337,8 +337,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
     constexpr bool split_j      = ggml_cuda_mmq_split_j(J, I, nwarps, fallback);
     constexpr int j_group       = split_j ? J/2 : J;
-    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
-    const int warp_j = split_j ? threadIdx.y / 4 : 0;
+    const int warp_i = split_j ? threadIdx.y % ggml_cuda_mmq_row_groups(I) : threadIdx.y;
+    const int warp_j = split_j ? threadIdx.y / ggml_cuda_mmq_row_groups(I) : 0;
     y += (warp_j*j_group + (warp_i % ntx)*tile_C::J) * MMQ_TILE_Y_K;
 
     const int   * x_qs = (const int   *) x;
