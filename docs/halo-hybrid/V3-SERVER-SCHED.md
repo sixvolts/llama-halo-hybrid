@@ -368,6 +368,19 @@ mainframe's compute term. The remaining launch-fusion items (hc_post into the ne
 softmax+topk) are each worth well under 1 ms. Gibson's own share of the step (~65-70 ms of ~108 by mainframe's
 client-idle measure) is 3c and is where the step is.
 
+## Targets set 2026-09-21 (the user's): decode 28-30 tok/s, prefill 800 tok/s, on v3s KM=6 ub1024
+Baseline at the time: decode 23-24.6 t/s (108 ms/step, 2.5-2.7 tok/step), prefill 530 t/s at 12.7K.
+Decode budget (median step at 13K, sched trace 09:10): 96 ms blocked in the verify graph (mainframe busy 42;
+gibson's 25 layers + APU experts + 45 split gaps 54), 1.2 ms launch work, 9.5 ms host chain (three sequential
+draft graphs, each with the shared 634 MB q8_0 vocab head at n=1, plus sampling). GPU floor of the step with this
+placement ~65-70 ms (APU expert reads at n=3 ~52, card dense ~13). 28 t/s at 2.6 tok/step = 93 ms/step, i.e.
+~15 ms of the ~40 ms of overhead: the draft chain (head copy for the draft, fewer draft graphs), gibson's split
+syncs, mainframe's launch gaps; n-max 4 helps at long contexts only (+17 ms/step per extra draft token from the
+APU expert floor; sweep: n-max 2/3/4 = 108/143/143 ms/step, 2.6/3.1/3.5 tok/step).
+Prefill: mainframe's 13K prefill is 94.6% GPU busy; expert GEMM 37% at ~17% of gfx1151's int8 peak, flash
+attention 13.5%, dense GEMM 13%, MoE reduce/quantize 9%, element-wise remainder. 800 = 1.5x = roughly double the
+expert-GEMM efficiency at 1024-token batches plus attention; kernel work on the APUs, the design unchanged.
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,
