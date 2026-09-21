@@ -134,7 +134,14 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0:
             return 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0 + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1:
+#if defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78)
+            // halo-hybrid experiment: a row pitch of 78 ints (== 14 mod 32) puts 16 consecutive rows on 16 distinct
+            //     bank groups for 8-byte loads; every 16-byte-aligned pitch repeats banks every 8 rows (2-way
+            //     conflicts, 15.5% of GPU time on the q4_K expert GEMM at n=1024)
+            return 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_1 + 6;
+#else
             return 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_1 + 4;
+#endif
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K         + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K:
@@ -142,7 +149,11 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI6_K   + MMQ_TILE_NE_K/8 + 7;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_FP4:
+#if defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78)
+            return 2*MMQ_TILE_NE_K + 8                     + 6;   // must equal the Q8_1 pitch (static_assert below)
+#else
             return 2*MMQ_TILE_NE_K + 8                     + 4;
+#endif
         case GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2       + 4;
         default:
@@ -151,11 +162,15 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
 }
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)  % 8 == 4, "Wrong padding.");
+#if !(defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78))
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)  % 8 == 4, "Wrong padding.");
+#endif
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K)  % 8 == 4, "Wrong padding.");
+#if !(defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78))
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4)   % 8 == 4, "Wrong padding.");
+#endif
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4) % 8 == 4, "Wrong padding.");
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4) == ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1), "Wrong tile size for MXFP4");
@@ -432,7 +447,15 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
 // FIXME temporary until all combinations of data types and GPUs can use the MMA data layout
 static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config & config, const int cc) {
     if (config.use_mma_data_layout(cc)) {
-        return config.I * ggml_cuda_mmq_get_sram_stride(config.sram_layout) * 4;
+        int stride = ggml_cuda_mmq_get_sram_stride(config.sram_layout);
+#if defined(MMQ_RDNA35_STRIDE_78)
+        // the device pitch for these layouts is 2 ints wider on RDNA3.5 (see ggml_cuda_mmq_get_sram_stride); the
+        // host compiles without the arch macro, so size the dynamic LDS from cc
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && (config.sram_layout == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1 || config.sram_layout == GGML_CUDA_MMQ_SRAM_LAYOUT_FP4)) {
+            stride += 2;
+        }
+#endif
+        return config.I * stride * 4;
     }
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(config.type, config.I);
     return (txs.qs + txs.dm + txs.sc) * 4;

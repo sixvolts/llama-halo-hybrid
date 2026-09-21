@@ -842,8 +842,16 @@ namespace ggml_cuda_mma {
 #ifdef RDNA3
         static_assert(dl == DATA_LAYOUT_I_MAJOR_MIRRORED, "bad data layout");
         static_assert(sizeof(t.x) == 32, "bad ne");
+#if defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78)
+        // 8-byte pieces: the row pitch is only 8-byte aligned in this configuration
+        ggml_cuda_memcpy_1<8>(t.x + 0, xs0 + t.get_i(0)*stride + 0);
+        ggml_cuda_memcpy_1<8>(t.x + 2, xs0 + t.get_i(0)*stride + 2);
+        ggml_cuda_memcpy_1<8>(t.x + 4, xs0 + t.get_i(0)*stride + 4);
+        ggml_cuda_memcpy_1<8>(t.x + 6, xs0 + t.get_i(0)*stride + 6);
+#else
         ggml_cuda_memcpy_1<16>(t.x + 0, xs0 + t.get_i(0)*stride + 0);
         ggml_cuda_memcpy_1<16>(t.x + 4, xs0 + t.get_i(0)*stride + 4);
+#endif
 #else
         static_assert(dl == DATA_LAYOUT_I_MAJOR, "bad data layout");
         static_assert(sizeof(t.x) == 16, "bad ne");

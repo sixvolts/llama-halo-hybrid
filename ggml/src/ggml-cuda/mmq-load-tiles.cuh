@@ -837,8 +837,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int qs0 = get_int_b4(bxi->qs, txi);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 0] = (qs0 >> 0) & 0x0F0F0F0F;
-        x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 8] = (qs0 >> 4) & 0x0F0F0F0F;
+        {
+            // halo-hybrid: lanes 16-31 store their high nibbles first, so that one store instruction covers ints
+            //     0-7, 16-23, 40-47 and 56-63 of the row (all 32 LDS banks) instead of 0-7, 16-23, 32-39, 48-55
+            //     (banks 0-7 and 16-23 twice: a 2-way conflict on every tile store). Layout unchanged.
+            const int lo = (qs0 >> 0) & 0x0F0F0F0F;
+            const int hi = (qs0 >> 4) & 0x0F0F0F0F;
+            const int base = i*sram_stride + 16*(txi/8) + txi % 8;
+            const bool hf = txi >= 16;
+            x_qs[base + (hf ? 8 : 0)] = hf ? hi : lo;
+            x_qs[base + (hf ? 0 : 8)] = hf ? lo : hi;
+        }
 #else
         x_qs[i*(MMQ_TILE_NE_K + 1) + txi] = qs0;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -1001,8 +1010,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
         const int qs0 = r.qs[i0/R::rows_per_step];
-        x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 0] = (qs0 >> 0) & 0x0F0F0F0F;
-        x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 8] = (qs0 >> 4) & 0x0F0F0F0F;
+        {
+            // halo-hybrid: lanes 16-31 store their high nibbles first, so that one store instruction covers ints
+            //     0-7, 16-23, 40-47 and 56-63 of the row (all 32 LDS banks) instead of 0-7, 16-23, 32-39, 48-55
+            //     (banks 0-7 and 16-23 twice: a 2-way conflict on every tile store). Layout unchanged.
+            const int lo = (qs0 >> 0) & 0x0F0F0F0F;
+            const int hi = (qs0 >> 4) & 0x0F0F0F0F;
+            const int base = i*sram_stride + 16*(txi/8) + txi % 8;
+            const bool hf = txi >= 16;
+            x_qs[base + (hf ? 8 : 0)] = hf ? hi : lo;
+            x_qs[base + (hf ? 0 : 8)] = hf ? lo : hi;
+        }
     }
 
 #pragma unroll
@@ -1093,8 +1111,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int kq1 = ky - ky % (QI5_K/2) + txi % (QI5_K/4) + QI5_K/4;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*sram_stride + kq0] = ql0 | qh0;
-        x_qs[i*sram_stride + kq1] = ql1 | qh1;
+        {
+            // halo-hybrid: same store-order swap as Q4_K (kq0/kq1 follow the same 16-int group pattern)
+            const bool hf = txi >= 16;
+            x_qs[i*sram_stride + (hf ? kq1 : kq0)] = hf ? (ql1 | qh1) : (ql0 | qh0);
+            x_qs[i*sram_stride + (hf ? kq0 : kq1)] = hf ? (ql0 | qh0) : (ql1 | qh1);
+        }
 #else
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq0] = ql0 | qh0;
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq1] = ql1 | qh1;

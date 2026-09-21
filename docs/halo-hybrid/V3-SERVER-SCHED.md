@@ -494,6 +494,17 @@ whitelist (a real 5% at n=2048). Table-level knobs on the RDNA3.5 MMQ are exhaus
 column-hint factor all lose or tie at n=1024 against the J=32/4-wave config that sits at 63% of the weight-read
 floor. What remains for P1 is profiler-guided kernel work (why the K loop stalls at occupancy 2 with 64 KiB LDS:
 bank conflicts, the load->sync->compute serialisation, the ldmatrix pattern), days rather than hours.
+Counters on the q4_K J=32 kernel at n=1024 (rocprofv3 --pmc, gfx1151): occupancy 31% (LDS-limited, 2 blocks x 4 waves
+per CU), LDS bank-conflict stall 15.5% of GPU time, SQ_INSTS_LDS 8.3e7 vs VALU 5.3e8 per dispatch; VALUBusy /
+MemUnitStalled / SQ_WAIT_INST_ANY do not collect on this part. First follow-up, a 78-int tile pitch with 8-byte tile
+loads (16-byte-aligned pitches repeat banks every 8 rows): correct once the host sized the LDS from cc, and WORSE -
+conflict stall 35.6%, kernel +1.4% (8.59 vs 8.47 ms); guarded by MMQ_RDNA35_STRIDE_78 and left off. Second lead from
+the store side: load_tiles writes each row's nibble-split layout so that lanes 0-7 and 16-23 hit the same eight
+banks in one instruction (ints 0-7 and 32-39); swapping the low/high store order for the upper half-wave keeps the
+layout and removes that 2-way conflict. Measured: bank-conflict stall 15.5% -> 7.9%, kernel time unchanged (8.46 vs
+8.47 ms at n=1024; 923/923 + 2244/2244 pass). Kept (harmless, and the conflicts were not on the critical path), and
+it says the kernel is bound elsewhere: occupancy 31% with 4 syncs per K iteration is the next lead - an I=32 tile
+(half the LDS per block, 4 blocks per CU) needs the split-J mapping generalised to I/16 row groups.
 
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
