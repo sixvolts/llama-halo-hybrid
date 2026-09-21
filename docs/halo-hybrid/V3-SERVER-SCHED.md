@@ -468,7 +468,7 @@ and the arithmetic says why: with two lanes and N units the pipeline's tail cost
 expert class's -14% per token at n=2048. A tapered ubatch schedule (large units first, the last one or two small)
 would keep the tail at ~0.5u and let 2048 pay; that is a client-side change in the ubatch splitter, no wire change
 (LLAMA_UBATCH_TAPER=1, in llama-memory-hybrid).
-**8 waves per tile (256 threads at J=32/64, same 64-row tile):** q4_K n=1024 8.45 -> 6.96 ms, q5_K 10.07 -> 8.78;
+**8 waves per tile (256 threads at J=32/64, same 64-row tile) - INVALID, see below:** q4_K n=1024 8.45 -> 6.96 ms, q5_K 10.07 -> 8.78;
 n=2048 q4_K 14.6 -> 7.97, q5_K 16.0 -> 10.16 - the first real kernel win of P1 (-18% / -13% at ub 1024, and at
 ub 2048 the expert class costs 3.9 us per token against 8.3 before). Committed as the RDNA3.5 table default.
 In situ with the tiles on gibson only (mainframe still on the old table), LOCAL=27 KM=5, 12.7K / 25.8K: ub 1024
@@ -476,6 +476,24 @@ plain 524 / 565 (509 / 557 before the tiles: gibson is not the long lane, so lit
 520 / 543; ub 2048 + taper 460 / 543. The half-unit-first clause of the taper costs more than it saves; mode 2
 (equal final pair only) is in the tree for the re-test once mainframe has the tiles, which is when ub 2048 can be
 judged at all (its expert class is 3.9 us/token there too only after the rebuild).
+Extending 8 waves to the other Q4_K/Q5_K rows (J=16, 48, 80-128) and Q6_K J=32/64 FAILS correctness (TBO_GLM_EVAL:
+sentinel mismatches, i.e. an out-of-bounds write, at q5_K n=128 and q4_K n=1024) although the perf looked good
+(n=4096 27 -> 10 ms); those rows are not committed and the failing tile/wave combination is to be found before
+any of them is used. Re-verification of the committed J=32/64 rows FAILED too (ROCm1: q4_K/q5_K at n=1024/2048
+ERR ~3e3, sentinel mismatch; the standard suite's q4_K n=17 case as well; ROCm0's RDNA4 table untouched, 923/923):
+the 8-wave timings above are a wrong kernel, not a win - the RDNA3.5 mma path maps waves to rows for 4 waves on a
+64-row tile, and 8 waves need the split-J mapping the fork only has for Q8_0 J=128. The experiment scripts checked
+perf without gating on the correctness line (a process failure: the t256 chain's decision read the timing only).
+3abd6f26a is reverted in the tree; the in-situ p4b numbers were taken with the wrong kernel on gibson's APU and are
+void. The lesson repeats 3b's: a kernel change is not a result until the correctness suite AND the greedy gate pass.
+**Corrected 8 waves (split-J mapping ported to the K-quant mma dot, 923/923 on both parts, 2244/2244 standard):**
+q4_K n=1024 9.20 ms (baseline 8.50), q5_K 10.75 (10.07), n=2048 15.0 / 16.8 (15.4 / 16.3 with J=64 whitelisted).
+A loss at 1024, flat at 2048: the "win" was entirely the wrong kernel doing less work. The split-J generalisation
+stays in the tree (inactive: no table row uses 8 waves at I=64 except Q8_0 J=128) and J=64 stays in the prefetch
+whitelist (a real 5% at n=2048). Table-level knobs on the RDNA3.5 MMQ are exhausted: I=128, 8 waves, J=64/128 and the
+column-hint factor all lose or tie at n=1024 against the J=32/4-wave config that sits at 63% of the weight-read
+floor. What remains for P1 is profiler-guided kernel work (why the K loop stalls at occupancy 2 with 64 KiB LDS:
+bank conflicts, the load->sync->compute serialisation, the ldmatrix pattern), days rather than hours.
 
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
