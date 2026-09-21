@@ -94,13 +94,14 @@ llama_memory_hybrid::llama_memory_hybrid(
 // together instead of one lane running the last full unit alone. Sizes never exceed n_ubatch (the reserved
 // compute buffers) and stay multiples of 64.
 static uint32_t llama_ubatch_taper(uint32_t n_ubatch, uint32_t n_total, uint32_t n_used) {
-    static const bool on = getenv("LLAMA_UBATCH_TAPER") != nullptr && atoi(getenv("LLAMA_UBATCH_TAPER")) != 0;
-    if (!on || n_total <= n_ubatch || n_ubatch < 256) {
+    // 1 = half unit first + equal final pair; 2 = equal final pair only
+    static const int mode = getenv("LLAMA_UBATCH_TAPER") ? atoi(getenv("LLAMA_UBATCH_TAPER")) : 0;
+    if (mode <= 0 || n_total <= n_ubatch || n_ubatch < 256) {
         return n_ubatch;
     }
     const uint32_t remaining = n_total - n_used;
     auto round64 = [](uint32_t v) { return (v + 63) / 64 * 64; };
-    if (n_used == 0) {
+    if (mode == 1 && n_used == 0) {
         return n_ubatch / 2;
     }
     if (remaining > n_ubatch && remaining <= 2*n_ubatch) {

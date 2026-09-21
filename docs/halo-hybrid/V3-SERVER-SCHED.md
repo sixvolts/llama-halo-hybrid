@@ -452,6 +452,31 @@ Candidate work, in order of yield per effort:
 Reaching 800 is P1 + P2 landing most of their estimates plus the balance re-tuned after each (the knee moves as
 mainframe's lane shortens).
 
+## P1 log: q4_K/q5_K expert GEMM on gfx1151 (2026-09-21, isolated on gibson's APU, test-backend-ops TBO_GLM)
+Baseline (288 experts, 8 used, q4_K 2048x4096 / q5_K 4096x2048): n=128 5.85 / 7.2 ms, n=512 6.8 / 8.7, n=1024
+8.48 / 10.07, n=2048 ~15 / 16.8, n=4096 28 / 29.8. The weight read is 1.36 / 1.66 GB per call regardless of n (each
+expert's rows once per column tile), i.e. a 5.3 / 6.5 ms floor at 256 GB/s: at n=128 the kernel is at 91% of
+bandwidth, at n=1024 at 63% (the column hint picks J=32 for ~29 tokens per expert; the extra 3.2 ms is compute at
+that tile), at n=2048 (J=64) the per-token cost is 7.1-7.5 us vs 8.3 at 1024. So the class's software headroom at
+ub=1024 is ~25-35% (8.5 -> 5.5-6.5), and ub=2048 halves the bandwidth term per token but pays a J=64 tile.
+Experiments: I=128 tiles at J=32 (halve activation re-reads): n=1024 8.48 -> 9.15, no; J=64 and J=128 in the
+RDNA3.5 prefetch whitelist: n=2048 15.4 -> 14.6 (q5_K 16.3 -> 16.0), n=4096 27 -> 61 (J=128 with the staged tiles
+spills), so J=64 only; GGML_CUDA_MMQ_MOE_J_FACTOR=0.5 (J=32 at n=2048): no gain, and J=16 at n=1024 costs 20%.
+In situ, ub=2048 vs 1024 at LOCAL=27 KM=5 with the J=64 whitelist: 12.7K 467 vs 509, 25.8K 536 vs 557 - still a loss,
+and the arithmetic says why: with two lanes and N units the pipeline's tail costs about one unit, so 12.6 units of
+2048 cost (12.6/2 + 1) x 2u = 14.6u against (25/2 + 1) x u = 13.5u for 1024-token units (+8%), which outweighs the
+expert class's -14% per token at n=2048. A tapered ubatch schedule (large units first, the last one or two small)
+would keep the tail at ~0.5u and let 2048 pay; that is a client-side change in the ubatch splitter, no wire change
+(LLAMA_UBATCH_TAPER=1, in llama-memory-hybrid).
+**8 waves per tile (256 threads at J=32/64, same 64-row tile):** q4_K n=1024 8.45 -> 6.96 ms, q5_K 10.07 -> 8.78;
+n=2048 q4_K 14.6 -> 7.97, q5_K 16.0 -> 10.16 - the first real kernel win of P1 (-18% / -13% at ub 1024, and at
+ub 2048 the expert class costs 3.9 us per token against 8.3 before). Committed as the RDNA3.5 table default.
+In situ with the tiles on gibson only (mainframe still on the old table), LOCAL=27 KM=5, 12.7K / 25.8K: ub 1024
+plain 524 / 565 (509 / 557 before the tiles: gibson is not the long lane, so little shows yet); ub 1024 + taper mode 1
+520 / 543; ub 2048 + taper 460 / 543. The half-unit-first clause of the taper costs more than it saves; mode 2
+(equal final pair only) is in the tree for the re-test once mainframe has the tiles, which is when ub 2048 can be
+judged at all (its expert class is 3.9 us/token there too only after the rebuild).
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,
