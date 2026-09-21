@@ -1327,7 +1327,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// halo-hybrid: LLAMA_SPEC_TRACE=1 prints, per draft() call, where the host chain's time goes (ms):
+//   ingest = the accept() decode of the accepted tokens, dec[i] = each draft decode, smp[i] = its sampling
+static bool spec_trace_enabled() { static const bool v = getenv("LLAMA_SPEC_TRACE") != nullptr; return v; }
+struct spec_trace_acc { int64_t t_ingest = 0; int64_t t_dec[8] = {0}; int64_t t_smp[8] = {0}; int n = 0; };
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+    spec_trace_acc trace;
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
@@ -1549,6 +1555,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
+            const int64_t t_ing0 = spec_trace_enabled() ? ggml_time_us() : 0;
             for (int head = 0; head < n_mtp_layers; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
@@ -1573,6 +1580,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+            if (spec_trace_enabled()) { trace.t_ingest = ggml_time_us() - t_ing0; }
             if (!ok) {
                 return false;
             }
@@ -1633,6 +1641,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
+        const bool tr = spec_trace_enabled();
+        if (tr) { trace.n = 0; }
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
@@ -1650,11 +1660,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t t_d0 = tr ? ggml_time_us() : 0;
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
+            const int64_t t_d1 = tr ? ggml_time_us() : 0;
+            if (tr && i < 8) { trace.t_dec[i] = t_d1 - t_d0; trace.n = i + 1; }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
@@ -1731,7 +1744,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 break;
             }
 
+            if (tr && i < 8) { trace.t_smp[i] = ggml_time_us() - t_d1; }
             ++i;
+        }
+        if (tr) {
+            char buf[320]; int p = snprintf(buf, sizeof(buf), "spec-trace: ingest %.2f ms", trace.t_ingest/1000.0);
+            for (int q = 0; q < trace.n; ++q) { p += snprintf(buf + p, sizeof(buf) - p, " | dec%d %.2f smp%d %.2f", q, trace.t_dec[q]/1000.0, q, trace.t_smp[q]/1000.0); }
+            LOG_INF("%s\n", buf);
         }
 
         if (chain_heads) {

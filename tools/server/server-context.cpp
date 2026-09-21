@@ -3930,12 +3930,15 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                static const bool spec_trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
+                const int64_t t_sa0 = spec_trace ? ggml_time_us() : 0;
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 slot.spec_i_batch.clear();
+                if (spec_trace) { SRV_INF("spec-trace: tgt sample+accept %.2f ms (%zu drafts, %zu accepted)\n", (ggml_time_us() - t_sa0)/1000.0, n_draft, accepted.size() - 1); }
 
                 GGML_ASSERT(accepted.size() >= 1);
 
