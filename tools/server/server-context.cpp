@@ -496,6 +496,18 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
+        // halo-hybrid: draft depth by context length. Each extra draft token costs a fixed ~17 ms of expert reads
+        // per step on this two-host layout, so a deeper draft only pays where a step is already long (long
+        // contexts). LLAMA_SPEC_NMAX_SHORT caps the draft below LLAMA_SPEC_NMAX_LONG_CTX tokens of context; the
+        // launcher's --spec-draft-n-max is then the long-context depth.
+        {
+            static const int nmax_short = getenv("LLAMA_SPEC_NMAX_SHORT")    ? atoi(getenv("LLAMA_SPEC_NMAX_SHORT"))    : 0;
+            static const int long_ctx   = getenv("LLAMA_SPEC_NMAX_LONG_CTX") ? atoi(getenv("LLAMA_SPEC_NMAX_LONG_CTX")) : 8192;
+            if (nmax_short > 0 && (int) prompt.n_tokens() < long_ctx) {
+                n_draft_max = std::min(n_draft_max, nmax_short);
+            }
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
