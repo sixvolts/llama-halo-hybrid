@@ -518,11 +518,33 @@ occupancy buys. P1 table so far (q4_K 2048x4096 x288/8, n=1024, gfx1151, ms; all
 | pitch 78 + 8-byte loads | 8.59 | conflicts 35.6%, worse |
 | store-order swap | 8.46 | conflicts 15.5 -> 7.9%, kept |
 | I=32 (4 blocks/CU) | 9.36 | occupancy up, worse |
-The tile/wave/pitch space is exhausted at n=1024; the kernel's remaining structure is the K loop with four barriers
-per 256-wide iteration at two blocks per CU. The next step, if P1 continues, is a rewrite of that loop (a two-stage
-LDS ring for the activation halves so loads overlap the second dot without a barrier pair), half a day for an
-unknown 5-10%. The alternatives are P2 (attention, 13.5% of the lane) and the pipeline tail (so ub=2048 can pay its
--14% on the expert class per token).
+The tile/wave/pitch space is exhausted at n=1024. Two structural experiments followed, both correct and both
+neutral or worse, kept in the tree behind build macros that default off:
+| variant | q4_K n=1024 ms | note |
+|---|---|---|
+| double-buffered activation tile, 2 barriers per iteration (GGML_CUDA_MMQ_Y2) | 8.68 | 28.8 KiB, still 2 blocks/CU; barriers are not the wait |
+| two-deep weight prefetch (GGML_CUDA_MMQ_X_DEPTH2) | 8.52 | +20 VGPRs; the weight stream is not latency-bound |
+
+**Ablation (timing-only builds with parts of the kernel deleted, never run against the model).** q4_K 2048x4096 x288/8 on
+gfx1151, ms:
+| build | n=128 | n=512 | n=1024 | n=2048 |
+|---|---|---|---|---|
+| real kernel | 5.85 | 6.80 | 8.44 | 14.5 |
+| no scale epilogue (raw MMA sums) | - | 6.81 | 8.07 | (spills) |
+| constant scales, math kept | - | - | 8.38 | - |
+| no MMA | - | - | 7.07 | - |
+| loads + LDS stores only, no dot products | - | 6.56 | 7.10 | 8.23 |
+| no activation global loads | 5.82 | - | 7.89 | 14.2 |
+| no activation loads or stores | 5.84 | - | 8.22 | 14.0 |
+Loads-only at n=1024 is 7.09-7.11 for every forced J from 32 to 64 (7.76 at J=16, two tiles per expert), so neither
+the column-tile count nor the activation volume sets it. The weight stream is 1.36 GB per call: 232 GB/s at n=128,
+~190 GB/s at n >= 512, and the whole tuning surface of the day (barriers, tiles, bank conflicts, epilogue) is the last
+1.3 ms above the skeleton. Registers are not the limit: q4_K J=32 uses 155 VGPRs with no spills (q8_0 J=32 spills
+29-62 VGPRs on gfx1151, an APU-only lead). SQ counters at n=1024: VALU issue ~28% and WMMA ~15% of SIMD cycles,
+LDS ~20%, occupancy 8 waves/CU. What separates n=128 from n=1024 in the skeleton is still open (the same loader,
+the same block count at J=48); the next probe would be the ISA of the load issue pattern. At n=2048 (J=64, one
+block per CU) the vec_dot is fully exposed: 14.5 vs an 8.2 skeleton, which is the number that decides whether ub=2048
+can ever pay. Paused here to regroup (DFLASH for decode, prefill status).
 
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
