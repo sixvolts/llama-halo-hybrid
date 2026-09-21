@@ -344,6 +344,30 @@ mid-enum while libggml-hip/rpc kept the old ids; a queued load ran on that mix a
 reached mainframe. The op now goes in appended last, as protocol 7.4 (minor is the field the handshake compares),
 and the HELLO reply carries GGML_OP_COUNT so a mismatched pair is refused.
 
+## Phase 3b, step 2: the hyper-connection prologue as one op (2026-09-21, 608cad103 + 919c2ade9, protocol 7.4)
+GGML_OP_DSV4_HC_MIX replaces, per mixer at decode, rms_norm + the 24-row hc_fn GEMV + the two gate chains +
+dsv4_hc_comb + dsv4_hc_pre (six launches; two mixers per layer, ~250 launches per step on gibson) with one
+1024-thread block per token; post and comb are views of its result. v1's data path (one scalar q8 load per element
+per row) ran 113 us per mixer in situ against ~60 for the pieces and regressed the step by 5 ms; v2 (16 consecutive
+elements per thread, one 16-byte quant load per row, float4 activations) runs 31.5 us under the timer, 18.8 us
+isolated. Greedy gate identical both times. A/B on one build, both hosts on 919c2ade9, KM=6, back to back:
+| | ms/step (3 reps x 2 ctx) | prefill 12760 |
+|---|---|---|
+| LLAMA_NO_HC_MIX=1 (six launches) | 109.9 111.0 107.2 110.9 108.2 110.7 = **109.7** | 528 |
+| merged op | 109.1 109.7 107.0 109.4 105.8 109.0 = **108.3** | 530 |
+-1.3 ms/step. Mainframe's decomposition of the v2 op (its 22 layers): compute 40.86 -> 40.61, alloc 0.685 -> 0.581
+(the smaller graph; first move of that term in the series), rest 0.848 -> 0.726, server busy -0.52 ms. A 3-rep
+20 minutes earlier on the same build had read 116.5 ms/step with a 125.7 first probe; the back-to-back A/B and
+mainframe's trace show that batch was an outlier of the host, not the op. Rule from it: judge a change by a
+same-session A/B, never by two batches an hour apart.
+Wire: the op is appended last in the enum, the protocol is 7.4 (minor is compared, patch is not) and the HELLO reply
+carries GGML_OP_COUNT which the client refuses on mismatch. LLAMA_NO_HC_MIX=1 restores the six-launch path.
+
+Phase 3b stands at 113.8 -> 108.3 ms/step (5%) across 3a + 3b on gibson's harness, and 42.88 -> 40.61 ms on
+mainframe's compute term. The remaining launch-fusion items (hc_post into the next prologue, KDA concats, router
+softmax+topk) are each worth well under 1 ms. Gibson's own share of the step (~65-70 ms of ~108 by mainframe's
+client-idle measure) is 3c and is where the step is.
+
 ## Sequencing (the user's order: build V3 end to end, then optimise)
 Phase 1 - build V3, TCP only, KM=4 (VRAM), both hosts on one commit:
   1a. Client: composite device per endpoint (`RPC<k>[host]`), extra buffer type per additional server device,
