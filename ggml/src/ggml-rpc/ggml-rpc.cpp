@@ -57,6 +57,21 @@ struct rpc_tensor {
 
 static_assert(sizeof(rpc_tensor) % 8 == 0, "rpc_tensor size must be multiple of 8");
 
+// halo-hybrid (proto 7.4.1): rpc_tensor.flags bit set by the client when the tensor's buffer is a WEIGHTS buffer on the
+// client. The client sets that usage on its own buffer object only (there is no command for it), so without the bit
+// every server buffer stays USAGE_ANY and the server's scheduler (RPC_CMD_GRAPH_COMPUTE_SCHED) never applies its
+// "an op with a weight source runs on the weight's device" rule: on a composite device whose experts sit on a second
+// server device, the expert GEMMs landed there only as leftovers (pass 3) after the down-expansion from the first device
+// had taken the GLU and the weighted reduction, so every such layer shipped its [n_ff, n_used, n_tokens] expert
+// intermediates across PCIe and back (~470 ms per 1024-token ubatch on mainframe). The server marks the buffer and strips
+// the bit; an older server ignores it, an older client never sets it.
+#define RPC_TENSOR_FLAG_WEIGHTS (1 << 30)
+// an older server copies rpc_tensor.flags into ggml_tensor.flags unfiltered, so the bit must never alias a ggml flag
+// (and stay clear of the int32 sign bit); extend this list when ggml gains a flag
+static_assert((RPC_TENSOR_FLAG_WEIGHTS & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_PARAM |
+               GGML_TENSOR_FLAG_LOSS | GGML_TENSOR_FLAG_COMPUTE | GGML_TENSOR_FLAG_BOUNDARY)) == 0 &&
+              RPC_TENSOR_FLAG_WEIGHTS > 16*GGML_TENSOR_FLAG_BOUNDARY, "RPC_TENSOR_FLAG_WEIGHTS aliases a ggml tensor flag");
+
 // RPC commands
 enum rpc_cmd {
     RPC_CMD_ALLOC_BUFFER = 0,
@@ -699,6 +714,10 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const std::shared
         result.op_params[i] = tensor->op_params[i];
     }
     result.flags = tensor->flags;
+    static const bool no_weights_flag = getenv("GGML_RPC_NO_WEIGHTS_FLAG") != nullptr; // A/B: the pre-7.4.1 placement
+    if (!no_weights_flag && result.buffer != 0 && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        result.flags |= RPC_TENSOR_FLAG_WEIGHTS;
+    }
     for (uint32_t i = 0; i < GGML_MAX_SRC; i++) {
         result.src[i] = reinterpret_cast<uint64_t>(tensor->src[i]);
     }
@@ -1559,7 +1578,11 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
         result->op_params[i] = tensor->op_params[i];
     }
-    result->flags = tensor->flags;
+    result->flags = tensor->flags & ~RPC_TENSOR_FLAG_WEIGHTS;
+    if ((tensor->flags & RPC_TENSOR_FLAG_WEIGHTS) && result->buffer != nullptr &&
+            ggml_backend_buffer_get_usage(result->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        ggml_backend_buffer_set_usage(result->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     result->data = reinterpret_cast<void *>(tensor->data);
     ggml_set_name(result, tensor->name);
     return result;
