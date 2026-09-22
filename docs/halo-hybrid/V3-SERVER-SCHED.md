@@ -572,3 +572,59 @@ Phase 3 - optimisation, on the V3 layout, judged against the physics (card dense
 
 Naming from here: "v3" = this (server sched, intended placement, N-node shape). The old client-split layout is
 "v3c"; what runs today is v2c.
+
+## Adversarial review of the week (2026-09-22): what the numbers were, what changed
+**The probe was the problem first.** Every decode figure of Phase 3 (25.9 t/s production, 28 with four drafts, the
+DFlash tables) came from probe_ctx/probe_tune: summaries of a synthetic ledger, formulaic text the drafter predicts
+easily. The user's WebUI read ~21 t/s. `~/bench/glm/probe_real.py` (six everyday prompts, thinking on, the WebUI's
+sampling, fixed seeds) reproduces the UI: production MTP 3 drafts = **21.0 t/s at T=0.7, 20.4 at T=1.0**, 2.53
+tok/step, 120 ms/step. Seeded runs of one config repeat to 3 decimals; across configs whose sampling differs the
+content variance is about +-1 t/s per 2400 tokens, so only 5%+ effects are judged on it. Judge decode on this probe.
+
+**Decode findings, each measured on the real-content probe:**
+| change | T=0.7 (2 seeds) | T=1.0 | step |
+|---|---|---|---|
+| production: MTP 3 drafts, compare | 21.0 / 21.7 | 20.4 | 120 ms |
+| lossless rejection sampling (RS), 3 drafts | 22.1 / 22.4 | 22.2 | 120 ms |
+| RS, 2 drafts | 24.2 / 24.7 | 24.2 | 95.6 ms |
+| RS, 2 drafts, gfx1151 MoE GEMV -> MMQ from 3 tokens (gibson only) | 24.9 / 25.9 | - | 93.2 ms |
+1. Verification was sample-and-compare against the draft's argmax: at T > 0 a draft token survived only with the
+   target's probability of that one token. RS (Leviathan/Chen): the MTP draft samples from its top-10 at the target's
+   temperature (top-p/min-p mirrored; measured neutral), the target accepts with min(1, p/q) and resamples the residual
+   on rejection - exactly the target's distribution, more tokens per step. On by default (LLAMA_SPEC_RS=0 disables).
+2. The verify graph cost 90.6 / 112.9 / 117.2 ms at 3 / 4 / 5 tokens (medians over ~2.5K steps each): a cliff at 4
+   and almost nothing at 5. mul_mat_vec_q_moe gives each (token, expert slot) pair its own warp, so an expert picked by
+   two tokens is streamed twice; MMQ (from 5 tokens on gfx1151) streams each distinct expert once, and real text
+   shares experts between neighbouring tokens. Random-routing isolation shows no cliff (q4_K x288/8 on gfx1151:
+   145/342/499/664/803 us at 1..5 tokens) - the upstream table was tuned on exactly that. The old "17.6 ms per
+   verified token is physics" slope was this per-pair cost. RDNA3.5 now hands K-quant experts to MMQ from 3 tokens
+   (gibson: 3 tokens 90.6 -> 87.8 ms, 4 tokens 112.9 -> 107.3); mainframe needs the same build for its half.
+   The card's per-pair path is at bandwidth (q4_K n=4 236 us = 640 GB/s) and keeps its table.
+3. At this acceptance two drafts beat three (the third token costs ~22 ms for +0.34 tok/step). Production: NMAX=2.
+
+**Decode step anatomy (gibson kernel trace, 4-token verify, short context):** 22 x [card 0.85 ms (47 kernels: 0.58
+ms of kernels, 0.27 ms of launch gaps) -> APU ~2.1 ms (6 kernels)], a ~42 ms hole while mainframe computes, then
+the output head and the drafts (~16 ms of card activity). Gibson's card spends ~19-25 ms per step on small kernels
+and their gaps; that and the same on mainframe's card is the next decode lever (fusion of the KDA decode chain).
+
+**Prefill: the card and the APU never overlapped.** Kernel trace of gibson's 25.8K prefill (LOCAL=27, two lanes):
+card busy 13.6 s, APU 19.0 s of 38.0 s, both busy **0 ms**; per 1024-token ubatch the card worked ~545 ms (MMQ 23%,
+sparse FA 16%, GDN 13%, lightning indexer 12%) and the APU ~758 ms (expert MMQ 87%, weighted reduction 7%) strictly in
+turn. The two-lane pipeline only ever overlapped gibson with mainframe. Four lanes (LLAMA_PREFILL_LANES=4): ubatches
+go in pairs whose local heads are interleaved split by split while the previous pair is on mainframe. Greedy text
+identical to two lanes; card and APU now both busy 41% of each pair; gibson ~1.1 s per ubatch instead of 1.4-1.6,
+which makes mainframe the long lane - so layers move to gibson:
+| config | 25.8K | 12.7K |
+|---|---|---|
+| 2 lanes, LOCAL=27 (production until today) | 576 | 522 |
+| 4 lanes, LOCAL=27 | 552 | 497 |
+| 4 lanes, LOCAL=28 | 589 | 522 |
+| 4 lanes, LOCAL=29 | 622 | 548 |
+LOCAL=30 pages gibson's host. The MoE weighted reduction ran at ~60 GB/s in situ (2.51 ms per 1024-token layer:
+the column-chunk grid read 8 rows 32 KB apart per block in GTT memory) against cache speed in isolation; one block
+per token with 16-byte loads runs 0.66 ms in situ, bit-identical (-44 ms per ubatch on gibson's 24 APU layers).
+Mainframe (call median 1506 ms at LOCAL=27, 1374 -> 1583 over the prompt) is ~0.7 s longer per ubatch than gibson's
+per-layer costs predict for its layers (card 18 x ~19 ms + 6 expert layers x ~12 ms, APU 12 x ~34.5 ms = ~0.83 s);
+its rocprofv3 trace (2026-09-22 20:52) is what decides the next prefill step. Its busy counters cannot answer overlap
+questions: the R9700's reads 100 whenever work is queued and the APU's is a slow average (retracted: "97.7% interior
+busy" and "0% both busy").

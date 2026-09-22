@@ -139,3 +139,11 @@ with the cut (31.4); no single drafter config reaches both, and the working adap
    target's features is the realistic version and would also close the acceptance gap the Q4_K_XL target induces. Park
    until 1-4 are done and the ceiling is known.
 6. Not for this setup: DFlash for Qwen3.8-Flash-Next (no drafter exists; the 27B one is a different model).
+
+## Real content (2026-09-22): DFlash is out for chat, the MTP head wins with rejection sampling
+On the WebUI-shaped probe (probe_real.py: six everyday prompts, thinking on, T=0.7) the ledger-summary numbers above
+did not hold: DFlash block 7 with the cut from position 4 accepted 0.66 / 0.31 / 0.19 per position on technical prose
+and ran 15.5-16.6 t/s (the user saw 13), against 19-21 for the MTP head. With lossless rejection sampling for the MTP
+drafts, two drafts, and the gfx1151 MoE GEMV fix (V3-SERVER-SCHED.md, 2026-09-22 section) the MTP path runs
+24.9-25.9 t/s on the same probe. DFlash remains a code-only option (31 t/s on the greedy code probe); it would need
+rejection sampling too (its selector already has per-position candidate scores) before any re-test on real content.
