@@ -93,11 +93,18 @@ llama_memory_hybrid::llama_memory_hybrid(
 // unit first (the second lane starts sooner), full units, and the remainder as two equal units so both lanes finish
 // together instead of one lane running the last full unit alone. Sizes never exceed n_ubatch (the reserved
 // compute buffers) and stay multiples of 64.
+// LLAMA_UBATCH_TAPER=3 puts the partial unit (n_total % n_ubatch) FIRST instead of last: its graph shapes are new, and
+// allocating a graph of new shapes asks the remote for alloc sizes (ggml-rpc caches them per shape), which queue behind
+// whatever graph the remote is computing - as the last unit of a pipelined prompt that is the previous pair, 2.4-2.9 s
+// of stall per prompt on the two-host layout; as the first unit the remote is idle and the queries return at once.
 static uint32_t llama_ubatch_taper(uint32_t n_ubatch, uint32_t n_total, uint32_t n_used) {
-    // 1 = half unit first + equal final pair; 2 = equal final pair only
+    // 1 = half unit first + equal final pair; 2 = equal final pair only; 3 = partial unit first
     static const int mode = getenv("LLAMA_UBATCH_TAPER") ? atoi(getenv("LLAMA_UBATCH_TAPER")) : 0;
     if (mode <= 0 || n_total <= n_ubatch || n_ubatch < 256) {
         return n_ubatch;
+    }
+    if (mode == 3) {
+        return n_used == 0 && n_total % n_ubatch != 0 ? n_total % n_ubatch : n_ubatch;
     }
     const uint32_t remaining = n_total - n_used;
     auto round64 = [](uint32_t v) { return (v + 63) / 64 * 64; };
