@@ -167,6 +167,10 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    // halo-hybrid: bracket the target's llama_decode of a batch that process() will then see (optional)
+    virtual void process_begin(const llama_batch & /*batch*/) {}
+    virtual void process_end() {}
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1397,6 +1401,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<uint32_t>           rs_rng;  // halo-hybrid: xorshift32 state per seq for sampled drafts
     std::vector<std::vector<float>> chain_h;
 
+    // halo-hybrid: early ingest. The catch-up decode of a prompt batch runs per target ubatch, from inside the
+    // target's llama_decode (llama_set_ubatch_done_callback), instead of once after it: on the two-host prefill
+    // pipeline it fills gibson's wait for the remote lane rather than adding ~2 s after a 25.8K prompt.
+    // LLAMA_MTP_EARLY_MIN = smallest batch that uses it (default 256 tokens; 0 disables).
+    struct early_ingest {
+        bool                active   = false; // callback registered for the current target decode
+        bool                ok       = true;
+        const llama_token * token    = nullptr; // identity of the batch it covers
+        const llama_pos   * pos      = nullptr;
+        int32_t             n_tokens = 0;
+        llama_seq_id        seq      = 0;
+        int32_t             n_done   = 0;     // leading tokens of the batch decoded into ctx_dft
+    } early;
+    int32_t n_batch_dft = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1421,6 +1440,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        n_batch_dft = n_b;
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
@@ -1478,6 +1498,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (early.active && this->params.ctx_tgt) {
+            llama_set_ubatch_done_callback(this->params.ctx_tgt, nullptr, nullptr);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1515,7 +1538,91 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void process_begin(const llama_batch & batch_in) override {
+        early = {};
+
+        static const int min_tokens = getenv("LLAMA_MTP_EARLY_MIN") ? atoi(getenv("LLAMA_MTP_EARLY_MIN")) : 256;
+        if (min_tokens <= 0 || is_mem_shared || chain_heads || batch_in.n_tokens < min_tokens ||
+                batch_in.token == nullptr || batch_in.embd != nullptr || batch_in.pos == nullptr ||
+                batch_in.seq_id == nullptr || batch_in.n_seq_id == nullptr) {
+            return;
+        }
+        // one sequence, consecutive positions: the target's ubatches then arrive in batch order
+        const llama_seq_id s0 = batch_in.seq_id[0][0];
+        if (s0 < 0 || s0 >= (llama_seq_id) n_seq) {
+            return;
+        }
+        for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
+            if (batch_in.n_seq_id[k] != 1 || batch_in.seq_id[k][0] != s0 || (k > 0 && batch_in.pos[k] != batch_in.pos[k-1] + 1)) {
+                return;
+            }
+        }
+
+        early.active   = true;
+        early.token    = batch_in.token;
+        early.pos      = batch_in.pos;
+        early.n_tokens = batch_in.n_tokens;
+        early.seq      = s0;
+
+        // a failed earlier attempt at this batch (the server retries with a smaller n_batch) may have left entries
+        llama_memory_seq_rm(llama_get_memory(this->params.ctx_dft), s0, batch_in.pos[0], -1);
+
+        llama_set_ubatch_done_callback(this->params.ctx_tgt, &early_ingest_cb, this);
+    }
+
+    void process_end() override {
+        if (early.active) {
+            llama_set_ubatch_done_callback(this->params.ctx_tgt, nullptr, nullptr);
+            early.active = false; // n_done and the batch identity stay for process()
+        }
+    }
+
+    static void early_ingest_cb(void * user_data, const float * h_nextn, int32_t i_first, int32_t n) {
+        static_cast<common_speculative_impl_draft_mtp *>(user_data)->early_ingest_ubatch(h_nextn, i_first, n);
+    }
+
+    // decode tokens [i0, i0 + n) of the registered batch into ctx_dft: token k pairs with the target's row k-1 (the
+    // previous batch's last row for k == 0), exactly the rows the whole-batch catch-up in process() uses
+    void early_ingest_ubatch(const float * h, int32_t i0, int32_t n) {
+        if (!early.active || !early.ok || h == nullptr || n <= 0 || i0 != early.n_done ||
+                i0 + n > early.n_tokens || n > n_batch_dft) {
+            early.ok = false;
+            return;
+        }
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        common_batch_clear(batch);
+        for (int32_t k = i0; k < i0 + n; ++k) {
+            common_batch_add(batch, early.token[k], early.pos[k], { early.seq }, 0);
+        }
+        if (i0 == 0) {
+            std::memcpy(batch.embd, pending_h[early.seq].data(), row_bytes);
+            if (n > 1) {
+                std::memcpy(batch.embd + (size_t) n_embd, h, row_bytes * (n - 1));
+            }
+        } else {
+            std::memcpy(batch.embd, h + (size_t) (i0 - 1) * n_embd, row_bytes * n);
+        }
+
+        const int64_t t0 = spec_trace_enabled() ? ggml_time_us() : 0;
+        const int32_t rc = llama_decode(this->params.ctx_dft, batch);
+        if (spec_trace_enabled()) { trace.t_ingest += ggml_time_us() - t0; }
+        if (rc != 0) {
+            SPC_WRN("early ingest: llama_decode(ctx_dft) failed rc=%d at pos %d; the rest is ingested after the batch\n",
+                    (int) rc, (int) early.pos[i0]);
+            early.ok = false;
+            return;
+        }
+        early.n_done += n;
+    }
+
     bool process(const llama_batch & batch_in) override {
+        // leading tokens of this batch that the early ingest already decoded (0 unless it ran for this very batch)
+        const int32_t k0 = (early.token == batch_in.token && early.pos == batch_in.pos && early.n_tokens == batch_in.n_tokens)
+            ? early.n_done : 0;
+        const llama_seq_id k0_seq = early.seq;
+        early = {};
+
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1550,10 +1657,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        // (and the early ingest may already have done all or the leading part of it: tokens [0, k0))
+        if (!is_mem_shared && k0 < n_tokens) {
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
+            for (int k = k0; k < n_tokens; ++k) {
                 common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
             }
 
@@ -1564,7 +1672,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                if (k0 == 0) {
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                } else {
+                    std::memcpy(batch.embd, h_tgt + (size_t) (k0-1) * n_embd, row_bytes * (n_tokens-k0));
+                }
             }
 
             // fill the pending embeddings from a previous run
@@ -1572,15 +1684,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
             };
 
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
-                }
+            if (k0 == 0) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+            if (k0 > 0) {
+                // the early ingest stopped part way (a ubatch whose rows were remote, or a failed decode)
+                llama_memory_seq_rm(mem_dft, k0_seq, batch_in.pos[k0], -1);
+            }
 
             bool ok = true;
             const int64_t t_ing0 = spec_trace_enabled() ? ggml_time_us() : 0;
@@ -2889,6 +3007,24 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_process_begin(common_speculative * spec, const llama_batch & batch) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->process_begin(batch);
+    }
+}
+
+void common_speculative_process_end(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->process_end();
     }
 }
 

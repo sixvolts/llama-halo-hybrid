@@ -3787,7 +3787,13 @@ private:
         static const bool spec_trace_dec = getenv("LLAMA_SPEC_TRACE") != nullptr;
         const int64_t t_dec0 = spec_trace_dec && batch_view.n_tokens <= 16 ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
+            if (spec) {
+                common_speculative_process_begin(spec.get(), batch_view);
+            }
             ret = llama_decode(ctx_tgt, batch_view);
+            if (spec) {
+                common_speculative_process_end(spec.get());
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }

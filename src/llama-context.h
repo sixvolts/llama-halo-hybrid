@@ -117,6 +117,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_ubatch_done_callback(llama_ubatch_done_callback cb, void * user_data);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -409,6 +410,10 @@ private:
     // run interleaved on lanes {0,1} or {2,3} while the previous pair is on the remote
     bool pair_pipeline      = false;
     uint32_t pipe_min_tokens = 32;   // smaller ubatches (decode, verify batches) bypass the pipeline
+
+    // halo-hybrid: per-ubatch completion hook (llama_set_ubatch_done_callback)
+    llama_ubatch_done_callback ubatch_done_cb = nullptr;
+    void *                     ubatch_done_ud = nullptr;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

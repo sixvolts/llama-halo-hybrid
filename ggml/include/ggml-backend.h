@@ -379,6 +379,8 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_tail(ggml_backend_sched_t sched);
     // synchronize the local backends only (a remote's queue is ordered by itself)
     GGML_API void                 ggml_backend_sched_synchronize_local(ggml_backend_sched_t sched);
+    // a backend whose queue lives on another host (RPC): synchronizing it drains that host's whole command queue
+    GGML_API bool                 ggml_backend_sched_backend_is_remote_ext(ggml_backend_t backend);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

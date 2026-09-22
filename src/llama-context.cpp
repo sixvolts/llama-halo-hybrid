@@ -1374,6 +1374,11 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_ubatch_done_callback(llama_ubatch_done_callback cb, void * user_data) {
+    ubatch_done_cb = cb;
+    ubatch_done_ud = user_data;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -2224,6 +2229,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sch, &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sch, &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sch, &sampling.candidates_count);
+        }
+
+        // halo-hybrid: per-ubatch hook (the MTP draft's early ingest). The rows above are async copies: complete them
+        // on their own device only - a remote backend's queue may already hold the next pipelined graph, so a
+        // ubatch whose rows live there is skipped (the consumer then ingests it after llama_decode returns)
+        if (ubatch_done_cb && t_h_nextn && embd_nextn.data && !cparams.embeddings_nextn_masked &&
+                cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sch, t_h_nextn);
+            if (backend_h && !ggml_backend_sched_backend_is_remote_ext(backend_h)) {
+                ggml_backend_synchronize(backend_h);
+                ubatch_done_cb(ubatch_done_ud, embd_nextn.data, (int32_t) n_tokens_prev, (int32_t) ubatch.n_tokens);
+            }
         }
 
         n_outputs_prev += n_outputs;
@@ -4608,6 +4625,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_ubatch_done_callback(llama_context * ctx, llama_ubatch_done_callback cb, void * user_data) {
+    ctx->set_ubatch_done_callback(cb, user_data);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

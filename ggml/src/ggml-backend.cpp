@@ -2737,6 +2737,10 @@ void ggml_backend_sched_synchronize_local(ggml_backend_sched_t sched) {
     }
 }
 
+bool ggml_backend_sched_backend_is_remote_ext(ggml_backend_t backend) {
+    return backend != NULL && ggml_backend_sched_backend_is_remote(backend);
+}
+
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_backends;

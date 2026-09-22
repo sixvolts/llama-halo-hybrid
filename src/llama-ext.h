@@ -100,6 +100,15 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// halo-hybrid: called from inside llama_decode, on the decoding thread, once the nextn rows of a ubatch are in host
+// memory. h_nextn is the batch's row buffer (row i = batch token i; the context must output unmasked nextn
+// embeddings, see llama_set_embeddings_nextn) and rows [0, i_first + n_tokens) are complete; i_first/n_tokens is
+// the ubatch's token range, in batch order when the batch holds one sequence. Not called for a ubatch whose rows come
+// from a remote backend (reading them would drain the remote's queue, which may hold the next pipelined graph).
+// The callback may llama_decode ANOTHER context; it must not touch this one. nullptr unregisters.
+typedef void (*llama_ubatch_done_callback)(void * user_data, const float * h_nextn, int32_t i_first, int32_t n_tokens);
+LLAMA_API void llama_set_ubatch_done_callback(struct llama_context * ctx, llama_ubatch_done_callback cb, void * user_data);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
