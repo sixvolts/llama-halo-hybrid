@@ -1394,6 +1394,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t> verify_h_rows;
 
     std::vector<int>                i_last;
+    std::vector<uint32_t>           rs_rng;  // halo-hybrid: xorshift32 state per seq for sampled drafts
     std::vector<std::vector<float>> chain_h;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -1720,7 +1721,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1730,9 +1731,61 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                auto & dp = dparams.at(seq_id);
+
+                // halo-hybrid: lossless speculative sampling - draw the draft token from the head's distribution at
+                // the target's temperature over its top candidates and hand that distribution to the verifier
+                if (dp.temp > 0.0f && dp.result_q != nullptr && cur_p->size > 0) {
+                    float lmax = -INFINITY;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        lmax = std::max(lmax, cur_p->data[k].logit);
+                    }
+                    std::vector<llama_token_data> q(cur_p->data, cur_p->data + cur_p->size);
+                    std::sort(q.begin(), q.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; });
+                    // mirror the target chain: top-p and min-p on the untempered distribution, then temperature
+                    {
+                        double z1 = 0.0;
+                        for (auto & c : q) { c.p = (float) std::exp((double) (c.logit - lmax)); z1 += c.p; }
+                        size_t keep = q.size();
+                        if (dp.top_p < 1.0f) {
+                            double cum = 0.0;
+                            for (size_t k = 0; k < q.size(); ++k) {
+                                cum += q[k].p / z1;
+                                if (cum >= dp.top_p) { keep = k + 1; break; }
+                            }
+                        }
+                        if (dp.min_p > 0.0f) {
+                            const double pmax = q[0].p / z1;
+                            size_t k = 1;
+                            while (k < keep && q[k].p / z1 >= dp.min_p * pmax) { ++k; }
+                            keep = k;
+                        }
+                        q.resize(std::max<size_t>(1, keep));
+                    }
+                    double z = 0.0;
+                    for (auto & c : q) {
+                        c.p = (float) std::exp((double) (c.logit - lmax) / dp.temp);
+                        z  += c.p;
+                    }
+                    for (auto & c : q) {
+                        c.p = (float) (c.p / z);
+                    }
+                    if (rs_rng.size() < n_seq) {
+                        rs_rng.assign(n_seq, 0x2545F491u);
+                    }
+                    uint32_t & st = rs_rng[seq_id];
+                    st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+                    double t = (st >> 8) * (1.0 / 16777216.0);
+                    id = q.back().id;
+                    for (const auto & c : q) {
+                        t -= c.p;
+                        if (t <= 0.0) { id = c.id; break; }
+                    }
+                    dp.result_q->push_back(std::move(q));
+                }
+
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);

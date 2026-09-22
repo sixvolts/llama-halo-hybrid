@@ -258,6 +258,11 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // halo-hybrid: lossless speculative sampling (on by default, LLAMA_SPEC_RS=0 disables): the drafter's distribution for each token of
+    // spec_draft (filled by the drafter when the task samples at temperature > 0) and the acceptance rng state
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
+    uint32_t spec_rs_rng = 0x9E3779B9u;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -388,6 +393,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -527,7 +533,7 @@ struct server_slot {
             static const int   explore = getenv("LLAMA_SPEC_ADAPT_EXPLORE") ? atoi(getenv("LLAMA_SPEC_ADAPT_EXPLORE")) : 0;
             static const int   burnin  = getenv("LLAMA_SPEC_ADAPT_BURNIN")  ? atoi(getenv("LLAMA_SPEC_ADAPT_BURNIN"))  : 6;
             if (adapt && !spec_acc_ema.empty() && n_draft_max > 1) {
-                if ((explore > 0 && spec_steps % explore == explore - 1) || (int) spec_steps_task < burnin) {
+                if ((explore > 0 && spec_steps % (uint32_t) explore == (uint32_t) explore - 1) || (int) spec_steps_task < burnin) {
                     SLT_DBG(*this, "adapt: explore step, draft %d\n", n_draft_max);
                 } else {
                     int   best_l = 1;
@@ -1870,6 +1876,12 @@ private:
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
             }
+            if (spec) {
+                const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
+                    ? std::random_device{}()
+                    : task.params.sampling.seed;
+                slot.spec_rs_rng = seed ? seed : 0x9E3779B9u;
+            }
         } else {
             slot.smpl.reset();
         }
@@ -3094,6 +3106,23 @@ private:
                             /* .result   = */ &slot.spec_draft,
                         };
 
+                        // halo-hybrid: lossless speculative sampling when the task samples (LLAMA_SPEC_RS=1)
+                        slot.spec_draft_q.clear();
+                        {
+                            static const bool spec_rs = getenv("LLAMA_SPEC_RS") == nullptr || atoi(getenv("LLAMA_SPEC_RS")) != 0;
+                            const float temp = slot.task->params.sampling.temp;
+                            if (spec_rs && temp > 0.0f) {
+                                auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                                dp.temp     = temp;
+                                dp.result_q = &slot.spec_draft_q;
+                                static const bool mirror = getenv("LLAMA_SPEC_RS_NOTRUNC") == nullptr;
+                                if (mirror) {
+                                    dp.top_p = slot.task->params.sampling.top_p;
+                                    dp.min_p = slot.task->params.sampling.min_p;
+                                }
+                            }
+                        }
+
                         drafting.push_back(&slot);
                     }
                 }
@@ -3996,11 +4025,16 @@ private:
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 static const bool spec_trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
                 const int64_t t_sa0 = spec_trace ? ggml_time_us() : 0;
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                const bool use_rs = synth_probs.empty() && !slot.spec_is_replay && slot.spec_draft_q.size() == n_draft;
+                auto accepted = !synth_probs.empty()
+                    ? server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
+                    : use_rs
+                    ? common_sampler_sample_and_accept_n_rs(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.spec_draft_q, slot.spec_rs_rng)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                slot.spec_draft_q.clear();
                 slot.spec_i_batch.clear();
                 if (spec_trace) { SRV_INF("spec-trace: tgt sample+accept %.2f ms (%zu drafts, %zu accepted)\n", (ggml_time_us() - t_sa0)/1000.0, n_draft, accepted.size() - 1); }
 

@@ -69,6 +69,17 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // halo-hybrid: lossless speculative sampling (LLAMA_SPEC_RS). When temp > 0 and result_q is set, a drafter that
+    // supports it draws each draft token from its own distribution at this temperature (instead of taking the argmax)
+    // and appends that distribution to *result_q, one entry per draft token, so the target can accept a draft token
+    // with probability min(1, p/q) (common_sampler_sample_and_accept_n_rs).
+    float temp = 0.0f;
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+    // the target's truncation (applied before temperature, as in the default sampler chain), mirrored on the draft
+    // distribution so the drafter does not spend draws on tokens the target can never emit
+    float top_p = 1.0f;
+    float min_p = 0.0f;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

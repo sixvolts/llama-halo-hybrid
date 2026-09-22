@@ -714,6 +714,105 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+// halo-hybrid: see the header. rng_state is a caller-owned xorshift32 state (never 0).
+static double common_rs_uniform(uint32_t & st) {
+    st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+    return (st >> 8) * (1.0 / 16777216.0);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_rs(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q,
+        uint32_t & rng_state, bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    if (draft_q.size() < draft.size() || grammar_should_apply(gsmpl)) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    }
+    if (rng_state == 0) {
+        rng_state = 0x9E3779B9u;
+    }
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // a lazy grammar (tool calls) can switch on at an accepted token: from then on, compare as usual, since
+        // cur_p is only grammar-constrained when the sampler had to resample
+        if (grammar_should_apply(gsmpl)) {
+            const llama_token y = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+            common_sampler_accept(gsmpl, y, true);
+            result.push_back(y);
+            if (draft[i] != y) {
+                return result;
+            }
+            continue;
+        }
+
+        // the target's own sample y (kept as the fallback) and, in cur_p, its full post-chain distribution p
+        const llama_token y = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token_data_array & cur = gsmpl->cur_p;
+
+        const llama_token x = draft[i];
+        const auto & q = draft_q[i];
+
+        double qx = 0.0;
+        for (const auto & c : q) {
+            if (c.id == x) { qx = c.p; break; }
+        }
+        // the backend sampled the target (cur_p is not the full distribution) or the draft is not from q: compare
+        if (qx <= 0.0 || llama_get_sampled_token_ith(ctx, idxs[i]) != LLAMA_TOKEN_NULL) {
+            common_sampler_accept(gsmpl, y, true);
+            result.push_back(y);
+            if (x != y) {
+                return result;
+            }
+            continue;
+        }
+
+        double px = 0.0;
+        for (size_t k = 0; k < cur.size; ++k) {
+            if (cur.data[k].id == x) { px = cur.data[k].p; break; }
+        }
+
+        if (common_rs_uniform(rng_state) * qx < px) {
+            common_sampler_accept(gsmpl, x, true);
+            result.push_back(x);
+            continue;
+        }
+
+        // rejected: draw from the residual max(0, p - q), renormalised
+        auto q_of = [&](llama_token id) -> double {
+            for (const auto & c : q) {
+                if (c.id == id) { return c.p; }
+            }
+            return 0.0;
+        };
+        double z = 0.0;
+        for (size_t k = 0; k < cur.size; ++k) {
+            z += std::max(0.0, (double) cur.data[k].p - q_of(cur.data[k].id));
+        }
+        llama_token r = y;
+        if (z > 0.0) {
+            double t = common_rs_uniform(rng_state) * z;
+            for (size_t k = 0; k < cur.size; ++k) {
+                t -= std::max(0.0, (double) cur.data[k].p - q_of(cur.data[k].id));
+                if (t <= 0.0) { r = cur.data[k].id; break; }
+            }
+        }
+        common_sampler_accept(gsmpl, r, true);
+        result.push_back(r);
+        return result;
+    }
+
+    // every draft token accepted: the bonus token comes from the target as usual
+    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+    common_sampler_accept(gsmpl, id, true);
+    result.push_back(id);
+
+    return result;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
