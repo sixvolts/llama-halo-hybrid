@@ -1224,10 +1224,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        static const bool trace_draft = getenv("LLAMA_SPEC_TRACE") != nullptr;
+        const int64_t t_dd0 = trace_draft ? ggml_time_us() : 0;
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
+        }
+        if (trace_draft) {
+            LOG_INF("spec-trace: dflash draft decode %.1f ms (n=%d)\n", (ggml_time_us() - t_dd0) / 1000.0, (int) batch.n_tokens);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1247,6 +1252,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                // halo-hybrid: LLAMA_DFLASH_PMIN_FROM=k (default 4) applies the p_min cut only from block position k on,
+                //     so the first k-1 draft tokens (accepted 0.6-0.95 of the time on GLM-5.3-Flash regardless of the
+                //     selector's confidence) are always kept; cutting them left steps with no draft at all, which cost
+                //     a full target step for one token (p_min 0.85 measured 19 t/s against 22 with no cut)
+                static const int32_t pmin_from = getenv("LLAMA_DFLASH_PMIN_FROM") ? atoi(getenv("LLAMA_DFLASH_PMIN_FROM")) : 4;
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1254,7 +1265,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
-                    if (params.p_min > 0.0f) {
+                    if (params.p_min > 0.0f && i >= pmin_from) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
@@ -1267,6 +1278,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                 }
 
+                // halo-hybrid: per-step draft length from the caller (adaptive policy); the block is always decoded whole
+                if (dp.n_max > 0 && result.size() > (size_t) dp.n_max) {
+                    result.resize(dp.n_max);
+                }
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                 }
@@ -1333,7 +1348,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+        // noop. (halo-hybrid, 2026-09-22: rolling the rejected drafts' injected features out of the draft KV here
+        //     measured identical to the third decimal on every probe - the server's pre-verify rollback already
+        //     covers what the next block sees; the confidence-cut gain comes from where steps END, see docs.)
     }
 };
 

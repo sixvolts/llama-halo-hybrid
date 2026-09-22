@@ -70,6 +70,56 @@ per step is not its GEMMs; it is the step path (five layer-input extractions inc
 injection decode of the accepted tokens, the selector, host-side batch work) and is the thing to instrument. On the APU
 (4x less bandwidth) the format would matter 4x more, which is where a re-quant pays.
 
+## Adaptive block length (2026-09-21 evening, greedy 256-320 token probes: 4K prose / code / 16K prose)
+
+| config | 4K prose | code | 16K prose |
+|---|---|---|---|
+| MTP, 2 drafts | 26.8 | 24.4 | 24.9 |
+| MTP, 4 drafts | 28.2 | 22.5 | 26.2 |
+| DFlash block 4 | 28.1 | 25.7 | 22.3 |
+| DFlash block 7, uncut | 26.0-27.3 | 20.5 | 20.7 |
+| DFlash block 7, decoded whole, truncated to 4 below 8K ctx | 27.7-29.1 | 25.5 | 20.2 |
+| DFlash block 7, selector cut p 0.7 from position 4 | 26.9-28.2 | **31.3-31.5** | 19.6 |
+| DFlash block 7, cut p 0.85 from position 3 | 26.7 | 24.5 | 23.2 |
+| feedback controller (acceptance EMA x cost line), best variant | 24.7-25.2 | 21-25 | 21-22 |
+
+Findings, each reproduced in an alternating repeat (greedy probes agree to 0.05 t/s):
+
+* `--spec-draft-p-min` applied from block position 1 leaves empty drafts (a full ~83 ms step for one token):
+  p 0.85 gave 19.0 t/s against 22.4 uncut on 4K prose while the acceptance ratio rose 0.45 -> 0.74. The cut now
+  starts at `LLAMA_DFLASH_PMIN_FROM` (default 3): the first two drafts are kept unconditionally (accepted 0.8-0.97
+  of the time on every probe) and confidence only decides the extension.
+* The cut from position 4 raises acceptance at EVERY position on the code probe (0.93/0.82/0.69 vs 0.88/0.63/0.41
+  uncut), positions the cut never touches. Greedy output is identical, so it is where steps end: an uncut block ends
+  its accepted run exactly at a token the drafter got wrong, so the next step starts at a hard spot; a cut block ends
+  on the drafter's own terms. Rolling the rejected drafts' injected features out of the draft KV (the other candidate
+  explanation) measured identical to the third decimal on/off, so it is not a cache defect. The corollary for any
+  length policy: the marginal value of a draft position is lower than its acceptance rate suggests, because a
+  rejection also costs the next step.
+* A per-step feedback controller (per-position acceptance EMA, cost line T(n) = 48 + 17.6 n, argmax tokens/ms;
+  `LLAMA_SPEC_ADAPT=1`, env-gated, default off) lost to every fixed setting in four variants: periodic full-block
+  exploration costs ~7% by itself; burn-in exploration freezes the tail estimates on the hardest text (the start of a
+  response) and locks the depth at 2; optimistic drift recovers the estimates but the objective is flat between 3
+  and 5 drafts on prose, so the controller adds variance without gain, and on code it never learns the long-block
+  payoff because that payoff is the rejection-reset effect above, which a per-position model does not see.
+  Varying the verify size costs nothing per step (the graph cache is shape-keyed, 64 entries): decode by n is the
+  same in adaptive and fixed runs (122-128 ms at n=4, 166-175 at n=8).
+* DFlash truncated after a whole-block decode equals a natively smaller block (27.7-29.1 vs 28.1), so any policy can
+  set the length per step through `dp.n_max` without retraining concerns.
+* DFlash stays weak on the 16K narrative (19.6-23 vs MTP's 26): its 2048-token sliding window cannot see the records
+  the answer draws on, and neither the selector confidence nor a feedback controller can fix a drafter that lacks the
+  context.
+* Drafter format on the R9700: at a shallow cut (p 0.5 from position 1, sampled code) IQ4_XS matched Q8_0, but in the
+  config that pays (block 7, cut 0.7 from position 4, greedy code) it does not: Q8_0 31.1-31.5 t/s (acceptance 0.78),
+  IQ4_XS 23.3 (0.56), IQ4_XS with the selector, fc and conv projections kept at Q8_0 22.5 (0.53), so it is the 4-bit
+  backbone, not the selector, that loses the block's later positions. Q4_1 loses drafts everywhere (no imatrix). The
+  drafter's weights cost ~2 ms of a 130+ ms step on this card, so Q8_0 is the build here; a 4-bit drafter only makes
+  sense where its bandwidth matters (APU-only) and then with an imatrix and a re-measured cut.
+
+Standing at the regroup: the 27 target is met on prose by MTP at 4 drafts (28.2 / 26.2) and on code by DFlash block 7
+with the cut (31.4); no single drafter config reaches both, and the working adaptive mechanism is the selector cut
+(default from position 4, `LLAMA_DFLASH_PMIN_FROM`), not the feedback controller. Drafter file: Q8_0. The next real lever for either drafter is the 48 ms fixed cost per step.
+
 ## Plan
 
 1. **Instrument the DFlash step** (LLAMA_SPEC_TRACE: extract / inject / draft / select ms) and take the overhead down: batch

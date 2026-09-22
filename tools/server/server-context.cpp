@@ -359,6 +359,13 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // halo-hybrid: feedback-driven draft length (LLAMA_SPEC_ADAPT=1). Per block position, an EMA of "this position was
+    //     accepted" over the recent verify steps (unconditional, so 1 + sum = expected tokens per step); kept across
+    //     tasks on purpose so the depth follows the workload. See get_n_draft_max().
+    std::vector<float> spec_acc_ema;
+    uint32_t           spec_steps      = 0;
+    uint32_t           spec_steps_task = 0; // verify steps in the current task (burn-in exploration)
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -394,6 +401,7 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_steps_task = 0;
 
         n_predict_max = -1;
 
@@ -505,6 +513,37 @@ struct server_slot {
             static const int long_ctx   = getenv("LLAMA_SPEC_NMAX_LONG_CTX") ? atoi(getenv("LLAMA_SPEC_NMAX_LONG_CTX")) : 8192;
             if (nmax_short > 0 && (int) prompt.n_tokens() < long_ctx) {
                 n_draft_max = std::min(n_draft_max, nmax_short);
+            }
+        }
+
+        // halo-hybrid: LLAMA_SPEC_ADAPT=1 picks the draft length that maximises expected tokens per ms from the
+        //     per-position acceptance EMA and the measured step cost line T(n) = C0 + C1 * n (n = 1 + draft; on the
+        //     two-host GLM layout C0 ~ 48 ms, C1 ~ 17.6 ms). Every LLAMA_SPEC_ADAPT_EXPLORE-th step drafts the full
+        //     block so the tail positions keep an estimate.
+        {
+            static const bool  adapt   = getenv("LLAMA_SPEC_ADAPT") != nullptr && atoi(getenv("LLAMA_SPEC_ADAPT")) != 0;
+            static const float c0      = getenv("LLAMA_SPEC_ADAPT_C0") ? (float) atof(getenv("LLAMA_SPEC_ADAPT_C0")) : 48.0f;
+            static const float c1      = getenv("LLAMA_SPEC_ADAPT_C1") ? (float) atof(getenv("LLAMA_SPEC_ADAPT_C1")) : 17.6f;
+            static const int   explore = getenv("LLAMA_SPEC_ADAPT_EXPLORE") ? atoi(getenv("LLAMA_SPEC_ADAPT_EXPLORE")) : 0;
+            static const int   burnin  = getenv("LLAMA_SPEC_ADAPT_BURNIN")  ? atoi(getenv("LLAMA_SPEC_ADAPT_BURNIN"))  : 6;
+            if (adapt && !spec_acc_ema.empty() && n_draft_max > 1) {
+                if ((explore > 0 && spec_steps % explore == explore - 1) || (int) spec_steps_task < burnin) {
+                    SLT_DBG(*this, "adapt: explore step, draft %d\n", n_draft_max);
+                } else {
+                    int   best_l = 1;
+                    float best_r = 0.0f;
+                    float tokens = 1.0f;
+                    for (int l = 1; l <= n_draft_max && l <= (int) spec_acc_ema.size(); ++l) {
+                        tokens += spec_acc_ema[l - 1];
+                        const float r = tokens / (c0 + c1 * (float) (1 + l));
+                        if (r > best_r) {
+                            best_r = r;
+                            best_l = l;
+                        }
+                    }
+                    SLT_DBG(*this, "adapt: draft %d of %d (%.1f tok/s expected)\n", best_l, n_draft_max, 1000.0f * best_r);
+                    n_draft_max = best_l;
+                }
             }
         }
 
@@ -690,6 +729,13 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            if (!spec_acc_ema.empty()) {
+                std::string ema_str;
+                for (size_t i = 0; i < spec_acc_ema.size(); ++i) {
+                    ema_str += string_format("%s%.2f", i ? ", " : "", spec_acc_ema[i]);
+                }
+                SLT_INF(*this, "     adapt ema   = (%s)\n", ema_str.c_str());
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -3708,12 +3754,18 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // halo-hybrid: LLAMA_SPEC_TRACE=1 times the target's verify/decode call (small batches only)
+        static const bool spec_trace_dec = getenv("LLAMA_SPEC_TRACE") != nullptr;
+        const int64_t t_dec0 = spec_trace_dec && batch_view.n_tokens <= 16 ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (t_dec0) {
+            SRV_INF("spec-trace: tgt decode %.1f ms (n=%d)\n", (ggml_time_us() - t_dec0) / 1000.0, (int) batch_view.n_tokens);
+        }
 
         if (ret != 0) {
             {
@@ -4019,6 +4071,32 @@ private:
             }
             for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
                 n_accepted_per_pos[i]++;
+            }
+
+            // halo-hybrid: per-position acceptance EMA for the adaptive draft length (positions drafted this step only)
+            {
+                static const float alpha = getenv("LLAMA_SPEC_ADAPT_ALPHA") ? (float) atof(getenv("LLAMA_SPEC_ADAPT_ALPHA")) : 0.1f;
+                auto & ema = slot.spec_acc_ema;
+                if (ema.empty()) {
+                    ema.resize(common_speculative_n_max(spec.get()));
+                    for (size_t i = 0; i < ema.size(); ++i) {
+                        ema[i] = std::max(0.2f, 0.9f - 0.1f * (float) i); // optimistic prior: explore first
+                    }
+                }
+                // positions not drafted this step drift back toward the optimistic prior (LLAMA_SPEC_ADAPT_DRIFT,
+                // default 0.05 per step): a short block chosen during a hard passage is re-tried a few steps
+                // later instead of locking the depth in for the rest of the request
+                static const float drift = getenv("LLAMA_SPEC_ADAPT_DRIFT") ? (float) atof(getenv("LLAMA_SPEC_ADAPT_DRIFT")) : 0.05f;
+                for (size_t i = 0; i < ema.size(); ++i) {
+                    if (i < (size_t) n_draft) {
+                        ema[i] = (1.0f - alpha) * ema[i] + alpha * (i < n_accepted ? 1.0f : 0.0f);
+                    } else {
+                        const float prior = std::max(0.2f, 0.9f - 0.1f * (float) i);
+                        ema[i] += drift * (prior - ema[i]);
+                    }
+                }
+                slot.spec_steps++;
+                slot.spec_steps_task++;
             }
 
             // add accepted tokens to the prompt
