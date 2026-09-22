@@ -11359,6 +11359,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // GLM-5.3-Flash UD-Q4_K_XL (halo-hybrid two-host): 288 experts, 8 used, expert width 2048, n_embd 4096
+    // halo-hybrid: the MoE weighted reduction at GLM-5.3-Flash prefill width (TBO_GLM_MWR=1): 4096 x 8 experts x 1024
+    //     tokens; in situ on gfx1151 it ran 2.5 ms per call (~60 GB/s)
+    if (getenv("TBO_GLM_MWR") != nullptr) {
+        test_cases.emplace_back(new test_moe_weighted_reduction(4096, 8, 1024));
+        test_cases.emplace_back(new test_moe_weighted_reduction(4096, 8, 512));
+        test_cases.emplace_back(new test_moe_weighted_reduction(4096, 8, 4));
+    }
+    // halo-hybrid: GLM-5.3-Flash expert GEMV at every verify width 1..8 (TBO_GLM_DECODE=1): gate/up q4_K 2048x4096,
+    //     down q5_K 4096x2048, 288 experts, 8 used per token, random routing (no locality between tokens)
+    if (getenv("TBO_GLM_DECODE") != nullptr) {
+        for (int64_t n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 288, 8, true,  2048, n, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 288, 8, false, 4096, n, 2048));
+        }
+    }
     if (getenv("TBO_GLM") != nullptr) {
         // elementwise / memory-bound kernels at a 1024-token ubatch (mainframe's profile: rms_norm, cpy, the KDA
         // conv-state concat and the hyper-connection adds run far below the APU's bandwidth)

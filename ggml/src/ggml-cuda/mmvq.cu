@@ -271,6 +271,27 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
+// halo-hybrid: Q4_K/Q5_K/Q6_K cap at 2 on RDNA3.5 (RDNA3 keeps 4). mul_mat_vec_q_moe streams an expert once per (token, slot)
+//     pair, MMQ once per distinct expert; on real text the tokens of a speculative verify batch share experts, and on
+//     gfx1151 (GLM-5.3-Flash, two-host) MMQ took the verify graph from 90.6 to 87.8 ms at 3 tokens and 112.9 to 107.3
+//     at 4 while random-routing isolation showed a tie. GGML_CUDA_MMID_MMVQ_MAX_RDNA3=<n> (RDNA3 and 3.5) still lowers it further.
+static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3_5(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ1_S:   return 6;
+        case GGML_TYPE_IQ1_M:   return 6;
+        case GGML_TYPE_IQ2_S:   return 4;
+        case GGML_TYPE_IQ2_XS:  return 4;
+        case GGML_TYPE_IQ2_XXS: return 4;
+        case GGML_TYPE_IQ3_S:   return 4;
+        case GGML_TYPE_IQ3_XXS: return 4;
+        case GGML_TYPE_IQ4_NL:  return 6;
+        case GGML_TYPE_IQ4_XS:  return 6;
+        case GGML_TYPE_Q4_K:    return 2;
+        case GGML_TYPE_Q5_K:    return 2;
+        case GGML_TYPE_Q6_K:    return 2;
+        default:                return MMVQ_MAX_BATCH_SIZE;
+    }
+}
 
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type type) {
     switch (type) {
@@ -298,8 +319,30 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
     }
 }
 
+// halo-hybrid: the multi-token MoE GEMV (mul_mat_vec_q_moe) gives every (token, expert slot) pair its own warp, so
+//     an expert chosen by two tokens of a verify batch is streamed twice, while MMQ streams each distinct expert once.
+//     On real text neighbouring tokens share experts, so the crossover is lower than the random-routing tables
+//     assume. GGML_CUDA_MMID_MMVQ_MAX_RDNA3=<n> / _RDNA4=<n> caps the vector path at n tokens for the K-quants on
+//     that family (lowering only; the compiled kernels cover every smaller width).
+static int get_mmvq_mmid_max_batch_env_cap(int cc) {
+    static const int cap3 = getenv("GGML_CUDA_MMID_MMVQ_MAX_RDNA3") ? atoi(getenv("GGML_CUDA_MMID_MMVQ_MAX_RDNA3")) : 0;
+    static const int cap4 = getenv("GGML_CUDA_MMID_MMVQ_MAX_RDNA4") ? atoi(getenv("GGML_CUDA_MMID_MMVQ_MAX_RDNA4")) : 0;
+    if (GGML_CUDA_CC_IS_RDNA4(cc)) { return cap4; }
+    if (GGML_CUDA_CC_IS_RDNA3(cc)) { return cap3; }
+    return 0;
+}
+
+static int get_mmvq_mmid_max_batch_uncapped(ggml_type type, int cc);
+
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    const int n = get_mmvq_mmid_max_batch_uncapped(type, cc);
+    const int cap = get_mmvq_mmid_max_batch_env_cap(cc);
+    const bool kquant = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+    return (cap > 0 && kquant) ? std::min(n, cap) : n;
+}
+
+static int get_mmvq_mmid_max_batch_uncapped(ggml_type type, int cc) {
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -315,6 +358,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
             return get_mmvq_mmid_max_batch_rdna4(type);
+        }
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+            return get_mmvq_mmid_max_batch_rdna3_5(type);
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc)) {
             return get_mmvq_mmid_max_batch_rdna3(type);
@@ -433,6 +479,8 @@ template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #if defined(RDNA4)
     return get_mmvq_mmid_max_batch_rdna4(type);
+#elif defined(RDNA3_5)
+    return get_mmvq_mmid_max_batch_rdna3_5(type);
 #elif defined(RDNA3)
     return get_mmvq_mmid_max_batch_rdna3(type);
 #elif defined(RDNA2) || defined(RDNA1)
