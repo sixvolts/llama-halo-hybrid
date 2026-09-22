@@ -689,6 +689,11 @@ void llama_context::sched_reserve() {
 
     sched_lane.reset();
     gf_res_prev_lane.reset();
+    for (int x = 0; x < 2; ++x) {
+        sched_lane_x[x].reset();
+        gf_res_prev_lane_x[x].reset();
+    }
+    pair_pipeline = false;
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -836,6 +841,32 @@ void llama_context::sched_reserve() {
                         ggml_backend_buft_name(backend_buft[i]), size / 1024.0 / 1024.0);
             }
         }
+
+        // halo-hybrid: LLAMA_PREFILL_LANES=4 with a remote device - two more lanes, so a pair of ubatches can run its
+        // heads interleaved on the local devices while the previous pair is on the remote
+        const char * lanes_env = getenv("LLAMA_PREFILL_LANES");
+        if (prefill_pipeline && lanes_env && atoi(lanes_env) >= 4) {
+            for (int x = 0; x < 2; ++x) {
+                gf_res_prev_lane_x[x].reset(new llm_graph_result(max_nodes));
+                sched_lane_x[x].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                auto * gfx = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), false, nullptr, 2 + x);
+                if (!gfx) {
+                    throw std::runtime_error("failed to allocate compute buffers for a paired prefill lane");
+                }
+                ggml_backend_sched_set_async_inputs(sched_lane_x[x].get(), true);
+                ggml_backend_sched_set_eager_copies(sched_lane_x[x].get(), true);
+                ggml_backend_sched_set_remote_fetch(sched_lane_x[x].get(), remote_fetch_enabled);
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    const size_t size = ggml_backend_sched_get_buffer_size(sched_lane_x[x].get(), backend_ptrs[i]);
+                    if (size > 1) {
+                        LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB (prefill lane %d)\n", __func__,
+                                ggml_backend_buft_name(backend_buft[i]), size / 1024.0 / 1024.0, 3 + x);
+                    }
+                }
+            }
+            pair_pipeline = true;
+            LLAMA_LOG_INFO("%s: paired four-lane prefill pipeline (heads of two ubatches interleaved on the local devices)\n", __func__);
+        }
     }
 
     if (n_nodes_pp == n_nodes_tg) {
@@ -864,6 +895,11 @@ void llama_context::synchronize() {
     ggml_backend_sched_synchronize(sched.get());
     if (sched_lane) {
         ggml_backend_sched_synchronize(sched_lane.get());
+    }
+    for (int x = 0; x < 2; ++x) {
+        if (sched_lane_x[x]) {
+            ggml_backend_sched_synchronize(sched_lane_x[x].get());
+        }
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1483,10 +1519,29 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, int lane) {
-    GGML_ASSERT(lane == 0 || (lane == 1 && sched_lane));
+ggml_backend_sched_t llama_context::lane_sched(int lane) const {
+    switch (lane) {
+        case 0:  return sched.get();
+        case 1:  return sched_lane.get();
+        case 2:  return sched_lane_x[0].get();
+        case 3:  return sched_lane_x[1].get();
+        default: return nullptr;
+    }
+}
 
-    ggml_backend_sched_t sch = lane == 0 ? sched.get() : sched_lane.get();
+llm_graph_result_ptr & llama_context::lane_res(int lane) {
+    switch (lane) {
+        case 0:  return gf_res_prev;
+        case 1:  return gf_res_prev_lane;
+        case 2:  return gf_res_prev_lane_x[0];
+        default: return gf_res_prev_lane_x[1];
+    }
+}
+
+llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, int lane) {
+    GGML_ASSERT(lane_sched(lane) != nullptr);
+
+    ggml_backend_sched_t sch = lane_sched(lane);
 
     static const bool prep_debug = getenv("LLAMA_LANES_DEBUG") != nullptr;
     const int64_t tp0 = prep_debug ? ggml_time_us() : 0;
@@ -1500,7 +1555,7 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
     int64_t tp2 = tp1, tp3 = tp1, tp4 = tp1;
     bool reused = false;
 
-    auto * res = lane == 0 ? gf_res_prev.get() : gf_res_prev_lane.get();
+    auto * res = lane_res(lane).get();
     auto * gf  = res->get_gf();
 
     // a pipelined graph must not wait for the other lane's remote graph when its allocation is re-planned
@@ -2193,7 +2248,39 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (st != GGML_STATUS_SUCCESS) {
             return st;
         }
-        extract_outputs(pipe_res, pipe_ubatch, pipe_n_outputs, pipe_lane == 0 ? sched.get() : sched_lane.get());
+        extract_outputs(pipe_res, pipe_ubatch, pipe_n_outputs, lane_sched(pipe_lane));
+        return GGML_STATUS_SUCCESS;
+    };
+
+    // halo-hybrid: paired pipeline state (pair_pipeline): the pair whose heads are submitted and whose tails are due
+    struct pair_group {
+        bool               pending = false;
+        bool               have_b  = false;
+        int                la      = 0;
+        int                lb      = 1;
+        llm_graph_result * res_a   = nullptr;
+        llm_graph_result * res_b   = nullptr;
+        llama_ubatch       ua      = {};
+        llama_ubatch       ub      = {};
+        int32_t            na      = 0;
+        int32_t            nb      = 0;
+    };
+    pair_group pg;
+    int        pg_next = 0;
+    auto pair_flush = [&]() -> ggml_status {
+        pg.pending = false;
+        ggml_status st = graph_compute_tail(pg.la);
+        if (st != GGML_STATUS_SUCCESS) {
+            return st;
+        }
+        extract_outputs(pg.res_a, pg.ua, pg.na, lane_sched(pg.la));
+        if (pg.have_b) {
+            st = graph_compute_tail(pg.lb);
+            if (st != GGML_STATUS_SUCCESS) {
+                return st;
+            }
+            extract_outputs(pg.res_b, pg.ub, pg.nb, lane_sched(pg.lb));
+        }
         return GGML_STATUS_SUCCESS;
     };
 
@@ -2225,6 +2312,120 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_backend_sched_set_remote_fetch(sched.get(), prefill_pipeline && (big || small_eager) && remote_fetch_enabled);
         }
 
+        if (use_lanes && prefill_pipeline && pair_pipeline && ubatch.n_tokens >= pipe_min_tokens) {
+            const int la = 2*pg_next;
+            const int lb = la + 1;
+            pg_next ^= 1;
+
+            static const bool pipe_debug = getenv("LLAMA_LANES_DEBUG") != nullptr;
+            const int64_t t0_us = pipe_debug ? ggml_time_us() : 0;
+
+            pipeline_active = true;
+            auto * res_a = prepare_ubatch(ubatch, gtype, mctx.get(), status, la);
+            if (!res_a) {
+                pipeline_active = false;
+                if (pg.pending) { pair_flush(); }
+                return handle_failure({&ubatch}, status);
+            }
+
+            // take the next ubatch as the partner if it is big enough to pipeline
+            llama_ubatch       ubatch_b    = {};
+            llm_graph_result * res_b       = nullptr;
+            int32_t            n_outputs_b = 0;
+            bool               have_b      = false;
+            more = mctx->next();
+            if (more && mctx->get_ubatch().n_tokens >= pipe_min_tokens) {
+                ubatch_b    = mctx->get_ubatch();
+                n_outputs_b = count_outputs(ubatch_b);
+                n_outputs   = n_outputs_b;
+                res_b = prepare_ubatch(ubatch_b, gtype, mctx.get(), status, lb);
+                if (!res_b) {
+                    pipeline_active = false;
+                    if (pg.pending) { pair_flush(); }
+                    return handle_failure({&ubatch, &ubatch_b}, status);
+                }
+                have_b = true;
+            }
+            const int64_t t1_us = pipe_debug ? ggml_time_us() : 0;
+
+            if (ggml_backend_sched_last_remote_split(lane_sched(la)) < 0 ||
+                    (have_b && ggml_backend_sched_last_remote_split(lane_sched(lb)) < 0)) {
+                // no remote split: compute whole, in order
+                if (pg.pending) { pair_flush(); }
+                status = graph_compute_lane(res_a->get_gf(), la);
+                if (status == GGML_STATUS_SUCCESS) {
+                    extract_outputs(res_a, ubatch, n_outputs_a, lane_sched(la));
+                }
+                if (status == GGML_STATUS_SUCCESS && have_b) {
+                    status = graph_compute_lane(res_b->get_gf(), lb);
+                    if (status == GGML_STATUS_SUCCESS) {
+                        extract_outputs(res_b, ubatch_b, n_outputs_b, lane_sched(lb));
+                    }
+                }
+                pipeline_active = false;
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+                    return handle_failure({&ubatch}, status);
+                }
+                if (have_b) {
+                    more = mctx->next();
+                }
+                continue;
+            }
+
+            status = have_b ? graph_compute_head_pair(la, lb) : graph_compute_head(la);
+            const int64_t t2_us = pipe_debug ? ggml_time_us() : 0;
+            if (status != GGML_STATUS_SUCCESS) {
+                pipeline_active = false;
+                LLAMA_LOG_ERROR("%s: failed to compute paired graph head, compute status: %d\n", __func__, status);
+                return handle_failure({&ubatch}, status);
+            }
+
+            const bool had_pending = pg.pending;
+            if (pg.pending) {
+                status = pair_flush();
+                if (status != GGML_STATUS_SUCCESS) {
+                    pipeline_active = false;
+                    LLAMA_LOG_ERROR("%s: failed to compute graph tail, compute status: %d\n", __func__, status);
+                    return handle_failure({&ubatch}, status);
+                }
+            }
+            if (pipe_debug) {
+                const int64_t t3_us = ggml_time_us();
+                LLAMA_LOG_INFO("pipe-debug: pair lanes %d/%d, %u+%u tokens: prepare %.0f ms, heads %.0f ms, %s %.0f ms\n",
+                        la, lb, ubatch.n_tokens, have_b ? ubatch_b.n_tokens : 0, (t1_us - t0_us) / 1000.0, (t2_us - t1_us) / 1000.0,
+                        had_pending ? "previous tails+wait" : "no previous", (t3_us - t2_us) / 1000.0);
+            }
+
+            pg.pending = true;
+            pg.have_b  = have_b;
+            pg.la      = la;
+            pg.lb      = lb;
+            pg.res_a   = res_a;
+            pg.res_b   = res_b;
+            pg.ua      = ubatch;
+            pg.ub      = ubatch_b;
+            pg.na      = n_outputs_a;
+            pg.nb      = n_outputs_b;
+
+            if (have_b) {
+                more = mctx->next();
+            }
+            if (!more) {
+                const int64_t t4_us = pipe_debug ? ggml_time_us() : 0;
+                status = pair_flush();
+                if (pipe_debug) {
+                    LLAMA_LOG_INFO("pipe-debug: final tails+wait %.0f ms\n", (ggml_time_us() - t4_us) / 1000.0);
+                }
+                pipeline_active = false;
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: failed to compute graph tail, compute status: %d\n", __func__, status);
+                    return handle_failure({&ubatch}, status);
+                }
+            }
+            continue;
+        }
+
         if (use_lanes && prefill_pipeline && ubatch.n_tokens >= pipe_min_tokens) {
             const int lane = pipe_next_lane;
             pipe_next_lane ^= 1;
@@ -2241,7 +2442,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 return handle_failure({&ubatch}, status);
             }
 
-            ggml_backend_sched_t sch = lane == 0 ? sched.get() : sched_lane.get();
+            ggml_backend_sched_t sch = lane_sched(lane);
             if (ggml_backend_sched_first_remote_split(sch) < 0) {
                 // no remote split in this graph: compute it whole, in order
                 if (pipe_pending) { pipe_flush(); }
@@ -2301,6 +2502,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             }
             continue;
+        }
+
+        if (pg.pending) {
+            // a small ubatch follows a pipelined pair: finish it first, in order
+            status = pair_flush();
+            pipeline_active = false;
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: failed to compute graph tail, compute status: %d\n", __func__, status);
+                return handle_failure({&ubatch}, status);
+            }
         }
 
         if (pipe_pending) {
@@ -2821,9 +3032,9 @@ ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, int lane) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
-    GGML_ASSERT(lane == 0 || (lane == 1 && sched_lane));
+    GGML_ASSERT(lane_sched(lane) != nullptr);
 
-    ggml_backend_sched_t sch = lane == 0 ? sched.get() : sched_lane.get();
+    ggml_backend_sched_t sch = lane_sched(lane);
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
@@ -2833,7 +3044,7 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sch);
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    (lane == 0 ? gf_res_prev : gf_res_prev_lane)->reset();
+    lane_res(lane)->reset();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -2884,7 +3095,7 @@ llm_graph_params llama_context::graph_params(
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
-        /*.sched       =*/ lane == 0 ? sched.get() : sched_lane.get(),
+        /*.sched       =*/ lane_sched(lane),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
@@ -2928,6 +3139,11 @@ ggml_status llama_context::graph_compute(
     if (cparams.prefill_lanes >= 2 && lanes_sync_pending) {
         ggml_backend_sched_synchronize(sched.get());
         ggml_backend_sched_synchronize(sched_lane.get());
+        for (int x = 0; x < 2; ++x) {
+            if (sched_lane_x[x]) {
+                ggml_backend_sched_synchronize(sched_lane_x[x].get());
+            }
+        }
         lanes_sync_pending = false;
     }
 
@@ -2959,9 +3175,9 @@ ggml_status llama_context::graph_compute_lane(ggml_cgraph * gf, int lane) {
     if (lane == 0) {
         return graph_compute(gf, true);
     }
-    GGML_ASSERT(sched_lane);
+    GGML_ASSERT(lane_sched(lane));
     graph_compute_set_threads(true);
-    auto status = ggml_backend_sched_graph_compute_async(sched_lane.get(), gf);
+    auto status = ggml_backend_sched_graph_compute_async(lane_sched(lane), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -2969,10 +3185,21 @@ ggml_status llama_context::graph_compute_lane(ggml_cgraph * gf, int lane) {
     return status;
 }
 
-ggml_status llama_context::graph_compute_head(int lane) {
-    GGML_ASSERT(lane == 0 || (lane == 1 && sched_lane));
+ggml_status llama_context::graph_compute_head_pair(int lane_a, int lane_b) {
+    GGML_ASSERT(lane_sched(lane_a) && lane_sched(lane_b));
     graph_compute_set_threads(true);
-    auto status = ggml_backend_sched_graph_compute_async_head(lane == 0 ? sched.get() : sched_lane.get());
+    auto status = ggml_backend_sched_graph_compute_async_head_pair(lane_sched(lane_a), lane_sched(lane_b));
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async_head_pair failed with error %d\n", __func__, status);
+    }
+    lanes_sync_pending = true;
+    return status;
+}
+
+ggml_status llama_context::graph_compute_head(int lane) {
+    GGML_ASSERT(lane_sched(lane));
+    graph_compute_set_threads(true);
+    auto status = ggml_backend_sched_graph_compute_async_head(lane_sched(lane));
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async_head failed with error %d\n", __func__, status);
     }
@@ -2981,8 +3208,8 @@ ggml_status llama_context::graph_compute_head(int lane) {
 }
 
 ggml_status llama_context::graph_compute_tail(int lane) {
-    GGML_ASSERT(lane == 0 || (lane == 1 && sched_lane));
-    auto status = ggml_backend_sched_graph_compute_async_tail(lane == 0 ? sched.get() : sched_lane.get());
+    GGML_ASSERT(lane_sched(lane));
+    auto status = ggml_backend_sched_graph_compute_async_tail(lane_sched(lane));
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async_tail failed with error %d\n", __func__, status);
     }
@@ -3850,6 +4077,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
             if (sched_lane) {
                 ret[buft].compute += ggml_backend_sched_get_buffer_size(sched_lane.get(), backend);
+            }
+            for (int x = 0; x < 2; ++x) {
+                if (sched_lane_x[x]) {
+                    ret[buft].compute += ggml_backend_sched_get_buffer_size(sched_lane_x[x].get(), backend);
+                }
             }
         }
     }

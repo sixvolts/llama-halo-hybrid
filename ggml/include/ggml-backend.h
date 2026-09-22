@@ -347,6 +347,10 @@ extern "C" {
     // backends, submitting their splits alternately so that work of one graph on one device can overlap work of the
     // other graph on another device. Neither scheduler may have an eval callback set.
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_t sched_a, ggml_backend_sched_t sched_b);
+    // halo-hybrid: the heads of two pipelined lanes (see ggml_backend_sched_graph_compute_async_head) with their local
+    // splits interleaved split by split, so one lane's work on one device overlaps the other lane's on another; then
+    // lane a through its remote cut, then lane b. Finish each with ggml_backend_sched_graph_compute_async_tail.
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_head_pair(ggml_backend_sched_t sched_a, ggml_backend_sched_t sched_b);
     // Copy host-resident graph inputs to their split backend with stream-ordered async copies instead of a host wait and a
     // synchronous copy. The caller must not modify the input data until the graph has been computed
     // (ggml_backend_sched_synchronize) - llama.cpp does this before set_inputs when it enables this.

@@ -2659,6 +2659,57 @@ enum ggml_status ggml_backend_sched_graph_compute_async_head(ggml_backend_sched_
     return GGML_STATUS_SUCCESS;
 }
 
+enum ggml_status ggml_backend_sched_graph_compute_async_head_pair(ggml_backend_sched_t sa, ggml_backend_sched_t sb) {
+    GGML_ASSERT(sa && sb && sa != sb && sa->is_alloc && sb->is_alloc && !sa->callback_eval && !sb->callback_eval);
+    GGML_ASSERT(sa->pipe_state == NULL && sb->pipe_state == NULL && "head called twice without tail");
+    GGML_ASSERT(sa->n_backends == sb->n_backends);
+    const int ra = ggml_backend_sched_last_remote_split(sa);
+    const int rb = ggml_backend_sched_last_remote_split(sb);
+    const int fa = ggml_backend_sched_first_remote_split(sa);
+    const int fb = ggml_backend_sched_first_remote_split(sb);
+    GGML_ASSERT(ra >= 0 && rb >= 0 && fa >= 0 && fb >= 0 && "no remote split");
+
+    // Interleaving is only safe when split i of both lanes runs on the same backend: lane b reads the KV and
+    // recurrent state lane a writes at the same layer, and that order is kept by the shared in-order stream.
+    bool same_shape = fa == fb;
+    for (int i = 0; same_shape && i < fa; i++) {
+        same_shape = sa->splits[i].backend_id == sb->splits[i].backend_id;
+    }
+
+    sa->pipe_state = new ggml_backend_sched_compute_state;
+    sa->pipe_first_remote = ra;
+    sb->pipe_state = new ggml_backend_sched_compute_state;
+    sb->pipe_first_remote = rb;
+    auto fail = [&](enum ggml_status ec) {
+        delete sa->pipe_state; sa->pipe_state = NULL;
+        delete sb->pipe_state; sb->pipe_state = NULL;
+        return ec;
+    };
+
+    enum ggml_status ec = GGML_STATUS_SUCCESS;
+    if (same_shape) {
+        for (int i = 0; i < fa; i++) {
+            if ((ec = ggml_backend_sched_compute_split(sa, i, *sa->pipe_state)) != GGML_STATUS_SUCCESS) { return fail(ec); }
+            if ((ec = ggml_backend_sched_compute_split(sb, i, *sb->pipe_state)) != GGML_STATUS_SUCCESS) { return fail(ec); }
+        }
+        // then each lane through its remote cut, a before b: the remote host runs them in submission order
+        for (int i = fa; i <= ra; i++) {
+            if ((ec = ggml_backend_sched_compute_split(sa, i, *sa->pipe_state)) != GGML_STATUS_SUCCESS) { return fail(ec); }
+        }
+        for (int i = fb; i <= rb; i++) {
+            if ((ec = ggml_backend_sched_compute_split(sb, i, *sb->pipe_state)) != GGML_STATUS_SUCCESS) { return fail(ec); }
+        }
+    } else {
+        for (int i = 0; i <= ra; i++) {
+            if ((ec = ggml_backend_sched_compute_split(sa, i, *sa->pipe_state)) != GGML_STATUS_SUCCESS) { return fail(ec); }
+        }
+        for (int i = 0; i <= rb; i++) {
+            if ((ec = ggml_backend_sched_compute_split(sb, i, *sb->pipe_state)) != GGML_STATUS_SUCCESS) { return fail(ec); }
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_backend_sched_graph_compute_async_tail(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched && sched->pipe_state != NULL && "tail without head");
     enum ggml_status ec = GGML_STATUS_SUCCESS;
