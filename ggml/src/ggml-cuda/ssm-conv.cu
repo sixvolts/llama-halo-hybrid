@@ -204,3 +204,135 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// halo-hybrid: the KDA conv tail at decode as one launch (ggml_cuda_op_ssm_conv_kda_l2). The graph builds the conv
+// weight as concat(concat(w_q, w_k), w_v) every step and L2-normalises the Q and K heads of the SiLU output in two
+// more launches. Here each 128-channel block picks its rows straight from w_q / w_k / w_v, writes the full SiLU
+// output (V is read through a view of it) and, for Q and K blocks (one block = one 128-wide head), writes the L2
+// normalised head. The norm reproduces l2_norm_f32<WARP_SIZE> exactly: one 32-lane warp per token row, each lane
+// summing columns lane, lane+32, lane+64, lane+96 in that order, then warp_reduce_sum.
+#define KDA_L2_HEAD      128
+#define KDA_L2_MAX_TOKENS 8
+
+template <size_t d_conv>
+static __global__ void __launch_bounds__(KDA_L2_HEAD) ssm_conv_kda_l2_f32(
+        const float * __restrict__ src0, const float * __restrict__ w_q, const float * __restrict__ w_k,
+        const float * __restrict__ w_v, const int src0_nb1, const int src0_nb2, const int d_inner,
+        float * __restrict__ dst, const int dst_nb1, const int dst_nb2,
+        float * __restrict__ q_out, float * __restrict__ k_out, const int qk_nb2, const int qk_nb3,
+        const int n_t, const float eps) {
+    static_assert(KDA_L2_HEAD == 4*WARP_SIZE, "one head = four warps");
+    __shared__ float s_y[KDA_L2_MAX_TOKENS][KDA_L2_HEAD];
+
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;   // sequence
+    const int bidy = blockIdx.y;   // 128-channel block of the 3*d_inner conv channels
+
+    const int c0    = bidy * KDA_L2_HEAD;
+    const int which = c0 / d_inner;           // 0 = q, 1 = k, 2 = v
+    const int row0  = c0 - which * d_inner;   // first channel within that weight
+    const float * w_block = (which == 0 ? w_q : which == 1 ? w_k : w_v) + (int64_t) row0 * d_conv;
+
+    const float * x_block = (const float *) ((const char *) src0 + (int64_t) bidx * src0_nb2 + (int64_t) c0 * src0_nb1);
+    float       * y_block = (float *) ((char *) dst + (int64_t) bidx * dst_nb2) + c0;
+
+    const int stride_x = src0_nb1 / sizeof(float);
+    const int stride_y = dst_nb1 / sizeof(float);
+
+    float x[d_conv] = { 0.0f };
+    float w[d_conv] = { 0.0f };
+
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_block[tid * d_conv + j];
+    }
+
+    for (int i = 0; i < n_t; i++) {
+        float sumf = 0.0f;
+
+        if (i == 0) {
+            for (size_t j = 0; j < d_conv; j++) {
+                x[j] = x_block[tid * stride_x + j];
+            }
+        } else {
+            x[(i - 1) % d_conv] = x_block[tid * stride_x + i + d_conv - 1];
+        }
+
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += x[(i + j) % d_conv] * w[j];
+        }
+        sumf += 0.0f;   // the unfused kernel's (zero) bias term, kept so -0.0 rounds the same way
+        const float y = ggml_cuda_op_silu_single(sumf);
+        y_block[i * stride_y + tid] = y;
+        if (which < 2) {
+            s_y[i][tid] = y;
+        }
+    }
+
+    if (which >= 2) {
+        return;
+    }
+    __syncthreads();
+
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+    float * out = (which == 0 ? q_out : k_out) + (int64_t) bidx * qk_nb3 + row0;
+    for (int i = warp; i < n_t; i += KDA_L2_HEAD / WARP_SIZE) {
+        // l2_norm_f32 runs this as a rolled loop of fmac into a zeroed accumulator: x0*x0, then fma per column.
+        // Written out with explicit fmaf, because unrolled `tmp += xi*xi` lets the compiler fuse the first two
+        // terms the other way round (fma(x0, x0, x32*x32)), which moves the scale by an ulp on some heads.
+        float tmp = s_y[i][lane] * s_y[i][lane];
+#pragma unroll
+        for (int col = lane + WARP_SIZE; col < KDA_L2_HEAD; col += WARP_SIZE) {
+            const float xi = s_y[i][col];
+            tmp = fmaf(xi, xi, tmp);
+        }
+        tmp = warp_reduce_sum(tmp);
+        const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+#pragma unroll
+        for (int col = lane; col < KDA_L2_HEAD; col += WARP_SIZE) {
+            out[(int64_t) i * qk_nb2 + col] = scale * s_y[i][col];
+        }
+    }
+}
+
+bool ggml_cuda_ssm_conv_kda_l2_supported(int64_t d_conv, int64_t d_inner, int64_t n_t) {
+    return (d_conv == 3 || d_conv == 4) && d_inner % KDA_L2_HEAD == 0 && n_t >= 1 && n_t <= KDA_L2_MAX_TOKENS;
+}
+
+void ggml_cuda_op_ssm_conv_kda_l2(ggml_backend_cuda_context & ctx, const ggml_tensor * conv_in,
+        const ggml_tensor * w_q, const ggml_tensor * w_k, const ggml_tensor * w_v,
+        ggml_tensor * silu_dst, ggml_tensor * q_out, ggml_tensor * k_out, float eps) {
+    const int64_t d_conv  = w_q->ne[0];
+    const int64_t d_inner = w_q->ne[1];
+    const int64_t n_t     = silu_dst->ne[1];
+    const int64_t n_s     = silu_dst->ne[2];
+
+    GGML_ASSERT(ggml_cuda_ssm_conv_kda_l2_supported(d_conv, d_inner, n_t));
+    GGML_ASSERT(silu_dst->ne[0] == 3*d_inner && conv_in->ne[1] == 3*d_inner);
+    GGML_ASSERT(conv_in->nb[0] == sizeof(float) && conv_in->nb[1] == conv_in->ne[0]*sizeof(float));
+    GGML_ASSERT(silu_dst->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(q_out) && ggml_is_contiguous(k_out));
+
+    const float * src0_d = (const float *) conv_in->data;
+    const float * wq_d   = (const float *) w_q->data;
+    const float * wk_d   = (const float *) w_k->data;
+    const float * wv_d   = (const float *) w_v->data;
+    float * dst_d = (float *) silu_dst->data;
+    float * q_d   = (float *) q_out->data;
+    float * k_d   = (float *) k_out->data;
+
+    const int qk_nb2 = q_out->nb[2] / sizeof(float);   // token stride of the normed heads
+    const int qk_nb3 = q_out->nb[3] / sizeof(float);   // sequence stride
+
+    const dim3 blocks(n_s, 3*d_inner / KDA_L2_HEAD, 1);
+    cudaStream_t stream = ctx.stream();
+    if (d_conv == 4) {
+        ssm_conv_kda_l2_f32<4><<<blocks, KDA_L2_HEAD, 0, stream>>>(src0_d, wq_d, wk_d, wv_d, conv_in->nb[1], conv_in->nb[2],
+            d_inner, dst_d, silu_dst->nb[1], silu_dst->nb[2], q_d, k_d, qk_nb2, qk_nb3, n_t, eps);
+    } else {
+        ssm_conv_kda_l2_f32<3><<<blocks, KDA_L2_HEAD, 0, stream>>>(src0_d, wq_d, wk_d, wv_d, conv_in->nb[1], conv_in->nb[2],
+            d_inner, dst_d, silu_dst->nb[1], silu_dst->nb[2], q_d, k_d, qk_nb2, qk_nb3, n_t, eps);
+    }
+}

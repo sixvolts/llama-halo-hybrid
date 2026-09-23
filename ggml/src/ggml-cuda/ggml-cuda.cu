@@ -4100,6 +4100,104 @@ static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml
     return m.last - i;
 }
 
+// halo-hybrid: KDA conv tail at decode (glm5next build_kda_layer): concat(concat(w_q, w_k, 1), w_v, 1) -> ssm_conv ->
+// silu -> l2_norm(Q-head view), l2_norm(K-head view) becomes one launch that reads the three conv weights directly
+// (the two concats only rebuild a constant) and normalises the Q and K heads in-block. The SiLU output is still
+// written in full, V is read from it through a view. Decode widths only (n_t <= 8); prefill keeps the unfused path.
+// GGML_CUDA_NO_KDA_CONV_L2=1 disables.
+static int ggml_cuda_try_fuse_kda_conv_l2(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_KDA_CONV_L2") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KDA_CONV_L2"));
+    if (disabled) {
+        return 0;
+    }
+    const int n = cgraph->n_nodes;
+    auto is_w = [](const ggml_tensor * w, const ggml_tensor * ref) {
+        return w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_are_same_shape(w, ref);
+    };
+    auto concat_dim1 = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_CONCAT && t->type == GGML_TYPE_F32 && ggml_get_op_params_i32(t, 0) == 1;
+    };
+
+    ggml_tensor * c1 = cgraph->nodes[i];
+    if (!concat_dim1(c1) || !hc_uses1(cgraph, i)) {
+        return 0;
+    }
+    const ggml_tensor * w_q = c1->src[0];
+    const ggml_tensor * w_k = c1->src[1];
+    if (w_q->ne[2] != 1 || w_q->ne[3] != 1 || !is_w(w_q, w_q) || !is_w(w_k, w_q)) {
+        return 0;
+    }
+    const int64_t d_conv  = w_q->ne[0];
+    const int64_t d_inner = w_q->ne[1];
+
+    const int j1 = hc_next(cgraph, i + 1);
+    if (j1 >= n || !concat_dim1(cgraph->nodes[j1]) || cgraph->nodes[j1]->src[0] != c1 || !hc_uses1(cgraph, j1)) {
+        return 0;
+    }
+    ggml_tensor * c2 = cgraph->nodes[j1];
+    const ggml_tensor * w_v = c2->src[1];
+    if (!is_w(w_v, w_q)) {
+        return 0;
+    }
+
+    const int j2 = hc_next(cgraph, j1 + 1);
+    if (j2 >= n || cgraph->nodes[j2]->op != GGML_OP_SSM_CONV || cgraph->nodes[j2]->src[1] != c2 || !hc_uses1(cgraph, j2)) {
+        return 0;
+    }
+    ggml_tensor * conv = cgraph->nodes[j2];
+    const ggml_tensor * conv_in = conv->src[0];
+    const int j3 = hc_next(cgraph, j2 + 1);
+    if (j3 >= n || !hc_unary(cgraph->nodes[j3], GGML_UNARY_OP_SILU) || cgraph->nodes[j3]->src[0] != conv) {
+        return 0;
+    }
+    ggml_tensor * silu = cgraph->nodes[j3];
+    if (conv->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 || conv_in->type != GGML_TYPE_F32 ||
+        conv_in->nb[0] != sizeof(float) || conv_in->nb[1] != conv_in->ne[0]*sizeof(float) ||
+        silu->nb[0] != sizeof(float) || silu->ne[0] != 3*d_inner ||
+        !ggml_cuda_ssm_conv_kda_l2_supported(d_conv, d_inner, silu->ne[1])) {
+        return 0;
+    }
+
+    // the two L2 norms: views of the SiLU output, one 128-wide head per row, at the Q and K channel offsets
+    ggml_tensor * l2[2] = { nullptr, nullptr };
+    int j = j3;
+    for (int r = 0; r < 2; ++r) {
+        j = hc_next(cgraph, j + 1);
+        if (j >= n || cgraph->nodes[j]->op != GGML_OP_L2_NORM) {
+            return 0;
+        }
+        ggml_tensor * t = cgraph->nodes[j];
+        const ggml_tensor * v = t->src[0];
+        if (v->op != GGML_OP_VIEW || v->view_src != silu || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
+            v->ne[0] != 128 || v->ne[1] != d_inner/128 || v->ne[2] != silu->ne[1] || v->ne[3] != silu->ne[2] ||
+            v->nb[0] != sizeof(float) || v->nb[1] != 128*sizeof(float) || v->nb[2] != silu->nb[1] || v->nb[3] != silu->nb[2]) {
+            return 0;
+        }
+        const size_t k = v->view_offs == 0 ? 0 : v->view_offs == (size_t) d_inner*sizeof(float) ? 1 : 2;
+        if (k > 1 || l2[k] != nullptr) {
+            return 0;
+        }
+        l2[k] = t;
+    }
+    const float eps = ggml_get_op_params_f32(l2[0], 0);
+    if (eps != ggml_get_op_params_f32(l2[1], 0) || !(eps >= 0.0f)) {
+        return 0;
+    }
+    // the fused kernel reads conv_in while writing silu/q/k from other blocks: they must not alias
+    if (!hc_disjoint(silu, conv_in) || !hc_disjoint(l2[0], conv_in) || !hc_disjoint(l2[1], conv_in) ||
+        !hc_disjoint(l2[0], silu) || !hc_disjoint(l2[1], silu) || !hc_disjoint(l2[0], l2[1])) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: %s aliases its conv input or outputs, KDA conv-l2 fusion declined\n", __func__, silu->name);
+        }
+        return 0;
+    }
+
+    ggml_cuda_op_ssm_conv_kda_l2(*cuda_ctx, conv_in, w_q, w_k, w_v, silu, l2[0], l2[1], eps);
+    return j - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4119,6 +4217,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_CONCAT) {
+        const int skip = ggml_cuda_try_fuse_kda_conv_l2(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
         }
     }
 

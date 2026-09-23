@@ -1535,8 +1535,9 @@ struct test_case {
 
         static const size_t graph_nodes = 8192;
 
+        // halo-hybrid: room for multi-copy perf graphs (test_kda_conv_l2 reps); no_alloc, so only metadata
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*1024 + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -4570,6 +4571,81 @@ struct test_ssm_conv_bias_silu : public test_case {
 
         out = ggml_silu(ctx, out);
 
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// halo-hybrid: the KDA conv tail of glm5next build_kda_layer, as the builder emits it: the conv weight rebuilt by
+// concat(concat(w_q, w_k, 1), w_v, 1), ssm_conv + silu, then l2_norm of the Q and K head views. The CUDA backend
+// runs it as one launch at decode widths (ggml_cuda_try_fuse_kda_conv_l2); node-by-node evaluation never reaches
+// the fusion, so the whole graph runs. The two L2 outputs and the full SiLU output (V is read from it) are checked.
+// reps > 1 (perf only) builds that many independent copies (one per layer) joined by adds, and op_size is inflated
+// so perf mode times one graph compute instead of repeating the output node.
+struct test_kda_conv_l2 : public test_case {
+    const int64_t d_inner, d_conv, nt, ns, reps;
+    ggml_tensor * q_norm = nullptr;
+    ggml_tensor * k_norm = nullptr;
+    ggml_tensor * conv_out = nullptr;
+    ggml_tensor * sum = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "KDA_CONV_L2";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(d_inner, d_conv, nt, ns, reps);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { q_norm, k_norm, conv_out, sum }; }
+
+    size_t op_size(ggml_tensor * t) override {
+        return reps > 1 ? (size_t) 1 << 40 : test_case::op_size(t);
+    }
+
+    test_kda_conv_l2(int64_t d_inner, int64_t d_conv, int64_t nt, int64_t ns = 1, int64_t reps = 1)
+        : d_inner(d_inner), d_conv(d_conv), nt(nt), ns(ns), reps(reps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hd = 128;
+        const int64_t nh = d_inner / hd;
+        ggml_tensor * out = nullptr;
+        for (int64_t r = 0; r < reps; ++r) {
+            ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1 + nt, 3*d_inner, ns);
+            ggml_set_name(x, "conv_in");
+            ggml_tensor * wq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv, 1, d_inner);
+            ggml_tensor * wk = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv, 1, d_inner);
+            ggml_tensor * wv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv, 1, d_inner);
+            ggml_set_name(wq, "w_q");
+            ggml_set_name(wk, "w_k");
+            ggml_set_name(wv, "w_v");
+
+            ggml_tensor * w = ggml_concat(ctx,
+                    ggml_concat(ctx, ggml_reshape_2d(ctx, wq, d_conv, d_inner), ggml_reshape_2d(ctx, wk, d_conv, d_inner), 1),
+                    ggml_reshape_2d(ctx, wv, d_conv, d_inner), 1);
+            ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, x, w));
+            ggml_set_name(y, "conv_out");
+
+            const size_t nb_qkv  = ggml_row_size(y->type, 3*d_inner);
+            const size_t nb_head = ggml_row_size(y->type, hd);
+            ggml_tensor * q = ggml_view_4d(ctx, y, hd, nh, nt, ns, nb_head, nb_qkv, nb_qkv*nt, 0);
+            ggml_tensor * k = ggml_view_4d(ctx, y, hd, nh, nt, ns, nb_head, nb_qkv, nb_qkv*nt, ggml_row_size(y->type, d_inner));
+            ggml_tensor * v = ggml_view_4d(ctx, y, hd, nh, nt, ns, nb_head, nb_qkv, nb_qkv*nt, ggml_row_size(y->type, 2*d_inner));
+            ggml_tensor * qn = ggml_l2_norm(ctx, q, 1e-6f);
+            ggml_tensor * kn = ggml_l2_norm(ctx, k, 1e-6f);
+            ggml_set_name(qn, "q_norm");
+            ggml_set_name(kn, "k_norm");
+
+            // a consumer of all three, like gated_delta_net
+            ggml_tensor * o = ggml_add(ctx, ggml_add(ctx, qn, kn), v);
+            if (r == 0) {
+                q_norm = qn; k_norm = kn; conv_out = y;
+            }
+            out = out ? ggml_add(ctx, out, o) : o;
+        }
+        sum = out;
         ggml_set_name(out, "out");
         return out;
     }
@@ -10032,6 +10108,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // halo-hybrid: KDA conv tail (concat weights + ssm_conv + silu + two l2_norms), fused at n_t <= 8, unfused at 64
+    for (int64_t nt : {1, 3, 4, 8, 64}) {
+        test_cases.emplace_back(new test_kda_conv_l2(8192, 4, nt));
+        test_cases.emplace_back(new test_kda_conv_l2(256, 4, nt));
+    }
+    test_cases.emplace_back(new test_kda_conv_l2(256, 3, 3));
+    test_cases.emplace_back(new test_kda_conv_l2(256, 4, 3, 2));
+    test_cases.emplace_back(new test_kda_conv_l2(8192, 4, 3, 2));
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 9}) {
@@ -11332,6 +11417,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // halo-hybrid: the fused hyper-connection prologue at decode widths
     for (int64_t nt : {1, 3}) {
         test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 4));
+    }
+    // halo-hybrid: KDA conv tail, TBO_KDA_CONV_L2="d_inner:nt[:reps],..." (d_conv 4); reps copies per graph, one per layer
+    if (const char * env = getenv("TBO_KDA_CONV_L2")) {
+        std::string spec(env);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
+            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+            int64_t di = 0, nt = 3, reps = 1;
+            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &di, &nt, &reps) >= 2 && di > 0 && nt > 0 && reps > 0) {
+                test_cases.emplace_back(new test_kda_conv_l2(di, 4, nt, 1, reps));
+            }
+        }
+        return test_cases;
     }
     // halo-hybrid: fused gate/up + SwiGLU GEMV shapes, TBO_MMV_FUSION_SHAPES="m:k[:n],..." (q8_0 x f32, n defaults to 3)
     if (const char * env = getenv("TBO_MMV_FUSION_SHAPES")) {
