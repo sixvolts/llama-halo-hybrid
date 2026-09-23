@@ -665,3 +665,28 @@ Diagnostics left in the tree: LLAMA_DBG_CLEAR_MEM/_PARTS, GGML_SCHED_ZERO_BUFFER
   each paying the remote alloc-size round trip, and a pair's remote work starts only after both heads. Follow-up-turn
   acceptance (0.74 -> 0.64 -> 0.62 over three chat turns) is content, not state: replaying turn 3 as a fresh request
   gives the same 0.61.
+
+## 2026-09-23 (afternoon): items 1-2 of the plan, and a "regression" that was mainframe's card
+- **Item 1, `--checkpoint-min-new N` (c4e2f07c7):** no user-message checkpoint/prompt split for turns shorter than N new
+  tokens (production 256); near-end checkpoints only at the tail offsets. Short tool turns 543-812 -> 440-573 ms TTFT.
+- **Item 2a, view routing (9966d0805):** a full-size view of a crossing tensor reads a view of the root's copy; remote
+  inputs per prefill ubatch 16 -> 12, 128 -> 64 MiB. Client-side it was measured at 800 t/s / 107.8 ms/step against
+  mainframe on d86b94eca (vr1). GGML_SCHED_NO_VIEW_ROUTE=1 restores the old path; on the local Qwen composite the
+  server-side path is neutral (dev 2620/2699, novr 2565/2689, host 2667/2706, both 2665/2684 t/s prefill; decode 63-64).
+- **Item 2b, GGML_OP_KQ_MASK_BUILD (789f6d754 + 39c35d363, proto 7.5, GGML_OP_COUNT 103):** the causal mask and the
+  indexer pool-select/candidate masks are built on each device from per-cell/per-query i32 position arrays; no mask
+  bytes cross the host link or card<->APU. Correct (greedy hash 57fc9097aea5eef6 identical to host masks); mainframe's
+  scheduler dump shows the three ops on its card next to their FLASH_ATTN consumers, split layout and per-call timing
+  identical to host masks. Two fixes after the first cut: the graph callback must pin into the scheduler of the graph
+  being built (`sched_build`; prefill lanes have their own, and the per-device instances had collapsed onto one that
+  was then shipped as a graph input), and the hybrid memory input must delegate to the attention input's set_input
+  (asserted on the unallocated host mask at warmup). LLAMA_NO_MASK_DEVICE=1 disables.
+- **The regression that was not code.** With mainframe rebuilt to 789f6d754 the gate went 800 -> 768 t/s and 108 -> 115
+  ms/step (mainframe compute +150-200 ms/ubatch, decode MODEL call 37.5 -> 53.4 ms; host masks equally slow). Mainframe
+  re-ran the 09-21 isolated q8_0 GEMV shapes with the EXACT 09-21 binary and got the new, slower numbers (24x16384
+  3.89 -> 4.66 us, 2048x1024 7.83 -> 9.95; the big 12288x4096 only +5%): its R9700 lost 17-27% on launch-bound
+  kernels across the afternoon's reboot + 17-minute power-off, with clocks, temps, power, PCIe AER, ASPM, packages,
+  firmware, host governor and its APU all unchanged. gibson's card, with the same amdgpu.lockup_timeout active, is at or
+  below the 09-21 numbers (3.79 / 11.61 / 14.56 / 7.67 / 55.01 / 4.38 us), so the boot parameter is not it. Lesson:
+  after any reboot, re-run the six-shape GEMV probe on both cards BEFORE reading a two-host number as a code change.
+  The item-2 gate (expect >= 800 t/s, ~108 ms/step with masks gone) waits for mainframe's card.
