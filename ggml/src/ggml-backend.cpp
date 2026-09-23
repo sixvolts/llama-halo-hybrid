@@ -794,6 +794,9 @@ struct ggml_backend_sched_split {
     // per input: host staging for a remote (RPC) producer or consumer (ggml_backend_sched_set_remote_fetch);
     // ev != NULL: the producer's queue marker after the eager fetch into data
     struct ggml_backend_sched_stage * stages;
+    // halo-hybrid: copies that are views of another input's copy (no data of their own; see split_graph)
+    struct ggml_tensor * view_copies[8];
+    int n_view_copies;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -1390,6 +1393,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->n_view_copies = 0;
         if (split->input_events) { memset(split->input_events, 0, split->inputs_capacity * sizeof(ggml_backend_event_t)); }
         ggml_backend_sched_split_reset_stages(split);
         int cur_backend_id = split->backend_id;
@@ -1476,6 +1480,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->n_view_copies = 0;
         if (split->input_events) { memset(split->input_events, 0, split->inputs_capacity * sizeof(ggml_backend_event_t)); }
                 ggml_backend_sched_split_reset_stages(split);
                 cur_backend_id = node_backend_id;
@@ -1544,6 +1549,47 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    // halo-hybrid: a full-size view (reshape/permute) of a tensor that crosses to this backend: copy the
+                    // root once and read a view of that copy, instead of copying the same bytes once per view (the
+                    // hyper-connection mixer reads the residual as [n_embd, hc, n] and as [n_embd*hc, n]: 2 x 64 MiB
+                    // per 1024-token ubatch over the host link before this)
+                    static const bool no_view_route = getenv("GGML_SCHED_NO_VIEW_ROUTE") != nullptr;
+                    if (!no_view_route && sched->n_copies == 1 && src->view_src != NULL && tensor_id_copy(src_id, cur_backend_id, 0) == NULL &&
+                            split->n_view_copies < 8) {
+                        struct ggml_tensor * root = src->view_src;
+                        while (root->view_src) {
+                            root = root->view_src;
+                        }
+                        const size_t root_id = hash_id(root);
+                        const int root_backend_id = sched->hv_tensor_backend_ids[root_id];
+                        if (root != src && src->type == root->type && ggml_nbytes(src) == ggml_nbytes(root) &&
+                                root_backend_id != -1 && root_backend_id != cur_backend_id &&
+                                !ggml_backend_sched_buffer_supported(sched, root, cur_backend_id)) {
+                            if (tensor_id_copy(root_id, cur_backend_id, 0) == NULL) {
+                                // register the root as this split's input (same as the plain path below)
+                                ggml_backend_t backend = sched->backends[cur_backend_id];
+                                struct ggml_tensor * root_copy = ggml_dup_tensor_layout(sched->ctx, root);
+                                ggml_format_name(root_copy, "%s#%s#%d", ggml_backend_name(backend), root->name, 0);
+                                tensor_id_copy(root_id, cur_backend_id, 0) = root_copy;
+                                SET_CAUSE(root_copy, "4.cpy");
+                                int n_inputs = split->n_inputs++;
+                                if (n_inputs >= split->inputs_capacity) {
+                                    ggml_backend_sched_split_inputs_grow(split);
+                                }
+                                split->inputs[n_inputs] = root;
+                                root->flags |= GGML_TENSOR_FLAG_BOUNDARY;
+                            }
+                            struct ggml_tensor * root_copy = tensor_id_copy(root_id, cur_backend_id, 0);
+                            struct ggml_tensor * view_copy = ggml_view_4d(sched->ctx, root_copy, src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                                    src->nb[1], src->nb[2], src->nb[3], src->view_offs);
+                            ggml_format_name(view_copy, "%s#%s#v", ggml_backend_name(sched->backends[cur_backend_id]), src->name);
+                            tensor_id_copy(src_id, cur_backend_id, 0) = view_copy;
+                            split->view_copies[split->n_view_copies++] = view_copy;
+                            SET_CAUSE(view_copy, "4.vcp");
+                            node->src[j] = view_copy;
+                            continue;
+                        }
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1622,7 +1668,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
+    int total_view_copies = 0;
+    for (int i = 0; i < sched->n_splits; i++) {
+        total_view_copies += sched->splits[i].n_view_copies;
+    }
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + total_view_copies + n_dep_nodes;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1703,6 +1753,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
                 graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
             }
+        }
+        // halo-hybrid: views of input copies, after the copies they view (ggml-alloc initializes them as views)
+        for (int j = 0; j < split->n_view_copies; j++) {
+            assert(graph_copy->size > graph_copy->n_nodes);
+            sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+            graph_copy->nodes[graph_copy->n_nodes++] = split->view_copies[j];
         }
 
         for (int j = split->i_start; j < split->i_end; j++) {
@@ -1965,6 +2021,17 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                 continue;
             }
 
+            // halo-hybrid (diagnostic): GGML_SCHED_LOG_REMOTE_INPUTS=N lists the inputs of the first N remote splits with sizes
+            {
+                static const int log_n = getenv("GGML_SCHED_LOG_REMOTE_INPUTS") ? atoi(getenv("GGML_SCHED_LOG_REMOTE_INPUTS")) : 0;
+                static int logged = 0;
+                if (log_n > 0 && logged < log_n && ggml_backend_sched_backend_is_remote(split_backend)) {
+                    if (input_id == 0) { logged++; }
+                    GGML_LOG_WARN("remote-input: split %d/%d input %d/%d %-28s %s ne=[%lld,%lld,%lld] %.1f MiB%s\n", split_id, sched->n_splits, input_id, split->n_inputs, input->name,
+                        ggml_type_name(input->type), (long long) input->ne[0], (long long) input->ne[1], (long long) input->ne[2], ggml_nbytes(input) / 1048576.0,
+                        (input->buffer && ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) ? " (weights)" : "");
+                }
+            }
             if (sched->remote_fetch && split->stages && ggml_backend_sched_backend_is_remote(split_backend) &&
                     !ggml_backend_buffer_is_host(input->buffer) &&
                     ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
