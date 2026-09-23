@@ -690,3 +690,24 @@ Diagnostics left in the tree: LLAMA_DBG_CLEAR_MEM/_PARTS, GGML_SCHED_ZERO_BUFFER
   below the 09-21 numbers (3.79 / 11.61 / 14.56 / 7.67 / 55.01 / 4.38 us), so the boot parameter is not it. Lesson:
   after any reboot, re-run the six-shape GEMV probe on both cards BEFORE reading a two-host number as a code change.
   The item-2 gate (expect >= 800 t/s, ~108 ms/step with masks gone) waits for mainframe's card.
+
+## 2026-09-23 (evening): mainframe's card was pinned to perf level high; items 1-2 closed
+- **The slowdown's cause (Mainframe session):** `gpu-perf-high.service` on mainframe wrote `high` into
+  card1's power_dpm_force_performance_level at boot. It was written for the iGPU when that was card1; since the R9700
+  went in, card1 is the R9700, and on the R9700 a forced `high` makes launch-bound kernels 20-27% slower than `auto`
+  at the same clocks under load (24x16384 4.68 vs 3.86 us, reversible both ways; big SGEMM -3%; the APU gains nothing
+  from `high`). Service disabled, both devices on auto; kernels back to 09-21 (3.85 / 11.87 / 14.68 / 7.79 / 56.52 /
+  4.50 us). gibson runs nothing that pins a card by number (checked). Why 09-22 was fast with the service enabled is
+  unknown (probably something had reset the card to auto during that boot).
+- **Gate on the recovered mainframe, LOCAL=26 four lanes taper 3 NMAX=2 (25.8K prefill / ms/step / 12.7K greedy):**
+  host masks 838 / 102.3 / 749; device masks 873 / 102.7 / 760; device masks + pinned flat norm (1d4e23b71) 892 / 103.3 / 776.
+  Mainframe per-ubatch 1006 ms (ref 1011), decode MODEL 36.8 (ref 37.5); device masks save ~9 ms/ubatch on its side,
+  the rest of the +4% is the mask bytes no longer crossing. Greedy hash 57fc9097aea5eef6 in every device-mask run.
+- **Review fixes (Opus 5.5 review of items 1-2, 9a7b81a7f):** view routing only for pure view ops with element-size
+  nb[0] (a transpose moving dim 0 would have been rebuilt with wrong strides; an in-place op's result would have
+  reused a stale root copy); the first turn keeps its system/user checkpoint regardless of --checkpoint-min-new.
+  Open from the review, not done: share pos_kv with the kpool pos_at array (same values, two uploads); the device
+  path adds ~6 bytes per KV cell per decode step, measured neutral.
+- **What crossed the link was not what the routing commit thought:** the second 64 MiB tensor at the layer-26
+  boundary was the hyper-connection flat norm's RESULT, computed on gibson because the op has no weights. Pinned to the
+  layer's device (hc_flat_norm) it reads the routed view of the residual instead: 128 -> 64 MiB per ubatch.
