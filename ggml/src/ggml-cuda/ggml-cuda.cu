@@ -4196,6 +4196,8 @@ static int ggml_cuda_try_fuse_kda_conv_l2(ggml_backend_cuda_context * cuda_ctx, 
 
     ggml_cuda_op_ssm_conv_kda_l2(*cuda_ctx, conv_in, w_q, w_k, w_v, silu, l2[0], l2[1], eps);
     return j - i;
+}
+
 // halo-hybrid: KDA conv-input assembly (build_conv_state of glm5next/kimi-linear at decode) as one launch:
 //     c1 = CONCAT(q, k, 0), [one MUL_MAT producing v when the GEMV hoist did not run], c2 = CONCAT(c1, v, 0),
 //     c3 = CONCAT(states, TRANSPOSE(RESHAPE(c2)), 0), then up to KDA_CONV_ROWS_MAX_DST CPY(VIEW(c3), slot view).

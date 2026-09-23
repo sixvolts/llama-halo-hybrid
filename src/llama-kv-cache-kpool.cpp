@@ -85,7 +85,9 @@ void llama_kv_cache_set_input_kpool(
               uint32_t         kpool) {
     GGML_ASSERT(kv != nullptr);
     GGML_ASSERT(kpool > 0);    GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(pool_bias ->buffer));
+    // halo-hybrid: with the fused indexer the f32 pool bias has no consumer (its f16 twin is the input), so it may be
+    // unallocated; it is then filled in a scratch buffer that the caller converts to f16
+    GGML_ASSERT(pool_bias->buffer == nullptr || ggml_backend_buffer_is_host(pool_bias->buffer));
     GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(pool_bias ->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(pool_cells));
@@ -190,6 +192,11 @@ void llama_kv_cache_set_input_kpool(
     int32_t * dst_cell_pool  = cell_pool ? (int32_t *) cell_pool->data : nullptr;
     int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
     float   * dst_bias       = bias ? (float *) bias->data : nullptr;
+    static thread_local std::vector<float> pool_bias_scratch;
+    if (pool_bias->buffer == nullptr) {
+        pool_bias_scratch.resize(ggml_nelements(pool_bias));
+        pool_bias->data = pool_bias_scratch.data();
+    }
     float   * dst_pool_bias  = (float   *) pool_bias ->data;    char    * dst_sel_mask   = dev_mode ? nullptr : (char *) sel_mask  ->data;
     char    * dst_cand_mask  = dev_mode ? nullptr : (char *) cand_mask ->data;
 
@@ -557,6 +564,14 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             pool_reps ? (int64_t) mctx_idx->get_kv()->get_size() : 0,
             rebuild,
             ubatch, kpool);
+    // halo-hybrid: the fused indexer's f16 copy of the pool bias is a plain input now, filled from the f32 one
+    if (pool_bias_f16 != nullptr && pool_bias_f16->buffer != nullptr) {
+        const int64_t n = ggml_nelements(pool_bias);
+        GGML_ASSERT(ggml_nelements(pool_bias_f16) == n);
+        std::vector<ggml_fp16_t> tmp(n);
+        ggml_fp32_to_fp16_row((const float *) pool_bias->data, tmp.data(), n);
+        ggml_backend_tensor_set(pool_bias_f16, tmp.data(), 0, n*sizeof(ggml_fp16_t));
+    }
 
     // cleared here, not in build_inp_kpool: a graph built but not evaluated must not clear it
     if (rebuild) {

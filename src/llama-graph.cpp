@@ -3841,11 +3841,11 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->pool_bias);
         ggml_set_name(inp->pool_bias, "kpool_pool_bias");
 
-        // the fused indexer wants f16; built once, shared by every indexer layer
+        // the fused indexer wants f16; a host-filled input (0 / -inf are exact in f16), not a device cast: the cast ran
+        // on the first device and its result was then a synchronous device -> host -> remote copy per decode step
         if (cparams.fused_lid) {
-            inp->pool_bias_f16 = ggml_cast(ctx0,
-                    ggml_reshape_4d(ctx0, inp->pool_bias, n_pools, n_tps, 1, n_stream),
-                    GGML_TYPE_F16);
+            inp->pool_bias_f16 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_pools, n_tps, 1, n_stream);
+            ggml_set_input(inp->pool_bias_f16);
             ggml_set_name(inp->pool_bias_f16, "kpool_pool_bias_f16");
         }
 

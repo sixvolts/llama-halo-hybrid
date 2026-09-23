@@ -2007,8 +2007,22 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
         const int64_t t_copy_start = ggml_time_us();
         const bool trace_sends = sched->trace_split_sends && ggml_backend_sched_backend_is_remote(split_backend) && split->n_inputs <= 24;
         int64_t send_offs[25];
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (trace_sends) { send_offs[input_id] = ggml_time_us() - t_copy_start; }
+        // halo-hybrid: for a remote split, send the host-resident graph inputs (positions, pool tables: ready at graph
+        // start, fire-and-forget) BEFORE the tensors produced by earlier splits, whose copy blocks on their producer;
+        // the server then receives and unpacks the small messages while the local devices still compute, and only
+        // the produced tensor is left on the critical path. GGML_SCHED_NO_INPUT_ORDER=1 restores graph order.
+        static const bool no_input_order = getenv("GGML_SCHED_NO_INPUT_ORDER") != nullptr;
+        std::vector<int> ord(split->n_inputs);
+        for (int i = 0; i < split->n_inputs; i++) { ord[i] = i; }
+        if (!no_input_order && ggml_backend_sched_backend_is_remote(split_backend) && split->n_inputs > 1) {
+            std::stable_partition(ord.begin(), ord.end(), [&](int i) {
+                const struct ggml_tensor * t = split->inputs[i];
+                return ggml_backend_sched_is_input(t) && t->buffer && ggml_backend_buffer_is_host(t->buffer);
+            });
+        }
+        for (int oi = 0; oi < split->n_inputs; oi++) {
+            const int input_id = ord[oi];
+            if (trace_sends) { send_offs[oi] = ggml_time_us() - t_copy_start; }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -2225,7 +2239,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
             send_offs[split->n_inputs] = ggml_time_us() - t_copy_start;
             char buf[512]; int p = snprintf(buf, sizeof(buf), "sched-sends split %d (%d inputs, %.0f us):", split_id, split->n_inputs, (double) send_offs[split->n_inputs]);
             for (int i = 0; i < split->n_inputs && p < (int) sizeof(buf) - 40; i++) {
-                p += snprintf(buf + p, sizeof(buf) - p, " %s=%lld", split->inputs[i]->name, (long long) (send_offs[i + 1] - send_offs[i]));
+                p += snprintf(buf + p, sizeof(buf) - p, " %s=%lld", split->inputs[ord[i]]->name, (long long) (send_offs[i + 1] - send_offs[i]));
             }
             GGML_LOG_INFO("%s\n", buf);
         }

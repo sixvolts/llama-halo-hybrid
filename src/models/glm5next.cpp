@@ -657,6 +657,14 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
+        // halo-hybrid: expand the layer's output now, so the next layer's recurrent-state gather (which depends only
+        // on the cache and the copy indices) is not visited before this layer's tail: with the tail after it, the
+        // scheduler cut one remote graph per step into two (a 6-node state split, a 6-node local split, the model)
+        // (opt-in until the folded head is accepted by the rpc-server's allocator: LLAMA_LAYER_EXPAND=1)
+        static const bool layer_expand = getenv("LLAMA_LAYER_EXPAND") != nullptr;
+        if (layer_expand) {
+            ggml_build_forward_expand(gf, inpL);
+        }
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
