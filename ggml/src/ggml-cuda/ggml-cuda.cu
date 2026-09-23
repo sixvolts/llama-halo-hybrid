@@ -4196,6 +4196,200 @@ static int ggml_cuda_try_fuse_kda_conv_l2(ggml_backend_cuda_context * cuda_ctx, 
 
     ggml_cuda_op_ssm_conv_kda_l2(*cuda_ctx, conv_in, w_q, w_k, w_v, silu, l2[0], l2[1], eps);
     return j - i;
+// halo-hybrid: KDA conv-input assembly (build_conv_state of glm5next/kimi-linear at decode) as one launch:
+//     c1 = CONCAT(q, k, 0), [one MUL_MAT producing v when the GEMV hoist did not run], c2 = CONCAT(c1, v, 0),
+//     c3 = CONCAT(states, TRANSPOSE(RESHAPE(c2)), 0), then up to KDA_CONV_ROWS_MAX_DST CPY(VIEW(c3), slot view).
+//     2 + 1 + K launches -> 1 (K = n_rs_seq + 1). Decode only (n_seqs == 1, nt <= 8); structure-only here so that
+//     graph_optimize can call it before allocation; the aliasing checks are in ggml_cuda_kda_conv_rows_disjoint.
+//     GGML_CUDA_NO_KDA_CONV_ROWS=1 disables.
+struct ggml_cuda_kda_conv_rows_match {
+    ggml_tensor * c1;
+    ggml_tensor * c2;
+    ggml_tensor * c3;
+    ggml_tensor * mid;   // the v MUL_MAT between c1 and c2, or nullptr
+    int           n_cpy;
+    ggml_tensor * cpy[KDA_CONV_ROWS_MAX_DST];
+    int           s_idx[KDA_CONV_ROWS_MAX_DST];
+    int           last;  // index of the last fused node
+};
+
+static bool ggml_cuda_kda_conv_rows_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_NO_KDA_CONV_ROWS") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KDA_CONV_ROWS"));
+    return disabled;
+}
+
+// use count of any tensor in the graph (views included), -1 when unknown
+static int kda_use_count(const ggml_cgraph * g, const ggml_tensor * t) {
+    if (!g->use_counts || !ggml_hash_contains(&g->visited_hash_set, (ggml_tensor *) t)) {
+        return -1;
+    }
+    return g->use_counts[ggml_hash_find(&g->visited_hash_set, t)];
+}
+
+static bool kda_f32_cols(const ggml_tensor * t, int64_t nt) {
+    return t->type == GGML_TYPE_F32 && t->ne[1] == nt && t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == sizeof(float);
+}
+
+static bool ggml_cuda_kda_conv_rows_find(const ggml_cgraph * g, int i, ggml_cuda_kda_conv_rows_match & m) {
+    const int n = g->n_nodes;
+    ggml_tensor * c1 = g->nodes[i];
+    auto concat0 = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_CONCAT && ggml_get_op_params_i32(t, 0) == 0 && t->type == GGML_TYPE_F32 &&
+               !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+    };
+    if (!concat0(c1)) {
+        return false;
+    }
+    const ggml_tensor * q = c1->src[0];
+    const ggml_tensor * k = c1->src[1];
+    const int64_t nt = q->ne[1];
+    if (nt < 1 || nt > 8 || !kda_f32_cols(q, nt) || !kda_f32_cols(k, nt) || kda_use_count(g, c1) != 1) {
+        return false;
+    }
+    int j = hc_next(g, i + 1);
+    m.mid = nullptr;
+    if (j < n && g->nodes[j]->op == GGML_OP_MUL_MAT) {
+        m.mid = g->nodes[j];
+        if (m.mid->src[0] == c1 || m.mid->src[1] == c1) {
+            return false;
+        }
+        j = hc_next(g, j + 1);
+    }
+    if (j >= n || !concat0(g->nodes[j])) {
+        return false;
+    }
+    ggml_tensor * c2 = g->nodes[j];
+    const ggml_tensor * v = c2->src[1];
+    if (c2->src[0] != c1 || !kda_f32_cols(v, nt) || kda_use_count(g, c2) != 1 || (m.mid && v != m.mid)) {
+        return false;
+    }
+    const int64_t C = c2->ne[0];
+    if (C > INT_MAX / 2) {
+        return false;
+    }
+    const int k3 = hc_next(g, j + 1);
+    if (k3 >= n || g->nodes[k3]->op != GGML_OP_CONCAT || ggml_get_op_params_i32(g->nodes[k3], 0) != 0 ||
+            g->nodes[k3]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    ggml_tensor * c3 = g->nodes[k3];
+    const ggml_tensor * st = c3->src[0];
+    const ggml_tensor * xt = c3->src[1];
+    const int64_t ns = st->ne[0];
+    // x^T: element (t, c) at c2 + (t*C + c)*4, reached only through single-use view nodes
+    if (xt->view_src != c2 || xt->view_offs != 0 || xt->ne[0] != nt || xt->ne[1] != C || xt->ne[2] != 1 || xt->ne[3] != 1 ||
+            xt->nb[0] != (size_t) C*sizeof(float) || xt->nb[1] != sizeof(float)) {
+        return false;
+    }
+    for (const ggml_tensor * t = xt; t != c2; t = t->src[0]) {
+        if (!hc_is_view_op(t) || !t->src[0] || kda_use_count(g, t) != 1) {
+            return false;
+        }
+    }
+    if (st->type != GGML_TYPE_F32 || ns < 1 || ns > KDA_CONV_ROWS_MAX_DST || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 ||
+            !ggml_is_contiguous(c3) || c3->ne[0] != ns + nt || c3->ne[1] != C) {
+        return false;
+    }
+    m.c1 = c1; m.c2 = c2; m.c3 = c3;
+    m.n_cpy = 0;
+    m.last  = k3;
+    for (int p = hc_next(g, k3 + 1); p < n && m.n_cpy < KDA_CONV_ROWS_MAX_DST; p = hc_next(g, p + 1)) {
+        ggml_tensor * cp = g->nodes[p];
+        if (cp->op != GGML_OP_CPY) {
+            break;
+        }
+        const ggml_tensor * s = cp->src[0];
+        const ggml_tensor * d = cp->src[1];
+        if (s->view_src != c3 || s->type != GGML_TYPE_F32 || s->ne[0] != ns || s->ne[1] != C || s->ne[2] != 1 || s->ne[3] != 1 ||
+                s->nb[0] != sizeof(float) || s->nb[1] != c3->nb[1] || s->view_offs % sizeof(float) != 0 ||
+                (int64_t) (s->view_offs / sizeof(float)) + ns > ns + nt) {
+            break;
+        }
+        if (d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || ggml_nelements(d) != ns*C) {
+            break;
+        }
+        m.cpy[m.n_cpy]   = cp;
+        m.s_idx[m.n_cpy] = (int) (s->view_offs / sizeof(float));
+        m.n_cpy++;
+        m.last = p;
+    }
+    return true;
+}
+
+// the fused kernel reads q/k/v while it writes conv_input and the slots; the unfused graph let the allocator reuse
+//     q/k/v memory for conv_input (and, without the hoist, v's for q/k). Decline on any overlap except the one the
+//     kernel handles: a slot that IS the contiguous states memory (build_rs's single-slot view path).
+static bool ggml_cuda_kda_conv_rows_disjoint(const ggml_cuda_kda_conv_rows_match & m) {
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const ggml_tensor * q  = m.c1->src[0];
+    const ggml_tensor * k  = m.c1->src[1];
+    const ggml_tensor * v  = m.c2->src[1];
+    const ggml_tensor * st = m.c3->src[0];
+    const ggml_tensor * in[4] = { q, k, v, st };
+    for (const ggml_tensor * t : in) {
+        if (overlap(m.c3, t)) {
+            return false;
+        }
+    }
+    if (m.mid && (overlap(v, q) || overlap(v, k))) {
+        return false;
+    }
+    for (int a = 0; a < m.n_cpy; ++a) {
+        const ggml_tensor * d = m.cpy[a]->src[1];
+        if (overlap(d, q) || overlap(d, k) || overlap(d, v) || overlap(d, m.c3)) {
+            return false;
+        }
+        if (overlap(d, st) && !(d->data == st->data && ggml_is_contiguous(st))) {
+            return false;
+        }
+        for (int b = 0; b < a; ++b) {
+            if (overlap(d, m.cpy[b]->src[1])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_kda_conv_rows_disabled()) {
+        return 0;
+    }
+    ggml_cuda_kda_conv_rows_match m;
+    if (!ggml_cuda_kda_conv_rows_find(cgraph, i, m)) {
+        return 0;
+    }
+    if (!ggml_cuda_kda_conv_rows_disjoint(m)) {
+        // expected only where graph_optimize's alloc deps did not run (an RPC server's graphs are allocated by the client)
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: %s: conv_input or a slot overlaps q/k/v, unfused path (logged once)\n", __func__, m.c3->name);
+        }
+        return 0;
+    }
+    // v's GEMV (no hoist: it sits between the two concats) runs first, as in the graph; the check above made sure
+    // it does not land on q or k, which the unfused graph had already consumed at that point
+    if (m.mid && !ggml_cuda_compute_forward(*cuda_ctx, m.mid)) {
+        GGML_ABORT("%s: op not supported %s (%s)", __func__, m.mid->name, ggml_op_name(m.mid->op));
+    }
+    ggml_cuda_kda_conv_rows_args a = {};
+    a.q = m.c1->src[0];
+    a.k = m.c1->src[1];
+    a.v = m.c2->src[1];
+    a.states = m.c3->src[0];
+    a.conv_input = m.c3;
+    a.n_dst = m.n_cpy;
+    for (int kk = 0; kk < m.n_cpy; ++kk) {
+        a.dst[kk]   = (float *) m.cpy[kk]->src[1]->data;
+        a.s_idx[kk] = m.s_idx[kk];
+    }
+    ggml_cuda_op_kda_conv_rows(*cuda_ctx, a);
+    return m.last - i;
 }
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4230,6 +4424,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     static const bool no_hc_fuse = getenv("GGML_CUDA_NO_HC_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_HC_FUSE"));
     if (!no_hc_fuse) {
         const int skip = ggml_cuda_try_fuse_hc(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_CONCAT) {
+        const int skip = ggml_cuda_try_fuse_kda_conv_rows(cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
         }
@@ -5570,6 +5771,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
             }
             i += match.node_count - 1;
+        }
+    }
+
+    // halo-hybrid: keep q/k/v of the KDA conv-input assembly alive until conv_input is allocated, so the fused kernel
+    // (ggml_cuda_try_fuse_kda_conv_rows) never finds conv_input placed over them and has to fall back
+    if (!disable_fusion && !ggml_cuda_kda_conv_rows_disabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_kda_conv_rows_match m;
+            if (cgraph->nodes[i]->op != GGML_OP_CONCAT || !ggml_cuda_kda_conv_rows_find(cgraph, i, m)) {
+                continue;
+            }
+            params->add_alloc_dep(params->user_data, m.c1->src[0], m.c3);
+            params->add_alloc_dep(params->user_data, m.c1->src[1], m.c3);
+            params->add_alloc_dep(params->user_data, m.c2->src[1], m.c3);
+            i = m.last;
         }
     }
 

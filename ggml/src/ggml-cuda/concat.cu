@@ -347,3 +347,81 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 }
+
+// halo-hybrid: the KDA conv-input assembly at decode in one launch. Replaces concat(q,k), concat(+v),
+//     concat(states, transpose(qkv)) and the K rollback-slot copies of the last ns columns (build_conv_state):
+//     2 + 1 + K launches -> 1. One thread per channel c of the 3*d_inner channels; neighbouring threads read
+//     neighbouring elements of q/k/v at each token (coalesced) and write neighbouring rows. The slot copies re-read
+//     the row the thread has just written (same thread, so ordered), which keeps the row out of a dynamically
+//     indexed register array. The states may be the exact memory of dst[0] (single-slot fast path of build_rs):
+//     every state value of channel c is read before any write of channel c, and no other channel touches it.
+struct kda_conv_rows_dst {
+    float * d[KDA_CONV_ROWS_MAX_DST];
+    int     s_idx[KDA_CONV_ROWS_MAX_DST];
+};
+
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) kda_conv_state_rows_f32(
+        const char * __restrict__ q, const char * __restrict__ k, const char * __restrict__ v,
+        const uint64_t nbq1, const uint64_t nbk1, const uint64_t nbv1,
+        const int d0, const int d1, const int C, const int nt,
+        const char * st, const uint64_t nbs0, const uint64_t nbs1, const int ns,
+        float * __restrict__ ci, const int n_dst, const kda_conv_rows_dst out) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) {
+        return;
+    }
+    const char * src;
+    uint64_t     nb1;
+    if (c < d0) {
+        src = q + (int64_t) c*sizeof(float);        nb1 = nbq1;
+    } else if (c < d1) {
+        src = k + (int64_t) (c - d0)*sizeof(float); nb1 = nbk1;
+    } else {
+        src = v + (int64_t) (c - d1)*sizeof(float); nb1 = nbv1;
+    }
+    const int ne0 = ns + nt;
+    float * row = ci + (int64_t) c*ne0;
+
+    float sv[KDA_CONV_ROWS_MAX_DST];   // ns <= KDA_CONV_ROWS_MAX_DST (checked by the matcher)
+#pragma unroll
+    for (int j = 0; j < KDA_CONV_ROWS_MAX_DST; ++j) {
+        if (j < ns) {
+            sv[j] = *(const float *) (st + (int64_t) c*nbs1 + (int64_t) j*nbs0);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < KDA_CONV_ROWS_MAX_DST; ++j) {
+        if (j < ns) {
+            row[j] = sv[j];
+        }
+    }
+    for (int t = 0; t < nt; ++t) {
+        row[ns + t] = *(const float *) (src + (int64_t) t*nb1);
+    }
+    for (int kk = 0; kk < n_dst; ++kk) {
+        float *   d = out.d[kk] + (int64_t) c*ns;
+        const int s = out.s_idx[kk];
+        for (int j = 0; j < ns; ++j) {
+            d[j] = row[s + j];
+        }
+    }
+}
+
+void ggml_cuda_op_kda_conv_rows(ggml_backend_cuda_context & ctx, const ggml_cuda_kda_conv_rows_args & a) {
+    kda_conv_rows_dst out = {};
+    for (int kk = 0; kk < a.n_dst; ++kk) {
+        out.d[kk]     = a.dst[kk];
+        out.s_idx[kk] = a.s_idx[kk];
+    }
+    const int d0 = (int) a.q->ne[0];
+    const int d1 = d0 + (int) a.k->ne[0];
+    const int C  = (int) a.states->ne[1];
+    const int nt = (int) a.q->ne[1];
+    const int ns = (int) a.states->ne[0];
+    const int nblocks = (C + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+    kda_conv_state_rows_f32<<<nblocks, CUDA_CONCAT_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const char *) a.q->data, (const char *) a.k->data, (const char *) a.v->data,
+        a.q->nb[1], a.k->nb[1], a.v->nb[1], d0, d1, C, nt,
+        (const char *) a.states->data, a.states->nb[0], a.states->nb[1], ns,
+        (float *) a.conv_input->data, a.n_dst, out);
+}

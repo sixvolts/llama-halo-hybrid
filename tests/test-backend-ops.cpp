@@ -6757,6 +6757,121 @@ struct test_concat_transpose : public test_case {
     }
 };
 
+// halo-hybrid: the KDA conv-input assembly of build_conv_state (glm5next) as the graph builder emits it:
+//     concat(concat(q, k), v) -> reshape -> transpose, concat with the [ns, C] conv states along dim 0, then K copies
+//     of the last ns columns (shifted per rollback slot) into slot views of the persistent conv_states_all.
+//     The CUDA backend fuses the whole run into one launch at decode (ggml_cuda_try_fuse_kda_conv_rows); the CPU
+//     reference runs it unfused. mode "leaf": q/k/v are inputs (the order after the GEMV hoist); "mm": q/k/v are
+//     GEMVs, so v's MUL_MAT sits between the two concats (no hoist: test-backend-ops, RPC server); "alias": K = 1
+//     and the states are a view of slot 0 at the head, the memory the copy writes (build_rs's single-slot path).
+//     perf = true times one whole-graph compute per run (host issue + launches + sync), for A/B with
+//     GGML_CUDA_NO_KDA_CONV_ROWS=1.
+struct test_kda_conv_state : public test_case {
+    const int64_t     C;      // 3*d_inner channels
+    const int64_t     nt;     // tokens
+    const int64_t     K;      // n_rs_seq + 1 slot copies
+    const std::string mode;
+    const bool        perf;
+    const int64_t     ns = 3; // d_conv - 1
+
+    ggml_tensor * conv_input = nullptr;
+    std::vector<ggml_tensor *> cpys;
+
+    std::string vars() override {
+        return VARS_TO_STR4(C, nt, K, mode) + (perf ? ",perf" : "");
+    }
+
+    test_kda_conv_state(int64_t C, int64_t nt, int64_t K, std::string mode, bool perf = false)
+        : C(C), nt(nt), K(K), mode(mode), perf(perf) {}
+
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> v = { conv_input };
+        v.insert(v.end(), cpys.begin(), cpys.end());
+        return v;
+    }
+    size_t op_size(ggml_tensor * t) override {
+        return perf ? (size_t) 1 << 40 : test_case::op_size(t);   // one whole graph per run
+    }
+    double max_nmse_err() override {
+        return mode == "mm" ? 1e-6 : 1e-7;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "KDA_CONV_STATE";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = C / 3;
+        GGML_ASSERT(d * 3 == C);
+        ggml_tensor * q;
+        ggml_tensor * k;
+        ggml_tensor * v;
+        if (mode == "mm") {
+            const int64_t n_embd = 64;
+            ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+            ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, d);
+            ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, d);
+            ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, d);
+            ggml_set_name(x, "x");
+            q = ggml_mul_mat(ctx, wq, x);
+            k = ggml_mul_mat(ctx, wk, x);
+            v = ggml_mul_mat(ctx, wv, x);
+        } else {
+            q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
+            k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
+            v = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+
+        ggml_tensor * qkv = ggml_concat(ctx, ggml_concat(ctx, q, k, 0), v, 0);
+        qkv = ggml_reshape_3d(ctx, qkv, C, nt, 1);
+
+        const int64_t mem_size  = 2;
+        const int64_t kv_head   = 1;
+        const int64_t row_count = ns * C;
+        ggml_tensor * states_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_count, mem_size * K);
+        ggml_set_name(states_all, "conv_states_all");
+        const size_t row_size = ggml_row_size(states_all->type, row_count);
+
+        ggml_tensor * states;
+        if (mode == "alias") {
+            GGML_ASSERT(K == 1);
+            states = ggml_view_2d(ctx, states_all, row_count, 1, states_all->nb[1], kv_head * row_size);
+        } else {
+            states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_count, 1);
+            ggml_set_name(states, "conv_states");
+        }
+        states = ggml_reshape_3d(ctx, states, ns, C, 1);
+
+        conv_input = ggml_concat(ctx, states, ggml_transpose(ctx, qkv), 0);
+        ggml_set_name(conv_input, "conv_input");
+
+        cpys.clear();
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - ns - K + t);
+            const int64_t s_slot = K - t;
+            ggml_tensor * last = ggml_view_3d(ctx, conv_input, ns, C, 1, conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, s_idx));
+            ggml_tensor * upd = ggml_view_2d(ctx, states_all, row_count, 1, states_all->nb[1],
+                    (s_slot * mem_size + kv_head) * row_size);
+            ggml_tensor * cpy = ggml_cpy(ctx, last, upd);
+            ggml_set_name(cpy, ("slot_cpy_" + std::to_string(t)).c_str());
+            cpys.push_back(cpy);
+        }
+        // right-nested so the graph holds the K copies back to back after conv_input, as build_conv_state does
+        ggml_tensor * out = cpys.back();
+        for (int64_t t = K - 2; t >= 0; --t) {
+            out = ggml_concat(ctx, cpys[t], out, 1);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -9221,6 +9336,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ew_chain("kda",  nt));
         test_cases.emplace_back(new test_ew_chain("mean", nt));
     }
+    // halo-hybrid: KDA conv-input assembly (one launch at decode on CUDA/HIP, nt <= 8; gated off at nt = 64)
+    for (int64_t C : {24576, 300}) {
+        for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
+            for (int64_t K : {1, 3, 4}) {
+                test_cases.emplace_back(new test_kda_conv_state(C, nt, K, "leaf"));
+            }
+            test_cases.emplace_back(new test_kda_conv_state(C, nt, 3, "mm"));
+            test_cases.emplace_back(new test_kda_conv_state(C, nt, 1, "alias"));
+        }
+    }
     for (int64_t n : {1, 3, 8}) {
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q8_0, 256, n, 4096));
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 256, n, 4096));
@@ -11444,6 +11569,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 // ctor order is (n_tokens, rows, k)
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n, m, k,
                     false, 1, 1, false, false, true, false, {1, 1}));
+            }
+        }
+        return test_cases;
+    }
+    // halo-hybrid: KDA conv-input assembly, whole graph per run, TBO_KDA_CONV="C:nt:K[:mode],..." (mode leaf|mm|alias)
+    //     A/B the fused launch against the unfused chain with GGML_CUDA_NO_KDA_CONV_ROWS=1
+    if (const char * env = getenv("TBO_KDA_CONV")) {
+        std::string spec(env);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
+            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+            int64_t c = 0, nt = 3, k = 3;
+            char mode[16] = "leaf";
+            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15s", &c, &nt, &k, mode) >= 1 && c > 0 && c % 3 == 0) {
+                test_cases.emplace_back(new test_kda_conv_state(c, nt, k, mode, true));
             }
         }
         return test_cases;
