@@ -711,3 +711,50 @@ Diagnostics left in the tree: LLAMA_DBG_CLEAR_MEM/_PARTS, GGML_SCHED_ZERO_BUFFER
 - **What crossed the link was not what the routing commit thought:** the second 64 MiB tensor at the layer-26
   boundary was the hyper-connection flat norm's RESULT, computed on gibson because the op has no weights. Pinned to the
   layer's device (hc_flat_norm) it reads the routed view of the residual instead: 128 -> 64 MiB per ubatch.
+
+## 2026-09-23 (night): the overhead pass, and the first fusion wave from the Opus workflow
+**Expert parallelism across hosts is refuted by the link RTT**, not by implementation: splitting each layer's experts
+between the two APUs saves at best ~20 ms of the ~40 ms of expert streaming per step, but needs 90 crossings per
+step; at the measured 0.17 ms ping RTT that is a 15 ms floor with a transport that does not exist, and 40-60 ms with
+the RPC call tax as measured (0.4-0.7 ms per call). Intra-host splits do not fit VRAM. Shelved.
+
+**Where a decode step actually goes (4.65K ctx, HIP graphs on, quiet box; LLAMA_SPEC_TRACE=1 timers):** loop
+iteration 102.1 ms = target llama_decode 95.5 + draft path 3.5 (ingest 0.6, dec0 1.0, smp0 1.8 incl. the GPU wait,
+dec1 0.1) + post_decode 0.9 (sample+accept 0.6) + speculative process 0.75 + ~1.4 other. Inside the 95.5: mainframe
+MODEL 37.7, crossing ~2.7, gibson local ~54 = card ~28-33 ms of kernels across ~1150 launches (~1000 of them under
+40 us: 14 ms with graphs off) + APU 33 ms of expert GEMVs at isolated speed (1.54 ms per layer at n=3). The host side
+is ~7 ms, not 25: the earlier "25 ms of overhead" was the tiny-kernel time on the card plus the crossing.
+Op-timer method: GGML_CUDA_TIME_OPS=1 GGML_CUDA_TIME_OPS_TOP=400 GGML_CUDA_TIME_OPS_NAMES=1 needs
+GGML_CUDA_DISABLE_GRAPHS=1 (replayed graphs record no events) and GGML_CUDA_MMVQ_NO_TALL=1; decode-only figures are
+the delta between two flushes (every 200 graphs) after the last prefill-sized batch. CPU builds on the same box
+slow the APU 2.6x (shared LPDDR5X bandwidth) and inflate every wall number: measure on a quiet box.
+
+**The crossing, split by mainframe's per-message tracer (2.7 ms per step):** 15 set_tensor messages (285 KiB),
+handler time 0.02 ms, 1.1 ms of receive pacing between my messages, 1.0 ms of client work before the first send, a
+0.5 ms second graph call, and 1.14 ms of deserialize + alloc because every call was a fresh graph_compute: two
+graphs alternate per step (a 6-node recurrent-state gather for layer 26 that the node order emits before layer 25's
+tail, then the model) through a one-slot uid cache. Fixes landed (ca77cbfa7): host-resident inputs are sent before
+the produced residual (they now arrive while the local devices compute; only the residual is on the critical path);
+kpool_pool_bias_f16 is a host input instead of a device cast that cost a synchronous device -> host -> remote copy
+(110-360 us) per step. Parked: folding the state gather into the model graph via ggml_build_forward_expand at each
+layer end (LLAMA_LAYER_EXPAND=1) makes one remote graph per step but the kpool select_device map then collapses
+gibson's and mainframe's mask instances (a DUP of layer 3's device sel mask arrived in mainframe's graph as a
+bufferless op leaf behind a VIEW; its allocator asserted). The rpc-server now refuses that with a named error
+(fc6423eb6). Next: a 2-slot uid cache on both ends (~1.1 ms/step) or fixing the map key.
+
+**Single-launch top-k (b9d45eb86):** the DSA indexer's pool select (k=128 of a few hundred to ~1.6K pool scores, 1-8
+rows) went through argsort/radix + pool alloc + memcpy2D, ~85 us per call, 11 calls per step per host; one 512-thread
+block per row with an in-block radix select is 48 us in situ (0.9 -> 0.5 ms per step per host; still fixed-cost
+bound, a second pass could halve it again).
+
+**Fusion wave 1 (Opus 5.5 workflow: survey + 4 implementers in worktrees + 4 adversarial reviewers):** survey
+ground truth 46 launches per KDA layer, 59-70 per DSA layer on the card. Merged: KDA conv tail (c237ba96c: weight
+concats + ssm_conv + silu + Q/K l2_norm, 39.5 -> 9.7 us isolated, 4 launches/layer x 34 layers), KDA conv-input
+assembly (4e19f0360: q/k/v concats + state concat + rollback-slot copies, 61.6 -> 43.1 us, 5 launches/layer), and
+the hyper-connection boundary norm + q8 copy (dad429ac7: bit-identical; its hc_post absorption phase never fires
+under real allocation, harmless). Not merged: peer-copy-batch (never runs in production decode: the eager-copy path
+is off with lanes at small ubatch). In situ on gibson's card (op timer, graphs off): 1153 -> 969 launches per step,
+30.9 -> 28.8 ms; both KDA fusions fire in production (CONCAT +fused8 / +fused13 in the op table). Greedy 12.7K hash
+57fc9097aea5eef6 unchanged. Survey flag for the next wave: the shared-expert FFN on the card runs AFTER the card's
+~1.8 ms wait for the APU's routed experts; scheduling it before the wait would take ~2 ms per step off gibson's
+critical path (a split-order change, not a fusion).
