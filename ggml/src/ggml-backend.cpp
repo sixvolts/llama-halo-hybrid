@@ -1494,6 +1494,31 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
 
+                // halo-hybrid: a tensor produced by an EARLIER split on a remote backend that runs its own scheduler
+                // (rpc composite) and read by a later split with no copy in between (same backend, or a consumer
+                // that can read the buffer): the server keeps unpinned intermediates in its own buffers and writes
+                // back only BOUNDARY/OUTPUT tensors, so without the flag the reader gets whatever an earlier graph
+                // left at the client address (the history-dependent prefill of 2026-09-22/23)
+                {
+                    struct ggml_tensor * root = src;
+                    while (root->view_src) {
+                        root = root->view_src;
+                    }
+                    const int ps = sched->hv_tensor_split_ids[hash_id(root)];
+                    if (ps >= 0 && ps != i_split && ps < i_split &&
+                            ggml_backend_sched_backend_is_remote(sched->backends[sched->splits[ps].backend_id]) &&
+                            !(root->flags & GGML_TENSOR_FLAG_BOUNDARY)) {
+                        static int n_logged = 0;
+                        if (n_logged < 16) {
+                            n_logged++;
+                            GGML_LOG_WARN("%s: %s (from remote split %d) read by split %d on %s without a copy: flagged BOUNDARY\n",
+                                __func__, root->name, ps, i_split, ggml_backend_name(sched->backends[cur_backend_id]));
+                        }
+                        root->flags |= GGML_TENSOR_FLAG_BOUNDARY;
+                        src->flags  |= GGML_TENSOR_FLAG_BOUNDARY;
+                    }
+                }
+
                 if (src->flags & GGML_TENSOR_FLAG_INPUT && sched->n_copies > 1) {
                     if (tensor_id_copy(src_id, src_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[src_backend_id];

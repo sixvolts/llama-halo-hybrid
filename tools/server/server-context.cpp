@@ -2379,6 +2379,11 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        // halo-hybrid (diagnostic): LLAMA_DBG_NO_CKPT_SAVE=1 keeps the checkpoint-driven prompt splits but saves nothing
+        static const bool dbg_no_save = getenv("LLAMA_DBG_NO_CKPT_SAVE") != nullptr;
+        if (dbg_no_save) {
+            return;
+        }
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
