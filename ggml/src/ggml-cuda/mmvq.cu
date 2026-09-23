@@ -1634,7 +1634,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const int64_t launches = (int64_t) nchannels_dst * nsamples_dst;
                     const auto on_cliff = [&](int64_t waves) { return waves >= slots - 12 && waves <= slots + 3; };
                     const bool long_k = blocks_per_row_x >= 8 * blocks_per_iter_1warp;
-                    const bool big    = (int64_t) nrows_x * ncols_x >= (1 << 25);
+                    // halo-hybrid experiment: GGML_CUDA_MMVQ_BIG_WIDE=1 keeps the wide launch for >= 2^25 weights too
+                    // (in situ the 8192-row K=4096 KDA q projection ran at ~170 GB/s under the one-wave-per-row launch)
+                    static const bool big_wide = getenv("GGML_CUDA_MMVQ_BIG_WIDE") != nullptr;
+                    const bool big    = !big_wide && (int64_t) nrows_x * ncols_x >= (1 << 25);
                     const int64_t w_wide = (int64_t) nrows_x * 8 * launches;
                     const int64_t w_up   = (int64_t) nrows_x * launches;
                     bool wide = long_k && !big;

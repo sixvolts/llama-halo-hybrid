@@ -848,6 +848,7 @@ struct ggml_backend_sched {
     bool local_sync;
     // split loop state between ggml_backend_sched_graph_compute_async_head and _tail
     struct ggml_backend_sched_compute_state * pipe_state;
+    bool trace_split_sends = false; // halo-hybrid: GGML_SCHED_TRACE_SPLITS, one graph
     int pipe_first_remote;
     ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPY_EVENTS];
     int copy_event_next[GGML_SCHED_MAX_BACKENDS];
@@ -2004,7 +2005,10 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
 
         // copy the input tensors to the split backend
         const int64_t t_copy_start = ggml_time_us();
+        const bool trace_sends = sched->trace_split_sends && ggml_backend_sched_backend_is_remote(split_backend) && split->n_inputs <= 24;
+        int64_t send_offs[25];
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (trace_sends) { send_offs[input_id] = ggml_time_us() - t_copy_start; }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -2217,6 +2221,14 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
         }
 
         st.t_copy_us += ggml_time_us() - t_copy_start;
+        if (trace_sends) {
+            send_offs[split->n_inputs] = ggml_time_us() - t_copy_start;
+            char buf[512]; int p = snprintf(buf, sizeof(buf), "sched-sends split %d (%d inputs, %.0f us):", split_id, split->n_inputs, (double) send_offs[split->n_inputs]);
+            for (int i = 0; i < split->n_inputs && p < (int) sizeof(buf) - 40; i++) {
+                p += snprintf(buf + p, sizeof(buf) - p, " %s=%lld", split->inputs[i]->name, (long long) (send_offs[i + 1] - send_offs[i]));
+            }
+            GGML_LOG_INFO("%s\n", buf);
+        }
 
         if (!sched->callback_eval) {
             const int64_t t_comp_start = ggml_time_us();
@@ -2350,9 +2362,36 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
     return GGML_STATUS_SUCCESS;
 }
 
+// halo-hybrid: GGML_SCHED_TRACE_SPLITS=N lists the split structure of the first N graphs with 40+ splits computed on
+// the single path (a two-host decode step), and times the input sends of their remote splits
+static int ggml_backend_sched_trace_splits_n() {
+    static const int n = getenv("GGML_SCHED_TRACE_SPLITS") ? atoi(getenv("GGML_SCHED_TRACE_SPLITS")) : 0;
+    return n;
+}
+static bool ggml_backend_sched_trace_splits_now(ggml_backend_sched_t sched) {
+    static int logged = 0;
+    if (logged >= ggml_backend_sched_trace_splits_n() || sched->n_splits < 40) {
+        return false;
+    }
+    logged++;
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     ggml_backend_sched_compute_state st;
+    if (ggml_backend_sched_trace_splits_now(sched)) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            const struct ggml_backend_sched_split * sp = &sched->splits[i];
+            GGML_LOG_INFO("sched-splits %2d: %-28s nodes %5d (%s .. %s) inputs %d:%s%s%s%s\n", i,
+                ggml_backend_name(sched->backends[sp->backend_id]), sp->graph.n_nodes,
+                sp->graph.n_nodes > 0 ? sp->graph.nodes[0]->name : "-",
+                sp->graph.n_nodes > 0 ? sp->graph.nodes[sp->graph.n_nodes - 1]->name : "-", sp->n_inputs,
+                sp->n_inputs > 0 ? " " : "", sp->n_inputs > 0 ? sp->inputs[0]->name : "",
+                sp->n_inputs > 1 ? " " : "", sp->n_inputs > 1 ? sp->inputs[1]->name : "");
+        }
+        sched->trace_split_sends = true;
+    }
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         enum ggml_status ec = ggml_backend_sched_compute_split(sched, split_id, st);
         if (ec != GGML_STATUS_SUCCESS) {
@@ -2360,6 +2399,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
     ggml_backend_sched_trace_report("single", sched, st);
+    sched->trace_split_sends = false;
     return GGML_STATUS_SUCCESS;
 }
 

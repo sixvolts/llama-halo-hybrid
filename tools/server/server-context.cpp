@@ -1475,7 +1475,17 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
+            // halo-hybrid: LLAMA_SPEC_TRACE=1 also times the whole loop iteration and the gap before it, so the
+            // per-step remainder outside decode / sample / draft is visible
+            static const bool loop_trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
+            static int64_t t_prev_end = 0;
+            const int64_t t0 = loop_trace ? ggml_time_us() : 0;
             update_slots();
+            if (loop_trace) {
+                const int64_t t1 = ggml_time_us();
+                SRV_INF("spec-trace: loop iter %.2f ms (gap before %.2f ms)\n", (t1 - t0) / 1000.0, t_prev_end ? (t0 - t_prev_end) / 1000.0 : 0.0);
+                t_prev_end = t1;
+            }
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -2974,7 +2984,12 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                static const bool pd_trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
+                const int64_t t_pd0 = pd_trace && n_tokens <= 16 ? ggml_time_us() : 0;
                 post_decode(n_tokens, off, batch_view);
+                if (t_pd0) {
+                    SRV_INF("spec-trace: post_decode %.2f ms\n", (ggml_time_us() - t_pd0) / 1000.0);
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -3889,10 +3904,14 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_sp0 = spec_trace_dec && batch_view.n_tokens <= 16 ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
 
+            if (t_sp0) {
+                SRV_INF("spec-trace: spec process %.2f ms\n", (ggml_time_us() - t_sp0) / 1000.0);
+            }
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 

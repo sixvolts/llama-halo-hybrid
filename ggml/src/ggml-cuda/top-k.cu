@@ -257,6 +257,87 @@ static void top_k_radix_cuda(
         <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 }
 
+// halo-hybrid: single-block top-k for short rows (the DSA indexer's pool selection at decode: k=128 of a few hundred
+// to a few thousand pool scores, 1-8 rows). The generic path above costs 4-5 launches plus a pool allocation and a
+// strided memcpy per call (~85 us in situ on the R9700); this is one launch of a per-row radix select in shared
+// memory followed by a compacting gather. Output order is unspecified, like the CPU op. GGML_CUDA_NO_TOPK_SMALL=1
+// restores the generic path.
+template<int BLOCK_SIZE>
+static __global__ void top_k_small(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+    constexpr int RADIX_BITS = 8;
+    constexpr int NBINS      = 1 << RADIX_BITS;
+    __shared__ int histogram[NBINS];
+    __shared__ int s_rank;
+    __shared__ uint32_t s_prefix;
+    __shared__ uint32_t s_prefix_mask;
+    __shared__ int s_n_greater;
+    __shared__ int s_n_equal;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float * row_src = src + (size_t) row * ncols;
+    int * row_dst = dst + (size_t) row * k;
+
+    if (tid == 0) {
+        s_rank = k; s_prefix = 0; s_prefix_mask = 0; s_n_greater = 0; s_n_equal = 0;
+    }
+    __syncthreads();
+
+    // 4 passes of 8 bits, most significant first: after each pass the prefix identifies the bin that holds the k-th
+    // largest key, and rank is how many of the keys inside that bin still have to be taken
+    for (int shift = 24; shift >= 0; shift -= RADIX_BITS) {
+        for (int b = tid; b < NBINS; b += BLOCK_SIZE) {
+            histogram[b] = 0;
+        }
+        __syncthreads();
+        const uint32_t prefix = s_prefix, prefix_mask = s_prefix_mask;
+        for (int col = tid; col < ncols; col += BLOCK_SIZE) {
+            const uint32_t key = top_k_float_to_ordered(row_src[col]);
+            if ((key & prefix_mask) == prefix) {
+                atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int rank = s_rank;
+            int bin = NBINS - 1;
+            while (bin > 0 && histogram[bin] < rank) {
+                rank -= histogram[bin--];
+            }
+            s_rank        = rank;
+            s_prefix      = prefix | ((uint32_t) bin << shift);
+            s_prefix_mask = prefix_mask | ((uint32_t) (NBINS - 1) << shift);
+        }
+        __syncthreads();
+    }
+
+    // threshold = the k-th largest key; every key above it is taken, and `rank` of the keys equal to it
+    const uint32_t threshold = s_prefix;
+    const int      n_equal   = s_rank;
+    for (int col = tid; col < ncols; col += BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if (key > threshold) {
+            row_dst[atomicAdd(&s_n_greater, 1)] = col;
+        }
+    }
+    __syncthreads();
+    const int base = s_n_greater;   // == k - n_equal
+    for (int col = tid; col < ncols; col += BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if (key == threshold) {
+            const int slot = atomicAdd(&s_n_equal, 1);
+            if (slot < n_equal) {
+                row_dst[base + slot] = col;
+            }
+        }
+    }
+}
+
+static bool top_k_small_enabled() {
+    static const bool disabled = getenv("GGML_CUDA_NO_TOPK_SMALL") != nullptr;
+    return !disabled;
+}
+
 #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -308,7 +389,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
-    if (ncols > 1024) {
+    if (top_k_small_enabled() && nrows <= 64 && ncols <= 16384 && k <= ncols) {
+        top_k_small<512><<<nrows, 512, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+    } else if (ncols > 1024) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     } else {
 #endif // defined(GGML_USE_HIP)
