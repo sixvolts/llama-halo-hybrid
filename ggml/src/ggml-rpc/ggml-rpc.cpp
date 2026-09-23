@@ -2061,6 +2061,18 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
                     GGML_LOG_ERROR("[%s] node %s (%s) reads %s which lives in no server buffer\n", __func__, t->name, ggml_op_name(t->op), src->name);
                     return false;
                 }
+                // halo-hybrid: the same through a view chain: a view (a node here) of an op result that the client never
+                // computed on this server and never copied in arrives as a bufferless op leaf; the scheduler cannot place
+                // it and ggml-alloc would abort the server (GGML_ASSERT(buffer_id >= 0)). Refuse with the name instead.
+                ggml_tensor * root = src;
+                while (root && root->view_src) {
+                    root = root->view_src;
+                }
+                if (root && root != src && root->buffer == nullptr && root->op != GGML_OP_NONE && node_set.find(root) == node_set.end()) {
+                    GGML_LOG_ERROR("[%s] node %s (%s) reads %s, a view of %s (%s) which is neither computed here nor in any server buffer\n",
+                        __func__, t->name, ggml_op_name(t->op), src->name, root->name, ggml_op_name(root->op));
+                    return false;
+                }
             }
         }
         std::unordered_set<ggml_tensor *> unpinned;
