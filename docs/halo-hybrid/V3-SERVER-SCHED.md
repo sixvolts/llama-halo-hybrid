@@ -646,3 +646,16 @@ busy" and "0% both busy").
   KV/indexer/recurrent of both contexts before every fresh prompt: identical results). Weights flag and early ingest
   verified transparent. Next suspects: compute-buffer read-before-write (poison buffers with NaN) or partially-set
   graph inputs. The partial-ubatch stall (2.4-2.9 s/prompt) needs another fix than the taper until this is found.
+
+## 2026-09-23: the history-dependent prefill - found and fixed (bf3eb6e8d)
+Cause: the rpc-server's own scheduler keeps unpinned intermediates in its buffers and writes back to the client only
+BOUNDARY/OUTPUT tensors; the client flagged BOUNDARY only when it made a cross-backend copy. conv_states-26 (first
+remote KDA layer, remote split -> small local split -> remote split) and the final `norm` crossed without a copy, so
+their readers got an earlier graph's bytes. Elimination order: memory contents, graph reuse, HIP graphs, backend
+caches, local and server compute buffers - all negative; GGML_SCHED_ZERO_BUFFERS=2 (client RPC buffers) positive.
+After the fix, identical requests agree exactly without the MTP draft. With the draft, request 1 alone differs
+slightly (lower-ranked logprobs); requests 2 and 3 are identical. Every zeroing test is negative for it; mainframe's
+tracer shows request 1 alone runs decode-sized warm-up graphs first and then re-plans its allocation every ubatch,
+so its intermediates sit at different offsets -> alignment-dependent kernel paths -> different f32 summation order.
+Read as benign layout rounding, not a leak.
+Diagnostics left in the tree: LLAMA_DBG_CLEAR_MEM/_PARTS, GGML_SCHED_ZERO_BUFFERS=1|2, LLAMA_DBG_NO_CKPT_SAVE.
