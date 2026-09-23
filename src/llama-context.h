@@ -287,6 +287,8 @@ private:
     void graph_compute_set_threads(bool batched);
 
     llm_graph_cb graph_get_cb() const;
+    // halo-hybrid: the scheduler of the graph being built (a prefill lane's, or the main one); graph_get_cb pins into it
+    mutable ggml_backend_sched_t sched_build = nullptr;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)

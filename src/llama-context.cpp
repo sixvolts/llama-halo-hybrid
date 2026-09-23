@@ -1594,7 +1594,9 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        sched_build = sch;
         gf = model.build_graph(gparams);
+        sched_build = nullptr;
         tp2 = prep_debug ? ggml_time_us() : 0;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -3082,7 +3084,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
+    sched_build = sch;
     auto * gf = model.build_graph(gparams);
+    sched_build = nullptr;
 
     this->n_outputs = save_n_outputs;
 
@@ -3255,7 +3259,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched_build ? sched_build : sched.get(), cur, backend.get());
                         }
                     }
                 }
