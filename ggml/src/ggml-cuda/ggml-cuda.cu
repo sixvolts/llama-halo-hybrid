@@ -61,6 +61,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/hc.cuh"
+#include "ggml-cuda/kpool-compress.cuh"
 #include "ggml-cuda/f32act.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -4498,6 +4499,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    // halo-hybrid: glm5next DSA indexer pool compressor, 9 launches -> 1 (kpool-compress.cu)
+    if (node->op == GGML_OP_GET_ROWS) {
+        static const bool no_kpool = getenv("GGML_CUDA_NO_KPOOL_COMPRESS") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KPOOL_COMPRESS"));
+        ggml_cuda_kpool_compress_match km;
+        if (!no_kpool && ggml_cuda_kpool_compress_match_graph(cgraph, i, km)) {
+            ggml_cuda_op_kpool_compress(*cuda_ctx, km);
+            return km.last - i;
         }
     }
 

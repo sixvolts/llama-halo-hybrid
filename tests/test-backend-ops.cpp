@@ -1243,6 +1243,8 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // halo-hybrid: tensors to expand before `out`, in order (fixes model-like node order for multi-layer cases)
+    virtual std::vector<ggml_tensor *> expand_first() { return {}; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1423,6 +1425,7 @@ struct test_case {
         }
 
         // build graph
+        for (ggml_tensor * t : expand_first()) { ggml_build_forward_expand(gf, t); }
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
@@ -1591,6 +1594,7 @@ struct test_case {
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        for (ggml_tensor * t : expand_first()) { ggml_build_forward_expand(gf, t); }
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -4737,6 +4741,109 @@ struct test_kda_conv_l2 : public test_case {
         sum = out;
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+// halo-hybrid: glm5next DSA indexer pool compressor (build_indexer's new-pool branch) in GLM node order:
+// GET_ROWS(members) -> CONT(PERMUTE key), CONT(PERMUTE gate), CONT(TRANSPOSE ape) -> ADD -> SOFT_MAX -> MUL ->
+// SUM_ROWS -> SET_ROWS(pooled head of the same cache). The CUDA backend fuses the whole chain (kpool-compress.cu).
+// n_tok maps to n_new = n_tok/r + 1 as build_inp_kpool sizes it; reps chains share one cache (one per DSA layer).
+struct test_kpool_compress : public test_case {
+    const ggml_type type;   // indexer cache type (F16 in production)
+    const int64_t d, r, n_tok, n_kv, ns, reps;
+    const bool rebuild;     // n_new = n_pools (after a position mutation)
+    const int64_t kv_mult;  // cache cells per stream = kv_mult*n_kv (get_k views the first n_kv of each stream)
+    std::vector<ggml_tensor *> sets;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "KPOOL_COMPRESS";
+    }
+    std::string vars() override {
+        return VARS_TO_STR9(type, d, r, n_tok, n_kv, ns, reps, rebuild, kv_mult);
+    }
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return sets; }
+    std::vector<ggml_tensor *> expand_first() override { return sets; }   // each layer's store right after its chain, as glm5next
+    size_t op_size(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return (size_t) 1 << 40;   // one whole graph per perf run
+    }
+
+    test_kpool_compress(ggml_type type, int64_t d, int64_t r, int64_t n_tok, int64_t n_kv, int64_t ns = 1, int64_t reps = 1, bool rebuild = false,
+            int64_t kv_mult = 2)
+        : type(type), d(d), r(r), n_tok(n_tok), n_kv(n_kv), ns(ns), reps(reps), rebuild(rebuild), kv_mult(kv_mult) {}
+
+    int64_t n_new() const { return rebuild ? n_kv/r : n_tok/r + 1; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nn = n_new();
+        const int64_t kv_size = kv_mult*n_kv;
+        ggml_tensor * cache = ggml_new_tensor_4d(ctx, type, d, 3, kv_size, ns);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * kbuf = ggml_view_4d(ctx, cache, d, 3, n_kv, ns, cache->nb[1], cache->nb[2], cache->nb[3], 0);
+
+        sets.clear();
+        ggml_tensor * prev = nullptr;
+        for (int64_t k = 0; k < reps; ++k) {
+            ggml_tensor * cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*nn, ns);
+            ggml_set_name(cells, "new_pool_cells");
+            ggml_tensor * prep = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nn*ns);
+            ggml_set_name(prep, "new_pool_reps");
+            ggml_tensor * ape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, r);
+            ggml_set_name(ape, "ape");
+
+            ggml_tensor * kg_rows = ggml_view_3d(ctx, kbuf, 2*d, n_kv, ns, kbuf->nb[2], kbuf->nb[3], 0);
+            ggml_tensor * members = ggml_get_rows(ctx, kg_rows, cells);
+            ggml_set_name(members, "indexer_pool_members");
+            const size_t nb_mem = members->nb[1];
+            ggml_tensor * mem_k = ggml_view_4d(ctx, members, d, r, nn, ns, nb_mem, nb_mem*r, members->nb[2], 0);
+            ggml_tensor * mem_g = ggml_view_4d(ctx, members, d, r, nn, ns, nb_mem, nb_mem*r, members->nb[2], d*members->nb[0]);
+            ggml_tensor * keys_t = ggml_cont(ctx, ggml_permute(ctx, mem_k, 1, 0, 2, 3));
+            ggml_tensor * gate_t = ggml_cont(ctx, ggml_permute(ctx, mem_g, 1, 0, 2, 3));
+            ggml_tensor * apet = ggml_cont(ctx, ggml_transpose(ctx, ape));
+            gate_t = ggml_add(ctx, gate_t, ggml_reshape_4d(ctx, apet, r, d, 1, 1));
+            ggml_tensor * probs = ggml_soft_max(ctx, gate_t);
+            ggml_tensor * pool_new = ggml_sum_rows(ctx, ggml_mul(ctx, keys_t, probs));
+            pool_new = ggml_reshape_2d(ctx, pool_new, d, nn*ns);
+
+            // cpy_k_part: the pooled head of every cell, streams merged
+            ggml_tensor * dst;
+            if (prev) {
+                dst = prev;   // chain the layers so one graph holds them all
+            } else {
+                ggml_tensor * k2 = ggml_reshape_2d(ctx, cache, 3*d, kv_size*ns);
+                dst = ggml_view_2d(ctx, k2, d, kv_size*ns, k2->nb[1], ggml_row_size(k2->type, 2*d));
+            }
+            ggml_tensor * set = ggml_set_rows(ctx, dst, pool_new, prep);
+            ggml_set_name(set, "pool_set");
+            sets.push_back(set);
+            prev = set;
+        }
+        ggml_set_name(prev, "out");
+        return prev;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "new_pool_cells") == 0) {
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) n_kv - 1);
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & x : v) { x = dist(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "new_pool_reps") == 0) {
+                // distinct global rows (production repeats only identical pools)
+                std::vector<int64_t> all(kv_mult*n_kv*ns);
+                for (int64_t q = 0; q < kv_mult*n_kv*ns; ++q) { all[q] = q; }
+                std::shuffle(all.begin(), all.end(), rng);
+                all.resize(ggml_nelements(t));
+                ggml_backend_tensor_set(t, all.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
     }
 };
 
@@ -10343,6 +10450,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kda_conv_l2(256, 4, 3, 2));
     test_cases.emplace_back(new test_kda_conv_l2(8192, 4, 3, 2));
 
+    // halo-hybrid: DSA indexer pool compressor (GLM d=128, r=4); decode widths, a prefill width and a rebuild
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
+            test_cases.emplace_back(new test_kpool_compress(t, 128, 4, nt, 256));
+        }
+        test_cases.emplace_back(new test_kpool_compress(t, 128, 4, 3, 256, 2));
+        test_cases.emplace_back(new test_kpool_compress(t, 128, 4, 3, 256, 1, 3));
+        test_cases.emplace_back(new test_kpool_compress(t, 128, 4, 1, 1024, 1, 1, true));
+    }
+    test_cases.emplace_back(new test_kpool_compress(GGML_TYPE_F16, 64, 2, 3, 128));
+    test_cases.emplace_back(new test_kpool_compress(GGML_TYPE_F16, 128, 4, 3, 256, 2, 1, false, 1));
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 9}) {
@@ -11644,6 +11763,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t nt : {1, 3}) {
         test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 4));
     }
+    // halo-hybrid: DSA indexer pool compressor, 12 chained layers per graph (11 DSA + MTP); us/run is the whole graph.
+    //     Compare GGML_CUDA_NO_KPOOL_COMPRESS=1 against the default.
+    for (int64_t nt : {1, 3, 4, 8}) {
+        test_cases.emplace_back(new test_kpool_compress(GGML_TYPE_F16, 128, 4, nt, 4096, 1, 12));
+    }
+    test_cases.emplace_back(new test_kpool_compress(GGML_TYPE_F16, 128, 4, 3, 4096, 1, 1));
     // halo-hybrid: KDA conv tail, TBO_KDA_CONV_L2="d_inner:nt[:reps],..." (d_conv 4); reps copies per graph, one per layer
     if (const char * env = getenv("TBO_KDA_CONV_L2")) {
         std::string spec(env);
