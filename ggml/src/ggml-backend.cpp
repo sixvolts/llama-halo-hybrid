@@ -1554,8 +1554,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // hyper-connection mixer reads the residual as [n_embd, hc, n] and as [n_embd*hc, n]: 2 x 64 MiB
                     // per 1024-token ubatch over the host link before this)
                     static const bool no_view_route = getenv("GGML_SCHED_NO_VIEW_ROUTE") != nullptr;
-                    if (!no_view_route && sched->n_copies == 1 && src->view_src != NULL && tensor_id_copy(src_id, cur_backend_id, 0) == NULL &&
-                            split->n_view_copies < 8) {
+                    // only pure view ops with an element-size nb[0] qualify: the routed view is rebuilt with
+                    // ggml_view_4d (nb[0] = element size), so a transpose that moves dim 0 would read wrong strides,
+                    // and the RESULT of an in-place op (cpy, set_rows, *_inplace) has view_src too but new contents,
+                    // which a root copy made before the write would not carry
+                    const bool pure_view = src->op == GGML_OP_VIEW || src->op == GGML_OP_RESHAPE || src->op == GGML_OP_PERMUTE || src->op == GGML_OP_TRANSPOSE;
+                    if (!no_view_route && sched->n_copies == 1 && src->view_src != NULL && pure_view && src->nb[0] == ggml_type_size(src->type) &&
+                            tensor_id_copy(src_id, cur_backend_id, 0) == NULL && split->n_view_copies < 8) {
                         struct ggml_tensor * root = src->view_src;
                         while (root->view_src) {
                             root = root->view_src;

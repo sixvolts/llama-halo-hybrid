@@ -3663,7 +3663,10 @@ private:
                             const auto & checkpoints = slot.prompt.checkpoints;
 
                             // halo-hybrid: a short last message is not worth its own batch + 145 MiB checkpoint
-                            const bool enough_new = slot.task->n_tokens() - pos >= params_base.checkpoint_min_new;
+                            // (unless no checkpoint exists yet: a long system prompt followed by a short first
+                            // message must keep its system/user boundary checkpoint, or an edit or retry of that
+                            // message reprocesses the whole system prompt)
+                            const bool enough_new = checkpoints.empty() || slot.task->n_tokens() - pos >= params_base.checkpoint_min_new;
                             if (enough_new && (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step)) {
                                 break;
                             }
@@ -3717,7 +3720,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos &&
-                            slot.task->n_tokens() - n_tokens_start >= params_base.checkpoint_min_new;
+                            (slot.prompt.checkpoints.empty() || slot.task->n_tokens() - n_tokens_start >= params_base.checkpoint_min_new);
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
