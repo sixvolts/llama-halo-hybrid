@@ -2074,6 +2074,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
                     return false;
                 }
             }
+            // and the node's own view chain (an in-place op such as SET_ROWS returns a view of its first source: the
+            // 2026-09-23 case was set_rows(view(dup)) whose dup lived on the client's card)
+            {
+                ggml_tensor * root = t->view_src;
+                while (root && root->view_src) {
+                    root = root->view_src;
+                }
+                if (root && root->buffer == nullptr && root->op != GGML_OP_NONE && node_set.find(root) == node_set.end()) {
+                    GGML_LOG_ERROR("[%s] node %s (%s) is a view of %s (%s) which is neither computed here nor in any server buffer\n",
+                        __func__, t->name, ggml_op_name(t->op), root->name, ggml_op_name(root->op));
+                    return false;
+                }
+            }
         }
         std::unordered_set<ggml_tensor *> unpinned;
         for (uint32_t i = 0; i < n_nodes; i++) {

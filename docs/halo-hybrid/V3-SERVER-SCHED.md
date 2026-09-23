@@ -762,3 +762,11 @@ critical path (a split-order change, not a fusion).
   acceptance), greedy hash 57fc9097aea5eef6 unchanged; the afternoon gate on d0028207a was 892 / 103.3. The 4.65K
   gibson-only probe went 102.1 -> 98.6 ms/step; the smaller gain at 25.8K is mainframe's share (its per-step split
   pending from its tracer).
+- **Folded layer-tail (LLAMA_LAYER_EXPAND=1) diagnosis, 22:20:** the kpool mask map is correct (LLAMA_MASK_DEV_DEBUG=1:
+  layers 3-23 -> ROCm0, 27-43 -> RPC0, 45 -> ROCm0 new). The offender is layer 45, the target's NextN layer on
+  gibson's card: with the expand, the scheduler's neighbour expansion places its weightless attention ops (the mask
+  DUP, set_rows) on RPC0 next to layer 44's remote output, and ggml_set_rows returns an in-place VIEW whose view_src
+  chain still points at the DUP on the card (view routing redirects the consumer's src, not the result's view_src),
+  so mainframe receives a view of a tensor it never gets. Fix belongs in the scheduler (route in-place results with
+  their source, or pin a layer's weightless ops to its device); parked. The rpc-server now also refuses a node whose
+  own view chain roots in an unheld op result (no mainframe rebuild done for it yet).

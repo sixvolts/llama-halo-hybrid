@@ -589,6 +589,11 @@ void llm_graph_input_kpool::select_device(ggml_context * ctx0, ggml_backend_sche
     pin(s, "kq_mask_dev_sel", il);
     ggml_backend_t be = sched ? ggml_backend_sched_get_tensor_backend(sched, s) : nullptr;
     auto it = dev_masks.find(be);
+    static const bool dbg = getenv("LLAMA_MASK_DEV_DEBUG") != nullptr;
+    if (dbg) {
+        LLAMA_LOG_INFO("mask-dev: kpool il=%d op=%s sched=%p be=%s -> %s (map %zu)\n", il, s->name, (void *) sched,
+            be ? ggml_backend_name(be) : "NULL", it == dev_masks.end() ? "new" : "reuse", dev_masks.size());
+    }
     if (it == dev_masks.end()) {
         ggml_tensor * c = ggml_kq_mask_build(ctx0, dev_pos_at, dev_q, dev_pool_of, dev_tail_start, dev_bo_vis, 2, GGML_TYPE_F16);
         pin(c, "kq_mask_dev_cand", il);
