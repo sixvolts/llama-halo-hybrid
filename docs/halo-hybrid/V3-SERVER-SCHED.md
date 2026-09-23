@@ -758,3 +758,7 @@ is off with lanes at small ubatch). In situ on gibson's card (op timer, graphs o
 57fc9097aea5eef6 unchanged. Survey flag for the next wave: the shared-expert FFN on the card runs AFTER the card's
 ~1.8 ms wait for the APU's routed experts; scheduling it before the wait would take ~2 ms per step off gibson's
 critical path (a split-order change, not a fusion).
+- **Gate on fc6423eb6, both hosts (2026-09-23 22:00):** 25.8K prefill 892 t/s, 102.2 ms/step (26.9 t/s at 0.86
+  acceptance), greedy hash 57fc9097aea5eef6 unchanged; the afternoon gate on d0028207a was 892 / 103.3. The 4.65K
+  gibson-only probe went 102.1 -> 98.6 ms/step; the smaller gain at 25.8K is mainframe's share (its per-step split
+  pending from its tracer).
