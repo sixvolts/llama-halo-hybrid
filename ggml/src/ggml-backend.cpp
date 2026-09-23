@@ -2526,6 +2526,14 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
         return false;
     }
 
+    // halo-hybrid (diagnostic): GGML_SCHED_ZERO_BUFFERS=1 zeroes the local compute buffers after every allocation
+    // (=2 the remote ones as well); a result that changes reads compute memory before writing it
+    static const int zero_bufs = getenv("GGML_SCHED_ZERO_BUFFERS") ? atoi(getenv("GGML_SCHED_ZERO_BUFFERS")) : 0;
+    if (zero_bufs) {
+        ggml_backend_sched_synchronize_local(sched);
+        ggml_gallocr_fill_buffers(sched->galloc, 0, zero_bufs < 2);
+    }
+
     sched->is_alloc = true;
 
     return true;

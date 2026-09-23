@@ -1097,6 +1097,33 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     return true;
 }
 
+// halo-hybrid (diagnostic): fill every allocated compute buffer with `value` (GGML_SCHED_ZERO_BUFFERS); a result that
+// changes with it reads memory before writing it
+void ggml_gallocr_fill_buffers(ggml_gallocr_t galloc, uint8_t value, bool skip_remote) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+            continue;
+        }
+        bool dup = false;
+        for (int j = 0; j < i; j++) {
+            dup = dup || galloc->buffers[j] == galloc->buffers[i];
+        }
+        if (dup) {
+            continue;
+        }
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+            ggml_backend_buffer_t b = galloc->buffers[i]->chunks[c];
+            if (b == NULL) {
+                continue;
+            }
+            if (skip_remote && strncmp(ggml_backend_buffer_name(b), "RPC", 3) == 0) {
+                continue;
+            }
+            ggml_backend_buffer_clear(b, value);
+        }
+    }
+}
+
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 
