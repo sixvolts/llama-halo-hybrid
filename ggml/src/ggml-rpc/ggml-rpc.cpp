@@ -218,8 +218,15 @@ struct rpc_msg_get_device_memory_rsp {
 };
 
 struct rpc_msg_graph_recompute_req {
-    uint32_t device;
+    uint32_t device;   // halo-hybrid (proto 7.6): bits 16..23 carry the graph slot, as in GRAPH_COMPUTE's device field
 };
+
+// halo-hybrid (proto 7.6): per-device graph slots, so two graphs that alternate every step (a decode step's small
+// recurrent-state graph and the model graph) both stay stored and RECOMPUTE instead of being re-sent. Slot 1 takes
+// only small graphs (see RPC_GRAPH_SMALL_NODES), so a prefill-sized allocation plan is never held twice.
+#define RPC_GRAPH_SLOTS 2
+#define RPC_GRAPH_SMALL_NODES 64
+static inline uint32_t rpc_graph_dev_field(uint32_t device, uint32_t slot) { return device | (slot << 16); }
 
 #pragma pack(pop)
 
@@ -240,6 +247,7 @@ struct ggml_backend_rpc_device_context {
     // types and the server schedules each graph across them itself (GGML_RPC_COMPOSITE=1).
     bool        composite;
     uint32_t    n_server_devices;
+    uint64_t    last_graph_uid_small = 0; // halo-hybrid (proto 7.6): graph slot 1 (last member: the struct is aggregate-initialised positionally)
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -1083,7 +1091,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
-    bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
+    // halo-hybrid (proto 7.6): small graphs go to slot 1 so a decode step's two alternating graphs both RECOMPUTE
+    static const bool no_slots = getenv("GGML_RPC_NO_GRAPH_SLOTS") != nullptr;
+    const uint32_t slot = (!no_slots && rpc_ctx->dispatcher->server_minor >= 6 && cgraph->n_nodes <= RPC_GRAPH_SMALL_NODES) ? 1 : 0;
+    uint64_t & slot_uid = slot == 1 ? rpc_dev_ctx->last_graph_uid_small : rpc_dev_ctx->last_graph_uid;
+    bool reuse = cgraph->uid != 0 && slot_uid == cgraph->uid;
     // halo-hybrid: the server answers graph compute with an empty reply and the dispatcher waits for it
     // before sending the next command (the caller does not wait). The server is single-threaded per
     // connection and does not read the socket while it computes; with the RDMA transport its receive
@@ -1092,12 +1104,12 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     static uint8_t graph_done;
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
-        request->device = rpc_ctx->device;
+        request->device = rpc_graph_dev_field(rpc_ctx->device, slot);
         rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request), &graph_done, 0);
     } else {
-        rpc_dev_ctx->last_graph_uid = cgraph->uid;
+        slot_uid = cgraph->uid;
         size_t input_size = 0;
-        uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
+        uint8_t * input = serialize_graph(rpc_graph_dev_field(rpc_ctx->device, slot), cgraph, rpc_ctx->dispatcher, &input_size);
         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
         rpc_ctx->dispatcher->send_async(rpc_ctx->composite ? RPC_CMD_GRAPH_COMPUTE_SCHED : RPC_CMD_GRAPH_COMPUTE,
                                         input_ptr, input_size, &graph_done, 0);
@@ -1280,7 +1292,7 @@ class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
-        stored_graphs.resize(backends.size());
+        stored_graphs.resize(backends.size() * RPC_GRAPH_SLOTS);
     }
     ~rpc_server();
 
@@ -1314,12 +1326,14 @@ public:
     };
     struct stored_graph {
         std::vector<uint8_t>       buffer;
-        ggml_cgraph              * graph;
+        ggml_cgraph              * graph = nullptr;
         bool                       sched_mode = false;
         std::vector<boundary_out>  outs;
+        int                        slot = 0;   // halo-hybrid (proto 7.6): graph slot, 0 = main, 1 = small graphs
     };
     bool graph_compute_sched(const std::vector<uint8_t> & input) { return graph_compute(input, true); }
     bool run_sched_graph(stored_graph & sg, bool fresh);
+    bool run_sched_graph_on(ggml_backend_sched_t sched, stored_graph & sg, bool fresh);
 
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -1340,6 +1354,7 @@ private:
     // state stay where the client put them), allocates the graph's intermediates in its own per-device compute
     // buffers, and inserts the device-to-device copies locally. GGML_SCHED_DEBUG applies to it.
     ggml_backend_sched_t sched = nullptr;
+    ggml_backend_sched_t sched_small = nullptr; // halo-hybrid (proto 7.6): slot 1, the small graphs, own allocation plan
     ggml_backend_t sched_cpu = nullptr; // ggml_backend_sched requires a CPU backend last; never exported, never placed on
 };
 
@@ -1952,9 +1967,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
     uint32_t device;
     memcpy(&device, src, sizeof(device));
     src += sizeof(device);
-    if (device >= backends.size()) {
+    const uint32_t slot = (device >> 16) & 0xff;
+    device &= 0xffff;
+    if (device >= backends.size() || slot >= RPC_GRAPH_SLOTS) {
         return false;
     }
+    const size_t gidx = (size_t) device * RPC_GRAPH_SLOTS + slot;
     uint32_t n_nodes;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
@@ -1975,12 +1993,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
     // sched mode lists every non-node tensor as a graph leaf too (the scheduler assigns leafs by buffer)
     const size_t graph_cap = sched_mode ? (size_t) n_nodes + n_tensors : n_nodes;
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(graph_cap, false);
-    if (stored_graphs[device].buffer.size() < buf_size) {
-        stored_graphs[device].buffer.resize(buf_size);
+    if (stored_graphs[gidx].buffer.size() < buf_size) {
+        stored_graphs[gidx].buffer.resize(buf_size);
     }
     struct ggml_init_params params = {
         /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ stored_graphs[device].buffer.data(),
+        /*.mem_buffer =*/ stored_graphs[gidx].buffer.data(),
         /*.no_alloc   =*/ true,
     };
     ggml_context_ptr ctx_ptr { ggml_init(params) };
@@ -2013,9 +2031,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
         }
     }
     if (sched_mode) {
-        stored_graph & sg = stored_graphs[device];
+        stored_graph & sg = stored_graphs[gidx];
         sg.graph = graph;
         sg.sched_mode = true;
+        sg.slot = (int) slot;
         sg.outs.clear();
         // leafs: every deserialised tensor that is not a node of this graph, WHATEVER its op. The client sends a
         // split's nodes plus everything they read; a source that is not a node here was produced elsewhere (a
@@ -2122,26 +2141,46 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
-    stored_graphs[device].graph = graph;
-    stored_graphs[device].sched_mode = false;
+    stored_graphs[gidx].graph = graph;
+    stored_graphs[gidx].sched_mode = false;
     return true;
 }
 
 bool rpc_server::run_sched_graph(stored_graph & sg, bool fresh) {
+    if (sg.slot == 1) {
+        // the small-graph slot: its own scheduler, so the main graph's plan survives in `sched` for its RECOMPUTE
+        if (sched_small == nullptr) {
+            if (sched_cpu == nullptr) {
+                sched_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+                GGML_ASSERT(sched_cpu != nullptr && "server-side scheduling needs the CPU backend registered");
+            }
+            std::vector<ggml_backend_t> sb = backends;
+            sb.push_back(sched_cpu);
+            sched_small = ggml_backend_sched_new(sb.data(), nullptr, (int) sb.size(), 4096, false, false);
+            GGML_ASSERT(sched_small != nullptr);
+        }
+        return run_sched_graph_on(sched_small, sg, fresh);
+    }
     if (sched == nullptr) {
         // graph_size: the sched's hash sets are sized from it; the largest remote prefill graph we run is ~3-4K
         // nodes plus leafs, 32K leaves room for a whole model's slice at any ubatch
         // the sched asserts that its last backend is a CPU one (it is where unplaced graph inputs would go);
         // every tensor we hand it is either pinned to a device buffer or an intermediate of a device op, so the
         // CPU backend only satisfies the contract - op_offload is off and nothing is expected to land on it
-        sched_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-        GGML_ASSERT(sched_cpu != nullptr && "server-side scheduling needs the CPU backend registered");
+        if (sched_cpu == nullptr) {
+            sched_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            GGML_ASSERT(sched_cpu != nullptr && "server-side scheduling needs the CPU backend registered");
+        }
         std::vector<ggml_backend_t> sb = backends;
         sb.push_back(sched_cpu);
         sched = ggml_backend_sched_new(sb.data(), nullptr, (int) sb.size(), 32768, false, false);
         GGML_ASSERT(sched != nullptr);
         GGML_LOG_INFO("[%s] server-side scheduler over %zu device backend(s) + CPU\n", __func__, backends.size());
     }
+    return run_sched_graph_on(sched, sg, fresh);
+}
+
+bool rpc_server::run_sched_graph_on(ggml_backend_sched_t sched, stored_graph & sg, bool fresh) {
     // ggml_backend_sched_graph_compute = compute_async + ggml_backend_sched_synchronize, which drains EVERY backend
     // of the sched (not the _local variant that skips remote ones): the copy-back below reads device memory
     // produced on any of them, and the file's standing rule is that no host-side or cross-device read happens
@@ -2196,17 +2235,19 @@ bool rpc_server::run_sched_graph(stored_graph & sg, bool fresh) {
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
-    uint32_t device = request.device;
-    if (device >= backends.size()) {
+    const uint32_t slot = (request.device >> 16) & 0xff;
+    const uint32_t device = request.device & 0xffff;
+    if (device >= backends.size() || slot >= RPC_GRAPH_SLOTS) {
         return false;
     }
-    if (stored_graphs[device].graph == nullptr) {
+    stored_graph & sg = stored_graphs[(size_t) device * RPC_GRAPH_SLOTS + slot];
+    if (sg.graph == nullptr) {
         return false;
     }
-    ggml_cgraph * graph = stored_graphs[device].graph;
-    LOG_DBG("[%s] device: %u\n", __func__, device);
-    if (stored_graphs[device].sched_mode) {
-        return run_sched_graph(stored_graphs[device], /*fresh=*/ false);
+    ggml_cgraph * graph = sg.graph;
+    LOG_DBG("[%s] device: %u slot %u\n", __func__, device, slot);
+    if (sg.sched_mode) {
+        return run_sched_graph(sg, /*fresh=*/ false);
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
@@ -2230,6 +2271,9 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 rpc_server::~rpc_server() {
     if (sched) {
         ggml_backend_sched_free(sched);
+    }
+    if (sched_small) {
+        ggml_backend_sched_free(sched_small);
     }
     if (sched_cpu) {
         ggml_backend_free(sched_cpu);

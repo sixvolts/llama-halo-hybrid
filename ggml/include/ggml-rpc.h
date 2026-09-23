@@ -14,10 +14,10 @@ extern "C" {
 //      handshake instead of executing shifted op ids (the patch field is never compared, so a patch bump alone
 //      would not have protected the pairing)
 // 7.5: GGML_OP_KQ_MASK_BUILD appended (masks built on the device; both hosts must carry the op)
-#define RPC_PROTO_MINOR_VERSION 5
+#define RPC_PROTO_MINOR_VERSION 6
 // 7.4.1: rpc_tensor.flags carries RPC_TENSOR_FLAG_WEIGHTS (client buffer usage WEIGHTS); the server marks the buffer so
 //        its scheduler places ops by their weights. Compatible both ways (an older peer ignores or never sets the bit).
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - bump RPC_PROTO_MINOR_VERSION (the handshake compares major/minor only)");
