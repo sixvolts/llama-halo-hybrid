@@ -2724,6 +2724,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src, 
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+            // (GGML_SCHED_OVERLAP_CUT orders its copies in the scheduler instead, only for cut graphs)
             static const bool lazy_inputs = getenv("GGML_SCHED_LAZY_INPUTS") != nullptr;
             if (lazy_inputs) {
                 // With GGML_SCHED_LAZY_INPUTS a split may still be running on the destination device

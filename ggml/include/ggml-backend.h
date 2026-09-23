@@ -361,6 +361,8 @@ extern "C" {
     // of ggml_backend_sched_graph_compute_async_pair), which serializes the devices. Same caller contract as async
     // inputs: synchronize before the next graph. Needs backends with cpy_tensor_async_nowait and events.
     GGML_API void                 ggml_backend_sched_set_eager_copies(ggml_backend_sched_t sched, bool enable);
+    // halo-hybrid: allow the GGML_SCHED_OVERLAP_CUT split rule for the next split_graph (decode-sized graphs only)
+    GGML_API void                 ggml_backend_sched_set_overlap_cut(ggml_backend_sched_t sched, bool enable);
     // halo-hybrid: remote (RPC) split boundaries without draining the remote's command queue: a local device's
     // output for the remote split is downloaded (waiting for the local producer only) and uploaded with an async
     // set, and the remote split's outputs are fetched right behind its graph with a queue marker the consumer

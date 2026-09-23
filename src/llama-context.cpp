@@ -1607,6 +1607,9 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // halo-hybrid: GGML_SCHED_OVERLAP_CUT only for decode-sized graphs (the paired prefill pipeline assumes the
+        // uncut split structure: the cut gave wrong prefill logits with four lanes, exact with one)
+        ggml_backend_sched_set_overlap_cut(sch, ubatch.n_tokens < 32);
         if (!ggml_backend_sched_alloc_graph(sch, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
