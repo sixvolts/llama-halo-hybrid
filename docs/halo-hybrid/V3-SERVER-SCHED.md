@@ -628,3 +628,21 @@ per-layer costs predict for its layers (card 18 x ~19 ms + 6 expert layers x ~12
 its rocprofv3 trace (2026-09-22 20:52) is what decides the next prefill step. Its busy counters cannot answer overlap
 questions: the R9700's reads 100 whenever work is queued and the APU's is a slow average (retracted: "97.7% interior
 busy" and "0% both busy").
+
+## 2026-09-22 (late): server-side placement, prefill 799, and an open history-dependence bug
+- **RPC weights flag (d86b94eca, proto 7.4.1).** Mainframe's server-side scheduler never saw WEIGHTS buffers, so for
+  its APU-expert layers SwiGLU and the weighted reduction ran on the card: four PCIe crossings per layer of
+  [n_ff, 8, n_tokens] intermediates. Fixed by carrying the usage in rpc_tensor.flags. Mainframe per 1024-token ubatch
+  1377 -> 827 ms (-40%); server splits per prefill graph 41 -> 21; greedy text identical.
+- **MTP prompt ingest inside the pipeline (4d6cb6c26)**, bit-transparent: removes ~2 s after a 25.8K prompt.
+- **LOCAL sweep (all fixes, four lanes):** 25.8K prefill 29: 775, 27: 814, 26: 834, 25: 799 (mainframe long again).
+  LOCAL=26 KM=6 fits mainframe's card with ~1.5 GB spare.
+- **Production (LOCAL=26, 4 lanes, NMAX=2, no taper):** 25.8K 799 tok/s, 12.7K 690 (first request, one-time lane-2
+  stall); real-content decode 24.7 / 25.2 tok/s at ~94 ms/step. NMAX=3 now loses (23.2 / 23.7, 111 ms/step); the
+  grouped MoE GEMV (34ee0a814) gives nothing in situ.
+- **Open bug: prefill depends on earlier requests.** Same 25.8K prompt, same server, first-token logprob moves
+  ~0.01 between requests (deterministic given the history, reproduces across servers); with LLAMA_UBATCH_TAPER=3 it
+  moves ~0.25 and the top token flips. Present with one lane. NOT in the memory contents (LLAMA_DBG_CLEAR_MEM=1 zeroes
+  KV/indexer/recurrent of both contexts before every fresh prompt: identical results). Weights flag and early ingest
+  verified transparent. Next suspects: compute-buffer read-before-write (poison buffers with NaN) or partially-set
+  graph inputs. The partial-ubatch stall (2.4-2.9 s/prompt) needs another fix than the taper until this is found.
