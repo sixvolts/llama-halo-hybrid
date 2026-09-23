@@ -4510,6 +4510,95 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// halo-hybrid: the hyper-connection boundary as the model builds it (dsv4_hc_mix_fused): [hc_post ->] hc_mix ->
+//     view(pre-mix row) -> rms_norm -> mul(w) -> two q8_0 GEMVs sharing the normed activation -> hc_post(gemv sum,
+//     residual, post/comb views of the mix). with_post=false starts at the mix (a residual leaf feeds it);
+//     views_first puts the post/comb views between the mix and the norm (the ffn half's node order).
+//     n_layers > 1 chains the whole block (perf: one graph of n_layers boundaries, us/run is the graph).
+struct test_dsv4_hc_boundary : public test_dsv4_hc {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool with_post;
+    const bool views_first;
+    const int n_layers;
+    const int64_t m_out;
+    std::vector<ggml_tensor *> checks;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "DSV4_HC_BOUNDARY"; }
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, n_tokens, with_post) + "," + VARS_TO_STR3(views_first, n_layers, m_out);
+    }
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checks; }
+    double max_nmse_err() override { return 5e-4; }   // q8_1 GEMV against the CPU's q8_0 activations
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return n_layers > 1 ? 1000000000000ull : 0; }   // perf: one graph per run
+
+    test_dsv4_hc_boundary(ggml_type type = GGML_TYPE_Q8_0, int64_t n_embd = 4096, int64_t n_tokens = 3,
+            bool with_post = true, bool views_first = false, int n_layers = 1, int64_t m_out = 4096)
+        : type(type), n_embd(n_embd), n_tokens(n_tokens), with_post(with_post), views_first(views_first),
+          n_layers(n_layers), m_out(m_out) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checks.clear();
+        const int64_t nt = n_tokens;
+        ggml_tensor * h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(h, "residual");
+        if (with_post) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+            ggml_set_name(x, "x");
+            ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+            ggml_set_name(post, "post");
+            ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+            ggml_set_name(comb, "comb");
+            h = ggml_dsv4_hc_post(ctx, x, h, post, comb);
+            ggml_set_name(h, "h_in");
+            checks.push_back(h);
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, hc*n_embd, (2 + hc)*hc);
+        ggml_set_name(w, "hc_fn");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+        ggml_tensor * nw = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(nw, "norm_w");
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, m_out);
+        ggml_set_name(w1, "w1");
+        ggml_tensor * w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, m_out);
+        ggml_set_name(w2, "w2");
+        ggml_tensor * wo = nullptr;
+        if (m_out != n_embd) {
+            wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, m_out, n_embd);
+            ggml_set_name(wo, "wo");
+        }
+
+        for (int il = 0; il < n_layers; ++il) {
+            ggml_tensor * mix = ggml_dsv4_hc_mix(ctx, h, w, scale, base, 1e-6f, 1e-6f, 4);
+            ggml_tensor * postv = ggml_view_2d(ctx, mix, hc, nt, mix->nb[1], n_embd*sizeof(float));
+            ggml_tensor * combv = ggml_view_3d(ctx, mix, hc, hc, nt, hc*sizeof(float), mix->nb[1], (n_embd + hc)*sizeof(float));
+            if (views_first && mode == MODE_TEST && gf) {
+                ggml_build_forward_expand(gf, postv);
+                ggml_build_forward_expand(gf, combv);
+            }
+            ggml_tensor * cur = ggml_view_2d(ctx, mix, n_embd, nt, mix->nb[1], 0);
+            cur = ggml_rms_norm(ctx, cur, 1e-6f);
+            cur = ggml_mul(ctx, cur, nw);
+            ggml_set_name(cur, "normed");
+            if (il == 0) { checks.push_back(cur); }
+            ggml_tensor * y = ggml_add(ctx, ggml_mul_mat(ctx, w1, cur), ggml_mul_mat(ctx, w2, cur));
+            if (wo) {
+                y = ggml_mul_mat(ctx, wo, y);
+            }
+            if (il == 0) { checks.push_back(y); }
+            h = ggml_dsv4_hc_post(ctx, y, h, postv, combv);
+        }
+        ggml_set_name(h, "out");
+        checks.push_back(h);
+        return h;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -9456,6 +9545,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_dsv4_hc_mix(t, 4096, nt, 4));
         }
     }
+    // the fused hyper-connection boundary (hc_post + hc_mix + rms_norm*w + q8_1 copy), decode widths, a prefill width
+    // (no q8 copy above 8 tokens) and a chained block
+    for (int64_t nt : {1, 2, 3, 4, 8, 17, 64}) {
+        for (bool with_post : {true, false}) {
+            for (bool views_first : {false, true}) {
+                test_cases.emplace_back(new test_dsv4_hc_boundary(GGML_TYPE_Q8_0, 4096, nt, with_post, views_first));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_dsv4_hc_boundary(GGML_TYPE_F32, 4096, 3, true, false));
+    test_cases.emplace_back(new test_dsv4_hc_boundary(GGML_TYPE_Q8_0, 4096, 3, true, false, 3, 1536));
+    test_cases.emplace_back(new test_dsv4_hc_boundary(GGML_TYPE_Q8_0, 4096, 8, true, true, 3, 1536));
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
@@ -11556,6 +11657,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
         return test_cases;
+    }
+    // halo-hybrid: 8 chained hyper-connection boundaries in one graph (us/run is the whole graph); compare
+    //     GGML_CUDA_NO_HC_NORM_FUSE=1 / GGML_CUDA_NO_HC_POST_FUSE=1 / GGML_CUDA_NO_Q8_SIDE=1 against the default
+    for (int64_t nt : {1, 3}) {
+        test_cases.emplace_back(new test_dsv4_hc_boundary(GGML_TYPE_Q8_0, 4096, nt, true, false, 8, 1536));
     }
     // halo-hybrid: fused gate/up + SwiGLU GEMV shapes, TBO_MMV_FUSION_SHAPES="m:k[:n],..." (q8_0 x f32, n defaults to 3)
     if (const char * env = getenv("TBO_MMV_FUSION_SHAPES")) {

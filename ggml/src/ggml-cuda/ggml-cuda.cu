@@ -4087,6 +4087,90 @@ bool ggml_cuda_ewchain_match(const ggml_cgraph * cgraph, int i, ggml_cuda_ew_mat
     return true;
 }
 
+// halo-hybrid: the hyper-connection boundary in one launch (dsv4-hc.cu, dsv4_hc_mix_fused): an optional DSV4_HC_POST
+//     whose dst is the next DSV4_HC_MIX's input, the HC_MIX, and the RMS_NORM -> MUL(w) of its pre-mix row (the view
+//     at offset 0), which also registers the q8_1 copy of the MUL's dst for the GEMVs behind it. The hc_post dst and
+//     the post/comb part of the mix are still written (other consumers read them); the un-normed row is skipped when
+//     the norm is its only reader. GGML_CUDA_NO_HC_NORM_FUSE=1 disables; GGML_CUDA_NO_HC_POST_FUSE=1 keeps the
+//     norm tail but leaves hc_post as its own launch.
+static bool hc_f32_rows16(const ggml_tensor * t) {   // f32, contiguous dim 0, 16-byte aligned rows (float4 loads)
+    return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && ((uintptr_t) t->data) % 16 == 0 &&
+           t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
+}
+static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_HC_NORM_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_HC_NORM_FUSE"));
+    if (disabled) {
+        return 0;
+    }
+    const int n = cgraph->n_nodes;
+    ggml_tensor * node = cgraph->nodes[i];
+    ggml_tensor * post = nullptr;
+    int im = i;
+    static const bool no_post = getenv("GGML_CUDA_NO_HC_POST_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_HC_POST_FUSE"));
+    if (node->op == GGML_OP_DSV4_HC_POST) {
+        if (no_post) {
+            return 0;
+        }
+        im = hc_next(cgraph, i + 1);
+        if (im >= n || cgraph->nodes[im]->op != GGML_OP_DSV4_HC_MIX || cgraph->nodes[im]->src[0] != node) {
+            return 0;
+        }
+        post = node;
+    } else if (node->op != GGML_OP_DSV4_HC_MIX) {
+        return 0;
+    }
+    ggml_tensor * mix = cgraph->nodes[im];
+    const ggml_tensor * x = mix->src[0];
+    const int64_t n_embd = x->ne[0];
+    const int64_t nt     = x->ne[2];
+    if (x->type != GGML_TYPE_F32 || x->ne[1] != 4 || 4*n_embd != 16384 || x->ne[3] != 1 || mix->type != GGML_TYPE_F32 ||
+            (mix->src[1]->type != GGML_TYPE_Q8_0 && mix->src[1]->type != GGML_TYPE_F32) || !hc_f32_rows16(x)) {
+        return 0;
+    }
+    if (post) {
+        const ggml_tensor * px = post->src[0], * pr = post->src[1], * pp = post->src[2], * pc = post->src[3];
+        const bool ok = post->type == GGML_TYPE_F32 && ggml_are_same_shape(post, x) &&
+            px->ne[0] == n_embd && px->ne[1] == nt && px->ne[2] == 1 && px->ne[3] == 1 && hc_f32_rows16(px) &&
+            pr->ne[0] == n_embd && pr->ne[1] == 4 && pr->ne[2] == nt && pr->ne[3] == 1 && hc_f32_rows16(pr) &&
+            pp->type == GGML_TYPE_F32 && pp->ne[0] == 4 && pp->ne[1] == nt && pp->ne[2] == 1 && pp->ne[3] == 1 &&
+            pc->type == GGML_TYPE_F32 && pc->ne[0] == 4 && pc->ne[1] == 4 && pc->ne[2] == nt && pc->ne[3] == 1 &&
+            hc_disjoint(post, px) && hc_disjoint(post, pr) && hc_disjoint(post, pp) && hc_disjoint(post, pc) &&
+            hc_disjoint(mix, px) && hc_disjoint(mix, pr) && hc_disjoint(mix, pp) && hc_disjoint(mix, pc);
+        if (!ok) {
+            return 0;
+        }
+    }
+    // the norm tail: VIEW(mix, offset 0, n_embd x nt) -> RMS_NORM -> MUL(w [n_embd])
+    ggml_tensor * rn  = nullptr;
+    ggml_tensor * mul = nullptr;
+    bool write_out = true;
+    const int ir = hc_next(cgraph, im + 1);
+    if (ir + 1 < n && cgraph->nodes[ir]->op == GGML_OP_RMS_NORM && cgraph->nodes[ir + 1]->op == GGML_OP_MUL) {
+        ggml_tensor * r = cgraph->nodes[ir];
+        ggml_tensor * m = cgraph->nodes[ir + 1];
+        const ggml_tensor * v  = r->src[0];
+        const ggml_tensor * wv = m->src[0] == r ? m->src[1] : (m->src[1] == r ? m->src[0] : nullptr);
+        const bool ok = v->view_src == mix && v->view_offs == 0 && v->ne[0] == n_embd && v->ne[1] == nt &&
+            v->ne[2] == 1 && v->ne[3] == 1 && v->nb[0] == sizeof(float) && v->nb[1] == mix->nb[1] &&
+            r->type == GGML_TYPE_F32 && hc_uses1(cgraph, ir) &&
+            wv && wv->type == GGML_TYPE_F32 && ggml_is_contiguous(wv) && wv->ne[0] == n_embd && ggml_nrows(wv) == 1 &&
+            m->type == GGML_TYPE_F32 && ggml_are_same_shape(m, r) && m->nb[0] == sizeof(float) &&
+            hc_disjoint(m, x) && hc_disjoint(m, mix) && hc_disjoint(m, wv) &&
+            (!post || (hc_disjoint(m, post->src[0]) && hc_disjoint(m, post->src[1]) && hc_disjoint(m, post->src[2]) && hc_disjoint(m, post->src[3])));
+        if (ok) {
+            rn = r; mul = m;
+            for (int q = im + 1; q < ir; ++q) {
+                if (cgraph->nodes[q] == v) { write_out = !hc_uses1(cgraph, q); }
+            }
+        }
+    }
+    if (!post && !mul) {
+        return 0;
+    }
+    ggml_cuda_op_dsv4_hc_mix_fused(*cuda_ctx, mix, post, rn, mul, write_out);
+    return (mul ? ir + 1 : im) - i;
+}
+
 static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool disabled = getenv("GGML_CUDA_NO_EWCHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_NO_EWCHAIN"));
     if (disabled) {
@@ -4418,6 +4502,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_CONCAT) {
         const int skip = ggml_cuda_try_fuse_kda_conv_l2(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_DSV4_HC_MIX) {
+        const int skip = ggml_cuda_try_fuse_hc_norm(cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
         }

@@ -557,8 +557,16 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
-    // single-row consumers (mul_mat_vec_q) can take a q8_1 copy written in this launch instead of quantising again
-    block_q8_1 * q8 = (ne00 % QK8_1 == 0 && ggml_is_contiguous(mul_tensor)) ? ggml_cuda_q8_side_reserve(ctx, mul_tensor, ggml_nelements(mul_tensor)) : nullptr;
+    // single-row consumers (mul_mat_vec_q) can take a q8_1 copy written in this launch instead of quantising again.
+    // 2..8 rows register per row ([ne0][nrows], mmvq's layout when ne00 needs no row padding) so a GEMV over the
+    // [ne00, nrows] result finds it; a flat registration would only ever match a single-row consumer
+    const int64_t nrows_all = ne01*ne02*ne03;
+    block_q8_1 * q8 = nullptr;
+    if (ne00 % QK8_1 == 0 && ggml_is_contiguous(mul_tensor)) {
+        q8 = (nrows_all >= 2 && nrows_all <= 8 && ne00 == GGML_PAD(ne00, MATRIX_ROW_PADDING))
+            ? ggml_cuda_q8_side_reserve_rows(ctx, mul_tensor, ne00, nrows_all, ne00)
+            : ggml_cuda_q8_side_reserve(ctx, mul_tensor, ggml_nelements(mul_tensor));
+    }
     rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,
                           /*s00*/ s01, s02, s03,

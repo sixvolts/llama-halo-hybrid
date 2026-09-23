@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "hc.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -301,12 +302,31 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 #define DSV4_HC_MIX_THREADS 1024
 #define DSV4_HC_MIX_PER_THREAD 16   // hc*n_embd == 16 * 1024 (host checks); each thread owns 16 CONSECUTIVE elements
 
-template <bool WQ8>
+// halo-hybrid: optional work at the two ends of the prologue (dsv4_hc_mix_fused)
+//     POST: the preceding dsv4_hc_post is computed in the load stage: this thread's 16 elements of the new residual
+//           are post*x + sum_src comb*res, in dsv4_hc_post_f32's order, written to the hc_post dst (it has a second
+//           consumer, the next hc_post's residual) and used as the prologue's input without a reload
+//     NORM: the following RMS_NORM + MUL(w) runs on the finished pre-mix row in LDS in rms_norm_f32<1024>'s order and
+//           also writes the q8_1 copy of the result for the GEMVs that consume it
+struct dsv4_hc_mix_ext {
+    const float * px;   int64_t spx1;                   // hc_post x [n_embd, nt]
+    const float * pres; int64_t spr1, spr2;             // hc_post residual [n_embd, hc, nt]
+    const float * ppost; int64_t spp0, spp1;            // hc_post post [hc, nt]
+    const float * pcomb; int64_t spc0, spc1, spc2;      // hc_post comb [hc, hc, nt]
+    float * pdst;                                       // hc_post dst == the prologue's x (same strides)
+    const float * nw;                                   // norm weight [n_embd]
+    float * ndst; int64_t snd1;                         // MUL dst [n_embd, nt]
+    block_q8_1 * q8;                                    // q8_1 copy of ndst, [nt][n_embd/32] blocks; may be null
+    float eps_rms;
+    int write_out;                                      // also write the un-normed pre-mix row into dst
+};
+
+template <bool WQ8, bool POST, bool NORM>
 static __global__ void __launch_bounds__(DSV4_HC_MIX_THREADS) dsv4_hc_mix_f32(
         const float * __restrict__ x, const void * __restrict__ w, const float * __restrict__ scale, const float * __restrict__ base,
         float * __restrict__ dst,
         const int n_embd, const int64_t sx1, const int64_t sx2, const int64_t ss0, const int64_t sb0, const int64_t sd1,
-        const float eps_norm, const float eps_hc, const int n_iter) {
+        const float eps_norm, const float eps_hc, const int n_iter, const dsv4_hc_mix_ext ext) {
     constexpr int hc      = DSV4_HC;
     constexpr int mix_dim = (2 + hc)*hc;
     constexpr int NL      = DSV4_HC_MIX_PER_THREAD;
@@ -327,16 +347,46 @@ static __global__ void __launch_bounds__(DSV4_HC_MIX_THREADS) dsv4_hc_mix_f32(
     const int i0 = NL*tid;
     const int h  = i0 / n_embd;
     const int j0 = i0 - h*n_embd;
-    const float4 * xt = (const float4 *) (x + it*sx2 + h*sx1 + j0);
-
     // 1. load (4 x float4, consecutive threads read consecutive 64-byte runs)
     float xv[NL];
     float ss = 0.0f;
+    if constexpr (POST) {
+        // new_residual[h][j] = x[j]*post[h] + sum_src res[src][j]*comb[h][src], as dsv4_hc_post_f32 does it
+        const float ph = ext.ppost[h*ext.spp0 + it*ext.spp1];
+        float ch[hc];
 #pragma unroll
-    for (int q = 0; q < NL/4; ++q) {
-        const float4 v = xt[q];
-        xv[4*q + 0] = v.x; xv[4*q + 1] = v.y; xv[4*q + 2] = v.z; xv[4*q + 3] = v.w;
-        ss += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        for (int isrc = 0; isrc < hc; ++isrc) { ch[isrc] = ext.pcomb[h*ext.spc0 + isrc*ext.spc1 + it*ext.spc2]; }
+        const float4 * pxt = (const float4 *) (ext.px + it*ext.spx1 + j0);
+#pragma unroll
+        for (int q = 0; q < NL/4; ++q) {
+            const float4 v = pxt[q];
+            xv[4*q + 0] = __fmul_rn(v.x, ph); xv[4*q + 1] = __fmul_rn(v.y, ph);
+            xv[4*q + 2] = __fmul_rn(v.z, ph); xv[4*q + 3] = __fmul_rn(v.w, ph);
+        }
+#pragma unroll
+        for (int isrc = 0; isrc < hc; ++isrc) {
+            const float4 * rt = (const float4 *) (ext.pres + it*ext.spr2 + isrc*ext.spr1 + j0);
+#pragma unroll
+            for (int q = 0; q < NL/4; ++q) {
+                const float4 r = rt[q];
+                xv[4*q + 0] = __fmaf_rn(r.x, ch[isrc], xv[4*q + 0]); xv[4*q + 1] = __fmaf_rn(r.y, ch[isrc], xv[4*q + 1]);
+                xv[4*q + 2] = __fmaf_rn(r.z, ch[isrc], xv[4*q + 2]); xv[4*q + 3] = __fmaf_rn(r.w, ch[isrc], xv[4*q + 3]);
+            }
+        }
+        float4 * ot = (float4 *) (ext.pdst + it*sx2 + h*sx1 + j0);
+#pragma unroll
+        for (int q = 0; q < NL/4; ++q) {
+            ot[q] = make_float4(xv[4*q + 0], xv[4*q + 1], xv[4*q + 2], xv[4*q + 3]);
+            ss += xv[4*q + 0]*xv[4*q + 0] + xv[4*q + 1]*xv[4*q + 1] + xv[4*q + 2]*xv[4*q + 2] + xv[4*q + 3]*xv[4*q + 3];
+        }
+    } else {
+        const float4 * xt = (const float4 *) (x + it*sx2 + h*sx1 + j0);
+#pragma unroll
+        for (int q = 0; q < NL/4; ++q) {
+            const float4 v = xt[q];
+            xv[4*q + 0] = v.x; xv[4*q + 1] = v.y; xv[4*q + 2] = v.z; xv[4*q + 3] = v.w;
+            ss += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        }
     }
     // 2. rms
     ss = warp_reduce_sum(ss);
@@ -424,10 +474,57 @@ static __global__ void __launch_bounds__(DSV4_HC_MIX_THREADS) dsv4_hc_mix_f32(
         }
         __syncthreads();
     }
-    for (int j = tid; j < n_embd; j += DSV4_HC_MIX_THREADS) { drow[j] = acc[j]; }
+    if constexpr (NORM) {
+        // 6. RMS_NORM + MUL(w) on the finished row, rms_norm_f32<1024, true>'s loop and reduction order
+        float tmp = 0.0f;
+        for (int col = tid; col < n_embd; col += DSV4_HC_MIX_THREADS) {
+            const float xi = acc[col];
+            tmp += xi * xi;
+        }
+        tmp = block_reduce<block_reduce_method::SUM, DSV4_HC_MIX_THREADS>(tmp, redss);
+        const float mean  = tmp / n_embd;
+        const float scl   = rsqrtf(mean + ext.eps_rms);
+        float * nrow = ext.ndst + it*ext.snd1;
+        for (int col = tid; col < n_embd; col += DSV4_HC_MIX_THREADS) {
+            const float v = scl * acc[col] * ext.nw[col];
+            nrow[col] = v;
+            if (ext.q8) {
+                q8_side_store(ext.q8, (int64_t) it*n_embd + col, v);
+            }
+            if (ext.write_out) { drow[col] = acc[col]; }
+        }
+    } else {
+        for (int j = tid; j < n_embd; j += DSV4_HC_MIX_THREADS) { drow[j] = acc[j]; }
+    }
 }
 
-void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <bool WQ8, bool POST, bool NORM>
+static void dsv4_hc_mix_launch(const dim3 grid, const dim3 block, const size_t smem, cudaStream_t stream,
+        const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst,
+        const float eps_norm, const float eps_hc, const int32_t n_iter, const dsv4_hc_mix_ext & ext) {
+    dsv4_hc_mix_f32<WQ8, POST, NORM><<<grid, block, smem, stream>>>(
+        (const float *) x->data, w->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
+        (int) x->ne[0], x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), scale->nb[0] / sizeof(float), base->nb[0] / sizeof(float),
+        dst->nb[1] / sizeof(float), eps_norm, eps_hc, n_iter, ext);
+}
+
+template <bool WQ8>
+static void dsv4_hc_mix_dispatch(bool post, bool norm, const dim3 grid, const dim3 block, const size_t smem, cudaStream_t stream,
+        const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst,
+        const float eps_norm, const float eps_hc, const int32_t n_iter, const dsv4_hc_mix_ext & ext) {
+    if (post && norm) {
+        dsv4_hc_mix_launch<WQ8, true,  true >(grid, block, smem, stream, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+    } else if (post) {
+        dsv4_hc_mix_launch<WQ8, true,  false>(grid, block, smem, stream, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+    } else if (norm) {
+        dsv4_hc_mix_launch<WQ8, false, true >(grid, block, smem, stream, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+    } else {
+        dsv4_hc_mix_launch<WQ8, false, false>(grid, block, smem, stream, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+    }
+}
+
+void ggml_cuda_op_dsv4_hc_mix_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * hc_post, const ggml_tensor * rms_norm, ggml_tensor * mul, bool write_out) {
     const ggml_tensor * x     = dst->src[0];
     const ggml_tensor * w     = dst->src[1];
     const ggml_tensor * scale = dst->src[2];
@@ -449,6 +546,28 @@ void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const float   eps_hc   = ((const float *) dst->op_params)[1];
     const int32_t n_iter   = ggml_get_op_params_i32(dst, 2);
 
+    dsv4_hc_mix_ext ext = {};
+    ext.write_out = 1;
+    if (hc_post) {
+        // the matcher (ggml_cuda_dsv4_hc_mix_fusable) has checked shapes, contiguity and alignment
+        GGML_ASSERT(hc_post == x || hc_post == x->view_src);
+        const ggml_tensor * px = hc_post->src[0], * pr = hc_post->src[1], * pp = hc_post->src[2], * pc = hc_post->src[3];
+        ext.px    = (const float *) px->data; ext.spx1 = px->nb[1] / sizeof(float);
+        ext.pres  = (const float *) pr->data; ext.spr1 = pr->nb[1] / sizeof(float); ext.spr2 = pr->nb[2] / sizeof(float);
+        ext.ppost = (const float *) pp->data; ext.spp0 = pp->nb[0] / sizeof(float); ext.spp1 = pp->nb[1] / sizeof(float);
+        ext.pcomb = (const float *) pc->data; ext.spc0 = pc->nb[0] / sizeof(float); ext.spc1 = pc->nb[1] / sizeof(float); ext.spc2 = pc->nb[2] / sizeof(float);
+        ext.pdst  = (float *) x->data;
+    }
+    if (mul) {
+        const ggml_tensor * nw = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        memcpy(&ext.eps_rms, rms_norm->op_params, sizeof(float));
+        ext.nw   = (const float *) nw->data;
+        ext.ndst = (float *) mul->data;
+        ext.snd1 = mul->nb[1] / sizeof(float);
+        ext.q8   = ggml_is_contiguous(mul) ? ggml_cuda_q8_side_reserve_rows(ctx, mul, n_embd, n_tokens, n_embd) : nullptr;   // nullptr above 8 tokens
+        ext.write_out = write_out ? 1 : 0;
+    }
+
     constexpr int mix_dim = (2 + DSV4_HC)*DSV4_HC;
     const size_t smem = (n_embd + 32*mix_dim + mix_dim + DSV4_HC + 32) * sizeof(float);
 
@@ -456,14 +575,12 @@ void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid(n_tokens, 1, 1);
     const dim3 block(DSV4_HC_MIX_THREADS, 1, 1);
     if (w->type == GGML_TYPE_Q8_0) {
-        dsv4_hc_mix_f32<true><<<grid, block, smem, stream>>>(
-            (const float *) x->data, w->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
-            n_embd, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), scale->nb[0] / sizeof(float), base->nb[0] / sizeof(float),
-            dst->nb[1] / sizeof(float), eps_norm, eps_hc, n_iter);
+        dsv4_hc_mix_dispatch<true >(hc_post != nullptr, mul != nullptr, grid, block, smem, stream, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
     } else {
-        dsv4_hc_mix_f32<false><<<grid, block, smem, stream>>>(
-            (const float *) x->data, w->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
-            n_embd, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), scale->nb[0] / sizeof(float), base->nb[0] / sizeof(float),
-            dst->nb[1] / sizeof(float), eps_norm, eps_hc, n_iter);
+        dsv4_hc_mix_dispatch<false>(hc_post != nullptr, mul != nullptr, grid, block, smem, stream, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
     }
+}
+
+void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_dsv4_hc_mix_fused(ctx, dst, nullptr, nullptr, nullptr, true);
 }
