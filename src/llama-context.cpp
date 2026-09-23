@@ -241,6 +241,8 @@ llama_context::llama_context(
     cparams.auto_fgdn    = false;
 
     cparams.fused_lid = true;
+    // halo-hybrid: masks built on the device from per-cell/per-query ints instead of [n_kv, n_tokens] uploads
+    cparams.mask_device = getenv("LLAMA_NO_MASK_DEVICE") == nullptr;
     cparams.auto_flid = false;
 
     {
@@ -3245,8 +3247,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
-        if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+        // halo-hybrid: a device-built mask instance belongs to the device of its consumer layer, always
+        const bool mask_dev = il != -1 && strncmp(name, "kq_mask_dev", 11) == 0;
+        if (ubatch.n_tokens < 32 || full_offload || mask_dev) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || mask_dev)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {

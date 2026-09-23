@@ -67,6 +67,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/kq-mask.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2518,6 +2519,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_MIX:
             ggml_cuda_op_dsv4_hc_mix(ctx, dst);
+            break;
+        case GGML_OP_KQ_MASK_BUILD:
+            ggml_cuda_op_kq_mask_build(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -6498,6 +6502,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_KQ_MASK_BUILD:
+            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && op->ne[1] <= 65535;
         case GGML_OP_DSV4_HC_MIX:
             return op->src[0]->type == GGML_TYPE_F32 && (op->src[1]->type == GGML_TYPE_Q8_0 || op->src[1]->type == GGML_TYPE_F32) &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&

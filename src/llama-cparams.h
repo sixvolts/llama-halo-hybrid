@@ -43,6 +43,7 @@ struct llama_cparams {
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
+    bool mask_device;        // halo-hybrid: build the attention / pool masks on the device (ggml_kq_mask_build)
     bool auto_flid;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;

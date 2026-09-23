@@ -507,6 +507,14 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
+    if (self_pos_kv) {
+        mctx->set_input_pos_kv(self_pos_kv, ubatch);
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_pos_q->buffer));
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            ((int32_t *) self_pos_q->data)[i] = ubatch->pos[i];
+        }
+        return;
+    }
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 }
 
@@ -3054,11 +3062,48 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        // halo-hybrid: one causal sequence, no SWA/ALiBi/2-D positions: the mask is a function of the cell
+        // positions and the query positions, so build it on the device (see select_device) instead of
+        // uploading n_kv x n_tokens halves per ubatch
+        const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        const bool device_mask = cparams.mask_device && cparams.causal_attn && !hparams.use_alibi &&
+                n_stream == 1 && ubatch.n_seqs_unq == 1 && !ubatch.is_pos_2d();
+        if (device_mask) {
+            inp->self_pos_kv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_cur->get_n_kv());
+            ggml_set_input(inp->self_pos_kv);
+            ggml_set_name(inp->self_pos_kv, "attn_inp_pos_kv");
+            inp->self_pos_q = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+            ggml_set_input(inp->self_pos_q);
+            ggml_set_name(inp->self_pos_q, "attn_inp_pos_q");
+            // an unpinned instance: shape reference (can_reuse, kpool asserts) and the mask of any consumer that
+            // never selects a device
+            ggml_tensor * m = ggml_kq_mask_build(ctx0, inp->self_pos_kv, inp->self_pos_q, nullptr, nullptr, nullptr, 0,
+                    cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            ggml_set_name(m, "attn_inp_kq_mask");
+            inp->self_kq_mask = ggml_reshape_4d(ctx0, m, m->ne[0], m->ne[1], 1, 1);
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        }
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
     return inp;
+}
+
+void llm_graph_input_attn_k::select_device(ggml_context * ctx0, ggml_backend_sched_t sched, const std::function<void(ggml_tensor *, const char *, int)> & pin, int il) {
+    if (self_pos_kv == nullptr) {
+        return; // host-built mask: one tensor for every device
+    }
+    // the pin (graph callback) assigns the op to the layer's device; an instance whose backend already has one is
+    // simply left out of the forward graph
+    ggml_tensor * m = ggml_kq_mask_build(ctx0, self_pos_kv, self_pos_q, nullptr, nullptr, nullptr, 0, self_kq_mask->type);
+    pin(m, "kq_mask_dev", il);
+    ggml_backend_t be = sched ? ggml_backend_sched_get_tensor_backend(sched, m) : nullptr;
+    auto it = dev_masks.find(be);
+    if (it == dev_masks.end()) {
+        it = dev_masks.emplace(be, ggml_reshape_4d(ctx0, m, m->ne[0], m->ne[1], 1, 1)).first;
+    }
+    self_kq_mask_cnv = it->second;
 }
 
 llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
@@ -3805,13 +3850,36 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         }
 
         // lossless in f16 (only 0.0f and -INFINITY), and f16 + f32 -> f16 adds the KQ mask uncast
-        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
-        ggml_set_input(inp->sel_mask);
-        ggml_set_name(inp->sel_mask, "kpool_sel_mask");
+        // halo-hybrid: built on the device from per-cell / per-query ints when the ubatch is one sequence
+        if (cparams.mask_device && n_stream == 1 && n_ps == 1) {
+            auto mk = [&](ggml_tensor * & t, int64_t n, const char * name) {
+                t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
+                ggml_set_input(t);
+                ggml_set_name(t, name);
+            };
+            mk(inp->dev_pos_at,     n_kv,  "kpool_dev_pos_at");
+            mk(inp->dev_pool_of,    n_kv,  "kpool_dev_pool_of");
+            mk(inp->dev_q,          n_tps, "kpool_dev_q");
+            mk(inp->dev_tail_start, n_tps, "kpool_dev_tail_start");
+            mk(inp->dev_bo_vis,     n_tps, "kpool_dev_bo_vis");
+            // unpinned instances: shape references and the masks of a consumer that never selects a device
+            ggml_tensor * s = ggml_kq_mask_build(ctx0, inp->dev_pos_at, inp->dev_q, inp->dev_pool_of, inp->dev_tail_start, inp->dev_bo_vis, 1, GGML_TYPE_F16);
+            ggml_tensor * c = ggml_kq_mask_build(ctx0, inp->dev_pos_at, inp->dev_q, inp->dev_pool_of, inp->dev_tail_start, inp->dev_bo_vis, 2, GGML_TYPE_F16);
+            ggml_set_name(s, "kpool_sel_mask");
+            ggml_set_name(c, "kpool_cand_mask");
+            inp->sel_mask  = ggml_reshape_4d(ctx0, s, n_kv, n_tps, 1, 1);
+            inp->cand_mask = ggml_reshape_4d(ctx0, c, n_kv, n_tps, 1, 1);
+        } else {
+            inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+            ggml_set_input(inp->sel_mask);
+            ggml_set_name(inp->sel_mask, "kpool_sel_mask");
 
-        inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
-        ggml_set_input(inp->cand_mask);
-        ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+            inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+            ggml_set_input(inp->cand_mask);
+            ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+        }
+        inp->sel_cur  = inp->sel_mask;
+        inp->cand_cur = inp->cand_mask;
 
         // n_new_max is an exact bound (a contiguous run of L tokens closes at most L/kpool + 1
         // pools), FIXED for the decode phase so the graph shape does not track pools-closed-this-

@@ -1101,9 +1101,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "DSV4_HC_MIX",
+    "KQ_MASK_BUILD",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,9 +1219,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "dsv4_hc_mix(x, hc_fn, scale, base)",
+    "kq_mask_build(pos_kv, pos_q, pool_of, tail_start, bo_vis)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6580,6 +6582,40 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kq_mask_build(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pos_kv,
+        struct ggml_tensor  * pos_q,
+        struct ggml_tensor  * pool_of,
+        struct ggml_tensor  * tail_start,
+        struct ggml_tensor  * bo_vis,
+        int32_t               mode,
+        enum ggml_type        type) {
+    GGML_ASSERT(pos_kv->type == GGML_TYPE_I32 && pos_q->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(pos_kv) && ggml_is_contiguous(pos_q));
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(mode >= 0 && mode <= 2);
+    if (mode > 0) {
+        GGML_ASSERT(pool_of && tail_start && bo_vis);
+        GGML_ASSERT(pool_of->type == GGML_TYPE_I32 && tail_start->type == GGML_TYPE_I32 && bo_vis->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_nelements(pool_of) == ggml_nelements(pos_kv));
+        GGML_ASSERT(ggml_nelements(tail_start) == ggml_nelements(pos_q) && ggml_nelements(bo_vis) == ggml_nelements(pos_q));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, type, ggml_nelements(pos_kv), ggml_nelements(pos_q));
+
+    ggml_set_op_params_i32(result, 0, mode);
+
+    result->op     = GGML_OP_KQ_MASK_BUILD;
+    result->src[0] = pos_kv;
+    result->src[1] = pos_q;
+    result->src[2] = mode > 0 ? pool_of    : NULL;
+    result->src[3] = mode > 0 ? tail_start : NULL;
+    result->src[4] = mode > 0 ? bo_vis     : NULL;
 
     return result;
 }

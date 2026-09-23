@@ -3,8 +3,12 @@
 #include "ggml.h"
 #include "llama.h"
 #include "llama-graph.h"
+#include "ggml-backend.h"
 
 #include <cstdint>
+#include <functional>
+#include <map>
+#include <utility>
 
 struct llama_ubatch;
 class llama_kv_cache;
@@ -36,6 +40,12 @@ void llama_kv_cache_set_input_kpool(
               ggml_tensor    * pool_reps,
               ggml_tensor    * new_pool_cells,
               ggml_tensor    * new_pool_reps,
+        // halo-hybrid: device-built masks - when sel_mask is NULL these receive the per-cell / per-query ints instead
+              ggml_tensor    * dev_pos_at,
+              ggml_tensor    * dev_pool_of,
+              ggml_tensor    * dev_q,
+              ggml_tensor    * dev_tail_start,
+              ggml_tensor    * dev_bo_vis,
         // a global row is strm_of[s]*kv_size + cell; only read when pool_reps is set
         const uint32_t       * strm_of,
               int64_t          kv_size,
@@ -81,6 +91,17 @@ public:
 
     ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
     ggml_tensor * cand_mask  = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
+
+    // halo-hybrid: device-built masks (ggml_kq_mask_build): per-cell / per-query ints replace the uploads
+    ggml_tensor * dev_pos_at     = nullptr; // I32 [n_kv]  cell position, -1 unusable
+    ggml_tensor * dev_pool_of    = nullptr; // I32 [n_kv]  pool index of the cell, -1 none
+    ggml_tensor * dev_q          = nullptr; // I32 [n_tps] query position
+    ggml_tensor * dev_tail_start = nullptr; // I32 [n_tps]
+    ggml_tensor * dev_bo_vis     = nullptr; // I32 [n_tps]
+    ggml_tensor * sel_cur  = nullptr;       // the instances of the last selected device (host mode: sel_mask/cand_mask)
+    ggml_tensor * cand_cur = nullptr;
+    std::map<ggml_backend_t, std::pair<ggml_tensor *, ggml_tensor *>> dev_masks; // keyed by the backend the pin assigned
+    void select_device(ggml_context * ctx0, ggml_backend_sched_t sched, const std::function<void(ggml_tensor *, const char *, int)> & pin, int il);
 
     const llama_kv_cache_context * mctx_attn;
     const llama_kv_cache_context * mctx_idx;

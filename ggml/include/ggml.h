@@ -602,6 +602,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_DSV4_HC_MIX,   // halo-hybrid: appended last so the ids above stay wire-stable
+        GGML_OP_KQ_MASK_BUILD, // halo-hybrid (2026-09-23): masks built on the device from per-cell/per-query ints
 
         GGML_OP_COUNT,
     };
@@ -2729,6 +2730,24 @@ extern "C" {
     //   out   = sum_h pre[h]*x[:, h, t]                    (as ggml_dsv4_hc_pre)
     // x [n_embd, hc, n_tokens] f32; hc_fn [hc*n_embd, (2+hc)*hc] (f32 or q8_0); scale [>=3]; base [(2+hc)*hc]
     // result [n_embd + hc + hc*hc, n_tokens] f32: per token [out | post | comb(idst + hc*isrc)]
+    // halo-hybrid: build an attention mask on the device instead of uploading [n_kv, n_tokens] halves per ubatch.
+    //   pos_kv  [n_kv]     i32  position of the cell, -1 when empty or another sequence
+    //   pos_q   [n_tokens] i32  query positions
+    //   mode 0 (KQ):   keep iff pos_kv[j] <= pos_q[i]                          (causal, one sequence, no SWA)
+    //   mode 1 (SEL):  keep iff visible && pos_kv[j] >= tail_start[i]          (GLM-5-Next indexer pool tail)
+    //   mode 2 (CAND): keep iff visible && (pool_of[j] < bo_vis[i] || pos_kv[j] >= tail_start[i])
+    // pool_of [n_kv] i32 (-1 = no pool), tail_start / bo_vis [n_tokens] i32; only read by modes 1-2 (NULL for mode 0)
+    // result [n_kv, n_tokens] of `type` (F16 or F32): 0 keeps, -INFINITY drops. Comparisons on -1 are unsigned, as on the host.
+    GGML_API struct ggml_tensor * ggml_kq_mask_build(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pos_kv,
+            struct ggml_tensor  * pos_q,
+            struct ggml_tensor  * pool_of,
+            struct ggml_tensor  * tail_start,
+            struct ggml_tensor  * bo_vis,
+            int32_t               mode,
+            enum ggml_type        type);
+
     GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,

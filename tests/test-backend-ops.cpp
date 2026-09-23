@@ -4366,6 +4366,48 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// halo-hybrid: device-built attention masks (see ggml_kq_mask_build)
+struct test_kq_mask_build : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t n_q;
+    const int mode;
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "KQ_MASK_BUILD"; }
+    std::string vars() override { return VARS_TO_STR4(type, n_kv, n_q, mode); }
+
+    test_kq_mask_build(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 1024, int64_t n_q = 64, int mode = 0)
+        : type(type), n_kv(n_kv), n_q(n_q), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * pos_kv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv); ggml_set_name(pos_kv, "pos_kv");
+        ggml_tensor * pos_q  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);  ggml_set_name(pos_q, "pos_q");
+        ggml_tensor * pool   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv); ggml_set_name(pool, "pool_of");
+        ggml_tensor * tail   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);  ggml_set_name(tail, "tail_start");
+        ggml_tensor * bov    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);  ggml_set_name(bov, "bo_vis");
+        out = ggml_kq_mask_build(ctx, pos_kv, pos_q, mode ? pool : nullptr, mode ? tail : nullptr, mode ? bov : nullptr, mode, type);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(42);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) { init_tensor_uniform(t); continue; }
+            std::vector<int32_t> v(ggml_nelements(t));
+            for (auto & x : v) {
+                if (strcmp(t->name, "pos_kv") == 0)          { x = (rng() % 8 == 0) ? -1 : (int32_t) (rng() % (n_kv + 16)); }
+                else if (strcmp(t->name, "pool_of") == 0)    { x = (rng() % 8 == 0) ? -1 : (int32_t) (rng() % 64); }
+                else if (strcmp(t->name, "pos_q") == 0)      { x = (int32_t) (rng() % (n_kv + 16)); }
+                else if (strcmp(t->name, "tail_start") == 0) { x = (int32_t) (rng() % (n_kv + 16)); }
+                else                                         { x = (int32_t) (rng() % 64); }
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 // halo-hybrid: fused prologue
 struct test_dsv4_hc_mix : public test_dsv4_hc {
     const ggml_type type;
@@ -10138,6 +10180,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
 #if 1
 
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int mode : {0, 1, 2}) {
+            test_cases.emplace_back(new test_kq_mask_build(t, 1000, 7, mode));
+            test_cases.emplace_back(new test_kq_mask_build(t, 4096, 64, mode));
+        }
+    }
     // halo-hybrid: arbitrary dense q8_0 GEMV/GEMM shapes for kernel work, TBO_MMV_SHAPES="m:k[:n],m:k[:n],..." (n defaults to 3)
     if (const char * env = getenv("TBO_MMV_SHAPES")) {
         std::string spec(env);
@@ -11314,6 +11362,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
         return test_cases;
+    }
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int mode : {0, 1, 2}) {
+            test_cases.emplace_back(new test_kq_mask_build(t, 1000, 7, mode));
+            test_cases.emplace_back(new test_kq_mask_build(t, 4096, 64, mode));
+        }
     }
     // halo-hybrid: arbitrary dense q8_0 GEMV/GEMM shapes for kernel work, TBO_MMV_SHAPES="m:k[:n],m:k[:n],..." (n defaults to 3)
     if (const char * env = getenv("TBO_MMV_SHAPES")) {

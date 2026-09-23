@@ -11312,6 +11312,42 @@ void ggml_compute_forward_dsv4_hc_pre(
 
 // ggml_compute_forward_dsv4_hc_mix (halo-hybrid): reference for the fused hyper-connection prologue
 
+// halo-hybrid: see ggml_kq_mask_build
+void ggml_compute_forward_kq_mask_build(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int32_t * pos_kv     = (const int32_t *) dst->src[0]->data;
+    const int32_t * pos_q      = (const int32_t *) dst->src[1]->data;
+    const int32_t * pool_of    = dst->src[2] ? (const int32_t *) dst->src[2]->data : nullptr;
+    const int32_t * tail_start = dst->src[3] ? (const int32_t *) dst->src[3]->data : nullptr;
+    const int32_t * bo_vis     = dst->src[4] ? (const int32_t *) dst->src[4]->data : nullptr;
+
+    const int32_t mode = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_kv = dst->ne[0];
+    const int64_t n_q  = dst->ne[1];
+
+    for (int64_t i = params->ith; i < n_q; i += params->nth) {
+        const uint32_t  q  = (uint32_t) pos_q[i];
+        const int32_t   ts = tail_start ? tail_start[i] : 0;
+        const uint32_t  bv = bo_vis     ? (uint32_t) bo_vis[i] : 0;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int32_t p = pos_kv[j];
+            bool keep = (uint32_t) p <= q;
+            if (mode == 1) {
+                keep = keep && p >= ts;
+            } else if (mode == 2) {
+                keep = keep && (((uint32_t) pool_of[j] < bv) || p >= ts);
+            }
+            const float v = keep ? 0.0f : -INFINITY;
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) ((char *) dst->data + i*dst->nb[1]))[j] = GGML_CPU_FP32_TO_FP16(v);
+            } else {
+                ((float *) ((char *) dst->data + i*dst->nb[1]))[j] = v;
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_dsv4_hc_mix(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

@@ -386,10 +386,18 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // halo-hybrid: with device-built masks, one ggml_kq_mask_build instance per device so no [n_kv, n_tokens] mask
+    // ever crosses a device boundary; get_kq_mask() then returns the instance of the last selected device
+    void select_device(ggml_context * ctx0, ggml_backend_sched_t sched, const std::function<void(ggml_tensor *, const char *, int)> & pin, int il);
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * self_pos_kv = nullptr; // I32 [n_kv]     (device-built masks)
+    ggml_tensor * self_pos_q  = nullptr; // I32 [n_tokens]
+    std::map<ggml_backend_t, ggml_tensor *> dev_masks; // keyed by the backend the pin assigned
 
     const llama_hparams hparams;
     const llama_cparams cparams;

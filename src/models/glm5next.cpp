@@ -500,13 +500,19 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
 
     // absorbed MLA is MQA: one head of keys, and V is the same latent row as K
     ggml_tensor * k = ggml_reshape_3d(ctx0, kv, kv_lora_rank, 1, n_tokens);
-    cb(k, "dsa_kv_latent", il);
-
+    cb(k, "dsa_kv_latent", il);    // halo-hybrid: device-built masks live on the device of the layer that reads them
+    {
+        auto pin = [&](ggml_tensor * t, const char * name, int il_) { cb(t, name, il_); };
+        inp_attn->select_device(ctx0, sched, pin, il);
+        if (inp_kp) {
+            inp_kp->select_device(ctx0, sched, pin, il);
+        }
+    }
     if (top_k) {
         cur = build_attn_sparse(inp_attn,
                 layer.wo, nullptr, nullptr,
                 q, k, k, nullptr, nullptr, layer.wv_b,
-                top_k, inp_kp->sel_mask, inp_kp->cand_mask, kq_scale, il);
+                top_k, inp_kp->sel_cur, inp_kp->cand_cur, kq_scale, il);
     } else {
         cur = build_attn(inp_attn,
                 layer.wo, nullptr, nullptr,
