@@ -5195,16 +5195,28 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
+    // halo-hybrid: TBO_MMID_SHARE=S makes every token route to the first S experts of token 0 as well (the tokens of a
+    // speculative verify batch share experts on real text; fully random routing hides what the grouped MoE GEMV saves)
+    static const int share = getenv("TBO_MMID_SHARE") ? atoi(getenv("TBO_MMID_SHARE")) : 0;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
             continue;
         }
+        std::vector<int32_t> row0;
         for (int64_t r = 0; r < ggml_nrows(t); r++) {
             std::vector<int32_t> data(t->ne[0]);
             for (int i = 0; i < t->ne[0]; i++) {
                 data[i] = i % n_mats;
             }
             std::shuffle(data.begin(), data.end(), rng);
+            if (r == 0) {
+                row0 = data;
+            } else if (share > 0 && t->ne[0] == n_mats) {
+                for (int k = 0; k < share && k < (int) row0.size(); ++k) {
+                    const auto pos = std::find(data.begin(), data.end(), row0[k]) - data.begin();
+                    std::swap(data[k], data[pos]);
+                }
+            }
             ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
         }
     }

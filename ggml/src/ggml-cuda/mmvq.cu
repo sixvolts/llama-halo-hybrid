@@ -335,7 +335,13 @@ static int get_mmvq_mmid_max_batch_env_cap(int cc) {
 static int get_mmvq_mmid_max_batch_uncapped(ggml_type type, int cc);
 
 // Host function: returns the max batch size for the current arch+type at runtime.
+bool ggml_cuda_mmvq_moe_grouped_enabled(ggml_type type);
+
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    if (ggml_cuda_mmvq_moe_grouped_enabled(type)) {
+        // halo-hybrid: the grouped MoE GEMV reads each distinct expert once, like MMQ, without MMQ's tile overhead
+        return MMVQ_MAX_BATCH_SIZE;
+    }
     const int n = get_mmvq_mmid_max_batch_uncapped(type, cc);
     const int cap = get_mmvq_mmid_max_batch_env_cap(cc);
     const bool kquant = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
@@ -1168,6 +1174,297 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+// halo-hybrid: grouped MoE GEMV (GGML_CUDA_MMVQ_GROUPED=1). mul_mat_vec_q_moe gives every (token, expert slot) pair its
+// own warp, so an expert chosen by several tokens of a speculative verify batch is streamed from memory once per token:
+// on gfx1151 the per-pair kernel runs at DRAM speed (234-257 GB/s at 4 tokens) on largely redundant bytes, and MMQ,
+// which reads each distinct expert once, loses most of that back to its tile overhead at 3-4 tokens. Here one tiny
+// kernel groups the pairs by expert and the GEMV runs one block per (row block, distinct expert), reading the expert's
+// rows once and applying them to every token that routed to it.
+#define MMVQ_GRP_MAX_PAIRS 256 // n_tokens * n_expert_used
+#define MMVQ_GRP_MAX_COLS  MMVQ_MAX_BATCH_SIZE
+
+// grp: [0] = number of distinct experts D, then D records of (2 + max_cols) ints: expert, count, count x (token << 16 | slot)
+// in token-major pair order (the first token's experts first). A token never routes to one expert twice, so count <=
+// n_tokens <= max_cols; malformed ids are clamped rather than written out of bounds.
+static __global__ void mmvq_moe_group_ids(const int32_t * __restrict__ ids, int32_t * __restrict__ grp,
+        const int n_tokens, const int n_slots, const int ids_stride, const int max_cols) {
+    __shared__ int32_t e_sh[MMVQ_GRP_MAX_PAIRS];
+    __shared__ int32_t lead_sh[MMVQ_GRP_MAX_PAIRS];
+
+    const int p = threadIdx.x;
+    const int P = n_tokens*n_slots;
+
+    int e = -1;
+    if (p < P) {
+        e = ids[(p % n_slots) + (p / n_slots)*ids_stride];
+    }
+    e_sh[p] = e;
+    __syncthreads();
+
+    bool leader = p < P;
+    for (int q = 0; q < p && leader; ++q) {
+        leader = e_sh[q] != e;
+    }
+    lead_sh[p] = leader;
+    __syncthreads();
+
+    if (leader) {
+        int d = 0;
+        for (int q = 0; q < p; ++q) {
+            d += lead_sh[q];
+        }
+        int32_t * rec = grp + 1 + d*(2 + max_cols);
+        int cnt = 0;
+        for (int q = p; q < P && cnt < max_cols; ++q) {
+            if (e_sh[q] == e) {
+                rec[2 + cnt++] = ((q / n_slots) << 16) | (q % n_slots);
+            }
+        }
+        rec[0] = e;
+        rec[1] = cnt;
+    }
+    if (p == 0) {
+        int D = 0;
+        for (int q = 0; q < P; ++q) {
+            D += lead_sh[q];
+        }
+        grp[0] = D;
+    }
+}
+
+// Grid: (ceil(nrows_x / c_rows_per_block), n_tokens*n_slots) - blockIdx.y = distinct expert d (blocks past D exit).
+// Block: one warp; it reads c_rows_per_block rows of the expert once per K step and dots them with up to c_max_cols
+// activations. Same epilogue (fused gate, biases, GLU) as mul_mat_vec_q_moe.
+template <ggml_type type, int c_rows_per_block, int c_max_cols, bool has_fusion>
+__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_grouped(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * grp_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT grp = grp_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    bool use_gate = false;
+    const void  * vgate      = nullptr;
+    const float * x_bias     = nullptr;
+    const float * gate_bias  = nullptr;
+    ggml_glu_op   active_glu = GGML_GLU_OP_SWIGLU;
+    float         glu_limit  = 0.0f;
+
+    if constexpr (has_fusion) {
+        use_gate   = fusion.gate != nullptr;
+        vgate      = fusion.gate;
+        x_bias     = (const float *) fusion.x_bias;
+        gate_bias  = (const float *) fusion.gate_bias;
+        active_glu = fusion.glu_op;
+        glu_limit  = fusion.glu_limit;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const int d = blockIdx.y;
+    if (d >= grp[0]) {
+        return;
+    }
+    const int32_t * rec = grp + 1 + d*(2 + c_max_cols);
+    const uint32_t channel_x = rec[0];
+    const int      cnt       = rec[1];
+
+    const int row0             = c_rows_per_block*blockIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    const block_q8_1 * y[c_max_cols];
+    uint32_t           dst_off[c_max_cols];
+#pragma unroll
+    for (int j = 0; j < c_max_cols; ++j) {
+        const int      pk  = rec[2 + (j < cnt ? j : 0)];
+        const uint32_t tok = pk >> 16;
+        const uint32_t slt = pk & 0xFFFF;
+        y[j]       = ((const block_q8_1 *) vy) + fastmodulo(slt, nchannels_y)*stride_channel_y + tok*stride_col_y;
+        dst_off[j] = slt*stride_channel_dst + tok*stride_col_dst;
+    }
+
+    const int kbx_offset = channel_x*stride_channel_x + row0*stride_row_x;
+
+    float tmp[c_max_cols][c_rows_per_block]      = {{0.0f}};
+    float tmp_gate[c_max_cols][c_rows_per_block] = {{0.0f}};
+
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+        for (int j = 0; j < c_max_cols; ++j) {
+            if (j < cnt) {
+#pragma unroll
+                for (int i = 0; i < c_rows_per_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, &y[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+#pragma unroll
+    for (int j = 0; j < c_max_cols; ++j) {
+        if (j >= cnt) {
+            continue;
+        }
+#pragma unroll
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+                }
+            }
+        }
+
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            float result = tmp[j][threadIdx.x];
+            if constexpr (has_fusion) {
+                const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + threadIdx.x;
+                if (x_bias) {
+                    result += x_bias[bias_idx];
+                }
+                if (use_gate) {
+                    float gate_value = tmp_gate[j][threadIdx.x];
+                    if (gate_bias) {
+                        gate_value += gate_bias[bias_idx];
+                    }
+                    switch (active_glu) {
+                        case GGML_GLU_OP_SWIGLU:
+                            result *= ggml_cuda_op_silu_single(gate_value);
+                            break;
+                        case GGML_GLU_OP_GEGLU:
+                            result *= ggml_cuda_op_gelu_single(gate_value);
+                            break;
+                        case GGML_GLU_OP_SWIGLU_OAI:
+                            result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                            break;
+                        case GGML_GLU_OP_SWIGLU_CLAMP:
+                            result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                            break;
+                        default:
+                            result = result * gate_value;
+                            break;
+                    }
+                }
+            }
+            dst[dst_off[j] + row0 + threadIdx.x] = result;
+        }
+    }
+
+    if constexpr (!has_fusion) {
+        GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit);
+    }
+}
+
+template <ggml_type type, int c_max_cols>
+static void mul_mat_vec_q_moe_grouped_launch_cols(
+        const void * vx, const void * vy, const int32_t * grp, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const int n_pairs, const int warp_size, cudaStream_t stream) {
+    constexpr int rows_per_block = 2;
+    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks_rows, n_pairs);
+    const dim3 block_dims(warp_size, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    if (has_fusion) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_grouped<type, rows_per_block, c_max_cols, true>, launch_params,
+            vx, vy, grp, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_grouped<type, rows_per_block, c_max_cols, false>, launch_params,
+            vx, vy, grp, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst);
+    }
+}
+
+bool ggml_cuda_mmvq_moe_grouped_enabled(ggml_type type) {
+    static const bool enabled = getenv("GGML_CUDA_MMVQ_GROUPED") != nullptr && atoi(getenv("GGML_CUDA_MMVQ_GROUPED")) != 0;
+    if (!enabled) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// grouping (n_tokens*n_slots <= MMVQ_GRP_MAX_PAIRS) + grouped GEMV; the caller checked ggml_cuda_mmvq_moe_grouped_enabled.
+// With the env set, get_mmvq_mmid_max_batch admits up to MMVQ_MAX_BATCH_SIZE tokens for these types, which the per-pair
+// kernel's launch bounds do not cover: n_used <= MMVQ_GRP_MAX_PAIRS / MMVQ_MAX_BATCH_SIZE (32) keeps every such call here.
+static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
+        const void * vx, const ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst, const int ncols_x, const int nrows_x, const int n_tokens, const int n_slots, const int ids_stride,
+        const int nchannels_y, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst, cudaStream_t stream) {
+    const int n_pairs  = n_tokens*n_slots;
+    const int max_cols = n_tokens <= 4 ? 4 : MMVQ_GRP_MAX_COLS;
+    GGML_ASSERT(n_pairs <= MMVQ_GRP_MAX_PAIRS && n_tokens <= MMVQ_GRP_MAX_COLS);
+
+    ggml_cuda_pool_alloc<int32_t> grp(ctx.pool(), 1 + (size_t) n_pairs*(2 + max_cols));
+    mmvq_moe_group_ids<<<1, MMVQ_GRP_MAX_PAIRS, 0, stream>>>(ids, grp.get(), n_tokens, n_slots, ids_stride, max_cols);
+    CUDA_CHECK(cudaGetLastError());
+
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const uint3 nchannels_y_fd = init_fastdiv_values(nchannels_y);
+
+#define MMVQ_GRP_CASE(T) \
+    case T: \
+        if (max_cols == 4) { \
+            mul_mat_vec_q_moe_grouped_launch_cols<T, 4>(vx, vy, grp.get(), fusion, dst, ncols_x, nchannels_y_fd, nrows_x, \
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
+                n_pairs, warp_size, stream); \
+        } else { \
+            mul_mat_vec_q_moe_grouped_launch_cols<T, MMVQ_GRP_MAX_COLS>(vx, vy, grp.get(), fusion, dst, ncols_x, nchannels_y_fd, nrows_x, \
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
+                n_pairs, warp_size, stream); \
+        } \
+        break;
+
+    switch (type) {
+        MMVQ_GRP_CASE(GGML_TYPE_Q4_0)
+        MMVQ_GRP_CASE(GGML_TYPE_Q8_0)
+        MMVQ_GRP_CASE(GGML_TYPE_Q4_K)
+        MMVQ_GRP_CASE(GGML_TYPE_Q5_K)
+        MMVQ_GRP_CASE(GGML_TYPE_Q6_K)
+        default:
+            GGML_ABORT("grouped MoE GEMV: unsupported type %s", ggml_type_name(type));
+    }
+#undef MMVQ_GRP_CASE
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1970,6 +2267,14 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    if (ids && ncols_dst > 1 && ne03 == 1 && ggml_cuda_mmvq_moe_grouped_enabled(src0->type) &&
+            ncols_dst*nchannels_dst <= MMVQ_GRP_MAX_PAIRS) {
+        ggml_cuda_mul_mat_vec_q_moe_grouped(ctx, src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00, ne01,
+            ncols_dst, nchannels_dst, ids_stride, nchannels_y, s01, stride_col_y, stride_col_dst,
+            s02, stride_channel_y, stride_channel_dst, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
