@@ -200,9 +200,12 @@ bool llama_memory_hybrid::get_can_shift() const {
 }
 
 void llama_memory_hybrid::clear(bool data) {
-    mem_attn->clear(data);
-    if (mem_idx) mem_idx->clear(data);
-    mem_recr->clear(data);
+    // halo-hybrid (diagnostic): LLAMA_DBG_CLEAR_PARTS = bitmask of the parts whose DATA a clear zeroes (1 attention KV,
+    // 2 indexer cache, 4 recurrent state; default all); the cell metadata of every part is always reset
+    static const int parts = getenv("LLAMA_DBG_CLEAR_PARTS") ? atoi(getenv("LLAMA_DBG_CLEAR_PARTS")) : 7;
+    mem_attn->clear(data && (parts & 1));
+    if (mem_idx) mem_idx->clear(data && (parts & 2));
+    mem_recr->clear(data && (parts & 4));
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

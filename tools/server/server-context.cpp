@@ -3535,6 +3535,20 @@ private:
 
                     slot.mem.seq_rm(slot.id, p0, -1);
 
+                    // halo-hybrid (diagnostic): LLAMA_DBG_CLEAR_MEM=1 zeroes the memory buffers of both contexts before a
+                    // prompt that starts at position 0 (LLAMA_DBG_CLEAR_PARTS narrows it for hybrid memory), to test
+                    // whether a prompt's result depends on state left by earlier requests
+                    if (p0 == 0) {
+                        static const bool dbg_clear = getenv("LLAMA_DBG_CLEAR_MEM") != nullptr && atoi(getenv("LLAMA_DBG_CLEAR_MEM")) != 0;
+                        if (dbg_clear) {
+                            llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                            if (ctx_dft) {
+                                llama_memory_clear(llama_get_memory(ctx_dft), true);
+                            }
+                            SLT_INF(slot, "%s", "LLAMA_DBG_CLEAR_MEM: memory data cleared\n");
+                        }
+                    }
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be
