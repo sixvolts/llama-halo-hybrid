@@ -659,3 +659,9 @@ tracer shows request 1 alone runs decode-sized warm-up graphs first and then re-
 so its intermediates sit at different offsets -> alignment-dependent kernel paths -> different f32 summation order.
 Read as benign layout rounding, not a leak.
 Diagnostics left in the tree: LLAMA_DBG_CLEAR_MEM/_PARTS, GGML_SCHED_ZERO_BUFFERS=1|2, LLAMA_DBG_NO_CKPT_SAVE.
+- **2026-09-23 follow-ups.** LLAMA_UBATCH_TAPER=3 is production (post-fix it is exact; 12.7K 690 -> 724, 25.8K 799 -> 805
+  tok/s, second-request acceptance 0.83). Splitting a one-unit batch (~1K tokens of a tool-call turn) into halves,
+  paired or as two pipelined units, LOSES (987 tok: 374 -> 356 / 315 tok/s): the halves are new shapes every request,
+  each paying the remote alloc-size round trip, and a pair's remote work starts only after both heads. Follow-up-turn
+  acceptance (0.74 -> 0.64 -> 0.62 over three chat turns) is content, not state: replaying turn 3 as a fresh request
+  gives the same 0.61.
