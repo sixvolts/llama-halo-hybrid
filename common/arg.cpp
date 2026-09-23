@@ -1718,6 +1718,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-min-new"}, "N",
+        string_format("halo-hybrid: skip the checkpoint (and the prompt split) at the last user message unless at least N new tokens follow it; a short chat turn then runs as one batch with one checkpoint (default: %d, 0 = always)", params.checkpoint_min_new),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("checkpoint-min-new must be non-negative");
+            }
+            params.checkpoint_min_new = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_MIN_NEW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

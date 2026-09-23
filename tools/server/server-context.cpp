@@ -3662,7 +3662,9 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            // halo-hybrid: a short last message is not worth its own batch + 145 MiB checkpoint
+                            const bool enough_new = slot.task->n_tokens() - pos >= params_base.checkpoint_min_new;
+                            if (enough_new && (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step)) {
                                 break;
                             }
                         }
@@ -3707,10 +3709,15 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // halo-hybrid: only the batches that START at a checkpoint offset before the end count as
+                    // "near the end" (the original `task < prompt + n_ubatch` was true for every batch of a short
+                    // prompt, so a 30-token turn saved two 145 MiB checkpoints)
+                    const int  tail_span       = 4 + ((llama_n_prefill_lanes(ctx_tgt) >= 2 && !(getenv("LLAMA_TAIL_CKPT") && atoi(getenv("LLAMA_TAIL_CKPT")) == 2)) ? 0 : (int) llama_n_prefill_lanes(ctx_tgt) * n_ubatch);
+                    const bool near_prompt_end = slot.task->n_tokens() - n_tokens_start <= tail_span;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
-                    const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_last_user_message = n_tokens_start == last_user_pos &&
+                            slot.task->n_tokens() - n_tokens_start >= params_base.checkpoint_min_new;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
