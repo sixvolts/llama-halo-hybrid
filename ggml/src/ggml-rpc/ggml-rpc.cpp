@@ -2050,6 +2050,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
                 n_foreign++;
             }
         }
+        // halo-hybrid: a leaf that is an op result (not a view) which no node of this graph computes and that sits
+        // in no server buffer can never be placed by the scheduler; ggml-alloc would abort the server on it
+        // (GGML_ASSERT(buffer_id >= 0), 2026-09-23). Refuse with its name.
+        for (int i = 0; i < graph->n_leafs; i++) {
+            ggml_tensor * leaf = graph->leafs[i];
+            if (leaf && leaf->op != GGML_OP_NONE && leaf->view_src == nullptr && leaf->buffer == nullptr) {
+                GGML_LOG_ERROR("[%s] leaf %s (%s, ne=[%lld,%lld,%lld,%lld]) is an op result that no node computes here and no server buffer holds\n",
+                    __func__, leaf->name, ggml_op_name(leaf->op), (long long) leaf->ne[0], (long long) leaf->ne[1], (long long) leaf->ne[2], (long long) leaf->ne[3]);
+                return false;
+            }
+        }
         for (uint32_t i = 0; i < n_nodes; i++) {
             ggml_tensor * t = graph->nodes[i];
             if (t == nullptr || t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
