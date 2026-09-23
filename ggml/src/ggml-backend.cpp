@@ -1559,6 +1559,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // and the RESULT of an in-place op (cpy, set_rows, *_inplace) has view_src too but new contents,
                     // which a root copy made before the write would not carry
                     const bool pure_view = src->op == GGML_OP_VIEW || src->op == GGML_OP_RESHAPE || src->op == GGML_OP_PERMUTE || src->op == GGML_OP_TRANSPOSE;
+                    if (getenv("GGML_SCHED_VIEW_ROUTE_DEBUG") && src->view_src != NULL && ggml_nbytes(src) >= (1u << 20) &&
+                            !(pure_view && src->nb[0] == ggml_type_size(src->type) && tensor_id_copy(src_id, cur_backend_id, 0) == NULL && split->n_view_copies < 8)) {
+                        GGML_LOG_WARN("view-route: NOT routing %s op=%s nb0=%zu tsize=%zu view_src=%s (op=%s) copy=%p nvc=%d\n", src->name, ggml_op_name(src->op),
+                            src->nb[0], ggml_type_size(src->type), src->view_src->name, ggml_op_name(src->view_src->op), (void *) tensor_id_copy(src_id, cur_backend_id, 0), split->n_view_copies);
+                    }
                     if (!no_view_route && sched->n_copies == 1 && src->view_src != NULL && pure_view && src->nb[0] == ggml_type_size(src->type) &&
                             tensor_id_copy(src_id, cur_backend_id, 0) == NULL && split->n_view_copies < 8) {
                         struct ggml_tensor * root = src->view_src;
@@ -1589,6 +1594,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                     src->nb[1], src->nb[2], src->nb[3], src->view_offs);
                             ggml_format_name(view_copy, "%s#%s#v", ggml_backend_name(sched->backends[cur_backend_id]), src->name);
                             tensor_id_copy(src_id, cur_backend_id, 0) = view_copy;
+                            if (getenv("GGML_SCHED_VIEW_ROUTE_DEBUG")) {
+                                GGML_LOG_WARN("view-route: slot %d %s (%s of %s) %.2f MiB\n", split->n_view_copies, src->name, ggml_op_name(src->op), root->name, ggml_nbytes(src) / 1048576.0);
+                            }
                             split->view_copies[split->n_view_copies++] = view_copy;
                             SET_CAUSE(view_copy, "4.vcp");
                             node->src[j] = view_copy;

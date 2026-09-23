@@ -382,6 +382,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
+    cb(flat_norm, "hc_flat_norm", il);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
     cb(mixes, "hc_mixes", il);
 
