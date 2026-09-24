@@ -770,3 +770,32 @@ critical path (a split-order change, not a fusion).
   so mainframe receives a view of a tensor it never gets. Fix belongs in the scheduler (route in-place results with
   their source, or pin a layer's weightless ops to its device); parked. The rpc-server now also refuses a node whose
   own view chain roots in an unheld op result (no mainframe rebuild done for it yet).
+
+## 2026-09-24: levers 1-3 (overlap cut, graph slots, fusion wave 2); decode target met on real content
+- **Lever 1, decode overlap cut (6cc44201c, default on):** a card split that starts with independent work (the
+  shared-expert FFN) and only later reads the APU's routed-expert output is cut there, so the shared expert runs in
+  the APU window. Decode-sized graphs only: with the four-lane paired prefill pipeline the cut changed the prefill
+  logits (first-token 'Let' -4.206 -> -3.607; exact with one lane). For cut graphs the no-input host wait is skipped
+  and local peer input copies make the source queue wait for the destination's queued work (scheduler-side, so the
+  prefill pipeline's copies are untouched: a HIP-level version of that wait cost ~3% prefill). 4.65K A/B: 101.8/101.7
+  -> 100.9/100.8 ms/step, identical output (the survey's 2 ms estimate was optimistic). GGML_SCHED_OVERLAP_CUT=0 off.
+- **Lever 2, two graph slots per RPC device (b9ce8d3ce, proto 7.6):** graphs of <= 64 nodes (the 6-node state gather
+  before every MODEL call) use slot 1 with their own server-side scheduler. Mainframe: MODEL deserialize + alloc
+  1.01 -> 0.002 ms, small->MODEL gap 2.1 -> 1.05 ms, MODEL start-to-start 97.9 -> 94.1 ms; 100% RECOMPUTE in steady
+  state (the first two decode steps after a prefill re-plan, 2-5 ms once per request). Client 4.65K ~2 ms/step.
+  Trap hit on the way: ggml_backend_rpc_device_context is aggregate-initialised positionally, a member inserted
+  mid-struct silently turned composite mode off ("unknown buffer type" for RPC1); new members go last.
+- **Lever 3, fusion wave 2 (Opus 5.5 workflow, 4 implementers + 4 adversarial reviewers):** DSV4_HC_MIX split over
+  K (8c3315dce, 21 -> 7.5 us isolated, ~15 us in situ with graphs off), DSA indexer pool compressor 9 -> 1 launch per
+  DSA layer (4f7c32971), gated_delta_net reads the recurrent state through the copy index (d32f4ba3f, no 4 MB gather
+  per KDA layer), KDA gate prologue as one GEMV launch + MLA v tail in the permuted layout (300ae78a0). Review fixes
+  (568690afb): DPP row_xmask only on RDNA (gfx9 builds broke), MLA permute fusion requires the CONT to have the
+  permute's shape (the non-FA MLA branch would have written out of bounds). gibson card in situ: 969 -> 773 launches
+  per step, 28.8 -> 25.6 ms (wave 1 + 2: 1153 -> 773, 30.9 -> 25.6). Mainframe MODEL compute 34.8 -> 32.8 ms.
+- **Acceptance scare:** on the 4.65K temp-0 probe acceptance went 0.92 -> 0.82; bisected to the two fusions that
+  change summation order (HC_MIX split, pool compressor; each alone off gives 0.87, both 0.92), which feed the MTP
+  draft layer on gibson. Over the real-content set (3 seeds x 6 prompts, T=0.7) acceptance is equal (on 0.67, off
+  0.68) and the fusions save ~3 ms/step: a single-prompt near-tie flip, both kept on.
+- **Numbers after all three (568690afb both hosts):** 25.8K prefill 892 t/s, decode 93.7 ms/step (29.8 t/s on the
+  probe); greedy 12.7K hash 57fc9097aea5eef6 unchanged throughout. Real-content decode 27.3 t/s at ~85.6 ms/step
+  (was 24.7-25.2 at ~94): the 27 t/s target is met on real content.
