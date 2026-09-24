@@ -4587,6 +4587,7 @@ static bool ggml_cuda_try_defer_gdn_state_gather(ggml_backend_cuda_context * cud
         }
     }
     return false;
+}
 
 // halo-hybrid: the KDA gate prologue at decode widths (n <= 4) as ONE mul_mat_vec_q launch. The graph is
 //     MUL_MAT(f_b) -> ADD(dt_b) -> RESHAPE -> MUL(A, per head) -> SCALE(-1) -> SIGMOID -> SCALE(lower bound)
@@ -4789,6 +4790,13 @@ static int ggml_cuda_try_fuse_mla_v_permute(ggml_backend_cuda_context * cuda_ctx
     const int32_t * ax = (const int32_t *) p->op_params;
     if (ax[0] != 0 || ax[1] != 2 || ax[2] != 1 || ax[3] != 3) {
         return 0;
+    }
+    // the CONT must have the permute's own shape: the strides below are the permuted layout (the non-FA MLA branch
+    // uses ggml_cont_2d(permute(...)), a [v*H, T] shape whose nb[2] spans the tensor: writes would run past it)
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        if (cont->ne[k] != p->ne[k]) {
+            return 0;
+        }
     }
     // the permute is the only node between, and nothing else reads it
     for (int q = i + 1; q < j; ++q) {

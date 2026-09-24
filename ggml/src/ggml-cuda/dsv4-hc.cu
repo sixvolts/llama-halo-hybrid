@@ -566,7 +566,8 @@ static __device__ __forceinline__ float dsv4_rcp(const float x) {
 
 template <int M>
 static __device__ __forceinline__ float dsv4_row_xmask(const float v) {   // lane ^ M, M < 16
-#if defined(GGML_USE_HIP)
+// DPP row_xmask exists from gfx10 on (RDNA); gfx9 (Vega, CDNA) takes the shuffle
+#if defined(GGML_USE_HIP) && defined(RDNA)
     return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x160 + M, 0xF, 0xF, true));
 #else
     return __shfl_xor_sync(0xffffffff, v, M, WARP_SIZE);
