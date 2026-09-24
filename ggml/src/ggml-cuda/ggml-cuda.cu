@@ -6566,24 +6566,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
-    // halo-hybrid: the fused MoE tail reads ids / router weights / the shared gate logit in every block while writing
-    // ffn_out; keep them alive until ffn_out is allocated so ggml-alloc never places ffn_out over them
-    if (!disable_fusion) {
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            ggml_cuda_moe_tail_match m;
-            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_moe_tail_find(cuda_ctx->device, cgraph, i, m)) {
-                continue;
-            }
-            params->add_alloc_dep(params->user_data, m.mmid->src[2], m.out);
-            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.red.weights), m.out);
-            if (m.red.expert_scale != nullptr) {
-                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.red.expert_scale), m.out);
-            }
-            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.g), m.out);
-            i = m.last;
-        }
-    }
-
     // halo-hybrid: keep q/k/v of the KDA conv-input assembly alive until conv_input is allocated, so the fused kernel
     // (ggml_cuda_try_fuse_kda_conv_rows) never finds conv_input placed over them and has to fall back
     if (!disable_fusion && !ggml_cuda_kda_conv_rows_disabled()) {
@@ -6682,6 +6664,26 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(hc_root(m.c3->src[0])), m.l2);
             params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(hc_root(m.c3->src[1])), m.l2);
             i = to + (m.i_l2 - m.i_conv);
+        }
+    }
+
+    // halo-hybrid: the fused MoE tail reads ids / router weights / the shared gate logit in every block while writing
+    // ffn_out; keep them alive until ffn_out is allocated so ggml-alloc never places ffn_out over them. AFTER the GEMV
+    // hoist: the matcher needs the shared expert's gate/up/GLU pulled next to the router (in builder order it sits
+    // between the reduction and the shared-expert down, and nothing would match here)
+    if (!disable_fusion) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_moe_tail_match m;
+            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_moe_tail_find(cuda_ctx->device, cgraph, i, m)) {
+                continue;
+            }
+            params->add_alloc_dep(params->user_data, m.mmid->src[2], m.out);
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.red.weights), m.out);
+            if (m.red.expert_scale != nullptr) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.red.expert_scale), m.out);
+            }
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.g), m.out);
+            i = m.last;
         }
     }
 
