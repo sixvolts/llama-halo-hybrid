@@ -3,12 +3,15 @@
 #include "vecdotq.cuh"
 #include "mma.cuh"
 
+#include <type_traits>
+
 using namespace ggml_cuda_mma;
 
 #include "mmq.cuh"
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -58,7 +61,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_1_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -108,7 +112,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -141,7 +146,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>
 static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
-    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  8, int, input_layout>        tile_A;
@@ -171,41 +177,59 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
     const int i0 = (warp_i / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
-        const int k0 = k00 + k01;
+    // halo-hybrid: 16-column subtiles past the last valid column (j_max, block-uniform) are skipped: MoE tiles of an
+    //     expert with fewer tokens than J; full tiles take the unchanged path (GGML_CUDA_MMQ_SUBTILE_SKIP)
+    const int j_lim = __builtin_amdgcn_readfirstlane(j_max - (warp_j*j_group + (warp_i % ntx)*tile_C::J));
+    auto k_loop = [&](auto partial) {
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            const int k0 = k00 + k01;
 
-        tile_A A[ntx];
-#pragma unroll
-        for (int n = 0; n < ntx; ++n) {
-            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
-        }
-
-#pragma unroll
-        for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
-
-            float dB;
-            const int j = j0 + tile_C::get_j(0);
-            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
-                dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
-            } else {
-                dB = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            tile_A A[ntx];
+    #pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
             }
 
-#pragma unroll
-            for (int n = 0; n < ntx; ++n) {
-                tile_C C;
-                mma(C, A[n], B);
+    #pragma unroll
+            for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
+                if constexpr (decltype(partial)::value) {
+                    if (j0 > j_lim) {
+                        break;
+                    }
+                }
+                tile_B B;
+                load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
-#pragma unroll
-                for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
-                    const float dA = x_df[i*sram_stride + k0/QI8_0];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                float dB;
+                const int j = j0 + tile_C::get_j(0);
+                if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+                    dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                } else {
+                    dB = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                }
+
+    #pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
+
+    #pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                        const float dA = x_df[i*sram_stride + k0/QI8_0];
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    }
                 }
             }
         }
+    };
+    // The second loop costs registers: with two subtiles per wave it does not pay (q4_K J=32: +1%), and past 48
+    //     accumulators per lane (J >= 112) it spills on gfx1151 (GLM q4_K J=128 at 4096 tokens: +27%).
+    constexpr bool skip_ok = j_group >= 3*ntx*tile_C::J && (j_group/tile_C::J)*tile_C::ne <= 48;
+    if (!skip_ok || j_lim >= j_group - ntx*tile_C::J) { // no subtile past j_lim: the unchanged loop
+        k_loop(std::false_type{});
+    } else {
+        k_loop(std::true_type{});
     }
 #else
     typedef tile<16, 8, int> tile_A;
@@ -288,7 +312,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -320,7 +345,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  8, int, input_layout>        tile_A;
@@ -348,37 +374,55 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (warp_i / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
-        const int k0 = k00 + k01;
+    // halo-hybrid: 16-column subtiles past the last valid column (j_max, block-uniform) are skipped: MoE tiles of an
+    //     expert with fewer tokens than J; full tiles take the unchanged path (GGML_CUDA_MMQ_SUBTILE_SKIP)
+    const int j_lim = __builtin_amdgcn_readfirstlane(j_max - (warp_j*j_group + (warp_i % ntx)*tile_C::J));
+    auto k_loop = [&](auto partial) {
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+            const int k0 = k00 + k01;
 
-        tile_A A[ntx];
-#pragma unroll
-        for (int n = 0; n < ntx; ++n) {
-            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
-        }
-
-#pragma unroll
-        for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
-
-            const int j = j0 + tile_C::get_j(0);
-            const float2 dsB = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
-
-#pragma unroll
+            tile_A A[ntx];
+    #pragma unroll
             for (int n = 0; n < ntx; ++n) {
-                tile_C C;
-                mma(C, A[n], B);
+                load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+            }
 
-#pragma unroll
-                for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
-                    float2 dmA = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.y*dsB.y;
+    #pragma unroll
+            for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
+                if constexpr (decltype(partial)::value) {
+                    if (j0 > j_lim) {
+                        break;
+                    }
+                }
+                tile_B B;
+                load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+                const int j = j0 + tile_C::get_j(0);
+                const float2 dsB = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+
+    #pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
+
+    #pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                        float2 dmA = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.y*dsB.y;
+                    }
                 }
             }
         }
+    };
+    // The second loop costs registers: with two subtiles per wave it does not pay (q4_K J=32: +1%), and past 48
+    //     accumulators per lane (J >= 112) it spills on gfx1151 (GLM q4_K J=128 at 4096 tokens: +27%).
+    constexpr bool skip_ok = j_group >= 3*ntx*tile_C::J && (j_group/tile_C::J)*tile_C::ne <= 48;
+    if (!skip_ok || j_lim >= j_group - ntx*tile_C::J) { // no subtile past j_lim: the unchanged loop
+        k_loop(std::false_type{});
+    } else {
+        k_loop(std::true_type{});
     }
 #else
     typedef tile<16,  8, int> tile_A;
@@ -457,7 +501,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 // Used for NVFP4, Q3_K, IQ2_S, and IQ2_XS
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -492,7 +537,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 // Used for Q3_K, IQ2_S, and IQ2_XS:
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
@@ -523,6 +569,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+            if (__builtin_amdgcn_readfirstlane((threadIdx.y % ntx)*tile_C::J) + j0 > j_max) { // subtile skip, see q8_1_q8_1_mma
+                break;
+            }
             tile_B B;
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
@@ -625,7 +674,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q2_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -690,7 +740,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
@@ -721,6 +772,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+            if (__builtin_amdgcn_readfirstlane((threadIdx.y % ntx)*tile_C::J) + j0 > j_max) { // subtile skip, see q8_1_q8_1_mma
+                break;
+            }
             tile_B B;
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
@@ -885,7 +939,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -920,7 +975,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -955,7 +1011,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -990,7 +1047,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -1025,7 +1083,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
@@ -1057,6 +1116,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+            if (__builtin_amdgcn_readfirstlane((threadIdx.y % ntx)*tile_C::J) + j0 > j_max) { // subtile skip, see q8_1_q8_1_mma
+                break;
+            }
             tile_B B;
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
@@ -1191,7 +1253,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 // m16n8k64 MMA call; only the PTX kind (scale_vec::2X ue8m0 vs scale_vec::4X ue4m3)
 // and the per-type stride constant differ.
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_fp4_fp4_mma(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    GGML_UNUSED(j_max);
 
     typedef tile<16, 8, int>   tile_A;
     typedef tile<8,  8, int>   tile_B;
