@@ -4507,6 +4507,198 @@ static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx
     return m.last - i;
 }
 
+// halo-hybrid: the GDN conv front at decode (qwen4exp build_conv_state_at + ssm_conv + silu + l2_norm):
+//     c3 = CONCAT(states, TRANSPOSE(x), 0), K x CPY(VIEW(c3), slot view), SSM_CONV(c3, w) -> SILU, L2_NORM(VIEW(silu))
+//     4 + (K - 1) launches -> 1 (ggml_cuda_op_gdn_conv_front, ssm-conv.cu). The L2_NORM view must start at channel 0
+//     and cover whole 128-wide heads (qwen4exp normalises Q and K, adjacent, in one node). conv_input is not written:
+//     the copies and the conv must be its only readers. The builder puts the other layer's state gather between the
+//     copies and the conv; graph_optimize moves the conv..l2 run up behind the copies (dependency-safe: its inputs are
+//     conv_input and a weight) and keeps x and the states alive until the l2 output is allocated. Decode/verify only
+//     (n_seqs == 1, nt <= 8), f32, a stored conv weight (glm5next's is a concat, so glm never matches).
+//     GGML_CUDA_NO_GDN_CONV_FRONT=1 disables.
+struct ggml_cuda_gdn_conv_front_match {
+    ggml_tensor * c3;
+    ggml_tensor * conv;
+    ggml_tensor * silu;
+    ggml_tensor * l2;
+    int           n_cpy;
+    ggml_tensor * cpy[GDN_CONV_FRONT_MAX_DST];
+    int           s_idx[GDN_CONV_FRONT_MAX_DST];
+    int           last_cpy;   // index of the last slot copy (i when there is none)
+    int           i_conv;
+    int           i_l2;
+};
+
+static bool ggml_cuda_gdn_conv_front_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_NO_GDN_CONV_FRONT") != nullptr && std::atoi(getenv("GGML_CUDA_NO_GDN_CONV_FRONT"));
+    return disabled;
+}
+
+// adjacent: the conv must follow the copies (view ops aside), as at dispatch; otherwise it may sit up to 64 nodes
+// later, the order graph_optimize is handed
+static bool ggml_cuda_gdn_conv_front_find(const ggml_cgraph * g, int i, ggml_cuda_gdn_conv_front_match & m, bool adjacent) {
+    const int n = g->n_nodes;
+    ggml_tensor * c3 = g->nodes[i];
+    if (c3->op != GGML_OP_CONCAT || ggml_get_op_params_i32(c3, 0) != 0 || c3->type != GGML_TYPE_F32 ||
+            (c3->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * st = c3->src[0];
+    const ggml_tensor * xt = c3->src[1];
+    const int64_t ns = st->ne[0];
+    const int64_t C  = st->ne[1];
+    const int64_t nt = xt->ne[0];
+    if (st->type != GGML_TYPE_F32 || st->ne[2] != 1 || st->ne[3] != 1 || ns < 2 || ns > 3 ||
+            st->nb[0] % sizeof(float) != 0 || st->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    if (xt->type != GGML_TYPE_F32 || xt->ne[1] != C || xt->ne[2] != 1 || xt->ne[3] != 1 ||
+            xt->nb[1] != sizeof(float) || xt->nb[0] % sizeof(float) != 0 || !ggml_cuda_gdn_conv_front_supported(ns + 1, C, nt)) {
+        return false;
+    }
+    if (c3->ne[0] != ns + nt || c3->ne[1] != C || c3->ne[2] != 1 || c3->ne[3] != 1 || !ggml_is_contiguous(c3)) {
+        return false;
+    }
+
+    m.c3 = c3;
+    m.n_cpy = 0;
+    m.last_cpy = i;
+    for (int p = hc_next(g, i + 1); p < n && m.n_cpy < GDN_CONV_FRONT_MAX_DST; p = hc_next(g, p + 1)) {
+        ggml_tensor * cp = g->nodes[p];
+        if (cp->op != GGML_OP_CPY) {
+            break;
+        }
+        const ggml_tensor * s = cp->src[0];
+        const ggml_tensor * d = cp->src[1];
+        if (s->op != GGML_OP_VIEW || s->src[0] != c3 || kda_use_count(g, s) != 1 || s->type != GGML_TYPE_F32 ||
+                s->ne[0] != ns || s->ne[1] != C || s->ne[2] != 1 || s->ne[3] != 1 ||
+                s->nb[0] != sizeof(float) || s->nb[1] != c3->nb[1] || s->view_offs % sizeof(float) != 0 ||
+                (int64_t) (s->view_offs / sizeof(float)) + ns > ns + nt) {
+            return false;
+        }
+        if (d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || ggml_nelements(d) != ns*C) {
+            return false;
+        }
+        m.cpy[m.n_cpy]   = cp;
+        m.s_idx[m.n_cpy] = (int) (s->view_offs / sizeof(float));
+        m.n_cpy++;
+        m.last_cpy = p;
+    }
+
+    // the conv
+    int jc = -1;
+    if (adjacent) {
+        jc = hc_next(g, m.last_cpy + 1);
+    } else {
+        for (int p = m.last_cpy + 1; p < n && p <= m.last_cpy + 64; ++p) {
+            if (g->nodes[p]->op == GGML_OP_SSM_CONV && g->nodes[p]->src[0] == c3) {
+                jc = p;
+                break;
+            }
+        }
+    }
+    if (jc < 0 || jc >= n || g->nodes[jc]->op != GGML_OP_SSM_CONV || g->nodes[jc]->src[0] != c3 || !hc_uses1(g, jc)) {
+        return false;
+    }
+    // conv_input is read by the copies' views and the conv, nothing else: it is never written
+    if (kda_use_count(g, c3) != m.n_cpy + 1) {
+        return false;
+    }
+    ggml_tensor * conv = g->nodes[jc];
+    const ggml_tensor * w = conv->src[1];
+    if (w->op != GGML_OP_NONE || w->view_src != nullptr || w->type != GGML_TYPE_F32 || w->ne[0] != ns + 1 || w->ne[1] != C ||
+            w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != sizeof(float) || conv->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int js = jc + 1;
+    if (js >= n || !hc_unary(g->nodes[js], GGML_UNARY_OP_SILU) || g->nodes[js]->src[0] != conv) {
+        return false;
+    }
+    ggml_tensor * silu = g->nodes[js];
+    if (silu->type != GGML_TYPE_F32 || silu->ne[0] != C || silu->ne[1] != nt || silu->ne[2] != 1 || silu->ne[3] != 1 ||
+            silu->nb[0] != sizeof(float) || silu->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    const int jl = hc_next(g, js + 1);
+    if (jl >= n || g->nodes[jl]->op != GGML_OP_L2_NORM || !hc_views_belong(g, js, jl, { silu })) {
+        return false;
+    }
+    ggml_tensor * l2 = g->nodes[jl];
+    const ggml_tensor * v = l2->src[0];
+    if (v->op != GGML_OP_VIEW || v->view_src != silu || v->view_offs != 0 || v->type != GGML_TYPE_F32 ||
+            v->ne[0] != GDN_CONV_FRONT_HEAD || v->ne[1] < 1 || v->ne[1]*GDN_CONV_FRONT_HEAD > C || v->ne[2] != nt || v->ne[3] != 1 ||
+            v->nb[0] != sizeof(float) || v->nb[1] != GDN_CONV_FRONT_HEAD*sizeof(float) || v->nb[2] != silu->nb[1] ||
+            l2->type != GGML_TYPE_F32 || !ggml_is_contiguous(l2) || !(ggml_get_op_params_f32(l2, 0) >= 0.0f)) {
+        return false;
+    }
+    m.conv = conv;
+    m.silu = silu;
+    m.l2   = l2;
+    m.i_conv = jc;
+    m.i_l2   = jl;
+    return true;
+}
+
+// the kernel reads x and the states while it writes the SiLU output, the l2 output and the slots from every block:
+// decline on any overlap except a slot that IS the contiguous states memory (build_rs's single-slot view path, safe
+// channel by channel)
+static bool ggml_cuda_gdn_conv_front_disjoint(const ggml_cuda_gdn_conv_front_match & m) {
+    const ggml_tensor * st = m.c3->src[0];
+    const ggml_tensor * xt = m.c3->src[1];
+    if (!hc_disjoint(m.silu, xt) || !hc_disjoint(m.l2, xt) || !hc_disjoint(m.silu, st) || !hc_disjoint(m.l2, st) ||
+            !hc_disjoint(m.l2, m.silu)) {
+        return false;
+    }
+    const bool st_cont = st->nb[0] == sizeof(float) && st->nb[1] == st->ne[0]*sizeof(float);
+    for (int a = 0; a < m.n_cpy; ++a) {
+        const ggml_tensor * d = m.cpy[a]->src[1];
+        if (!hc_disjoint(d, xt) || !hc_disjoint(d, m.silu) || !hc_disjoint(d, m.l2)) {
+            return false;
+        }
+        if (!hc_disjoint(d, st) && !(d->data == st->data && st_cont)) {
+            return false;
+        }
+        for (int b = 0; b < a; ++b) {
+            if (!hc_disjoint(d, m.cpy[b]->src[1])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static int ggml_cuda_try_fuse_gdn_conv_front(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_gdn_conv_front_disabled()) {
+        return 0;
+    }
+    ggml_cuda_gdn_conv_front_match m;
+    if (!ggml_cuda_gdn_conv_front_find(cgraph, i, m, /*adjacent =*/ true)) {
+        return 0;
+    }
+    if (!ggml_cuda_gdn_conv_front_disjoint(m)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: %s: an output overlaps x, the states or a slot, unfused path (logged once)\n", __func__, m.silu->name);
+        }
+        return 0;
+    }
+    ggml_cuda_gdn_conv_front_args a = {};
+    a.states = m.c3->src[0];
+    a.xt     = m.c3->src[1];
+    a.w      = m.conv->src[1];
+    a.y      = m.silu;
+    a.l2     = m.l2;
+    a.eps    = ggml_get_op_params_f32(m.l2, 0);
+    a.n_dst  = m.n_cpy;
+    for (int k = 0; k < m.n_cpy; ++k) {
+        a.dst[k]   = (float *) m.cpy[k]->src[1]->data;
+        a.s_idx[k] = m.s_idx[k];
+    }
+    ggml_cuda_op_gdn_conv_front(*cuda_ctx, a);
+    return m.i_l2 - i;
+}
+
 static bool ggml_cuda_fusion_disabled() {
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     return disable_fusion;
@@ -4874,6 +5066,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_CONCAT) {
         const int skip = ggml_cuda_try_fuse_kda_conv_l2(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_CONCAT) {
+        const int skip = ggml_cuda_try_fuse_gdn_conv_front(cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
         }
@@ -6333,6 +6532,28 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 j = last;
             }
             i = last;
+        }
+    }
+
+    // halo-hybrid: GDN conv front (ggml_cuda_try_fuse_gdn_conv_front). Move the conv..l2 run up behind the slot copies
+    //     so the whole front is one contiguous run at dispatch, and keep x and the states alive until the l2 output is
+    //     allocated, so neither output lands on memory the fused kernel still reads. Runs after the GEMV hoist, which
+    //     never moves anything into this run (it only pulls GEMVs up to a GEMV run).
+    if (!disable_fusion && !ggml_cuda_gdn_conv_front_disabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_gdn_conv_front_match m;
+            if (cgraph->nodes[i]->op != GGML_OP_CONCAT || !ggml_cuda_gdn_conv_front_find(cgraph, i, m, /*adjacent =*/ false)) {
+                continue;
+            }
+            const int to = hc_next(cgraph, m.last_cpy + 1);
+            if (to < m.i_conv) {
+                // [to, i_conv) precede the run in the original order, so none of them reads it; the run reads only
+                // conv_input and the weight, both available at `to`
+                std::rotate(cgraph->nodes + to, cgraph->nodes + m.i_conv, cgraph->nodes + m.i_l2 + 1);
+            }
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(hc_root(m.c3->src[0])), m.l2);
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(hc_root(m.c3->src[1])), m.l2);
+            i = to + (m.i_l2 - m.i_conv);
         }
     }
 

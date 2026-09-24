@@ -336,3 +336,145 @@ void ggml_cuda_op_ssm_conv_kda_l2(ggml_backend_cuda_context & ctx, const ggml_te
             d_inner, dst_d, silu_dst->nb[1], silu_dst->nb[2], q_d, k_d, qk_nb2, qk_nb3, n_t, eps);
     }
 }
+
+// halo-hybrid: the GDN conv front at decode as one launch (ggml_cuda_try_fuse_gdn_conv_front). qwen4exp emits, per
+// DeltaNet layer and step: conv_input = concat(states, transpose(qkv_mixed), 0), K rollback-slot copies of its last
+// d_conv-1 columns into the conv cache, ssm_conv + silu (one launch already) and one l2_norm over the Q and K heads
+// (a view of the SiLU output at offset 0). Here one 128-thread block owns 128 channels (= one 128-wide head): each
+// thread assembles its channel's window in registers (state columns, then the nt new values), writes the slot
+// windows, runs the conv + SiLU and, when the block is one of the H normalised heads, the norm. conv_input itself is
+// never materialised (the matcher requires the copies and the conv to be its only readers).
+// Arithmetic mirrors ssm_conv_f32 (sum from 0 in tap order, plus the zero bias) and l2_norm_f32<WARP_SIZE> (one warp
+// per token row, lane sums columns lane, +32, +64, +96 as x0*x0 then fmaf, then warp_reduce_sum), as in
+// ssm_conv_kda_l2_f32.
+struct gdn_conv_front_dst {
+    float * d[GDN_CONV_FRONT_MAX_DST];
+    int     s_idx[GDN_CONV_FRONT_MAX_DST];
+};
+
+template <int d_conv>
+static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_f32(
+        const char * st, const int64_t nbs0, const int64_t nbs1,
+        const char * __restrict__ x, const int64_t nbx_t,
+        const float * __restrict__ w, const int64_t stride_w,
+        float * __restrict__ y, const int64_t stride_y,
+        float * __restrict__ l2, const int64_t l2_stride_t, const int n_heads,
+        const int nt, const float eps, const int n_dst, const gdn_conv_front_dst out) {
+    static_assert(GDN_CONV_FRONT_HEAD == 4*WARP_SIZE, "one head = four warps");
+    constexpr int ns   = d_conv - 1;
+    constexpr int MAXT = GDN_CONV_FRONT_MAX_TOKENS;
+    constexpr int MAXW = ns + MAXT;
+    __shared__ float s_y[MAXT][GDN_CONV_FRONT_HEAD];
+
+    const int tid  = threadIdx.x;
+    const int head = blockIdx.x;
+    const int64_t c = (int64_t) head*GDN_CONV_FRONT_HEAD + tid;
+
+    // the channel's window: its conv history, then the new columns. Every read of the history happens before any
+    // slot write below; a slot may be the history's own memory (build_rs's single-slot view), channel for channel.
+    float win[MAXW];
+#pragma unroll
+    for (int j = 0; j < ns; ++j) {
+        win[j] = *(const float *) (st + c*nbs1 + j*nbs0);
+    }
+#pragma unroll
+    for (int t = 0; t < MAXT; ++t) {
+        win[ns + t] = t < nt ? *(const float *) (x + t*nbx_t + c*(int64_t) sizeof(float)) : 0.0f;
+    }
+
+    float wr[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wr[j] = w[c*stride_w + j];
+    }
+
+    for (int k = 0; k < n_dst; ++k) {
+        float * d = out.d[k] + c*ns;
+        const int s = out.s_idx[k];
+#pragma unroll
+        for (int p = 0; p < MAXW; ++p) {
+            if (p >= s && p < s + ns) {
+                d[p - s] = win[p];
+            }
+        }
+    }
+
+    const bool norm = head < n_heads;
+#pragma unroll
+    for (int i = 0; i < MAXT; ++i) {
+        if (i < nt) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sumf += win[i + j] * wr[j];
+            }
+            sumf += 0.0f;   // the unfused kernel's (zero) bias term
+            const float v = ggml_cuda_op_silu_single(sumf);
+            y[i*stride_y + c] = v;
+            if (norm) {
+                s_y[i][tid] = v;
+            }
+        }
+    }
+
+    if (!norm) {
+        return;
+    }
+    __syncthreads();
+
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+    float * o = l2 + (int64_t) head*GDN_CONV_FRONT_HEAD;
+    for (int i = warp; i < nt; i += GDN_CONV_FRONT_HEAD / WARP_SIZE) {
+        float tmp = s_y[i][lane] * s_y[i][lane];
+#pragma unroll
+        for (int col = lane + WARP_SIZE; col < GDN_CONV_FRONT_HEAD; col += WARP_SIZE) {
+            const float xi = s_y[i][col];
+            tmp = fmaf(xi, xi, tmp);
+        }
+        tmp = warp_reduce_sum(tmp);
+        const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+#pragma unroll
+        for (int col = lane; col < GDN_CONV_FRONT_HEAD; col += WARP_SIZE) {
+            o[(int64_t) i*l2_stride_t + col] = scale * s_y[i][col];
+        }
+    }
+}
+
+bool ggml_cuda_gdn_conv_front_supported(int64_t d_conv, int64_t C, int64_t nt) {
+    return (d_conv == 3 || d_conv == 4) && C > 0 && C % GDN_CONV_FRONT_HEAD == 0 && C <= INT_MAX / 16 &&
+           nt >= 1 && nt <= GDN_CONV_FRONT_MAX_TOKENS;
+}
+
+void ggml_cuda_op_gdn_conv_front(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_front_args & a) {
+    const int64_t d_conv = a.w->ne[0];
+    const int64_t C      = a.w->ne[1];
+    const int64_t nt     = a.y->ne[1];
+    GGML_ASSERT(ggml_cuda_gdn_conv_front_supported(d_conv, C, nt));
+    GGML_ASSERT(a.xt->nb[1] == sizeof(float) && a.w->nb[0] == sizeof(float) && a.y->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(a.l2) && a.l2->ne[0] == GDN_CONV_FRONT_HEAD && a.l2->ne[1]*GDN_CONV_FRONT_HEAD <= C);
+    GGML_ASSERT(a.n_dst >= 0 && a.n_dst <= GDN_CONV_FRONT_MAX_DST);
+
+    gdn_conv_front_dst out = {};
+    for (int k = 0; k < a.n_dst; ++k) {
+        out.d[k]     = a.dst[k];
+        out.s_idx[k] = a.s_idx[k];
+    }
+    const int n_heads = (int) a.l2->ne[1];
+    const dim3 blocks(C / GDN_CONV_FRONT_HEAD, 1, 1);
+    cudaStream_t stream = ctx.stream();
+#define GDN_CONV_FRONT_LAUNCH(DC) \
+    gdn_conv_front_f32<DC><<<blocks, GDN_CONV_FRONT_HEAD, 0, stream>>>( \
+        (const char *) a.states->data, a.states->nb[0], a.states->nb[1], \
+        (const char *) a.xt->data, a.xt->nb[0], \
+        (const float *) a.w->data, a.w->nb[1] / sizeof(float), \
+        (float *) a.y->data, a.y->nb[1] / sizeof(float), \
+        (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, \
+        (int) nt, a.eps, a.n_dst, out)
+    if (d_conv == 4) {
+        GDN_CONV_FRONT_LAUNCH(4);
+    } else {
+        GDN_CONV_FRONT_LAUNCH(3);
+    }
+#undef GDN_CONV_FRONT_LAUNCH
+}

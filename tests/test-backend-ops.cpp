@@ -4940,6 +4940,104 @@ struct test_kda_conv_l2 : public test_case {
     }
 };
 
+// halo-hybrid: the qwen4exp GDN conv front in the order the CUDA graph_optimize leaves it: conv_input =
+// concat(states, transpose(x), 0), K rollback-slot copies of its last d_conv-1 columns into the conv cache, then
+// ssm_conv -> silu and one l2_norm over the leading H 128-wide heads of the SiLU output (Q and K), plus a consumer of
+// the normed heads and the V part (like gated_delta_net). The CUDA backend runs it as one launch at nt <= 8
+// (ggml_cuda_try_fuse_gdn_conv_front); nt = 64 is gated off. mode "alias": K = 1 and the states are a view of slot 0
+// at the head, the memory the copy writes (build_rs's single-slot path).
+struct test_gdn_conv_front : public test_case {
+    const int64_t     C, H, d_conv, nt, K;
+    const std::string mode;
+    ggml_tensor * y_out  = nullptr;
+    ggml_tensor * l2_out = nullptr;
+    ggml_tensor * sum    = nullptr;
+    std::vector<ggml_tensor *> cpys;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_CONV_FRONT";
+    }
+    std::string vars() override {
+        return VARS_TO_STR6(C, H, d_conv, nt, K, mode);
+    }
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> v = { y_out, l2_out, sum };
+        v.insert(v.end(), cpys.begin(), cpys.end());
+        return v;
+    }
+    std::vector<ggml_tensor *> expand_first() override { return cpys; }   // copies right after conv_input, as the builder
+
+    test_gdn_conv_front(int64_t C, int64_t H, int64_t d_conv, int64_t nt, int64_t K = 1, std::string mode = "leaf")
+        : C(C), H(H), d_conv(d_conv), nt(nt), K(K), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ns = d_conv - 1;
+        const int64_t hd = 128;
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, nt);
+        ggml_set_name(x, "qkv_mixed");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, C);
+        ggml_set_name(w, "conv1d_w");
+
+        const int64_t mem_size  = 2;
+        const int64_t kv_head   = 1;
+        const int64_t row_count = ns * C;
+        ggml_tensor * states_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_count, mem_size * K);
+        ggml_set_name(states_all, "conv_states_all");
+        const size_t row_size = ggml_row_size(states_all->type, row_count);
+
+        ggml_tensor * states;
+        if (mode == "alias") {
+            GGML_ASSERT(K == 1);
+            states = ggml_view_2d(ctx, states_all, row_count, 1, states_all->nb[1], kv_head * row_size);
+        } else {
+            states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_count, 1);
+            ggml_set_name(states, "conv_states");
+        }
+        states = ggml_reshape_3d(ctx, states, ns, C, 1);
+
+        ggml_tensor * conv_input = ggml_concat(ctx, states, ggml_transpose(ctx, x), 0);
+        ggml_set_name(conv_input, "conv_input");
+
+        cpys.clear();
+        for (int64_t slot = 0; slot < K; ++slot) {
+            const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - ns - slot);
+            ggml_tensor * tail = ggml_view_3d(ctx, conv_input, ns, C, 1, conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, s_idx));
+            ggml_tensor * dst = ggml_view_2d(ctx, states_all, row_count, 1, states_all->nb[1],
+                    (slot * mem_size + kv_head) * row_size);
+            ggml_tensor * cpy = ggml_cpy(ctx, tail, dst);
+            ggml_set_name(cpy, ("slot_cpy_" + std::to_string(slot)).c_str());
+            cpys.push_back(cpy);
+        }
+
+        ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_set_name(y, "conv_output_silu");
+        const size_t nb1 = ggml_row_size(y->type, C);
+        ggml_tensor * qk = ggml_view_4d(ctx, y, hd, H, nt, 1, ggml_row_size(y->type, hd), nb1, nb1*nt, 0);
+        qk = ggml_l2_norm(ctx, qk, 1e-6f);
+        ggml_set_name(qk, "qk_norm");
+
+        // consumer: the normed heads plus the first H heads after them (the V part in qwen4exp)
+        const int64_t Hv = std::min<int64_t>(H, C/hd - H);
+        ggml_tensor * o = qk;
+        if (Hv > 0) {
+            o = ggml_view_4d(ctx, qk, hd, Hv, nt, 1, qk->nb[1], qk->nb[2], qk->nb[3], 0);
+            ggml_tensor * v = ggml_view_4d(ctx, y, hd, Hv, nt, 1, ggml_row_size(y->type, hd), nb1, nb1*nt,
+                    ggml_row_size(y->type, H*hd));
+            o = ggml_add(ctx, o, v);
+        } else {
+            o = ggml_scale(ctx, o, 2.0f);
+        }
+        ggml_set_name(o, "out");
+        y_out  = y;
+        l2_out = qk;
+        sum    = o;
+        return o;
+    }
+};
+
 // halo-hybrid: glm5next DSA indexer pool compressor (build_indexer's new-pool branch) in GLM node order:
 // GET_ROWS(members) -> CONT(PERMUTE key), CONT(PERMUTE gate), CONT(TRANSPOSE ape) -> ADD -> SOFT_MAX -> MUL ->
 // SUM_ROWS -> SET_ROWS(pooled head of the same cache). The CUDA backend fuses the whole chain (kpool-compress.cu).
@@ -9853,6 +9951,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool hoisted : {true, false}) {
             test_cases.emplace_back(new test_kda_gate_prologue(4096, 128, 64, nt, hoisted));
         }
+    }
+    // halo-hybrid: qwen4exp GDN conv front (one launch at decode on CUDA/HIP, nt <= 8; gated off at nt = 64)
+    for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
+        test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1));            // Qwen3.8-Flash-Next
+        test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1, "alias"));
+        test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 3));            // MTP rollback slots
+        test_cases.emplace_back(new test_gdn_conv_front(512, 2, 3, nt, 2));
+        test_cases.emplace_back(new test_gdn_conv_front(384, 3, 4, nt, 1));               // every head normed
     }
     // halo-hybrid: KDA conv-input assembly (one launch at decode on CUDA/HIP, nt <= 8; gated off at nt = 64)
     for (int64_t C : {24576, 300}) {
