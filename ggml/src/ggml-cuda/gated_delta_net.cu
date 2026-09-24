@@ -841,7 +841,19 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const bool aligned = al16(q_d) && al16(k_d) && al16(v_d) && al16(s_d) && al16(dst_d) && al16(state_d) &&
         sq1 % 4 == 0 && sq2 % 4 == 0 && sq3 % 4 == 0 && sv1 % 4 == 0 && sv2 % 4 == 0 && sv3 % 4 == 0 &&
         state_row_stride % 4 == 0 && state_slot_stride % 4 == 0;
-    if (!kda && aligned && !gdn_chunked_disabled() && n_tokens >= gdn_chunked_min_tokens() && n_tokens - n_tail >= GDN_CH_C &&
+    // the scan keeps a state slice in dynamic LDS (~60 KB at S_v = 128): parts whose opt-in limit is smaller (NVIDIA
+    // Pascal, 48 KB) keep the token loop
+    auto chunk_lds = [](int64_t sv) -> size_t {
+        switch (sv) {
+            case 16:  return gdn_chunk_scan_lds<16,  16>() * sizeof(float);
+            case 32:  return gdn_chunk_scan_lds<32,  32>() * sizeof(float);
+            case 64:  return gdn_chunk_scan_lds<64,  32>() * sizeof(float);
+            case 128: return gdn_chunk_scan_lds<128, 32>() * sizeof(float);
+            default:  return SIZE_MAX;
+        }
+    };
+    const bool lds_ok = chunk_lds(S_v) <= ggml_cuda_info().devices[ctx.device].smpbo;
+    if (!kda && aligned && lds_ok && !gdn_chunked_disabled() && n_tokens >= gdn_chunked_min_tokens() && n_tokens - n_tail >= GDN_CH_C &&
             (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
         const int64_t n_main = n_tokens - n_tail;
         ggml_cuda_pool_alloc<float> state_mid(ctx.pool());

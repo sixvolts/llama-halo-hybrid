@@ -259,7 +259,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     if (K->ne[0] == 256 && dst->src[2]->ne[0] == 256) {
         static const bool d256 = getenv("GGML_CUDA_FA_SPARSE_D256") == nullptr || atoi(getenv("GGML_CUDA_FA_SPARSE_D256")) != 0;
         static const int64_t d256_ratio = getenv("GGML_CUDA_FA_SPARSE_D256_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_SPARSE_D256_MIN_RATIO")) : 4;
-        return d256 && amd && Q->ne[1] >= 64 && (Q->ne[2] / K->ne[2]) % 4 == 0 &&
+        // measured on RDNA3.5 (gfx1151) and RDNA4 (gfx1201) only; RDNA3 dGPUs keep the dense walk until measured
+        const bool d256_arch = GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+        return d256 && amd && d256_arch && Q->ne[1] >= 64 && (Q->ne[2] / K->ne[2]) % 4 == 0 &&
             mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
             mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
             K->ne[1] >= d256_ratio*n_kv_max;
