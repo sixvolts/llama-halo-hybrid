@@ -3512,6 +3512,122 @@ struct test_ew_chain : public test_case {
     }
 };
 
+// halo-hybrid: the GLM-5.3 KDA gate prologue (ggml_cuda_try_fuse_kda_gate): f_a -> f_b GEMVs, + dt_b, per-head A,
+// -1 scale, sigmoid, lower-bound scale, and the beta GEMV's sigmoid. `hoisted` puts the beta GEMV first (next to f_a,
+// as graph_optimize's GEMV hoist does at decode), so the beta sigmoid lands right behind the gate chain; otherwise
+// the build order, where the beta GEMV sits between the two and only the gate part fuses.
+struct test_kda_gate_prologue : public test_case {
+    const int64_t n_embd, head_dim, n_head, nt;
+    const bool hoisted;
+    ggml_tensor * beta_raw = nullptr;
+    ggml_tensor * g_out = nullptr;
+    ggml_tensor * b_out = nullptr;
+    ggml_tensor * out_t = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, head_dim, n_head, nt) + "," + VARS_TO_STR1(hoisted) + ",kda_gate";
+    }
+
+    test_kda_gate_prologue(int64_t n_embd, int64_t head_dim, int64_t n_head, int64_t nt, bool hoisted)
+        : n_embd(n_embd), head_dim(head_dim), n_head(n_head), nt(nt), hoisted(hoisted) {}
+
+    double max_nmse_err() override {
+        // quantized GEMVs against the CPU reference, as test_mul_mat. Above 4 columns the fusion is gated off and
+        // gfx1151 takes the f16 WMMA GEMM (mmq-wmma.cu), whose f16 activation of the |x| ~ 40 f_a output reads
+        // 6e-4..1e-3 here with every fusion disabled (GGML_CUDA_DISABLE_FUSION=1): the data, not this path.
+        return nt <= 4 ? 5e-4 : 2e-3;
+    }
+
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { g_out, b_out, out_t }; }
+    std::vector<ggml_tensor *> expand_first() override {
+        if (hoisted) {
+            return { beta_raw };
+        }
+        return {};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d_inner = head_dim * n_head;
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * w_fa = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, head_dim);
+        ggml_set_name(w_fa, "ssm_f_a");
+        ggml_tensor * w_fb = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, head_dim, d_inner);
+        ggml_set_name(w_fb, "ssm_f_b");
+        ggml_tensor * w_beta = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, n_head);
+        ggml_set_name(w_beta, "ssm_beta");
+        ggml_tensor * dt_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d_inner);
+        ggml_set_name(dt_b, "ssm_dt_b");
+        ggml_tensor * ssm_a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_set_name(ssm_a, "ssm_a");
+
+        beta_raw = ggml_mul_mat(ctx, w_beta, x);
+        ggml_set_name(beta_raw, "beta_raw");
+
+        // as src/models/glm5next.cpp build_kda_layer (one sequence)
+        ggml_tensor * g = ggml_mul_mat(ctx, w_fb, ggml_mul_mat(ctx, w_fa, x));
+        g = ggml_add(ctx, g, dt_b);
+        g = ggml_reshape_3d(ctx, g, head_dim, n_head, nt);
+        g = ggml_mul(ctx, g, ggml_reshape_3d(ctx, ssm_a, 1, n_head, 1));
+        g = ggml_sigmoid(ctx, ggml_scale(ctx, g, -1.0f));
+        g = ggml_scale(ctx, g, -5.0f);
+        g = ggml_reshape_4d(ctx, g, head_dim, n_head, nt, 1);
+        g_out = g;
+        ggml_set_name(g_out, "kda_gate");
+
+        b_out = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, beta_raw, 1, n_head, nt, 1));
+        ggml_set_name(b_out, "kda_beta");
+
+        // stand-in for the gated_delta_net consumer: reads both
+        out_t = ggml_add(ctx, g_out, b_out);
+        ggml_set_name(out_t, "out");
+        return out_t;
+    }
+};
+
+// halo-hybrid: the MLA/DSA attention tail (ggml_cuda_try_fuse_mla_v_permute): flash-attention output [kv_lora, n_head,
+// nt] -> permute -> per-head wv_b GEMV -> permute -> cont -> 2d, then the wo GEMV (as llama-graph build_attn_mha + GLM)
+struct test_mla_v_permute : public test_case {
+    const ggml_type type;
+    const int64_t kv_lora, v_head, n_head, nt;
+    ggml_tensor * cont_t = nullptr;
+    ggml_tensor * out_t = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, kv_lora, v_head, n_head) + "," + VARS_TO_STR1(nt) + ",mla_v_permute";
+    }
+
+    test_mla_v_permute(ggml_type type, int64_t kv_lora, int64_t v_head, int64_t n_head, int64_t nt)
+        : type(type), kv_lora(kv_lora), v_head(v_head), n_head(n_head), nt(nt) {}
+
+    double max_nmse_err() override {
+        return 5e-4;   // quantized GEMVs against the CPU reference, as test_mul_mat
+    }
+
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cont_t, out_t }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * fa = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kv_lora, n_head, nt);
+        ggml_set_name(fa, "fattn_out");
+        ggml_tensor * wv_b = ggml_new_tensor_3d(ctx, type, kv_lora, v_head, n_head);
+        ggml_set_name(wv_b, "wv_b");
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, type, v_head*n_head, 512);
+        ggml_set_name(wo, "wo");
+        ggml_tensor * cur = ggml_permute(ctx, fa, 0, 2, 1, 3);
+        cur = ggml_mul_mat(ctx, wv_b, cur);
+        cur = ggml_permute(ctx, cur, 0, 2, 1, 3);
+        cur = ggml_cont(ctx, cur);
+        cont_t = cur;
+        ggml_set_name(cont_t, "mla_v_cont");
+        cur = ggml_reshape_2d(ctx, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        out_t = ggml_mul_mat(ctx, wo, cur);
+        ggml_set_name(out_t, "out");
+        return out_t;
+    }
+};
+
 // halo-hybrid: two GEMVs on the same f32 activation at decode/verify widths (the q8_1 copy is made once)
 struct test_mul_mat_shared : public test_case {
     const ggml_type type;
@@ -9647,6 +9763,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ew_chain("kda",  nt));
         test_cases.emplace_back(new test_ew_chain("mean", nt));
     }
+    // halo-hybrid: MLA/DSA attention tail (the wv_b GEMV writes the permuted layout at nt <= 4; gated off at 8 and 64)
+    for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
+        test_cases.emplace_back(new test_mla_v_permute(GGML_TYPE_Q8_0, 512, 256, 64, nt));
+    }
+    test_cases.emplace_back(new test_mla_v_permute(GGML_TYPE_Q4_K, 512, 128, 16, 3));
+    // halo-hybrid: KDA gate prologue (one GEMV launch at decode on CUDA/HIP, nt <= 4; gated off at 8 and 64)
+    for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
+        for (bool hoisted : {true, false}) {
+            test_cases.emplace_back(new test_kda_gate_prologue(4096, 128, 64, nt, hoisted));
+        }
+    }
     // halo-hybrid: KDA conv-input assembly (one launch at decode on CUDA/HIP, nt <= 8; gated off at nt = 64)
     for (int64_t C : {24576, 300}) {
         for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
@@ -11904,6 +12031,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_kpool_compress(GGML_TYPE_F16, 128, 4, 3, 4096, 1, 1));
     for (int64_t nt : {1, 2, 3, 4, 8}) {
         test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 20));   // GLM-5.3: 20 sinkhorn iterations
+    }
+    // halo-hybrid: KDA gate prologue at decode widths (compare against GGML_CUDA_NO_KDA_GATE_PROLOGUE=1)
+    for (int64_t nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_kda_gate_prologue(4096, 128, 64, nt, true));
     }
     // halo-hybrid: KDA conv tail, TBO_KDA_CONV_L2="d_inner:nt[:reps],..." (d_conv 4); reps copies per graph, one per layer
     if (const char * env = getenv("TBO_KDA_CONV_L2")) {

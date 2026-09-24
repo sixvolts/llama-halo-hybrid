@@ -738,6 +738,16 @@ static __global__ void mul_mat_vec_q(
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
+    if constexpr (has_fusion) {
+        // halo-hybrid: the KDA beta sigmoid rides on block 0 (see ggml_cuda_mm_fusion_args_device::aux_dst); an
+        // in-place alias of aux_src is fine, each element is read and written by the same thread
+        if (fusion.aux_dst && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+            for (uint32_t e = tid; e < fusion.aux_n; e += nwarps*warp_size) {
+                fusion.aux_dst[e] = 1.0f / (1.0f + expf(-fusion.aux_src[e]));
+            }
+        }
+    }
+
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;
@@ -773,12 +783,16 @@ static __global__ void mul_mat_vec_q(
     [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
     [[maybe_unused]] float x_scales = 1.0f;
     [[maybe_unused]] float gate_scales = 1.0f;
+    [[maybe_unused]] float x_mul_v = 1.0f;
     if constexpr (has_fusion) {
         // 1. Hide latency by prefetching bias, gates and scales here
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
         if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
             (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            if (fusion.x_mul) {   // halo-hybrid: KDA gate tail multiplier, same thread as the row's epilogue
+                x_mul_v = fusion.x_mul[(row0 + threadIdx.x) / fusion.x_mul_div];
+            }
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
@@ -928,6 +942,14 @@ static __global__ void mul_mat_vec_q(
                                 result = result * gate_value;
                                 break;
                         }
+                    }
+                    if (fusion.tail_act) {   // halo-hybrid: KDA gate tail, same op order as the unfused chain
+                        result *= x_mul_v;
+                        result = fusion.tail_s0 * result + fusion.tail_b0;
+                        if (fusion.tail_act == 1) {
+                            result = 1.0f / (1.0f + expf(-result));
+                        }
+                        result = fusion.tail_s1 * result + fusion.tail_b1;
                     }
                 }
                 dst[j*stride_col_dst + i] = result;
@@ -1118,7 +1140,8 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr ||
+                            fusion.tail_act != 0 || fusion.aux_dst != nullptr;
     // halo-hybrid: fused gate/up + GLU up to 4 columns (the verify batch of an MTP draft); see
     // ggml_cuda_should_fuse_mul_mat_vec_q for why
     if constexpr (c_ncols_dst <= 4) {
@@ -2204,6 +2227,22 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        if (fusion->tail_act || fusion->aux_dst) {   // halo-hybrid: KDA gate prologue, plain MUL_MAT only
+            GGML_ASSERT(!ids && fusion->gate == nullptr);
+            fusion_local.tail_act  = fusion->tail_act;
+            fusion_local.tail_s0   = fusion->tail_s0;
+            fusion_local.tail_b0   = fusion->tail_b0;
+            fusion_local.tail_s1   = fusion->tail_s1;
+            fusion_local.tail_b1   = fusion->tail_b1;
+            fusion_local.x_mul     = fusion->x_mul ? (const float *) fusion->x_mul->data : nullptr;
+            fusion_local.x_mul_div = fusion->x_mul_div;
+            if (fusion->aux_dst) {
+                GGML_ASSERT(fusion->aux_src && ggml_nelements(fusion->aux_src) == ggml_nelements(fusion->aux_dst));
+                fusion_local.aux_src = (const float *) fusion->aux_src->data;
+                fusion_local.aux_dst = (float *) fusion->aux_dst->data;
+                fusion_local.aux_n   = (uint32_t) ggml_nelements(fusion->aux_dst);
+            }
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

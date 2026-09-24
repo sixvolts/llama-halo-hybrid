@@ -1635,6 +1635,13 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // halo-hybrid: element-wise tail after x_bias and a small side sigmoid, see ggml_cuda_mm_fusion_args_device
+    const ggml_tensor * x_mul = nullptr;
+    uint32_t x_mul_div = 1;
+    float tail_s0 = 1.0f, tail_b0 = 0.0f, tail_s1 = 1.0f, tail_b1 = 0.0f;
+    int   tail_act = 0;
+    const ggml_tensor * aux_src = nullptr;
+    const ggml_tensor * aux_dst = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1648,6 +1655,18 @@ struct ggml_cuda_mm_fusion_args_device {
     // over the columns; the operand of a residual-style add is [rows, n_tokens]). Used by mul_mat_vec_q at n > 1.
     uint32_t x_bias_stride_col = 0;
     uint32_t gate_bias_stride_col = 0;
+    // halo-hybrid: the KDA gate prologue (ggml_cuda_try_fuse_kda_gate). After x_bias, row r of every column goes
+    // through v *= x_mul[r / x_mul_div] (when x_mul is set), v = tail_s0*v + tail_b0, v = sigmoid(v) (tail_act 1),
+    // v = tail_s1*v + tail_b1 -- the add(dt_b) -> mul(A) -> scale -> sigmoid -> scale chain of the gate. Block 0
+    // also writes aux_dst[e] = sigmoid(aux_src[e]) for e < aux_n (the beta sigmoid, whose GEMV ran earlier in the
+    // grouped launch). mul_mat_vec_q (not the MoE kernels) only.
+    const float * x_mul = nullptr;
+    uint32_t x_mul_div = 1;
+    float tail_s0 = 1.0f, tail_b0 = 0.0f, tail_s1 = 1.0f, tail_b1 = 0.0f;
+    int   tail_act = 0;      // 0: tail disabled, 1: sigmoid, 2: identity (scales / x_mul only)
+    const float * aux_src = nullptr;
+    float * aux_dst = nullptr;
+    uint32_t aux_n = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

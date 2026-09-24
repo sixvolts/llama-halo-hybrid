@@ -4587,6 +4587,227 @@ static bool ggml_cuda_try_defer_gdn_state_gather(ggml_backend_cuda_context * cud
         }
     }
     return false;
+
+// halo-hybrid: the KDA gate prologue at decode widths (n <= 4) as ONE mul_mat_vec_q launch. The graph is
+//     MUL_MAT(f_b) -> ADD(dt_b) -> RESHAPE -> MUL(A, per head) -> SCALE(-1) -> SIGMOID -> SCALE(lower bound)
+//     and, with the GEMV hoist (graph_optimize) having pulled the beta GEMV into the grouped launch, the beta's
+//     RESHAPE -> SIGMOID comes right behind it. Unfused: GEMV + bin_bcast (the reshape of the ADD's output stops the
+//     element-wise chain fuser) + ewchain + sigmoid. The GEMV's fused epilogue takes the bias (broadcast over the
+//     columns), the per-head multiplier, both scales and the sigmoid; block 0 does the beta sigmoid on the side.
+//     Every piece is optional except the MUL_MAT and the sigmoid. GGML_CUDA_NO_KDA_GATE_PROLOGUE=1 disables.
+static bool kda_gate_rowshape(const ggml_tensor * t, int64_t nrows, int64_t ncols) {
+    // a contiguous f32 reshape of the [nrows, ncols] GEMV output that keeps the column in dims >= 1 or >= 2
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+        return false;
+    }
+    return (t->ne[0] == nrows && t->ne[1]*t->ne[2]*t->ne[3] == ncols) ||
+           (t->ne[0]*t->ne[1] == nrows && t->ne[2]*t->ne[3] == ncols);
+}
+
+static int ggml_cuda_try_fuse_kda_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_KDA_GATE_PROLOGUE") != nullptr && atoi(getenv("GGML_CUDA_NO_KDA_GATE_PROLOGUE")) != 0;
+    const int n = cgraph->n_nodes;
+    ggml_tensor * mm = cgraph->nodes[i];
+    if (disabled || mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
+            mm->ne[2] != 1 || mm->ne[3] != 1 || mm->src[1]->type != GGML_TYPE_F32 || !ggml_is_quantized(mm->src[0]->type) ||
+            mm->src[0]->ne[2] != 1 || mm->src[0]->ne[3] != 1 || !ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+        return 0;
+    }
+    const int64_t nrows = mm->ne[0], ncols = mm->ne[1];
+
+    const ggml_tensor * chain[8];   // mm + the absorbed nodes whose results are never written
+    int n_chain = 0;
+    chain[n_chain++] = mm;
+    ggml_cuda_mm_fusion_args_host f{};
+    const ggml_tensor * bias = nullptr;
+    int last = i;
+    int stage = 0;   // 0: bias, 1: mul, 2: scale0, 3: sigmoid, 4: scale1, 5: done
+    bool has_tail = false;
+    while (stage < 5 && n_chain < 8) {
+        const ggml_tensor * prev = cgraph->nodes[last];
+        if (!hc_uses1(cgraph, last) || (prev->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        const int j = hc_next(cgraph, last + 1);
+        if (j >= n) {
+            break;
+        }
+        ggml_tensor * t = cgraph->nodes[j];
+        // the node's chain input: prev itself or a reshape of it
+        auto from_prev = [&](const ggml_tensor * s) {
+            return s == prev || (s->op == GGML_OP_RESHAPE && s->src[0] == prev);
+        };
+        if (!kda_gate_rowshape(t, nrows, ncols)) {
+            break;
+        }
+        bool took = false;
+        if (stage <= 0 && t->op == GGML_OP_ADD) {
+            const ggml_tensor * b = t->src[0] == prev ? t->src[1] : t->src[1] == prev ? t->src[0] : nullptr;
+            // [rows] broadcast over the columns, or a per-column [rows, ncols] operand (x_bias_stride_col)
+            if (b && b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) && ggml_are_same_shape(t, prev) &&
+                    ((b->ne[0] == nrows && ggml_nelements(b) == nrows) || ggml_are_same_shape(b, mm))) {
+                bias = b; stage = 1; took = true;
+            }
+        } else if (stage <= 1 && t->op == GGML_OP_MUL && t->src[0] != t->src[1]) {
+            const ggml_tensor * a = from_prev(t->src[0]) ? t->src[0] : from_prev(t->src[1]) ? t->src[1] : nullptr;
+            const ggml_tensor * m = a == t->src[0] ? t->src[1] : t->src[0];
+            if (a && ggml_are_same_shape(a, t) && m->type == GGML_TYPE_F32 && ggml_is_contiguous(m) &&
+                    m->ne[2] == 1 && m->ne[3] == 1) {
+                // m broadcasts over the columns; per row r it reads m[r / div]
+                uint32_t div = 0;
+                if (ggml_nelements(m) == 1) {
+                    div = (uint32_t) nrows;
+                } else if (t->ne[0] == nrows && m->ne[0] == nrows && m->ne[1] == 1) {
+                    div = 1;
+                } else if (t->ne[0] != nrows && t->ne[0]*t->ne[1] == nrows && m->ne[1] == t->ne[1] && (m->ne[0] == 1 || m->ne[0] == t->ne[0])) {
+                    div = m->ne[0] == 1 ? (uint32_t) t->ne[0] : 1;
+                }
+                if (div) {
+                    f.x_mul = m; f.x_mul_div = div; stage = 2; took = true;
+                }
+            }
+        } else if (stage <= 2 && t->op == GGML_OP_SCALE && from_prev(t->src[0])) {
+            f.tail_s0 = hc_param(t, 0); f.tail_b0 = hc_param(t, 1); stage = 3; took = true;
+        } else if (stage <= 3 && t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID && from_prev(t->src[0])) {
+            f.tail_act = 1; stage = 4; took = true;
+        } else if (stage == 4 && t->op == GGML_OP_SCALE && from_prev(t->src[0])) {
+            f.tail_s1 = hc_param(t, 0); f.tail_b1 = hc_param(t, 1); stage = 5; took = true;
+        }
+        if (!took) {
+            break;
+        }
+        // views between the two must not view an intermediate (the fused kernel never writes one), except the
+        // reshape of prev that t itself consumes
+        for (int q = last + 1; q < j; ++q) {
+            const ggml_tensor * v = cgraph->nodes[q];
+            for (int c = 0; c < n_chain; ++c) {
+                if (hc_root(v) == chain[c] && !(v->op == GGML_OP_RESHAPE && v->src[0] == prev && hc_uses1(cgraph, q) && (t->src[0] == v || t->src[1] == v))) {
+                    return 0;
+                }
+            }
+        }
+        has_tail = has_tail || stage >= 2;
+        chain[n_chain++] = t;
+        last = j;
+    }
+    // only gate-shaped tails (a sigmoid in them): a plain bias is the MUL_MAT + ADD fusion's, and a GEMV with a
+    // bare scale or multiplier behind it keeps whatever path it had
+    if (last == i || !has_tail || f.tail_act != 1) {
+        return 0;
+    }
+    // a chain that ends in the sigmoid read by a MUL is the SIGMOID+MUL fusion's (the KDA output gate g_b: taking
+    // the sigmoid here would only move the launch to a bare MUL)
+    if (stage == 4) {
+        const int j2 = hc_next(cgraph, last + 1);
+        if (j2 < n && cgraph->nodes[j2]->op == GGML_OP_MUL &&
+                (cgraph->nodes[j2]->src[0] == cgraph->nodes[last] || cgraph->nodes[j2]->src[1] == cgraph->nodes[last])) {
+            return 0;
+        }
+    }
+    f.x_bias = bias;
+    ggml_tensor * out = cgraph->nodes[last];
+
+    // the beta sigmoid right behind: SIGMOID(RESHAPE(x)) with x computed before i (topological order: nothing
+    // between i and here but the chain and views), contiguous, small
+    int end = last;
+    {
+        const int k = hc_next(cgraph, last + 1);
+        if (k < n) {
+            ggml_tensor * sg = cgraph->nodes[k];
+            const ggml_tensor * src = sg->src[0];
+            const ggml_tensor * x = src && src->op == GGML_OP_RESHAPE ? src->src[0] : src;
+            bool ok = sg->op == GGML_OP_UNARY && ggml_get_unary_op(sg) == GGML_UNARY_OP_SIGMOID && sg->type == GGML_TYPE_F32 &&
+                      x && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(sg) &&
+                      ggml_nelements(sg) == ggml_nelements(x) && ggml_nelements(sg) <= 4096 &&
+                      x->op != GGML_OP_NONE && !hc_is_view_op(x);
+            for (int c = 0; ok && c < n_chain; ++c) {
+                ok = hc_root(x) != chain[c];
+            }
+            // views between the chain's end and the sigmoid: of the output, of x, or of the sigmoid's input
+            for (int q = last + 1; ok && q < k; ++q) {
+                const ggml_tensor * v = cgraph->nodes[q];
+                for (int c = 0; ok && c < n_chain - 1; ++c) {
+                    ok = hc_root(v) != chain[c];
+                }
+            }
+            // the sigmoid is in place over x or apart from it; it never lands on the gate output
+            ok = ok && (sg->data == x->data || hc_disjoint(sg, x)) && hc_disjoint(sg, out) && hc_disjoint(out, x);
+            if (ok) {
+                f.aux_src = x;
+                f.aux_dst = sg;
+                end = k;
+            }
+        }
+    }
+    // weights, but check: the kernel writes out while reading them
+    if ((bias && !hc_disjoint(out, bias)) || (f.x_mul && !hc_disjoint(out, f.x_mul))) {
+        return 0;
+    }
+    // out may sit on src1's memory (dead after the GEMV in the unfused graph): mul_mat_vec_q reads only the q8_1
+    // copy that the quantize launch (or an earlier producer) made before the kernel starts, never src1 itself
+
+    ggml_tensor d = *mm;   // the GEMV's own [nrows, ncols] view of the output
+    d.data = out->data;
+    d.view_src = nullptr;
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, &d, &f);
+    return end - i;
+}
+
+// halo-hybrid: the MLA/DSA attention tail at decode widths: the batched per-head GEMV (wv_b over the flash-attention
+//     output) -> PERMUTE(0,2,1,3) -> CONT is one mul_mat_vec_q launch that writes the permuted layout through its
+//     dst strides (token stride = the cont's nb[2], head stride = its nb[1]); the cpy launch goes away. Same kernel
+//     and arguments as the unfused GEMV otherwise. GGML_CUDA_NO_MLA_V_PERMUTE=1 disables.
+static int ggml_cuda_try_fuse_mla_v_permute(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_MLA_V_PERMUTE") != nullptr && atoi(getenv("GGML_CUDA_NO_MLA_V_PERMUTE")) != 0;
+    const int n = cgraph->n_nodes;
+    ggml_tensor * mm = cgraph->nodes[i];
+    if (disabled || mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || mm->ne[3] != 1 ||
+            !ggml_is_quantized(mm->src[0]->type) || mm->src[0]->ne[3] != 1 || mm->src[1]->type != GGML_TYPE_F32 ||
+            mm->ne[1] < 1 || mm->ne[1] > 4 || !hc_uses1(cgraph, i) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            mm->ne[0] % 64 != 0) {
+        // (whole row blocks: mul_mat_vec_q bounds a partial row block by stride_col_dst, which is not the row
+        // count once the columns are strided)
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+    // only where the unfused MUL_MAT takes mul_mat_vec_q itself (ggml_cuda_mul_mat's order)
+    if (!ggml_cuda_should_use_mmvq(mm->src[0]->type, cc, mm->ne[1]) ||
+            ggml_cuda_should_use_mmf(mm->src[0]->type, cc, warp_size, mm->src[0]->ne, mm->src[0]->nb, mm->ne[1], false)) {
+        return 0;
+    }
+    const int j = hc_next(cgraph, i + 1);
+    if (j >= n) {
+        return 0;
+    }
+    ggml_tensor * cont = cgraph->nodes[j];
+    const ggml_tensor * p = cont->src[0];
+    if (cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_F32 || !ggml_is_contiguous(cont) ||
+            !p || p->op != GGML_OP_PERMUTE || p->src[0] != mm) {
+        return 0;
+    }
+    const int32_t * ax = (const int32_t *) p->op_params;
+    if (ax[0] != 0 || ax[1] != 2 || ax[2] != 1 || ax[3] != 3) {
+        return 0;
+    }
+    // the permute is the only node between, and nothing else reads it
+    for (int q = i + 1; q < j; ++q) {
+        const ggml_tensor * v = cgraph->nodes[q];
+        if (v != p && hc_root(v) == mm) {
+            return 0;
+        }
+        if (v == p && !hc_uses1(cgraph, q)) {
+            return 0;
+        }
+    }
+    ggml_tensor d = *mm;
+    d.data  = cont->data;
+    d.nb[1] = cont->nb[2];   // token
+    d.nb[2] = cont->nb[1];   // head
+    d.nb[3] = cont->nb[3];
+    d.view_src = nullptr;
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, &d);
+    return j - i;
 }
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4644,6 +4865,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_CONCAT) {
         const int skip = ggml_cuda_try_fuse_kda_conv_rows(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        int skip = ggml_cuda_try_fuse_kda_gate(cuda_ctx, cgraph, i);
+        if (skip == 0) {
+            skip = ggml_cuda_try_fuse_mla_v_permute(cuda_ctx, cgraph, i);
+        }
         if (skip > 0) {
             return skip;
         }
