@@ -12,6 +12,13 @@ static __device__ __forceinline__ float hc_sigmoid(float x) {
 }
 
 
+// halo-hybrid: GGML_CUDA_NO_HC_BOUNDARY=1 turns off both halves of the qwen4exp hc boundary (the reshape match of
+// the q8_1 side copy and the fused combine+rms_norm*w kernel); =2 turns off only the fused kernel
+bool ggml_cuda_hc_boundary_disabled(int level) {
+    static const int v = getenv("GGML_CUDA_NO_HC_BOUNDARY") ? atoi(getenv("GGML_CUDA_NO_HC_BOUNDARY")) : 0;
+    return v != 0 && v <= level;
+}
+
 // ---- q8_1 side copies -------------------------------------------------------------------------
 static bool q8_side_disabled() {
     static const bool v = getenv("GGML_CUDA_NO_Q8_SIDE") != nullptr && atoi(getenv("GGML_CUDA_NO_Q8_SIDE"));
@@ -75,10 +82,22 @@ const char * ggml_cuda_q8_side_find(ggml_backend_cuda_context & ctx, const ggml_
     const ggml_tensor * r0 = src1->view_src   ? src1->view_src   : src1;
     const ggml_tensor * r1 = e.prod->view_src ? e.prod->view_src : e.prod;
     const bool same = (src1 == e.prod) || (r0 == r1 && src1->view_offs == e.prod->view_offs);
-    if (!same || src1->ne[0] != e.ne0 || src1->ne[1] != e.ne1 || !ggml_is_contiguous(src1)) {
+    if (!same || !ggml_is_contiguous(src1)) {
         return nullptr;
     }
-    return e.q8;
+    if (src1->ne[0] == e.ne0 && src1->ne[1] == e.ne1) {
+        return e.q8;
+    }
+    // halo-hybrid: a reshape of the producer (qwen4exp's hc_down reads the [n_embd*hc, nt] view of an rms_norm that
+    // registered [n_embd, hc*nt] rows). With no row padding on either side both q8_1 layouts are the flat sequence of
+    // 32-element blocks of the same contiguous data, so the copy is byte-identical to what the consumer would quantize.
+    // GGML_CUDA_NO_HC_BOUNDARY=1 disables (with the fused combine+norm kernel).
+    if (!ggml_cuda_hc_boundary_disabled(1) &&
+            src1->ne[0]*src1->ne[1] == e.ne0*e.ne1 && src1->ne[0] % MATRIX_ROW_PADDING == 0 &&
+            (e.ne1 == 1 || e.ne0 % MATRIX_ROW_PADDING == 0) && ggml_is_contiguous(e.prod)) {
+        return e.q8;
+    }
+    return nullptr;
 }
 
 
@@ -161,6 +180,73 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t n = n_embd * hc * nt;
     k_hc_combine<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data, (const float *) inj->data,
             (float *) dst->data, n_embd, hc, nt, s1, b1, s2, b2);
+}
+
+// halo-hybrid: the qwen4exp hc boundary. One block per stream row (c, t) builds res = x + b * w(c, t) exactly as
+// k_hc_combine does, then normalises the row exactly as rms_norm_f32<block_size, true> does (same per-thread
+// column stride, same block_reduce, same expressions), so every output is bit-identical to the three launches it
+// replaces. The block reads only its own row of x and writes only its own rows of res and xn: res and xn may
+// alias x at the same base; b and inj must be disjoint from both (checked by the matcher).
+template <int block_size>
+static __global__ void k_hc_combine_norm(const float * x, const float * b, const float * inj, const float * gamma,
+        float * res, float * xn, block_q8_1 * q8, const int n_embd, const int hc, const int gamma_rows,
+        const float s1, const float b1, const float s2, const float b2, const float eps) {
+    const int c   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int64_t row = (int64_t) t*hc + c;
+
+    x     += row*n_embd;
+    res   += row*n_embd;
+    xn    += row*n_embd;
+    b     += (int64_t) t*n_embd;
+    gamma += (int64_t) (c % gamma_rows)*n_embd;
+
+    const float w = s2 * hc_sigmoid(s1 * inj[(int64_t) t*hc + c] + b1) + b2;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < n_embd; col += block_size) {
+        const float xi = __fadd_rn(x[col], __fmul_rn(b[col], w));
+        res[col] = xi;
+        tmp += xi * xi;
+    }
+
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / n_embd;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < n_embd; col += block_size) {
+        const float v = scale * res[col] * gamma[col];
+        xn[col] = v;
+        if (q8) {
+            q8_side_store(q8, row*n_embd + col, v);
+        }
+    }
+}
+
+void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
+        const ggml_tensor * inj, const ggml_tensor * gamma, int64_t n_embd, int64_t hc, int64_t nt,
+        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn) {
+    GGML_ASSERT(n_embd % QK8_1 == 0 && hc <= 65535 && nt <= 65535);
+    GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(res) && ggml_is_contiguous(gamma));
+    // the same q8_1 registration as ggml_cuda_op_rms_norm_fused: rows for 2..8 unpadded rows, else one flat row
+    const int64_t nrows = hc*nt;
+    block_q8_1 * q8 = (nrows >= 2 && nrows <= 8 && n_embd == GGML_PAD(n_embd, MATRIX_ROW_PADDING))
+            ? ggml_cuda_q8_side_reserve_rows(ctx, xn, n_embd, nrows, n_embd)
+            : ggml_cuda_q8_side_reserve(ctx, xn, ggml_nelements(xn));
+    const dim3 grid(hc, nt, 1);
+    const int gamma_rows = (int) gamma->ne[1];
+    if (n_embd < 1024) {
+        k_hc_combine_norm<256><<<grid, 256, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
+                (const float *) inj->data, (const float *) gamma->data, (float *) res->data, (float *) xn->data, q8,
+                (int) n_embd, (int) hc, gamma_rows, s1, b1, s2, b2, eps);
+    } else {
+        k_hc_combine_norm<1024><<<grid, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
+                (const float *) inj->data, (const float *) gamma->data, (float *) res->data, (float *) xn->data, q8,
+                (int) n_embd, (int) hc, gamma_rows, s1, b1, s2, b2, eps);
+    }
 }
 
 static __global__ void k_mul_sigmoid(const float * x, const float * g, const float * y, float * dst, block_q8_1 * q8, const int64_t n, const int64_t ne0, const bool g_per_col) {

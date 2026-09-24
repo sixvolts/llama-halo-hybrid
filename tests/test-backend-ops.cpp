@@ -4719,6 +4719,86 @@ struct test_dsv4_hc_boundary : public test_dsv4_hc {
     }
 };
 
+// halo-hybrid: the qwen4exp hyper-connection boundary as src/models/qwen4exp.cpp builds it: build_hc_combine
+//     (REPEAT(b) ; SCALE -> SIGMOID -> SCALE on inj ; MUL ; ADD residual) -> build_hc_mix's RMS_NORM -> MUL(gamma
+//     [n_embd, hc] view) -> reshape [hc*n_embd, nt] -> two GEMVs sharing it (down, inject) -> a second combine that
+//     consumes the residual again. The CUDA backend fuses the combine with the norm and hands the GEMVs the q8_1
+//     copy of the normed rows (GGML_CUDA_NO_HC_BOUNDARY).
+struct test_qwen4exp_hc_boundary : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const bool gamma_per_stream;
+    std::vector<ggml_tensor *> checks;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN4EXP_HC_BOUNDARY"; }
+    std::string vars() override { return VARS_TO_STR4(n_embd, hc, n_tokens, gamma_per_stream); }
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checks; }
+    double max_nmse_err() override { return 5e-4; }   // q8_1 GEMV against the CPU's q8_0 activations
+
+    test_qwen4exp_hc_boundary(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 1, bool gamma_per_stream = true)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), gamma_per_stream(gamma_per_stream) {}
+
+    ggml_tensor * combine(ggml_context * ctx, ggml_tensor * residual, ggml_tensor * block_out, ggml_tensor * inject) {
+        const int64_t nt = n_tokens;
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        w = ggml_reshape_3d(ctx, w, 1, hc, nt);
+        ggml_tensor * b = ggml_reshape_3d(ctx, block_out, n_embd, 1, nt);
+        b = ggml_repeat_4d(ctx, b, n_embd, hc, nt, 1);
+        return ggml_add(ctx, residual, ggml_mul(ctx, b, w));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checks.clear();
+        const int64_t nt = n_tokens;
+        const int64_t lr = 128;
+        ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(res, "residual");
+        ggml_tensor * bo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+        ggml_set_name(bo, "block_out");
+        ggml_tensor * inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_name(inj, "inject");
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, gamma_per_stream ? n_embd*hc : n_embd);
+        ggml_set_name(gamma, "hc_norm");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc*n_embd, lr);
+        ggml_set_name(w_down, "hc_down");
+        ggml_tensor * w_inj = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc*n_embd, hc);
+        ggml_set_name(w_inj, "hc_inject");
+        ggml_tensor * w_b = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, lr, n_embd);
+        ggml_set_name(w_b, "w_b");
+
+        res = combine(ctx, res, bo, inj);
+        ggml_set_name(res, "hc_combine");
+        checks.push_back(res);
+
+        ggml_tensor * w2 = ggml_reshape_2d(ctx, gamma, n_embd, gamma_per_stream ? hc : 1);
+        if (mode == MODE_TEST && gf) {
+            ggml_build_forward_expand(gf, w2);
+        }
+        ggml_tensor * xn = ggml_rms_norm(ctx, res, 1e-6f);
+        xn = ggml_mul(ctx, xn, w2);
+        ggml_set_name(xn, "hc_norm_out");
+        checks.push_back(xn);
+        xn = ggml_reshape_2d(ctx, xn, hc*n_embd, nt);
+
+        ggml_tensor * lo  = ggml_mul_mat(ctx, w_down, xn);
+        ggml_tensor * in2 = ggml_mul_mat(ctx, w_inj, xn);
+        if (mode == MODE_TEST && gf) {
+            ggml_build_forward_expand(gf, lo);
+            ggml_build_forward_expand(gf, in2);
+        }
+        checks.push_back(lo);
+        checks.push_back(in2);
+        ggml_tensor * b2  = ggml_mul_mat(ctx, w_b, ggml_silu(ctx, lo));
+        ggml_tensor * out = combine(ctx, res, b2, in2);
+        ggml_set_name(out, "out");
+        checks.push_back(out);
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -9910,6 +9990,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_boundary(GGML_TYPE_F32, 4096, 3, true, false));
     test_cases.emplace_back(new test_dsv4_hc_boundary(GGML_TYPE_Q8_0, 4096, 3, true, false, 3, 1536));
     test_cases.emplace_back(new test_dsv4_hc_boundary(GGML_TYPE_Q8_0, 4096, 8, true, true, 3, 1536));
+    // qwen4exp hc boundary (combine + rms_norm*gamma + q8_1 copy): the MTP verify widths, a prefill width (no q8
+    // copy above 8 rows), a width past the row-registration limit, a shared gamma and a sub-1024 row (256 threads)
+    for (int64_t nt : {1, 2, 3, 4, 8, 17, 64}) {
+        test_cases.emplace_back(new test_qwen4exp_hc_boundary(2560, 4, nt, true));
+    }
+    test_cases.emplace_back(new test_qwen4exp_hc_boundary(2560, 4, 2, false));
+    test_cases.emplace_back(new test_qwen4exp_hc_boundary(512, 4, 1, true));
+    test_cases.emplace_back(new test_qwen4exp_hc_boundary(512, 4, 3, true));
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));

@@ -3944,6 +3944,29 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
         if (!x || x->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, add) || !ggml_is_contiguous(x) || !ggml_is_contiguous(add) ||
                 add->ne[0] != n_embd || add->ne[1] != hc || add->ne[2] != nt || add->ne[3] != 1 ||
                 !hc_views_belong(cgraph, i, j5, { sc2 }) || !hc_disjoint(add, b) || !hc_disjoint(add, inj)) { return 0; }
+        // halo-hybrid: qwen4exp hc boundary -- the next mix's RMS_NORM(add) -> MUL(gamma [n_embd, 1|hc]) joins the
+        // combine as one launch that also writes the q8_1 copy of the normed rows (GGML_CUDA_NO_HC_BOUNDARY=2 disables)
+        if (!ggml_cuda_hc_boundary_disabled(2) && n_embd % QK8_1 == 0) {
+            const int j6 = hc_next(cgraph, j5 + 1);
+            const int j7 = j6 < n ? hc_next(cgraph, j6 + 1) : n;
+            if (j7 < n && cgraph->nodes[j6]->op == GGML_OP_RMS_NORM && cgraph->nodes[j6]->src[0] == add && hc_uses1(cgraph, j6) &&
+                    cgraph->nodes[j7]->op == GGML_OP_MUL && cgraph->nodes[j7]->src[0] == cgraph->nodes[j6]) {
+                const ggml_tensor * rms   = cgraph->nodes[j6];
+                ggml_tensor *       xn    = cgraph->nodes[j7];
+                const ggml_tensor * gamma = xn->src[1];
+                auto same_or_disjoint = [](const ggml_tensor * o, const ggml_tensor * in) { return o->data == in->data || hc_disjoint(o, in); };
+                if (gamma->type == GGML_TYPE_F32 && ggml_is_contiguous(gamma) && gamma->ne[0] == n_embd &&
+                        (gamma->ne[1] == 1 || gamma->ne[1] == hc) && gamma->ne[2] == 1 && gamma->ne[3] == 1 &&
+                        xn->type == GGML_TYPE_F32 && ggml_is_contiguous(xn) && ggml_are_same_shape(xn, add) &&
+                        hc_views_belong(cgraph, i, j7, { sc2, add, rms, hc_root(gamma) }) &&
+                        same_or_disjoint(add, x) && same_or_disjoint(xn, x) && hc_disjoint(xn, add) &&
+                        hc_disjoint(xn, b) && hc_disjoint(xn, inj) && hc_disjoint(xn, gamma)) {
+                    ggml_cuda_op_hc_combine_norm(*cuda_ctx, x, b, inj, gamma, n_embd, hc, nt,
+                            hc_param(sc1, 0), hc_param(sc1, 1), hc_param(sc2, 0), hc_param(sc2, 1), hc_param(rms, 0), add, xn);
+                    return j7 - i;
+                }
+            }
+        }
         ggml_cuda_op_hc_combine(*cuda_ctx, x, b, inj, n_embd, hc, nt,
                 hc_param(sc1, 0), hc_param(sc1, 1), hc_param(sc2, 0), hc_param(sc2, 1), add);
         return j5 - i;

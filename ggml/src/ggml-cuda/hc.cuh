@@ -20,6 +20,13 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_tensor 
         const ggml_tensor * inj, int64_t n_embd, int64_t hc, int64_t nt,
         float s1, float b1, float s2, float b2, ggml_tensor * dst);
 
+// res = hc_combine(x, b, inj) as above, then xn = rms_norm(res rows of n_embd, eps) * gamma[n_embd, 1 or hc] with a
+//   q8_1 side copy of xn  (hc_combine ; RMS_NORM(res) -> MUL(gamma)); bit-identical to the separate launches
+void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
+        const ggml_tensor * inj, const ggml_tensor * gamma, int64_t n_embd, int64_t hc, int64_t nt,
+        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn);
+bool ggml_cuda_hc_boundary_disabled(int level);   // GGML_CUDA_NO_HC_BOUNDARY: 1 = all of it, 2 = the fused kernel only
+
 // dst = x * sigmoid(g) (+ y); g is either the same shape as x or a per-column scalar [1, ne1, ne2, ne3];
 // y, when given, is the same shape as x (the residual add that follows the shared-expert gate)
 void ggml_cuda_op_mul_sigmoid(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * g, const ggml_tensor * y, ggml_tensor * dst);
