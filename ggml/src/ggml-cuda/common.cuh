@@ -1480,6 +1480,16 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // halo-hybrid: recurrent-state gathers (get_rows of one cache row) left out of the graph evaluation;
+    // the gated_delta_net that reads the gathered state reads the cache row through the index instead
+    // (ggml_cuda_try_defer_gdn_state_gather). Several may be pending: the node order can emit the next
+    // layer's gather before this layer's recurrence.
+    static constexpr int GDN_STATE_GATHER_SLOTS = 4;
+    struct gdn_state_gather_entry {
+        const ggml_tensor * gdn  = nullptr; // consumer
+        const ggml_tensor * rows = nullptr; // the deferred GGML_OP_GET_ROWS
+    } gdn_state_gather[GDN_STATE_GATHER_SLOTS];
+
 #ifdef USE_CUDA_GRAPH
     // Map from graph key to cuda_graph - allows multiple graphs per context when the
     // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same

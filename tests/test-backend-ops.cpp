@@ -5144,6 +5144,121 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// halo-hybrid: the decode recurrent-state gather (build_rs + build_recurrent_attn in GLM/Kimi order):
+// get_rows(cache, s_copy) -> reshape -> GATED_DELTA_NET -> snapshot cpy back into the same cache. The CUDA backend
+// leaves the get_rows out and the gdn reads the cache row through the index (GGML_CUDA_NO_KDA_STATE_GATHER=1 off).
+// plane: the rollback snapshot plane the sequence resumes from; with K > 1 the gdn writes into the row it reads.
+struct test_kda_state_gather : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t K;        // snapshot slots (n_rs_seq + 1)
+    const int64_t mem_size; // cells per plane
+    const int64_t head;     // the sequence's cell
+    const int64_t plane;    // rollback plane read
+    const bool    kda;
+    const int     reps;     // independent layers per graph (perf: caches larger than the MALL, as in a decode step)
+
+    ggml_tensor * cpy_node  = nullptr;
+    ggml_tensor * attn_node = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR9(head_count, head_size, n_seq_tokens, K, mem_size, head, plane, kda, reps);
+    }
+
+    test_kda_state_gather(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 1, int64_t K = 3,
+            int64_t mem_size = 2, int64_t head = 1, int64_t plane = 1, bool kda = true, int reps = 1)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), K(K), mem_size(mem_size),
+          head(head), plane(plane), kda(kda), reps(reps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = nullptr;
+        for (int r = 0; r < reps; ++r) {
+            ggml_tensor * o = build_layer(ctx);
+            out = out ? ggml_add(ctx, out, o) : o;
+        }
+        return out;
+    }
+
+    ggml_tensor * build_layer(ggml_context * ctx) {
+        const int64_t S = head_size, H = head_count, T = n_seq_tokens, D = S*S*H;
+        const int64_t n_written = std::min<int64_t>(T, K);
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, mem_size*K);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(s_copy, "s_copy");
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? S : 1, H, T, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, 1);
+        ggml_set_name(q, "q"); ggml_set_name(k, "k"); ggml_set_name(v, "v");
+        ggml_set_name(g, "g"); ggml_set_name(beta, "beta");
+
+        ggml_tensor * state = ggml_get_rows(ctx, cache, s_copy);
+        ggml_set_name(state, "state_gather");
+        state = ggml_reshape_4d(ctx, state, S, S, H, 1);
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_set_name(gdn_out, "gdn_out");
+
+        ggml_tensor * attn = ggml_view_4d(ctx, gdn_out, S, H, T, 1,
+                ggml_row_size(GGML_TYPE_F32, S), ggml_row_size(GGML_TYPE_F32, S*H), ggml_row_size(GGML_TYPE_F32, S*H*T), 0);
+
+        const size_t row = ggml_row_size(GGML_TYPE_F32, D);
+        ggml_tensor * src = ggml_view_3d(ctx, gdn_out, D, 1, n_written, row, row, ggml_row_size(GGML_TYPE_F32, S*H*T));
+        ggml_tensor * dst = ggml_view_3d(ctx, cache, D, 1, n_written, row, (size_t) mem_size*row, (size_t) head*row);
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+        ggml_set_name(cpy, "state_cpy");
+
+        ggml_tensor * a = ggml_cont(ctx, attn);
+        ggml_set_name(a, "attn");
+        if (cpy_node == nullptr) {
+            cpy_node  = cpy;
+            attn_node = a;
+        }
+
+        // the compared nodes are cpy and attn (fusion_test_nodes); the output only has to pull both into the graph,
+        // through one-element views so the perf graph is the gather + gdn + cache writes and little else
+        return ggml_add(ctx, ggml_view_1d(ctx, cpy, 1, 0), ggml_view_1d(ctx, a, 1, 0));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "s_copy") == 0) {
+                const int32_t r = (int32_t) (plane*mem_size + head);
+                ggml_backend_tensor_set(t, &r, 0, sizeof(r));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, kda ? -2.0f : -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "KDA_STATE_GATHER";
+    }
+
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the deferral
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, attn_node }; }
+
+    size_t op_size(ggml_tensor * t) override {
+        // perf: one whole-graph run per timing (us/run is the whole graph; the op would otherwise be duplicated)
+        return reps > 1 ? (size_t) 1 << 40 : test_case::op_size(t);
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -11715,6 +11830,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
     // gdn + cache cpy fusion (K > 1)
+    // decode recurrent-state gather (n = 1..4, 8; a prefill width; no rollback; the GLM decode shape)
+    for (int64_t n : { 1, 2, 3, 4, 8, 64 }) {
+        for (int64_t plane : { 0, 1, 2 }) {
+            test_cases.emplace_back(new test_kda_state_gather(4, 32, n, 3, 2, 1, plane, true));
+        }
+        test_cases.emplace_back(new test_kda_state_gather(4, 32, n, 1, 3, 2, 0, true));
+        test_cases.emplace_back(new test_kda_state_gather(4, 32, n, 3, 2, 0, 1, false));
+    }
+    test_cases.emplace_back(new test_kda_state_gather(64, 128, 3, 3, 1, 0, 1, true));
+    test_cases.emplace_back(new test_kda_state_gather(64, 128, 1, 3, 1, 0, 0, true));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
@@ -11759,6 +11884,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // halo-hybrid: the decode recurrent-state gather at the GLM KDA shape (H 64, S 128, K 3), 16 layers per graph
+    for (int64_t nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_kda_state_gather(64, 128, nt, 3, 1, 0, 1, true, 16));
+    }
     // halo-hybrid: the fused hyper-connection prologue at decode widths
     for (int64_t nt : {1, 3}) {
         test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 4));

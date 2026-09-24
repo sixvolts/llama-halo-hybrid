@@ -4480,11 +4480,115 @@ static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx
     return m.last - i;
 }
 
+static bool ggml_cuda_fusion_disabled() {
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    return disable_fusion;
+}
+
+// halo-hybrid: the recurrent-state gather at decode. build_rs gathers one cache row (get_rows by the s_copy
+// index: the rollback snapshot plane the sequence resumes from) into a scratch tensor that only the layer's
+// gated_delta_net reads, through a reshape. Leave the get_rows out and let the gdn kernel read the cache row
+// through the index (gated_delta_net.cu, gather_t): one ~12 us launch and a 4 MB copy per KDA layer at decode.
+// Gated to one sequence (a single index; n_rs == n_seqs, so build_rs's extra-state shuffle is empty) and to no
+// node between the two, nor the gdn's own output, writing into the cache tensor or the index, so reading both late
+// reads the same bytes. The index is the one that matters under real allocation: ggml-alloc frees s_copy after its
+// last reader (the last layer's gather) and hands its bytes to a later node. graph_optimize keeps it alive until the
+// gdn (alloc dep); where that did not run (an RPC server's graphs are allocated by the client) the range check
+// keeps that layer's get_rows. The kernel reads each (head, column) of the row before the same thread writes that
+// column's snapshots, so the gdn -> cache cpy fusion writing into the row it reads from is safe.
+// GGML_CUDA_NO_KDA_STATE_GATHER=1 disables it.
+static bool ggml_cuda_gdn_state_gather_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_NO_KDA_STATE_GATHER") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KDA_STATE_GATHER"));
+    return disabled;
+}
+
+// structural match (no data pointers: graph_optimize runs it before allocation); the gdn's node index or -1
+static int ggml_cuda_gdn_state_gather_find(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * rows = cgraph->nodes[i];
+    if (rows->op != GGML_OP_GET_ROWS) {
+        return -1;
+    }
+    const ggml_tensor * src = rows->src[0];
+    const ggml_tensor * idx = rows->src[1];
+    // one row of a 2D, row-contiguous f32 source by a one-element index that is the whole index tensor
+    // (a view of a longer s_copy means n_rs > n_seqs: the extra-state shuffle then writes other rows)
+    if (rows->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32 ||
+            (rows->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_nelements(idx) != 1 ||
+            (idx->view_src != nullptr && ggml_nelements(idx->view_src) != 1) ||
+            src->ne[2] != 1 || src->ne[3] != 1 || src->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(rows) || rows->ne[0] != src->ne[0] || rows->ne[1] != 1 ||
+            ggml_node_get_use_count(cgraph, i) != 1) {
+        return -1;
+    }
+    const ggml_tensor * cur = rows; // the gathered state, through its reshapes
+    const int n_scan = std::min(cgraph->n_nodes, i + 512);
+    for (int j = i + 1; j < n_scan; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_RESHAPE && n->src[0] == cur) {
+            if (ggml_node_get_use_count(cgraph, j) != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return -1;
+            }
+            cur = n;
+            continue;
+        }
+        if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == cur) {
+            const bool ok = n->type == GGML_TYPE_F32 && n->src[2]->ne[3] == 1 && cur->ne[3] == 1 && ggml_is_contiguous(cur) &&
+                cur->ne[0]*cur->ne[1]*cur->ne[2] == src->ne[0] && (n->flags & GGML_TENSOR_FLAG_COMPUTE);
+            return ok ? j : -1;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (n->src[k] == cur) {
+                return -1; // another reader of the gathered state
+            }
+        }
+    }
+    return -1;
+}
+
+static bool ggml_cuda_try_defer_gdn_state_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_gdn_state_gather_disabled()) {
+        return false;
+    }
+    const int ig = ggml_cuda_gdn_state_gather_find(cgraph, i);
+    if (ig < 0) {
+        return false;
+    }
+    const ggml_tensor * rows = cgraph->nodes[i];
+    const ggml_tensor * gdn  = cgraph->nodes[ig];
+    const ggml_tensor * src  = rows->src[0];
+    const ggml_tensor * idx  = rows->src[1];
+    if (src->data == nullptr || idx->data == nullptr || gdn->data == nullptr) {
+        return false;
+    }
+    const char * c0 = (const char *) src->data; // the cache
+    const char * c1 = c0 + ggml_nbytes(src);
+    const char * x0 = (const char *) idx->data; // the index
+    const char * x1 = x0 + ggml_nbytes(idx);
+    auto writes_either = [&](const ggml_tensor * n) {
+        const char * a0 = (const char *) n->data;
+        const char * a1 = a0 + ggml_nbytes(n);
+        return (a0 < c1 && c0 < a1) || (a0 < x1 && x0 < a1);
+    };
+    // nothing in between, nor the gdn's own output, may write into the cache tensor or the index
+    for (int j = i + 1; j <= ig; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (!ggml_is_empty(n) && n->data != nullptr && !ggml_cuda_is_view_or_noop(n) && writes_either(n)) {
+            return false;
+        }
+    }
+    for (auto & e : cuda_ctx->gdn_state_gather) {
+        if (e.gdn == nullptr) {
+            e = { gdn, rows };
+            return true;
+        }
+    }
+    return false;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
-    static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    if (ggml_cuda_fusion_disabled()) {
         return 0;
     }
 
@@ -5587,6 +5691,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             if (ggml_cuda_optimer::enabled() && !use_cuda_graph) { ggml_cuda_optimer_for(cuda_ctx->device).set_tag(cgraph); }
+            for (auto & e : cuda_ctx->gdn_state_gather) { e = {}; } // deferrals never outlive one evaluation
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -5626,6 +5731,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // halo-hybrid: a decode recurrent-state gather that the gated_delta_net reads through its index
+                if (node->op == GGML_OP_GET_ROWS && !ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() &&
+                        ggml_cuda_try_defer_gdn_state_gather(cuda_ctx, cgraph, i)) {
                     continue;
                 }
 
@@ -5891,6 +6002,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             params->add_alloc_dep(params->user_data, m.c1->src[1], m.c3);
             params->add_alloc_dep(params->user_data, m.c2->src[1], m.c3);
             i = m.last;
+        }
+    }
+
+    // halo-hybrid: keep the state-gather index alive until the gdn that reads it in place of the gather
+    // (ggml_cuda_try_defer_gdn_state_gather); otherwise the last KDA layer of a split finds s_copy's bytes reused
+    if (!disable_fusion && !ggml_cuda_gdn_state_gather_disabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const int ig = ggml_cuda_gdn_state_gather_find(cgraph, i);
+            if (ig >= 0) {
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], cgraph->nodes[ig]);
+            }
         }
     }
 
