@@ -205,3 +205,26 @@ The honest remaining program is the one halogen ran: get from ~2,250 kernels per
 gates, the router and sampling into the projection kernels, at ~5 us of boundary each. Nothing smaller moves this
 model, and the draft head (MTP) remains worth more than all of it, since it amortises the whole 6.33 GB over 2-3
 tokens.
+
+## 2026-09-24: Qwen3.8-Flash-Next APU-only decode, survey and first fusion wave (commits 01be81caf..82b8eaa32)
+Baseline on the current tree (llama-completion, -dev ROCm1, -c 4096, 256 greedy tokens): 39.0 ms/token, the same as
+the 09-16 build under the identical command (38.7 / 39.6), so no regression; the 37.2 ms of 09-16 was another workload.
+Survey (Opus agent, rocprofv3 + op timer): ~2,067 dispatches per token, 1,380 under 20 us; GDN layer 34 launches,
+attention layer 65 of which 28 were the QSA indexer's scoring; 39.0 ms = 28.4 bytes floor + ~1.6 GEMVs below
+223 GB/s + ~3.5 non-GEMV kernel time + ~4.5 inter-kernel gaps + ~1.5 host gap at the token boundary.
+- **QSA indexer skip (01be81caf):** with n_kv <= indexer_top_k + ratio - 1 (2051 cells) top-k returns every cell, so
+  the scoring (336 launches per token) is skipped; keys are still cached. 38.96 -> 37.75 ms/token, identical text at
+  short context; across a 1.9K prompt a near-tie flip, perplexity 7.1791 (scoring) vs 7.1818 (skip), +/- 0.198.
+  LLAMA_QSA_ALWAYS_SCORE=1 restores.
+- **Fusion wave (Opus 5.5 workflow, 4 implementers + 4 reviewers):** merged the hc boundary (combine + rms_norm*gamma
+  + q8_1 in one launch, and the q8_1 side copy found through the hc_down reshape: 97 standalone quantizes per token
+  gone; GGML_CUDA_NO_HC_BOUNDARY), the GDN conv front (concat + slot copy + ssm_conv/silu + Q/K l2_norm;
+  GGML_CUDA_NO_GDN_CONV_FRONT) and the MoE tail (expert down + weighted sum + gated shared-expert down + add;
+  GGML_CUDA_NO_MOE_TAIL; review fix: its alloc deps must run after the GEMV hoist). Rejected: GDN prologue/epilogue
+  (no end-to-end gain; not bit-identical, the compiler contracts x*x into the first butterfly add; +3.7% on the R9700).
+  Together: 37.78 / 37.87 -> 36.70 / 36.76 ms/token, identical greedy text, perplexity 7.1818 both.
+- **Now:** 36.7 ms/token serial (27.2 t/s, from 25.6), MTP head 33.3-37.3 t/s (from 31.8-35.9). halogen: 37.6 / 44.8.
+- **Open from the survey:** hc_down split-K on gfx1151 (~0.35 ms), topk_moe as one 512-thread block (~0.2 ms), the
+  ~1.5 ms token-boundary host gap (needs a host trace), indexer fusion for contexts past 2K, prefill (700 vs 1,246).
+- **Seen by a reviewer, pre-existing:** perplexity on one chunk varies ~2% with the ubatch width (8.087 at -ub 2,
+  8.237 at 3, 8.241 at 4, 8.163 at 512): worth a look at the width-3/4 GEMV paths the MTP verify uses.
