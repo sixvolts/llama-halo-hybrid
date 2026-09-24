@@ -5441,16 +5441,24 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const float   g_min; // log-gate range: [-20, -1e-4] mixes near-1 and vanishing decay; narrow ranges pin one regime
+    const float   g_max;
 
     std::string vars() override {
+        if (g_min != -20.0f || g_max != -1e-4f) {
+            return VARS_TO_STR11(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, g_min, g_max);
+        }
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
+    double max_nmse_err() override { return getenv("TBO_GDN_NMSE") ? atof(getenv("TBO_GDN_NMSE")) : 1e-7; }
+
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1,
+            float g_min = -20.0f, float g_max = -1e-4f)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), g_min(g_min), g_max(g_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -5487,7 +5495,7 @@ struct test_gated_delta_net : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                init_tensor_uniform(t, g_min, g_max);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
@@ -12328,6 +12336,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
 
+    // chunked prefill (scalar gate, CUDA: n_tokens >= 64, chunk 32): the Qwen3.8 shape (16 k-heads, 48 v-heads, 128),
+    // gates near 1 (slow decay: the state keeps everything), strongly decaying heads, and the default mix
+    for (int64_t T : { 1, 17, 64, 512, 2048 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 3));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 3, false, false, 1, -0.05f, -1e-4f));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 3, false, false, 1, -8.0f, -2.0f));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 100, 2, 3));                 // n_seqs > 1, partial chunk
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 97, 2, 2, true));            // permuted q/k/v
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 130, 1, 1, false, false, 3)); // K > 1: chunked + token tail
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3, false, false, 4, -0.05f, -1e-4f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 96, 2, 1, false, false, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 200, 1, 2));
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -12395,6 +12417,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // halo-hybrid: Qwen3.8 GDN prefill ubatch (16 k-heads, 48 v-heads, 128)
+    for (int64_t T : { 512, 1024, 2048 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 3));
+    }
 
     // halo-hybrid: the decode recurrent-state gather at the GLM KDA shape (H 64, S 128, K 3), 16 layers per graph
     for (int64_t nt : {1, 2, 3, 4}) {
