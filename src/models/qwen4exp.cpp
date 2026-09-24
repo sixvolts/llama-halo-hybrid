@@ -1051,8 +1051,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         }
     }
 
-    // upstream's in-kernel sparse attention (PR #27970) is not enabled yet; the gather above covers decode
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+    // halo-hybrid: the FA op carries the per-query bound (top-k width), which lets the backend walk each query
+    // tile's union of selections instead of the whole causal context at prefill (ggml-cuda fattn.cu,
+    // shall_use_sparse; the op stays exact, the masked cells are never visited). LLAMA_QSA_SPARSE_FA=0 = dense walk
+    static const bool sparse_fa = getenv("LLAMA_QSA_SPARSE_FA") == nullptr || atoi(getenv("LLAMA_QSA_SPARSE_FA")) != 0;
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr,
+            sparse_fa ? top_k->ne[0] : 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

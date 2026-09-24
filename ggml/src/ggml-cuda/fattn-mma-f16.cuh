@@ -187,6 +187,18 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
 
+// halo-hybrid: gfx1151 (RDNA3.5, Strix Halo), measured 2026-09-24 on Qwen3.8's QSA attention (D = 256, 16 queries x
+//     4 heads, 2048-query prefill ubatch, test-backend-ops TBO_Q38_FA): the RDNA 64-column config above holds Q in
+//     registers next to the 16 x 256 VKQ accumulator and spills ~1.1-1.6 KB per lane (256 VGPRs, compiler
+//     remarks); Q in shared memory and 32-cell K/V tiles spill 224 B. Dense walk per 2048-query call 25.5 -> 20.9 ms
+//     at 8K, 72 -> 60 ms at 16K (every causal cell), 163 -> 139 ms at 32K; the sparse union walk (fattn.cu,
+//     QSA) 28.7 -> 16.8 / 38.4 -> 22.2 / 46.3 -> 28.2 ms at 8K / 16K / 32K
+static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna3_5(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  32, 128,  64,  64, 1, false);
+
+    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+}
+
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_cdna(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 1,  64,  32,  32,  32, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 256, 2,  64,  32,  32,  32, 1, true);
@@ -250,7 +262,8 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
         return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
     }
     if (amd_wmma_available(cc)) {
-        return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+        return GGML_CUDA_CC_IS_RDNA3_5(cc) ? ggml_cuda_fattn_mma_get_config_rdna3_5(DKQ, DV, ncols)
+                                           : ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
     }
     GGML_ASSERT(volta_mma_available(cc));
     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
@@ -265,6 +278,8 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
     return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
 #elif defined(VOLTA_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
+#elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3_5)
+    return ggml_cuda_fattn_mma_get_config_rdna3_5(DKQ, DV, ncols);
 #elif defined(AMD_WMMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
 #else
@@ -411,7 +426,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 int64_t i_KV;
                 if constexpr (use_sparse) {
                     // padded slots gather row 0, the -inf mask removes their contribution
-                    const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : 0;
+                    const int32_t index = i < i_sup ? indices[i] : 0;
                     i_KV = index >= 0 ? index : 0;
                 } else {
                     i_KV = k_VKQ_0 + i;
@@ -457,7 +472,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 #pragma unroll
                 for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
                     const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
-                    idx_reg[i0/(nwarps*stride_i)] = i < nbatch_fa && i < i_sup ? indices[k_VKQ_0 + i] : -1;
+                    idx_reg[i0/(nwarps*stride_i)] = i < nbatch_fa && i < i_sup ? indices[i] : -1;
                 }
             }
 
@@ -542,7 +557,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
                 const int i = i0 + threadIdx.x;
 
                 if constexpr (use_sparse) {
-                    const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
+                    const int32_t index = i < i_sup ? indices[i] : -1;
                     tile_mask[j_sram*(nbatch_fa + 8) + i] = index >= 0 ? mask_h[int64_t(j_vram)*stride_mask + index] : half(-INFINITY);
                 } else {
                     tile_mask[j_sram*(nbatch_fa + 8) + i] = i < i_sup ? mask_h[int64_t(j_vram)*stride_mask + k_VKQ_0 + i] : half(0.0f);
@@ -1339,22 +1354,25 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
     if constexpr (ncols2 == 1 || use_sparse) {
         constexpr bool oob_check = true;
+        // sparse: the loads index the current tile's slice of the list
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
+            const int32_t * indices_tile = use_sparse ? indices + kb0*nbatch_fa : nullptr;
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, indices_tile, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
+        const int32_t * indices_tile = use_sparse ? indices + kb0*nbatch_fa : nullptr;
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+            (Q_f2, K_h2, V_h2, mask_h, indices_tile, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
@@ -1785,7 +1803,13 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
     // layers are 64 query heads over one MLA head at DKQ = DV = 512, so one query fills a 16- or 32-column tile
     // with its heads alone. 32 heads per tile is the default on RDNA (fattn.cu): the query's gathered rows feed
     // twice the MMA work per byte and the per-query walk is done in two head groups instead of four
-    return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
+    // (256, 256, 16, 4) / (256, 256, 8, 4): Qwen3.8's QSA layers at prefill (24 query heads over 2 KV heads, GQA 12):
+    // 16 consecutive queries x 4 heads per tile (8 with GGML_CUDA_FA_SPARSE_NCOLS1=8, measured slower in situ) walk
+    // the union of their top-k selections instead of the whole causal context; each query keeps its own mask
+    // values at the shared indices
+    return (DKQ == 256 && DV == 256 && ncols1 == 16 && ncols2 == 4) ||
+           (DKQ == 256 && DV == 256 && ncols1 ==  8 && ncols2 == 4) ||
+           (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
            (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 32) ||
            (DKQ == 512 && DV == 512 && ncols1 == 2 && ncols2 == 16) ||
@@ -1919,7 +1943,7 @@ static __global__ void flash_attn_ext_f16(
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
-        const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 : nullptr;
+        const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*((ne31 + ncols1 - 1)/ncols1) + jt)*ne11 : nullptr;
         // sparse: the tile's index list ([count, entries...]) is the union of its ncols1 queries' selections; the walk
         // stops at the count and ne11 (the row capacity) only sizes the stream-k partition
         int ne11_eff = ne11;
@@ -1974,7 +1998,7 @@ static __global__ void flash_attn_ext_f16(
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
-    const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 : nullptr;
+    const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*((ne31 + ncols1 - 1)/ncols1) + jt)*ne11 : nullptr;
     // sparse: the tile's index list ([count, entries...]) is the union of its ncols1 queries' selections; the walk
     // stops at the count and ne11 (the row capacity) only sizes the stream-k partition
     int ne11_eff = ne11;

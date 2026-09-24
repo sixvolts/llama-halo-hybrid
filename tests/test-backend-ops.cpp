@@ -216,6 +216,67 @@ static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// halo-hybrid: a Qwen3.8 QSA prefill mask. Row r is the query at position kv - nrows_per_seq + r (causal); a query
+// that sees more than n_kv_max cells keeps its own block of 4 (the tail), the 16 blocks before it and whole blocks
+// of 4 drawn from a pool shared by its 16-row group, n_kv_max cells in all, so that neighbouring queries overlap the
+// way the real indexer's selections do (union of a 16-query tile ~ 6-9K cells at 16-32K)
+static void init_tensor_kq_mask_qsa(ggml_tensor * tensor, int64_t n_kv_max) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+    const int64_t ne0 = tensor->ne[0];
+    const int64_t ne1 = tensor->ne[1];
+    const int64_t nseq = ggml_nrows(tensor) / ne1;
+    std::vector<float> data_f32(ggml_nelements(tensor), -INFINITY);
+    std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
+    std::mt19937 gen(0x0A58);
+    constexpr int64_t R = 4;
+    for (int64_t s = 0; s < nseq; ++s) {
+        std::vector<int64_t> pool;
+        for (int64_t r = 0; r < ne1; ++r) {
+            float * row = data_f32.data() + (s*ne1 + r)*ne0;
+            const int64_t p = ne0 - ne1 + r; // this query's position
+            const int64_t n_vis = std::max<int64_t>(p + 1, 1);
+            int64_t n_sel = 0;
+            auto sel = [&](int64_t c) {
+                if (c >= 0 && c < n_vis && std::isinf(row[c]) && n_sel < n_kv_max) {
+                    row[c] = -0.03125f * (1 + (c + r) % 7);
+                    n_sel++;
+                }
+            };
+            if (n_vis <= n_kv_max) {
+                for (int64_t c = 0; c < n_vis; ++c) {
+                    sel(c);
+                }
+                continue;
+            }
+            const int64_t nblk = p / R + 1;
+            if (r % 16 == 0 || pool.empty()) {
+                pool.clear();
+                std::uniform_int_distribution<int64_t> d(0, std::max<int64_t>(0, nblk - 1));
+                for (int i = 0; i < 1600; ++i) {
+                    pool.push_back(d(gen));
+                }
+            }
+            for (int64_t b = nblk - 1; b >= std::max<int64_t>(0, nblk - 17); --b) {
+                for (int64_t c = b*R; c < b*R + R; ++c) {
+                    sel(c);
+                }
+            }
+            std::uniform_int_distribution<size_t> dp(0, pool.size() - 1);
+            for (int tries = 0; n_sel < n_kv_max && tries < 100000; ++tries) {
+                const int64_t b = pool[dp(gen)];
+                for (int64_t c = b*R; c < b*R + R; ++c) {
+                    sel(c);
+                }
+            }
+            for (int64_t c = 0; n_sel < n_kv_max && c < n_vis; ++c) {
+                sel(c);
+            }
+        }
+    }
+    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+}
+
 // generate a lower triangular matrix
 static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F32);
@@ -8810,9 +8871,11 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const bool qsa_mask; // halo-hybrid: a causal Qwen3.8 QSA selection mask (init_tensor_kq_mask_qsa)
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max)
+            + (qsa_mask ? ",qsa_mask=1" : "");
     }
 
     double max_nmse_err() override {
@@ -8829,9 +8892,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool qsa_mask = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), qsa_mask(qsa_mask) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8904,7 +8967,9 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                if (n_kv_max > 0) {
+                if (qsa_mask) {
+                    init_tensor_kq_mask_qsa(t, n_kv_max);
+                } else if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
                 } else {
                     init_tensor_kq_mask(t);
@@ -10110,6 +10175,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4352, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2052));
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2052));
         }
+    }
+    // halo-hybrid: Qwen3.8 QSA prefill attention (TBO_Q38_EVAL=1): D=256, 24 q heads over 2 kv heads, 2051 cells of
+    // top-k per query under a causal mask; the sparse union walk runs from 4x the bound (8K) and >= 64 queries
+    if (getenv("TBO_Q38_EVAL") != nullptr) {
+        for (int64_t kv : {4096, 8448, 16384}) {
+            for (int64_t nb : {2048, 512, 100, 64, 17, 1}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                    GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051, true));
+            }
+        }
+        // uncorrelated selections (union ~ the whole cache) and a quantized-cache K/V
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 256, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051, true));
+        // two sequences (streams) in one batch
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 8192, 256, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051, true));
     }
     std::default_random_engine rng(0);
 
@@ -12429,6 +12512,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             }
         }
+        // prefill ubatch of 2048 at the end of an 8K / 16K / 32K prompt, QSA selection mask (2051 cells per query):
+        // GGML_CUDA_FA_SPARSE_D256=0 gives the dense walk of the same op
+        for (int64_t kv : {8192, 16384, 32768}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051, true));
+        }
+        // a bound as wide as the cache (every causal cell selected): the sparse walk visits the same cells as the
+        // dense one, so the pair of timings (GGML_CUDA_FA_SPARSE_D256_MIN_RATIO=1 vs GGML_CUDA_FA_SPARSE_D256=0)
+        // is the gathered tile's cost relative to the dense tile
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 2048, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 16384, true));
         return test_cases;
     }
 
