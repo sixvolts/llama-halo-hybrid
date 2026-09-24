@@ -25,3 +25,12 @@ void ggml_cuda_op_mul_mat_vec_q(
 // group does not qualify, in which case the caller launches one mul_mat_vec_q per matrix as before.
 bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n,
                                    const ggml_tensor * src1, const char * src1_q8_1);
+
+// halo-hybrid: the MoE tail (expert down GEMV + weighted reduction + gated shared-expert down + residual add) as one
+// launch at n_tokens <= 4; GGML_CUDA_NO_MOE_TAIL=1 turns it off (see mmvq.cu)
+bool ggml_cuda_mmvq_moe_tail_supported(int device, const ggml_tensor * down_exps, const ggml_tensor * act, const ggml_tensor * down_shexp,
+                                       const ggml_tensor * sact, int64_t n_used, int64_t n_tokens);
+void ggml_cuda_mmvq_moe_tail(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * down_exps, const ggml_tensor * act, const ggml_tensor * ids,
+        const ggml_tensor * weights, const ggml_tensor * expert_scale,
+        const ggml_tensor * down_shexp, const ggml_tensor * sact, const ggml_tensor * g, ggml_tensor * dst);

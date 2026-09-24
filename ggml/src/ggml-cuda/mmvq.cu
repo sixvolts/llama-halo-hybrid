@@ -2355,3 +2355,258 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
+
+// halo-hybrid: MoE tail at decode widths (n_tokens <= 4), one launch for
+//     MUL_MAT_ID(down_exps, act, ids) -> *router weights -> sum over the used experts          (moe_weighted_reduction)
+//     MUL_MAT(down_shexp, sact) * sigmoid(g)                                                    (shared expert, gated)
+//     ffn_out = moe_out + gated
+// One block per (tile of rows_per_wave output rows, token) with n_used + 1 waves: wave s < n_used dots expert ids[s]'s
+// rows, wave n_used the shared expert's rows; each wave runs the plain one-wave mul_mat_vec_q loop per row (the gfx1151
+// launch shape: nwarps = 1, so each row's dot is bit-identical to the unfused GEMV there). One thread per row then sums
+// the n_used partials in expert order with the same arithmetic as moe_weighted_reduction_f32_rows and applies the
+// sigmoid gate + residual add as k_mul_sigmoid does. No partials leave the block, so there are no arrival counters.
+#define MMVQ_MOE_TAIL_MAX_SLOTS 16
+
+// rows_per_wave consecutive rows per wave, the kbx loop outermost as in mul_mat_vec_q (each row still accumulates
+// its own partial over kbx in the same order, so the per-row result does not depend on rows_per_wave)
+template <ggml_type type, int rows_per_wave>
+static __device__ __forceinline__ void mmvq_moe_tail_dot(float (&tmp)[rows_per_wave], const void * vx, const block_q8_1 * y,
+                                                         const int kbx_offset, const int stride_row, const int ncols, const int lane) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int blocks_per_row_x = ncols / qk;
+    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (lane % (qi/vdr));
+#pragma unroll
+        for (int i = 0; i < rows_per_wave; ++i) {
+            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row + kbx, kqs);
+        }
+    }
+}
+
+struct mmvq_moe_tail_args {
+    const void       * vxe;       // down_exps
+    const void       * vxs;       // down_shexp
+    const block_q8_1 * ye;        // q8_1 of the expert activations, row (token*n_used + slot)
+    const block_q8_1 * ys;        // q8_1 of the shared-expert activation, row token
+    const int32_t    * ids;
+    const float      * wts;       // router weights
+    const float      * escale;    // optional per-expert scale (nullptr: 1)
+    const float      * g;         // shared-expert gate logits, one per token
+    float            * dst;
+    int32_t ncols_e, ncols_s, nrows, n_tokens, n_used;
+    int32_t s01e, s01s;           // weight row strides (blocks)
+    int64_t s02e;                 // expert stride (blocks)
+    int32_t sye, sys;             // q8_1 row strides (blocks)
+    int32_t ids_tok, w_slot, w_tok, es_slot, es_tok, g_tok, dst_tok;
+};
+
+template <ggml_type type_e, ggml_type type_s, int rows_per_wave>
+__launch_bounds__(MMVQ_MOE_TAIL_MAX_SLOTS*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_tail(const mmvq_moe_tail_args a) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(rows_per_wave <= warp_size, "one epilogue thread per row");
+    const int token = blockIdx.x % a.n_tokens;   // the n_tokens blocks of one row tile run next to each other
+    const int row0  = (blockIdx.x / a.n_tokens) * rows_per_wave;
+    const int slot  = threadIdx.y;
+    const int lane  = threadIdx.x;
+
+    __shared__ float part[MMVQ_MOE_TAIL_MAX_SLOTS][rows_per_wave];
+
+    // the host only picks rows_per_wave dividing nrows
+    float tmp[rows_per_wave] = { 0.0f };
+    if (slot < a.n_used) {
+        const int expert = a.ids[token*a.ids_tok + slot];
+        mmvq_moe_tail_dot<type_e, rows_per_wave>(tmp, a.vxe, a.ye + (int64_t) (token*a.n_used + slot)*a.sye,
+                                                 (int) (expert*a.s02e + (int64_t) row0*a.s01e), a.s01e, a.ncols_e, lane);
+    } else {
+        mmvq_moe_tail_dot<type_s, rows_per_wave>(tmp, a.vxs, a.ys + (int64_t) token*a.sys, row0*a.s01s, a.s01s, a.ncols_s, lane);
+    }
+#pragma unroll
+    for (int i = 0; i < rows_per_wave; ++i) {
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < rows_per_wave; ++i) {
+            part[slot][i] = tmp[i];
+        }
+    }
+    __syncthreads();
+    if (slot != 0 || lane >= rows_per_wave) {
+        return;
+    }
+    const int i = lane;
+
+    // moe_weighted_reduction_f32_rows: (v0*s0)*w0, then sum += (v*s)*w in expert order
+    const float * w  = a.wts + token*a.w_tok;
+    const float * es = a.escale ? a.escale + token*a.es_tok : nullptr;
+    const float s0 = es != nullptr ? es[0] : 1.0f;
+    float sum = (part[0][i] * s0) * w[0];
+    for (int e = 1; e < a.n_used; ++e) {
+        const float sc = es != nullptr ? es[e*a.es_slot] : 1.0f;
+        sum += (part[e][i] * sc) * w[e*a.w_slot];
+    }
+    // k_mul_sigmoid with the trailing ADD(moe_out, shexp*sigmoid(g)): a rounded product, then the add (no FMA; HIP's
+    // __fmul_rn/__fadd_rn are plain operators and would contract here, where the unfused kernel's branch keeps them apart)
+    const float gv  = a.g[token*a.g_tok];
+    const float sig = 1.0f / (1.0f + expf(-gv));
+    float r;
+    {
+#pragma clang fp contract(off)
+        const float gated = part[a.n_used][i] * sig;
+        r = sum + gated;
+    }
+    a.dst[(int64_t) token*a.dst_tok + row0 + i] = r;
+}
+
+template <ggml_type type_e, ggml_type type_s>
+static void mul_mat_vec_q_moe_tail_launch_r(int rows, const mmvq_moe_tail_args & a, const dim3 & block, cudaStream_t stream) {
+    const dim3 grid((unsigned) (a.nrows / rows * a.n_tokens), 1, 1);
+    switch (rows) {
+        case 1: mul_mat_vec_q_moe_tail<type_e, type_s, 1><<<grid, block, 0, stream>>>(a); break;
+        case 2: mul_mat_vec_q_moe_tail<type_e, type_s, 2><<<grid, block, 0, stream>>>(a); break;
+        case 4: mul_mat_vec_q_moe_tail<type_e, type_s, 4><<<grid, block, 0, stream>>>(a); break;
+        case 8: mul_mat_vec_q_moe_tail<type_e, type_s, 8><<<grid, block, 0, stream>>>(a); break;
+        default: GGML_ABORT("moe_tail rows %d", rows);
+    }
+}
+
+template <ggml_type type_e>
+static bool mul_mat_vec_q_moe_tail_launch_s(ggml_type type_s, int rows, const mmvq_moe_tail_args & a, const dim3 & block, cudaStream_t stream) {
+    switch (type_s) {
+        case GGML_TYPE_Q8_0: mul_mat_vec_q_moe_tail_launch_r<type_e, GGML_TYPE_Q8_0>(rows, a, block, stream); return true;
+        case GGML_TYPE_Q6_K: mul_mat_vec_q_moe_tail_launch_r<type_e, GGML_TYPE_Q6_K>(rows, a, block, stream); return true;
+        default: return false;
+    }
+}
+
+static bool mmvq_moe_tail_type_ok(ggml_type te, ggml_type ts) {
+    const bool e_ok = te == GGML_TYPE_Q5_1 || te == GGML_TYPE_Q8_0 || te == GGML_TYPE_Q4_K || te == GGML_TYPE_Q6_K;
+    const bool s_ok = ts == GGML_TYPE_Q8_0 || ts == GGML_TYPE_Q6_K;
+    return e_ok && s_ok;
+}
+
+bool ggml_cuda_mmvq_moe_tail_supported(int device, const ggml_tensor * down_exps, const ggml_tensor * act, const ggml_tensor * down_shexp,
+                                       const ggml_tensor * sact, int64_t n_used, int64_t n_tokens) {
+    static const bool disabled = getenv("GGML_CUDA_NO_MOE_TAIL") != nullptr && std::atoi(getenv("GGML_CUDA_NO_MOE_TAIL"));
+    if (disabled) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return false;   // measured on gfx1151 / gfx1201 only
+    }
+    if (!mmvq_moe_tail_type_ok(down_exps->type, down_shexp->type)) {
+        return false;
+    }
+    if (n_tokens < 1 || n_tokens > 4 || n_used < 1 || n_used + 1 > MMVQ_MOE_TAIL_MAX_SLOTS) {
+        return false;
+    }
+    if (down_exps->ne[3] != 1 || down_exps->ne[0] != act->ne[0] || down_shexp->ne[0] != sact->ne[0] ||
+            down_exps->ne[1] != down_shexp->ne[1] || down_exps->ne[0] % ggml_blck_size(down_exps->type) != 0 ||
+            down_shexp->ne[0] % ggml_blck_size(down_shexp->type) != 0 ||
+            down_exps->nb[0] != ggml_type_size(down_exps->type) || down_shexp->nb[0] != ggml_type_size(down_shexp->type) ||
+            down_exps->ne[1] > INT32_MAX / 4 || down_exps->ne[1] * n_tokens > INT32_MAX) {
+        return false;
+    }
+    const int64_t bs = ggml_type_size(down_exps->type);
+    if ((down_exps->nb[2] / bs) * down_exps->ne[2] > INT32_MAX) {
+        return false;   // vec_dot takes an int block index
+    }
+    if (!ggml_is_contiguous(act) || !ggml_is_contiguous(sact) || act->type != GGML_TYPE_F32 || sact->type != GGML_TYPE_F32) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_mmvq_moe_tail(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * down_exps, const ggml_tensor * act, const ggml_tensor * ids,
+        const ggml_tensor * weights, const ggml_tensor * expert_scale,
+        const ggml_tensor * down_shexp, const ggml_tensor * sact, const ggml_tensor * g, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+    const int64_t n_used   = act->ne[1];
+    const int64_t n_tokens = act->ne[2];
+
+    // expert activations: [K, n_used, n_tokens] -> q8_1 rows (token*n_used + slot), as ggml_cuda_mul_mat_vec_q does
+    const int64_t ke_pad = GGML_PAD(act->ne[0], MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> qe(ctx.pool());
+    const char * ye = nullptr;
+    {
+        qe.alloc(n_tokens*n_used*ke_pad * sizeof(block_q8_1)/QK8_1);
+        const int64_t ts = ggml_type_size(act->type);
+        quantize_row_q8_1_cuda((const float *) act->data, nullptr, qe.get(), down_exps->type, act->ne[0],
+            act->nb[1]/ts, act->nb[2]/ts, act->nb[3]/ts, ke_pad, n_used, n_tokens, 1, stream);
+        ye = qe.get();
+    }
+    // shared-expert activation [K_s, n_tokens]: the q8_1 side copy when a producer registered one
+    const int64_t ks_pad = GGML_PAD(sact->ne[0], MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> qs(ctx.pool());
+    const char * ys = ggml_cuda_q8_side_find(ctx, sact);
+    if (!ys) {
+        char * q8 = (char *) ggml_cuda_q8_side_reserve_rows(ctx, sact, sact->ne[0], n_tokens, ks_pad);
+        if (!q8) {
+            qs.alloc(n_tokens*ks_pad * sizeof(block_q8_1)/QK8_1);
+            q8 = qs.get();
+        }
+        const int64_t ts = ggml_type_size(sact->type);
+        quantize_row_q8_1_cuda((const float *) sact->data, nullptr, q8, down_shexp->type, sact->ne[0],
+            sact->nb[1]/ts, sact->nb[2]/ts, sact->nb[3]/ts, ks_pad, n_tokens, 1, 1, stream);
+        ys = q8;
+    }
+
+    mmvq_moe_tail_args a{};
+    a.vxe     = down_exps->data;
+    a.vxs     = down_shexp->data;
+    a.ye      = (const block_q8_1 *) ye;
+    a.ys      = (const block_q8_1 *) ys;
+    a.ids     = (const int32_t *) ids->data;
+    a.wts     = (const float *) weights->data;
+    a.escale  = expert_scale ? (const float *) expert_scale->data : nullptr;
+    a.g       = (const float *) g->data;
+    a.dst     = (float *) dst->data;
+    a.ncols_e = (int32_t) down_exps->ne[0];
+    a.ncols_s = (int32_t) down_shexp->ne[0];
+    a.nrows   = (int32_t) down_exps->ne[1];
+    a.n_tokens = (int32_t) n_tokens;
+    a.n_used  = (int32_t) n_used;
+    a.s01e    = (int32_t) (down_exps->nb[1] / ggml_type_size(down_exps->type));
+    a.s02e    = (int64_t) (down_exps->nb[2] / ggml_type_size(down_exps->type));
+    a.s01s    = (int32_t) (down_shexp->nb[1] / ggml_type_size(down_shexp->type));
+    a.sye     = (int32_t) (ke_pad / QK8_1);
+    a.sys     = (int32_t) (ks_pad / QK8_1);
+    a.ids_tok = (int32_t) (ids->nb[1] / sizeof(int32_t));
+    a.w_slot  = (int32_t) (weights->nb[1] / sizeof(float));
+    a.w_tok   = (int32_t) (weights->nb[2] / sizeof(float));
+    a.es_slot = expert_scale ? (int32_t) (expert_scale->nb[1] / sizeof(float)) : 0;
+    a.es_tok  = expert_scale ? (int32_t) (expert_scale->nb[2] / sizeof(float)) : 0;
+    a.g_tok   = (int32_t) (g->nb[1] / sizeof(float));
+    a.dst_tok = (int32_t) (dst->nb[1] / sizeof(float));
+
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    // rows per wave, measured in situ on gfx1151 (Qwen3.8, 2560 rows, K = 640, 10 experts + shared, rocprofv3 median):
+    // q5_1 experts 76.7 / 72.1 / 73.7 / 75.2 us and q8_0 experts 106.4 / 100.3 / 96.7 / 99.6 us at 1 / 2 / 4 / 8.
+    // GGML_CUDA_MOE_TAIL_ROWS=1|2|4|8 overrides.
+    static const int rows_env = getenv("GGML_CUDA_MOE_TAIL_ROWS") ? atoi(getenv("GGML_CUDA_MOE_TAIL_ROWS")) : 0;
+    int rows = rows_env == 1 || rows_env == 2 || rows_env == 4 || rows_env == 8 ? rows_env : (down_exps->type == GGML_TYPE_Q8_0 ? 4 : 2);
+    while (rows > 1 && a.nrows % rows != 0) {
+        rows /= 2;
+    }
+    const dim3 block(warp_size, (unsigned) (n_used + 1), 1);
+    bool ok = false;
+    switch (down_exps->type) {
+        case GGML_TYPE_Q5_1: ok = mul_mat_vec_q_moe_tail_launch_s<GGML_TYPE_Q5_1>(down_shexp->type, rows, a, block, stream); break;
+        case GGML_TYPE_Q8_0: ok = mul_mat_vec_q_moe_tail_launch_s<GGML_TYPE_Q8_0>(down_shexp->type, rows, a, block, stream); break;
+        case GGML_TYPE_Q4_K: ok = mul_mat_vec_q_moe_tail_launch_s<GGML_TYPE_Q4_K>(down_shexp->type, rows, a, block, stream); break;
+        case GGML_TYPE_Q6_K: ok = mul_mat_vec_q_moe_tail_launch_s<GGML_TYPE_Q6_K>(down_shexp->type, rows, a, block, stream); break;
+        default: break;
+    }
+    GGML_ASSERT(ok);   // ggml_cuda_mmvq_moe_tail_supported() checked the pair
+    CUDA_CHECK(cudaGetLastError());
+}

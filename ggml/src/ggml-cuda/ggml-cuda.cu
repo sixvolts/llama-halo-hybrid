@@ -5033,6 +5033,109 @@ static int ggml_cuda_try_fuse_mla_v_permute(ggml_backend_cuda_context * cuda_ctx
     return j - i;
 }
 
+// halo-hybrid: MoE tail at decode widths (mmvq.cu ggml_cuda_mmvq_moe_tail), matched from the expert down GEMV:
+//   MUL_MAT_ID(down_exps, act, ids) -> [MUL expert_scale] -> MUL weights -> VIEW x k -> ADD x (k-1)   => moe_out
+//   MUL_MAT(down_shexp, sact) ; UNARY SIGMOID(g) ; MUL(shexp, sig) ; ADD(moe_out, gated)               => ffn_out
+// with only view-type no-ops (any root) between the pieces and every intermediate used once, inside the chain.
+struct ggml_cuda_moe_tail_match {
+    const ggml_tensor * mmid   = nullptr;
+    const ggml_tensor * shexp  = nullptr;   // MUL_MAT(down_shexp, sact)
+    const ggml_tensor * g      = nullptr;   // pre-sigmoid gate logits
+    ggml_cuda_moe_weighted_reduction_match red;
+    ggml_tensor *       out    = nullptr;   // ffn_out
+    int                 last   = -1;
+};
+
+static bool ggml_cuda_moe_tail_find(int device, const ggml_cgraph * cgraph, int i, ggml_cuda_moe_tail_match & m) {
+    const int n = cgraph->n_nodes;
+    const ggml_tensor * mmid = cgraph->nodes[i];
+    if (mmid->op != GGML_OP_MUL_MAT_ID || mmid->type != GGML_TYPE_F32 || !ggml_is_quantized(mmid->src[0]->type) ||
+            mmid->src[1]->type != GGML_TYPE_F32 || mmid->src[2]->type != GGML_TYPE_I32 || !ggml_is_contiguous(mmid) ||
+            mmid->ne[3] != 1 || mmid->ne[2] < 1 || mmid->ne[2] > 4 || mmid->src[1]->ne[1] != mmid->ne[1] ||
+            mmid->src[1]->ne[2] != mmid->ne[2] || mmid->src[2]->ne[0] != mmid->ne[1] || mmid->src[2]->ne[1] != mmid->ne[2] ||
+            mmid->src[2]->nb[0] != sizeof(int32_t) || !hc_uses1(cgraph, i) || (mmid->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int j = hc_next(cgraph, i + 1);
+    if (j >= n || cgraph->nodes[j]->op != GGML_OP_MUL || !ggml_cuda_match_moe_weighted_reduction(cgraph, j, m.red) ||
+            m.red.experts != mmid) {
+        return false;
+    }
+    const int red_last = j + m.red.node_count - 1;
+    const ggml_tensor * moe_out = m.red.dst;
+    const int64_t nt = mmid->ne[2];
+    if (cgraph->nodes[red_last] != moe_out || !hc_uses1(cgraph, red_last) || (moe_out->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            !ggml_is_contiguous(m.red.weights) || moe_out->ne[0] != mmid->ne[0] || moe_out->ne[1] != nt) {
+        return false;
+    }
+    for (int q = j; q < red_last; ++q) {   // the reduction's own nodes feed nothing outside it
+        if (cgraph->nodes[q]->flags & GGML_TENSOR_FLAG_OUTPUT) { return false; }
+    }
+    const int k0 = hc_next(cgraph, red_last + 1);   // shared-expert down
+    if (k0 >= n) { return false; }
+    const ggml_tensor * sh = cgraph->nodes[k0];
+    if (sh->op != GGML_OP_MUL_MAT || sh->type != GGML_TYPE_F32 || !ggml_is_quantized(sh->src[0]->type) ||
+            sh->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(sh) || !ggml_are_same_shape(sh, moe_out) ||
+            sh->src[1]->ne[1] != nt || sh->src[1]->ne[2] != 1 || sh->src[1]->ne[3] != 1 ||
+            sh->src[0]->ne[2] != 1 || sh->src[0]->ne[3] != 1 || !hc_uses1(cgraph, k0) || (sh->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int k1 = hc_next(cgraph, k0 + 1);   // SIGMOID(g), g one value per token
+    if (k1 >= n || !hc_unary(cgraph->nodes[k1], GGML_UNARY_OP_SIGMOID)) { return false; }
+    const ggml_tensor * sig = cgraph->nodes[k1];
+    const ggml_tensor * g   = sig->src[0];
+    if (g->type != GGML_TYPE_F32 || !ggml_is_contiguous(g) || g->ne[0] != 1 || g->ne[1] != nt || g->ne[2] != 1 || g->ne[3] != 1 ||
+            !hc_uses1(cgraph, k1) || (sig->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int k2 = hc_next(cgraph, k1 + 1);   // MUL(shexp, sig)
+    if (k2 >= n) { return false; }
+    const ggml_tensor * mul = cgraph->nodes[k2];
+    if (mul->op != GGML_OP_MUL || !((mul->src[0] == sh && mul->src[1] == sig) || (mul->src[1] == sh && mul->src[0] == sig)) ||
+            !ggml_are_same_shape(mul, sh) || !ggml_is_contiguous(mul) || !hc_uses1(cgraph, k2) || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int k3 = hc_next(cgraph, k2 + 1);   // ADD(moe_out, gated)
+    if (k3 >= n) { return false; }
+    ggml_tensor * add = cgraph->nodes[k3];
+    if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || !ggml_are_same_shape(add, moe_out) ||
+            !((add->src[0] == moe_out && add->src[1] == mul) || (add->src[1] == moe_out && add->src[0] == mul))) {
+        return false;
+    }
+    if (!ggml_cuda_mmvq_moe_tail_supported(device, mmid->src[0], mmid->src[1], sh->src[0], sh->src[1], mmid->ne[1], nt)) {
+        return false;
+    }
+    m.mmid  = mmid;
+    m.shexp = sh;
+    m.g     = g;
+    m.out   = add;
+    m.last  = k3;
+    return true;
+}
+
+static bool ggml_cuda_moe_tail_disjoint(const ggml_tensor * out, const ggml_tensor * in) {
+    if (in == nullptr) { return true; }
+    const char * a0 = (const char *) out->data; const char * a1 = a0 + ggml_nbytes(out);
+    const char * b0 = (const char *) in->data;  const char * b1 = b0 + ggml_nbytes(in);
+    return a1 <= b0 || b1 <= a0;
+}
+
+static int ggml_cuda_try_fuse_moe_tail(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_cuda_moe_tail_match m;
+    if (!ggml_cuda_moe_tail_find(cuda_ctx->device, cgraph, i, m)) {
+        return 0;
+    }
+    // every block reads ids / router weights / the gate logit and writes its own ffn_out element: ffn_out must not
+    // sit over them (graph_optimize keeps them alive until ffn_out is allocated; this is the runtime guard)
+    if (!ggml_cuda_moe_tail_disjoint(m.out, m.mmid->src[2]) || !ggml_cuda_moe_tail_disjoint(m.out, m.red.weights) ||
+            !ggml_cuda_moe_tail_disjoint(m.out, m.red.expert_scale) || !ggml_cuda_moe_tail_disjoint(m.out, m.g)) {
+        return 0;
+    }
+    ggml_cuda_mmvq_moe_tail(*cuda_ctx, m.mmid->src[0], m.mmid->src[1], m.mmid->src[2], m.red.weights, m.red.expert_scale,
+        m.shexp->src[0], m.shexp->src[1], m.g, m.out);
+    return m.last - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5041,6 +5144,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {   // halo-hybrid: MoE tail at decode widths
+        const int skip = ggml_cuda_try_fuse_moe_tail(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -6453,6 +6563,24 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
             }
             i += match.node_count - 1;
+        }
+    }
+
+    // halo-hybrid: the fused MoE tail reads ids / router weights / the shared gate logit in every block while writing
+    // ffn_out; keep them alive until ffn_out is allocated so ggml-alloc never places ffn_out over them
+    if (!disable_fusion) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_moe_tail_match m;
+            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_moe_tail_find(cuda_ctx->device, cgraph, i, m)) {
+                continue;
+            }
+            params->add_alloc_dep(params->user_data, m.mmid->src[2], m.out);
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.red.weights), m.out);
+            if (m.red.expert_scale != nullptr) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.red.expert_scale), m.out);
+            }
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.g), m.out);
+            i = m.last;
         }
     }
 

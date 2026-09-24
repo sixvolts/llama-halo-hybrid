@@ -7912,6 +7912,98 @@ struct test_moe_weighted_reduction : public test_case {
     }
 };
 
+// halo-hybrid: the MoE tail of qwen3next-style FFNs (expert down MUL_MAT_ID -> router-weighted sum over the used
+// experts, plus the shared expert's down GEMV gated by sigmoid(g), added). The CUDA backend fuses it into one launch
+// at n <= 4 (ggml_cuda_mmvq_moe_tail); node order follows build_moe_ffn + qwen4exp build_layer_ffn.
+struct test_moe_tail : public test_case {
+    const ggml_type type_e;
+    const ggml_type type_s;
+    const int64_t m;        // n_embd
+    const int64_t k_e;      // n_ff_exp
+    const int64_t k_s;      // n_ff_shexp
+    const int n_mats;
+    const int n_used;
+    const int64_t n;        // tokens
+    const bool with_expert_scale;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_e, type_s, m, k_e, k_s, n_mats, n_used, n, with_expert_scale);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_TAIL";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+
+    test_moe_tail(ggml_type type_e, ggml_type type_s, int64_t m, int64_t k_e, int64_t k_s, int n_mats, int n_used, int64_t n,
+                  bool with_expert_scale = false)
+        : type_e(type_e), type_s(type_s), m(m), k_e(k_e), k_s(k_s), n_mats(n_mats), n_used(n_used), n(n),
+          with_expert_scale(with_expert_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_e, k_e, m, n_mats);
+        ggml_set_name(as, "down_exps");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_set_name(ids, "view_of_ids");
+        ggml_tensor * act = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_e, n_used, n);
+        ggml_set_name(act, "act");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(weights, "weights");
+        ggml_tensor * ws = ggml_new_tensor_2d(ctx, type_s, k_s, m);
+        ggml_set_name(ws, "down_shexp");
+        ggml_tensor * sact = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_s, n);
+        ggml_set_name(sact, "sact");
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
+        ggml_set_name(g, "shexp_gate");
+
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, as, act, ids);
+        ggml_set_name(experts, "experts");
+        if (with_expert_scale) {
+            ggml_tensor * es = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+            ggml_set_name(es, "expert_scale");
+            experts = ggml_mul(ctx, experts, es);
+            ggml_set_name(experts, "scaled_experts");
+        }
+        ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
+        ggml_set_name(weighted, "weighted");
+        std::vector<ggml_tensor *> views(n_used);
+        for (int e = 0; e < n_used; ++e) {
+            views[e] = ggml_view_2d(ctx, weighted, m, n, weighted->nb[2], e * weighted->nb[1]);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, views[e]);
+            }
+        }
+        ggml_tensor * moe_out = views[0];
+        for (int e = 1; e < n_used; ++e) {
+            moe_out = ggml_add(ctx, moe_out, views[e]);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, moe_out);
+            }
+        }
+        ggml_set_name(moe_out, "moe_out");
+
+        ggml_tensor * sh = ggml_mul_mat(ctx, ws, sact);
+        ggml_set_name(sh, "shexp");
+        ggml_tensor * sig = ggml_sigmoid(ctx, g);
+        ggml_set_name(sig, "shexp_gate_sigmoid");
+        ggml_tensor * gated = ggml_mul(ctx, sh, sig);
+        ggml_set_name(gated, "shexp_gated");
+        ggml_tensor * out = ggml_add(ctx, moe_out, gated);
+        ggml_set_name(out, "ffn_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -12109,6 +12201,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 16, 32, false, true));
+    // halo-hybrid: fused MoE tail (n <= 4 fused, wider widths take the unfused path through the same graph)
+    for (int64_t nt : { 1, 2, 3, 4, 7, 32 }) {
+        test_cases.emplace_back(new test_moe_tail(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, 2560, 640, 640, 32, 10, nt));
+        test_cases.emplace_back(new test_moe_tail(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2560, 640, 640, 32, 10, nt));
+    }
+    for (int64_t nt : { 1, 3 }) {
+        test_cases.emplace_back(new test_moe_tail(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, 2560, 640, 640, 32, 10, nt, true));
+        test_cases.emplace_back(new test_moe_tail(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 2048, 512, 512, 16, 8, nt));
+        test_cases.emplace_back(new test_moe_tail(GGML_TYPE_Q6_K, GGML_TYPE_Q6_K, 2048, 512, 1024, 16, 8, nt));
+        test_cases.emplace_back(new test_moe_tail(GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, 2048, 512, 512, 16, 15, nt));
+        test_cases.emplace_back(new test_moe_tail(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, 2048, 512, 512, 16, 8, nt));   // pair not instantiated: unfused
+    }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
