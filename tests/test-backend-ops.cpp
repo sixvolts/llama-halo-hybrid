@@ -1306,6 +1306,9 @@ struct test_case {
     virtual bool use_weight_context() { return false; }
     // halo-hybrid: tensors to expand before `out`, in order (fixes model-like node order for multi-layer cases)
     virtual std::vector<ggml_tensor *> expand_first() { return {}; }
+    // halo-hybrid: perf mode times one evaluation of the whole graph instead of repeating the output node (for cases
+    //     whose cost is in the nodes before `out`, e.g. a fused subgraph)
+    virtual bool perf_single_run() { return false; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1682,6 +1685,10 @@ struct test_case {
             const size_t target_size_gpu = 32 * GB;
             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+        }
+
+        if (perf_single_run()) {
+            n_runs = 1;
         }
 
         // duplicate the op
@@ -6081,6 +6088,75 @@ struct test_mul_mat_id : public test_case {
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
 
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// halo-hybrid: MoE expert FFN front: up = MUL_MAT_ID(ups, x, ids), gate = MUL_MAT_ID(gates, x, ids), GLU(gate, up), in
+//     the model's node order; perf mode times the whole graph once per run (GLU included), flops are the two GEMMs
+struct test_moe_gate_up : public test_case {
+    const ggml_type type_a;
+    const ggml_glu_op glu_op;
+    const int n_mats;
+    const int n_used;
+    const bool b; // broadcast activation
+    const int64_t m; // rows (n_ff)
+    const int64_t n; // tokens
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GATE_UP";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, glu_op, n_mats, n_used, b, m, n, k);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_single_run() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * (2 * m * k * n * n_used);
+    }
+
+    test_moe_gate_up(ggml_type type_a, ggml_glu_op glu_op, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), glu_op(glu_op), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gates = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(gates, "gates");
+        ggml_set_name(ups, "ups");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ups,   x, ids);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gates, x, ids);
+        ggml_tensor * out  = glu_op == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_swiglu_clamp(ctx, gate, up, 10.0f) : ggml_glu_split(ctx, gate, up, glu_op);
+        ggml_set_name(out, "out");
         return out;
     }
 
@@ -12256,6 +12332,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    }
     //}
 
+    // halo-hybrid: MoE gate/up + GLU at MMQ widths (ggml_cuda_mul_mat_q_gate_up): the fused kernel (rows % 128 == 0,
+    //     column tiles of every width), the shared-preparation path (rows % 128 != 0, or a tile the fused kernel cannot
+    //     run), broadcast and per-slot activations, and every GLU the fused epilogue implements
+    for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_CLAMP, GGML_GLU_OP_SWIGLU_OAI}) {
+        for (bool b : {false, true}) {
+            for (int64_t m_batch : {9, 64, 256}) {
+                for (int64_t rows : {128, 96}) {
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, glu_op, m_batch, rows, 256,
+                        true, 16, 8, b, false, true, false, {1, 1}));
+                }
+            }
+        }
+    }
+    for (bool b : {false, true}) {
+        for (int64_t n_tokens : {17, 300}) {
+            test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 32, 4, b, 256, n_tokens, 512));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+        for (int64_t m_batch : {32, 200, 1000}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 640, 512,
+                true, 64, 10, true, false, true, false, {1, 1}));
+        }
+    }
+
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
@@ -12618,6 +12719,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t n : {1, 3, 128, 512, 1024, 2048, 4096}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 288, 8, true,  2048, n, 4096));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 288, 8, false, 4096, n, 2048));
+            // gate + up + SwiGLU as one graph (ggml_cuda_mul_mat_q_gate_up; GGML_CUDA_MMQ_GATEUP=0/1/2 to compare)
+            test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 288, 8, true, 2048, n, 4096));
         }
         // dense q8_0 projections on the mainframe layers: shared expert, KDA qkv/out, MLA a/b, decode and prefill
         for (int64_t n : {1, 3, 1024}) {
@@ -12699,6 +12802,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,  640,  n_tokens, 2560));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));   // the model's down (most layers)
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+            // gate + up + SwiGLU as one graph (ggml_cuda_mul_mat_q_gate_up; GGML_CUDA_MMQ_GATEUP=0/1/2 to compare)
+            test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 512, 10, true, 640, n_tokens, 2560));
         }
         return test_cases;
     }

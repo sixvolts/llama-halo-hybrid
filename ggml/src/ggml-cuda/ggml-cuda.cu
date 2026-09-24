@@ -5873,6 +5873,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 3;
                 break;
             }
+
+            // halo-hybrid: MoE gate/up at MMQ widths: one quantize + expert sort for both, and where supported one
+            //     kernel for gate, up and the GLU (mmq-gateup.cu). Returns 2 when the GLU node is left to run.
+            if (op == GGML_OP_MUL_MAT_ID) {
+                const int n = ggml_cuda_mul_mat_q_gate_up(*cuda_ctx, gate, up, glu);
+                if (n > 0) {
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = n;
+                    break;
+                }
+            }
         }
     }
 
