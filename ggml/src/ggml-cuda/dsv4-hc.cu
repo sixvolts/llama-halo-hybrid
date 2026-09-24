@@ -523,6 +523,368 @@ static void dsv4_hc_mix_dispatch(bool post, bool norm, const dim3 grid, const di
     }
 }
 
+// halo-hybrid: the same prologue at decode widths (<= 8 tokens) with the K dimension spread over the GPU. The
+//     one-block-per-token kernel above puts the whole 417 KB hc_fn read (24 rows, 16384 wide) behind one WGP's
+//     memory-level parallelism, ~19 us isolated on gfx1201 for what is a ~1 us read. Here grid = (hc_dim/KS, nt):
+//     each 256-thread block reads a KS-wide slice of the token's activation (running the fused hc_post for that
+//     slice when POST) and of all 24 rows, and writes 24 partial dots + a partial sum of squares; the block that
+//     arrives last for a token (per-token counter, reset by that block) reduces the partials in fixed block order
+//     (deterministic whichever block finishes last), runs the gates and the 4x4 sinkhorn on 16 lanes (DPP lane
+//     exchanges, the serial loop's summation order, v_rcp_f32 for the 40 iteration reciprocals), the pre-mix and the
+//     optional RMS_NORM*w + q8_1 tail from registers. The weight quants are loaded before the activation so the two
+//     latencies overlap. Scratch: ctx.hc_mix_scratch (counters + partials, allocated and zeroed before any capture).
+//     GGML_CUDA_NO_HC_MIX_SPLIT=1 keeps the one-block-per-token kernel.
+#define DSV4_HC_SPLIT_T    256
+#define DSV4_HC_SPLIT_KS   512   // flat elements per block: one wave's 32 lanes x 16 (half a q8_0 block each)
+#define DSV4_HC_SPLIT_MAXT 8
+#define DSV4_HC_SPLIT_PS   32    // partial records per token: 24 dots + the sum of squares, padded
+#define DSV4_HC_SPLIT_MAXB 64    // blocks per token the scratch holds
+#define DSV4_HC_SPLIT_SCRATCH (256 + DSV4_HC_SPLIT_MAXT*DSV4_HC_SPLIT_PS*DSV4_HC_SPLIT_MAXB*sizeof(float))
+
+// lane exchanges inside a 16-lane row for the lane-parallel sinkhorn: DPP (no LDS round trip) on AMD
+static __device__ __forceinline__ float dsv4_quad_bcast(const float v, const int k) {   // lane k of this quad; k constant
+#if defined(GGML_USE_HIP)
+    switch (k) {
+        case 0:  return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x00, 0xF, 0xF, true));
+        case 1:  return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x55, 0xF, 0xF, true));
+        case 2:  return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0xAA, 0xF, 0xF, true));
+        default: return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0xFF, 0xF, 0xF, true));
+    }
+#else
+    return __shfl_sync(0xffffffff, v, (threadIdx.x & ~3) + k, WARP_SIZE);
+#endif
+}
+
+// the sinkhorn's 40 reciprocals are its critical path: v_rcp_f32 (1 ulp) instead of the ~11-instruction IEEE division
+static __device__ __forceinline__ float dsv4_rcp(const float x) {
+#if defined(GGML_USE_HIP)
+    return __builtin_amdgcn_rcpf(x);
+#else
+    return 1.0f / x;
+#endif
+}
+
+template <int M>
+static __device__ __forceinline__ float dsv4_row_xmask(const float v) {   // lane ^ M, M < 16
+#if defined(GGML_USE_HIP)
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x160 + M, 0xF, 0xF, true));
+#else
+    return __shfl_xor_sync(0xffffffff, v, M, WARP_SIZE);
+#endif
+}
+
+template <bool WQ8, bool POST, bool NORM>
+static __global__ void __launch_bounds__(DSV4_HC_SPLIT_T) dsv4_hc_mix_split_f32(
+        const float * __restrict__ x, const void * __restrict__ w, const float * __restrict__ scale, const float * __restrict__ base,
+        float * __restrict__ dst,
+        const int n_embd, const int64_t sx1, const int64_t sx2, const int64_t ss0, const int64_t sb0, const int64_t sd1,
+        const float eps_norm, const float eps_hc, const int n_iter, const dsv4_hc_mix_ext ext,
+        float * part, unsigned int * counters) {
+    constexpr int hc      = DSV4_HC;
+    constexpr int mix_dim = (2 + hc)*hc;
+    constexpr int T       = DSV4_HC_SPLIT_T;
+    constexpr int KS      = DSV4_HC_SPLIT_KS;
+    constexpr int PS      = DSV4_HC_SPLIT_PS;
+    constexpr int NW      = T/WARP_SIZE;          // waves; wave wv owns rows wv, wv + NW, wv + 2*NW
+    constexpr int NL      = 16;                   // elements per lane in the dot stage and per thread in the tail
+    static_assert(KS == WARP_SIZE*NL, "one wave spans the slice");
+    static_assert(mix_dim % NW == 0, "rows split evenly over the waves");
+    static_assert(mix_dim + 1 <= PS, "partial record");
+    static_assert(2*NL == QK8_1, "a q8_1 block is two threads' columns");
+
+    const int hc_dim = hc*n_embd;
+    const int nb     = gridDim.x;                 // hc_dim / KS
+    const int kb     = blockIdx.x;
+    const int it     = blockIdx.y;
+    const int tid    = threadIdx.x;
+    const int lane   = tid % WARP_SIZE;
+    const int wv     = tid / WARP_SIZE;
+
+    __shared__ float xs[KS];
+    __shared__ float red[NW];
+    __shared__ float sums[mix_dim + 1];
+    __shared__ float pre[hc];
+    __shared__ int   s_last;
+
+    // partial records of token it, [PS][nb]: the tail's lanes read one record's nb values contiguously
+    float * tpart = part + (int64_t) it*PS*nb;
+
+    const int k0 = kb*KS;
+    const int h  = k0 / n_embd;                   // KS divides n_embd: the slice lies in one stream
+    const int jb = k0 - h*n_embd;
+
+    // 0. the q8_0 quants of this lane's rows first: their latency overlaps the activation load below
+    constexpr int NR = mix_dim/NW;
+    const int i0   = k0 + NL*lane;
+    const int blk  = i0 / QK8_0;
+    const int half = (i0 % QK8_0) / 16;
+    int4  wq[NR];
+    float wd[NR];
+    if constexpr (WQ8) {
+#pragma unroll
+        for (int rr = 0; rr < NR; ++rr) {
+            const block_q8_0 * b = (const block_q8_0 *) w + (int64_t) (wv + NW*rr) * (hc_dim / QK8_0) + blk;
+            wq[rr] = *(const int4 *) (b->qs + 16*half);
+            wd[rr] = __half2float(b->d);
+        }
+    }
+
+    // 1. the slice of this token's activation, 2 elements per thread (the hc_post for them when POST)
+    {
+        const int e = 2*tid;
+        float2 v;
+        if constexpr (POST) {
+            const float ph = ext.ppost[h*ext.spp0 + it*ext.spp1];
+            const float2 p = *(const float2 *) (ext.px + it*ext.spx1 + jb + e);
+            v.x = __fmul_rn(p.x, ph); v.y = __fmul_rn(p.y, ph);
+#pragma unroll
+            for (int isrc = 0; isrc < hc; ++isrc) {
+                const float c  = ext.pcomb[h*ext.spc0 + isrc*ext.spc1 + it*ext.spc2];
+                const float2 r = *(const float2 *) (ext.pres + it*ext.spr2 + isrc*ext.spr1 + jb + e);
+                v.x = __fmaf_rn(r.x, c, v.x); v.y = __fmaf_rn(r.y, c, v.y);
+            }
+            *(float2 *) (ext.pdst + it*sx2 + h*sx1 + jb + e) = v;
+        } else {
+            v = *(const float2 *) (x + it*sx2 + h*sx1 + jb + e);
+        }
+        xs[e] = v.x; xs[e + 1] = v.y;
+        float ss = v.x*v.x + v.y*v.y;
+        ss = warp_reduce_sum(ss);
+        if (lane == 0) { red[wv] = ss; }
+    }
+    __syncthreads();
+
+    // 2. partial dots: lane = half a q8_0 block of the slice (16 elements), one 16-byte quant load per row
+    {
+        float xv[NL];
+#pragma unroll
+        for (int q = 0; q < NL/4; ++q) {
+            const float4 v = *(const float4 *) (xs + NL*lane + 4*q);
+            xv[4*q + 0] = v.x; xv[4*q + 1] = v.y; xv[4*q + 2] = v.z; xv[4*q + 3] = v.w;
+        }
+        float p[NR];
+#pragma unroll
+        for (int rr = 0; rr < NR; ++rr) {
+            const int r = wv + NW*rr;
+            if constexpr (WQ8) {
+                const int8_t * q = (const int8_t *) &wq[rr];
+                float acc_q = 0.0f;
+#pragma unroll
+                for (int k = 0; k < NL; ++k) { acc_q += (float) q[k] * xv[k]; }
+                p[rr] = wd[rr] * acc_q;
+            } else {
+                const float4 * wr = (const float4 *) ((const float *) w + (int64_t) r * hc_dim + i0);
+                float s = 0.0f;
+#pragma unroll
+                for (int q = 0; q < NL/4; ++q) {
+                    const float4 v = wr[q];
+                    s += v.x*xv[4*q] + v.y*xv[4*q + 1] + v.z*xv[4*q + 2] + v.w*xv[4*q + 3];
+                }
+                p[rr] = s;
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < NR; ++rr) {
+            const float s = warp_reduce_sum(p[rr]);
+            if (lane == 0) { tpart[(wv + NW*rr)*nb + kb] = s; }
+        }
+        if (tid == 0) {
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < NW; ++i) { s += red[i]; }
+            tpart[mix_dim*nb + kb] = s;
+        }
+    }
+
+    // 3. publish the partials; the last block of this token to arrive runs the tail
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int prev = atomicAdd(&counters[it], 1u);
+        const int last = prev == (unsigned int) (nb - 1);
+        if (last) { counters[it] = 0; }   // all nb blocks have arrived: ready for the next launch
+        s_last = last;
+    }
+    __syncthreads();
+    if (!s_last) {
+        return;
+    }
+    __threadfence();   // acquire: the other blocks' partials (and hc_post rows) through a clean L0
+
+    // 4. this thread's 16 consecutive columns of all 4 streams, loaded before the reduction needs them
+    const float * xrow = (POST ? (const float *) ext.pdst : x) + it*sx2;
+    const int j0 = NL*tid;
+    float xr[hc][NL];
+#pragma unroll
+    for (int hh = 0; hh < hc; ++hh) {
+#pragma unroll
+        for (int q = 0; q < NL/4; ++q) {
+            const float4 v = *(const float4 *) (xrow + hh*sx1 + j0 + 4*q);
+            xr[hh][4*q + 0] = v.x; xr[hh][4*q + 1] = v.y; xr[hh][4*q + 2] = v.z; xr[hh][4*q + 3] = v.w;
+        }
+    }
+
+    // 5. reduce the records in block order; wave wv takes records wv, wv + NW, ...
+    for (int r = wv; r < mix_dim + 1; r += NW) {
+        float s = 0.0f;
+        for (int b = lane; b < nb; b += WARP_SIZE) { s += tpart[r*nb + b]; }
+        s = warp_reduce_sum(s);
+        if (lane == 0) { sums[r] = s; }
+    }
+    __syncthreads();
+
+    // 6. gates and the 4x4 sinkhorn on wave 0, one comb element per lane (lanes 16..31 mirror 0..15); every sum is
+    //    taken in the serial loop's order, so all lanes of a row/column agree on its normaliser
+    float * drow = dst + it*sd1;
+    if (wv == 0) {
+        const float rms_inv = rsqrtf(sums[mix_dim] / (float) hc_dim + eps_norm);
+        const float scale_pre = scale[0], scale_post = scale[ss0], scale_comb = scale[2*ss0];
+        if (lane < hc) {
+            pre[lane] = 1.0f / (1.0f + expf(-((sums[lane]*rms_inv)*scale_pre + base[lane*sb0]))) + eps_hc;
+        } else if (lane < 2*hc) {
+            drow[n_embd + lane - hc] = 2.0f / (1.0f + expf(-((sums[lane]*rms_inv)*scale_post + base[lane*sb0])));
+        }
+        const int idx  = lane & (hc*hc - 1);
+        const int isrc = idx / hc;
+        float c = (sums[2*hc + idx]*rms_inv)*scale_comb + base[(2*hc + idx)*sb0];
+        // row isrc = the 4 lanes of a quad: element k of the row is a quad broadcast of lane k. column idst = lanes
+        // idst + 4*s' of the 16-lane row: element k is at lane ^ 4*(k ^ isrc)
+        float mx = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < hc; ++k) { mx = fmaxf(mx, dsv4_quad_bcast(c, k)); }
+        c = expf(c - mx);
+        {
+            float sum = 0.0f;
+#pragma unroll
+            for (int k = 0; k < hc; ++k) { sum += dsv4_quad_bcast(c, k); }
+            const float inv_sum = 1.0f / sum;
+            c = c*inv_sum + eps_hc;
+        }
+        auto norm_cols = [&]() {
+            const float x1 = dsv4_row_xmask<4>(c), x2 = dsv4_row_xmask<8>(c), x3 = dsv4_row_xmask<12>(c);
+            float sum = eps_hc;
+#pragma unroll
+            for (int k = 0; k < hc; ++k) {
+                const int j = k ^ isrc;
+                sum += j == 0 ? c : (j == 1 ? x1 : (j == 2 ? x2 : x3));
+            }
+            const float inv_sum = dsv4_rcp(sum);
+            c *= inv_sum;
+        };
+        auto norm_rows = [&]() {
+            float sum = eps_hc;
+#pragma unroll
+            for (int k = 0; k < hc; ++k) { sum += dsv4_quad_bcast(c, k); }
+            const float inv_sum = dsv4_rcp(sum);
+            c *= inv_sum;
+        };
+        norm_cols();
+        for (int i = 1; i < n_iter; ++i) { norm_rows(); norm_cols(); }
+        if (lane < hc*hc) { drow[n_embd + hc + idx] = c; }
+    }
+    __syncthreads();
+
+    // 7. out = sum_h pre[h] * x[:, h], the streams accumulated in order
+    float o[NL];
+#pragma unroll
+    for (int k = 0; k < NL; ++k) { o[k] = 0.0f; }
+#pragma unroll
+    for (int hh = 0; hh < hc; ++hh) {
+        const float ph = pre[hh];
+#pragma unroll
+        for (int k = 0; k < NL; ++k) { o[k] += ph * xr[hh][k]; }
+    }
+    if (!NORM || ext.write_out) {
+#pragma unroll
+        for (int q = 0; q < NL/4; ++q) {
+            *(float4 *) (drow + j0 + 4*q) = make_float4(o[4*q + 0], o[4*q + 1], o[4*q + 2], o[4*q + 3]);
+        }
+    }
+    if constexpr (NORM) {
+        // 8. RMS_NORM + MUL(w) on the finished row, from registers; a q8_1 block (32 columns) is this thread's 16 and
+        //    its neighbour's, quantized as q8_side_store does it (amax/127, roundf, the block sum in ds.y)
+        float tmp = 0.0f;
+#pragma unroll
+        for (int k = 0; k < NL; ++k) { tmp += o[k] * o[k]; }
+        tmp = block_reduce<block_reduce_method::SUM, T>(tmp, red);
+        const float mean = tmp / n_embd;
+        const float scl  = rsqrtf(mean + ext.eps_rms);
+        float v[NL];
+        float amax = 0.0f, sum = 0.0f;
+#pragma unroll
+        for (int q = 0; q < NL/4; ++q) {
+            const float4 nw4 = *(const float4 *) (ext.nw + j0 + 4*q);
+            v[4*q + 0] = scl * o[4*q + 0] * nw4.x; v[4*q + 1] = scl * o[4*q + 1] * nw4.y;
+            v[4*q + 2] = scl * o[4*q + 2] * nw4.z; v[4*q + 3] = scl * o[4*q + 3] * nw4.w;
+        }
+        float * nrow = ext.ndst + it*ext.snd1;
+#pragma unroll
+        for (int q = 0; q < NL/4; ++q) {
+            *(float4 *) (nrow + j0 + 4*q) = make_float4(v[4*q + 0], v[4*q + 1], v[4*q + 2], v[4*q + 3]);
+        }
+        if (ext.q8) {
+#pragma unroll
+            for (int k = 0; k < NL; ++k) { amax = fmaxf(amax, fabsf(v[k])); sum += v[k]; }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, WARP_SIZE));
+            sum += __shfl_xor_sync(0xffffffff, sum, 1, WARP_SIZE);
+            const float d = amax / 127.0f;
+            const int64_t col0 = (int64_t) it*n_embd + j0;
+            block_q8_1 * b = ext.q8 + col0 / QK8_1;
+            int8_t qs[NL];
+#pragma unroll
+            for (int k = 0; k < NL; ++k) { qs[k] = amax == 0.0f ? 0 : (int8_t) roundf(v[k] / d); }
+#pragma unroll
+            for (int k = 0; k < NL/4; ++k) {   // qs is only 4-byte aligned in block_q8_1
+                *(int *) (b->qs + col0 % QK8_1 + 4*k) = *(const int *) (qs + 4*k);
+            }
+            if (col0 % QK8_1 == 0) {
+                b->ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
+template <bool WQ8, bool POST, bool NORM>
+static void dsv4_hc_mix_split_launch(const int nt, cudaStream_t stream, float * part, unsigned int * counters,
+        const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst,
+        const float eps_norm, const float eps_hc, const int32_t n_iter, const dsv4_hc_mix_ext & ext) {
+    const int n_embd = (int) x->ne[0];
+    const dim3 grid(DSV4_HC*n_embd / DSV4_HC_SPLIT_KS, nt, 1);
+    dsv4_hc_mix_split_f32<WQ8, POST, NORM><<<grid, DSV4_HC_SPLIT_T, 0, stream>>>(
+        (const float *) x->data, w->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
+        n_embd, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), scale->nb[0] / sizeof(float), base->nb[0] / sizeof(float),
+        dst->nb[1] / sizeof(float), eps_norm, eps_hc, n_iter, ext, part, counters);
+}
+
+template <bool WQ8>
+static void dsv4_hc_mix_split_dispatch(bool post, bool norm, const int nt, cudaStream_t stream, float * part, unsigned int * counters,
+        const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst,
+        const float eps_norm, const float eps_hc, const int32_t n_iter, const dsv4_hc_mix_ext & ext) {
+    if (post && norm) {
+        dsv4_hc_mix_split_launch<WQ8, true,  true >(nt, stream, part, counters, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+    } else if (post) {
+        dsv4_hc_mix_split_launch<WQ8, true,  false>(nt, stream, part, counters, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+    } else if (norm) {
+        dsv4_hc_mix_split_launch<WQ8, false, true >(nt, stream, part, counters, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+    } else {
+        dsv4_hc_mix_split_launch<WQ8, false, false>(nt, stream, part, counters, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+    }
+}
+
+void ggml_cuda_dsv4_hc_mix_scratch_init(ggml_backend_cuda_context & ctx) {
+    static const bool disabled = getenv("GGML_CUDA_NO_HC_MIX_SPLIT") != nullptr && atoi(getenv("GGML_CUDA_NO_HC_MIX_SPLIT"));
+    if (disabled || ctx.hc_mix_scratch != nullptr) {
+        return;
+    }
+    void * p = nullptr;
+    if (cudaMalloc(&p, DSV4_HC_SPLIT_SCRATCH) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    CUDA_CHECK(cudaMemsetAsync(p, 0, DSV4_HC_SPLIT_SCRATCH, ctx.stream()));   // ordered before every kernel on this stream
+    ctx.hc_mix_scratch = p;
+}
+
 void ggml_cuda_op_dsv4_hc_mix_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_tensor * hc_post, const ggml_tensor * rms_norm, ggml_tensor * mul, bool write_out) {
     const ggml_tensor * x     = dst->src[0];
@@ -572,6 +934,19 @@ void ggml_cuda_op_dsv4_hc_mix_fused(ggml_backend_cuda_context & ctx, ggml_tensor
     const size_t smem = (n_embd + 32*mix_dim + mix_dim + DSV4_HC + 32) * sizeof(float);
 
     cudaStream_t stream = ctx.stream();
+    if (ctx.hc_mix_scratch != nullptr && n_tokens <= DSV4_HC_SPLIT_MAXT && n_embd == DSV4_HC_SPLIT_T*16 &&
+            n_embd % DSV4_HC_SPLIT_KS == 0 && hc_dim / DSV4_HC_SPLIT_KS <= DSV4_HC_SPLIT_MAXB &&
+            dst->nb[1] % 16 == 0 && ((uintptr_t) dst->data) % 16 == 0 &&
+            (!mul || (((uintptr_t) ext.nw) % 16 == 0 && ((uintptr_t) ext.ndst) % 16 == 0 && ext.snd1 % 4 == 0))) {
+        unsigned int * counters = (unsigned int *) ctx.hc_mix_scratch;
+        float * part = (float *) ((char *) ctx.hc_mix_scratch + 256);
+        if (w->type == GGML_TYPE_Q8_0) {
+            dsv4_hc_mix_split_dispatch<true >(hc_post != nullptr, mul != nullptr, n_tokens, stream, part, counters, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+        } else {
+            dsv4_hc_mix_split_dispatch<false>(hc_post != nullptr, mul != nullptr, n_tokens, stream, part, counters, x, w, scale, base, dst, eps_norm, eps_hc, n_iter, ext);
+        }
+        return;
+    }
     const dim3 grid(n_tokens, 1, 1);
     const dim3 block(DSV4_HC_MIX_THREADS, 1, 1);
     if (w->type == GGML_TYPE_Q8_0) {

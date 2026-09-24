@@ -1510,6 +1510,10 @@ struct ggml_backend_cuda_context {
     size_t q8_arena_size = 0;
     size_t q8_arena_used = 0;
 
+    // halo-hybrid: persistent zeroed scratch of the split DSV4_HC_MIX kernel (dsv4-hc.cu): per-token arrival counters
+    // (reset by the last block of every launch, so graph replays find them at zero) and the per-block partial dots
+    void * hc_mix_scratch = nullptr;
+
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {

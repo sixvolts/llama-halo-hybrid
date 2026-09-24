@@ -9766,6 +9766,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nt : {1, 3, 8}) {
             test_cases.emplace_back(new test_dsv4_hc_mix(t, 4096, nt, 4));
         }
+        // the model's 20 sinkhorn iterations at every decode width and a prefill width (split kernel gated off)
+        for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
+            test_cases.emplace_back(new test_dsv4_hc_mix(t, 4096, nt, 20));
+        }
     }
     // the fused hyper-connection boundary (hc_post + hc_mix + rms_norm*w + q8_1 copy), decode widths, a prefill width
     // (no q8 copy above 8 tokens) and a chained block
@@ -11898,6 +11902,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_kpool_compress(GGML_TYPE_F16, 128, 4, nt, 4096, 1, 12));
     }
     test_cases.emplace_back(new test_kpool_compress(GGML_TYPE_F16, 128, 4, 3, 4096, 1, 1));
+    for (int64_t nt : {1, 2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 20));   // GLM-5.3: 20 sinkhorn iterations
+    }
     // halo-hybrid: KDA conv tail, TBO_KDA_CONV_L2="d_inner:nt[:reps],..." (d_conv 4); reps copies per graph, one per layer
     if (const char * env = getenv("TBO_KDA_CONV_L2")) {
         std::string spec(env);
