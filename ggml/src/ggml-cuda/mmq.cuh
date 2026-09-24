@@ -242,7 +242,22 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
-static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {
+// halo-hybrid: the "fallback" template/config key is an int: 0 and 1 are the regular configs, GGML_CUDA_MMQ_VARIANT_HALF_I
+//     is the fallback == false config with half the rows and half the threads (one wave still owns 16 rows). The fused
+//     gate/up kernel (mmq-gateup.cu) stacks two such halves in one block, so the block has the rows, threads and LDS of
+//     the regular block. Loaders treat the variant like fallback (row clamp), which is a no-op on full row tiles.
+#define GGML_CUDA_MMQ_VARIANT_HALF_I 2
+
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_config_half_i(const ggml_cuda_mmq_config c) {
+    return c.type != GGML_TYPE_COUNT && !c.stream_k && c.I >= 64 && c.I % 64 == 0 && c.nthreads % 64 == 0 && c.nthreads*16 == c.I*32 ?
+        ggml_cuda_mmq_config(c.type, c.nthreads/2, c.occupancy, c.I/2, c.J, c.sram_layout, c.K_vram, false, false) :
+        ggml_cuda_mmq_config(GGML_TYPE_COUNT, c.nthreads, c.occupancy, c.I, c.J, c.sram_layout, c.K_vram, c.stream_k, true);
+}
+
+static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const int fallback, const int cc) {
+    if (fallback == GGML_CUDA_MMQ_VARIANT_HALF_I) {
+        return ggml_cuda_mmq_config_half_i(ggml_cuda_mmq_get_config(type, J, 0, cc));
+    }
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
             return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
@@ -273,7 +288,10 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
 }
 
-static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback) {
+static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, int fallback) {
+    if (fallback == GGML_CUDA_MMQ_VARIANT_HALF_I) {
+        return ggml_cuda_mmq_config_half_i(ggml_cuda_mmq_get_config(type, J, 0));
+    }
 #ifdef GGML_USE_HIP
 #ifdef GCN
     return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
@@ -302,85 +320,85 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     GGML_UNUSED_VARS(type, J, fallback);
 }
 
-static __host__ int ggml_cuda_mmq_get_type(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ int ggml_cuda_mmq_get_type(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).type;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_type(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_type(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).type;
 }
 
-static __host__ int ggml_cuda_mmq_get_nthreads(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ int ggml_cuda_mmq_get_nthreads(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).nthreads;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_nthreads(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_nthreads(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).nthreads;
 }
 
-static __host__ int ggml_cuda_mmq_get_occupancy(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ int ggml_cuda_mmq_get_occupancy(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).occupancy;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_occupancy(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_occupancy(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).occupancy;
 }
 
-static __host__ int ggml_cuda_mmq_get_I(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ int ggml_cuda_mmq_get_I(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).I;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_I(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_I(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).I;
 }
 
-static __host__ int ggml_cuda_mmq_get_J(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ int ggml_cuda_mmq_get_J(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).J;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_J(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_J(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).J;
 }
 
-static __host__ ggml_cuda_mmq_sram_layout ggml_cuda_mmq_get_sram_layout(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ ggml_cuda_mmq_sram_layout ggml_cuda_mmq_get_sram_layout(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).sram_layout;
 }
 
-static constexpr __device__ ggml_cuda_mmq_sram_layout ggml_cuda_mmq_get_sram_layout(ggml_type type, int J, bool fallback) {
+static constexpr __device__ ggml_cuda_mmq_sram_layout ggml_cuda_mmq_get_sram_layout(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).sram_layout;
 }
 
-static __host__ int ggml_cuda_mmq_get_K_vram(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ int ggml_cuda_mmq_get_K_vram(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).K_vram;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_K_vram(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_K_vram(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).K_vram;
 }
 
-static __host__ bool ggml_cuda_mmq_get_stream_k(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ bool ggml_cuda_mmq_get_stream_k(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).stream_k;
 }
 
-static constexpr __device__ bool ggml_cuda_mmq_get_stream_k(ggml_type type, int J, bool fallback) {
+static constexpr __device__ bool ggml_cuda_mmq_get_stream_k(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).stream_k;
 }
 
-static __host__ int ggml_cuda_mmq_get_fallback(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ int ggml_cuda_mmq_get_fallback(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).fallback;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_fallback(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_fallback(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).fallback;
 }
 
 // ---------------------------------------------------------------------------------------------
 
-static __host__ int ggml_cuda_mmq_get_sram_stride(const ggml_type type, const int J, const bool fallback, const int cc) {
+static __host__ int ggml_cuda_mmq_get_sram_stride(const ggml_type type, const int J, const int fallback, const int cc) {
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback, cc));
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback));
 }
 
@@ -395,13 +413,13 @@ static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fal
     return ret;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback) {
+static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, int fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).rows_per_warp();
 }
 
 // halo-hybrid: on the WMMA path a wave owns 16 rows, so 8 waves on a 64-row tile must split J into two wave
 //     groups of four (each group covers J/2 columns). Q8_0 J=128 used this first (halo-box); Q4_K/Q5_K J=32/64 now too.
-static constexpr __host__ __device__ bool ggml_cuda_mmq_split_j(int J, int I, int nwarps, bool fallback) {
+static constexpr __host__ __device__ bool ggml_cuda_mmq_split_j(int J, int I, int nwarps, int fallback) {
     // I/16 row groups of 16 rows; twice that many waves means two J groups
     return !fallback && I % 16 == 0 && nwarps == 2*(I/16) && J % 32 == 0;
 }
@@ -468,7 +486,7 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 #include "mmq-load-tiles.cuh"
 #include "mmq-vec-dot.cuh"
 
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
+template <ggml_type type, int J, int fallback> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
         const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -507,7 +525,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-template<ggml_type type, int J, bool fallback>
+template<ggml_type type, int J, int fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
             const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
             const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
@@ -579,7 +597,7 @@ struct ggml_cuda_mmq_util_funcs {
         vdr(vdr), load_tiles(load_tiles), vec_dot(vec_dot), write_back(write_back) {}
 };
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_funcs() {
     if (!ggml_cuda_mmq_get_config(type, J, fallback).use_mma_data_layout()) {
         switch (type) {
@@ -887,22 +905,22 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
     }
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 static constexpr __device__ int ggml_cuda_mmq_get_vdr() {
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().vdr;
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 static constexpr __device__ ggml_cuda_mmq_load_tiles_t ggml_cuda_mmq_get_load_tiles() {
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().load_tiles;
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 static constexpr __device__ ggml_cuda_mmq_vec_dot_t ggml_cuda_mmq_get_vec_dot() {
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().vec_dot;
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_back() {
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().write_back;
 }
@@ -910,7 +928,7 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 // ---------------------------------------------------------------------------------------------
 
 // Software prefetch of the next K iteration into registers, see mul_mat_q_process_tile.
-static constexpr __host__ __device__ bool ggml_cuda_mmq_prefetch_whitelist(ggml_type type, int J, bool fallback) {
+static constexpr __host__ __device__ bool ggml_cuda_mmq_prefetch_whitelist(ggml_type type, int J, int fallback) {
     // Whitelist: the extra registers cause spills in several other specializations.
     // halo-hybrid: Q4_K at J=16/32 too (the MoE column hint picks J=32 at a 1024-token ubatch; the expert GEMMs of
     //     GLM-5.3-Flash are q4_K) with the weight tile staged as well (ggml_cuda_mmq_x_regs): gfx1151 288 experts x
@@ -924,7 +942,7 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_prefetch_whitelist(ggml_
            (type == GGML_TYPE_IQ3_XXS &&  J == 128);
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
 #if defined(RDNA3_5) && defined(AMD_WMMA_AVAILABLE)
     return ggml_cuda_mmq_prefetch_whitelist(type, J, fallback);
@@ -939,7 +957,7 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
 //     24.2 -> 28.8 KiB, still two blocks per CU. Measured on gfx1151 (288 experts x 2048x4096, correctness-gated):
 //     q4_K n=1024 8.68 vs 8.46 ms, n=2048 14.76 vs 14.51, n=512 6.73 vs 6.78 - the barriers are not what the kernel
 //     waits on. Build with -DGGML_CUDA_MMQ_Y2 to enable; the host sizes the dynamic LDS from cc through this predicate.
-static constexpr __host__ __device__ bool ggml_cuda_mmq_y_double(ggml_type type, int J, bool fallback) {
+static constexpr __host__ __device__ bool ggml_cuda_mmq_y_double(ggml_type type, int J, int fallback) {
 #if defined(GGML_CUDA_MMQ_Y2)
     return ggml_cuda_mmq_prefetch_whitelist(type, J, fallback) && J <= 64;
 #else
@@ -948,7 +966,7 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_y_double(ggml_type type,
 #endif
 }
 
-template <ggml_type type, int J, bool fallback, bool fixup>
+template <ggml_type type, int J, int fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -1151,7 +1169,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1450,7 +1468,7 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
@@ -1659,7 +1677,7 @@ static bool mmq_moe_use_tile_list() {
     return use;
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, int fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -1753,7 +1771,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
-template <ggml_type type, bool fallback>
+template <ggml_type type, int fallback>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id    = ggml_cuda_get_device();
     const int    cc    = ggml_cuda_info().devices[id].cc;
@@ -1880,5 +1898,15 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+// halo-hybrid: MoE gate and up projections that share src1 and ids (the (MUL_MAT_ID, MUL_MAT_ID, GLU) pattern) at MMQ
+//     widths. Returns the number of graph nodes it computed: 0 (not handled), 2 (gate and up, the GLU node is left to
+//     run) or 3 (gate, up and the GLU in one fused kernel). GGML_CUDA_MMQ_GATEUP=0 off, 1 shared quantize/sort only,
+//     2 (default) fused kernel where supported.
+int ggml_cuda_mul_mat_q_gate_up(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, ggml_tensor * glu);
+
+// mmq-gateup.cu: the fused gate+up+GLU kernel; args describe the gate matrix and the GLU output, x_up the up weights
+bool ggml_cuda_mul_mat_q_gate_up_fused(ggml_backend_cuda_context & ctx, const mmq_args & args, const char * x_up,
+        int glu_op, float alpha, float limit, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
