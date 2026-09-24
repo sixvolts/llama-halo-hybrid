@@ -228,3 +228,22 @@ attention layer 65 of which 28 were the QSA indexer's scoring; 39.0 ms = 28.4 by
   ~1.5 ms token-boundary host gap (needs a host trace), indexer fusion for contexts past 2K, prefill (700 vs 1,246).
 - **Seen by a reviewer, pre-existing:** perplexity on one chunk varies ~2% with the ubatch width (8.087 at -ub 2,
   8.237 at 3, 8.241 at 4, 8.163 at 512): worth a look at the width-3/4 GEMV paths the MTP verify uses.
+
+## 2026-09-24: Qwen3.8 APU-only prefill - sparse prefill attention and chunked gated DeltaNet (82b766555, fa1e1b122, fix commit after)
+Profile before (server, -ub 2048, per prompt token at 4K / 16K / 32K): expert GEMM 0.39 / 0.38 / 0.38 ms, dense GEMM
+0.35 / 0.37 / 0.37, element-wise 0.24 / 0.26 / 0.31, gated DeltaNet + conv 0.14, flash attention 0.04 / 0.18 / 0.39
+(the only term growing with context: the QSA top-k was applied as a mask to DENSE attention at prefill; the gather
+path only turns on above 65,536 cells). Measured with GGML_CUDA_TIME_OPS_EVERY=1 (b961f4fa5).
+- **Sparse prefill attention (82b766555):** adjacent queries' top-k selections overlap poorly (for the dense kernel's
+  16 x 64 tile, 58-84% of KV tiles still hold a selected cell at 32K, so tile skipping would save only 15-40%); the
+  existing GLM sparse gather path now serves D=256 / GQA 12 with 16 queries of a tile walking the union of their
+  selections, from 4x the 2051-cell bound (~8.2K cells). Also a gfx1151 D=256 config (Q in LDS, 32-cell K/V tiles)
+  that removes a 1.1-1.6 KB/lane spill: dense FA per 2048-query call at 30K 118.9 -> 91.8 ms, sparse 41.8 ms.
+  Switches: LLAMA_QSA_SPARSE_FA=0, GGML_CUDA_FA_SPARSE_D256=0; the config has none (compile-time).
+- **Chunked gated DeltaNet (fa1e1b122):** WY/UT form, 32-token chunks, scalar-gate heads only (GLM's per-channel KDA
+  keeps the token loop), MTP rollback tail still on the token loop, f64 gate cumsum (f32 was 10-1000x worse on strongly
+  decaying heads): 6.7 -> 3.35 ms per 2048-token ubatch per layer. Perplexity +0.022 at 2K is within what a 1e-6
+  output perturbation of the old kernel produces (KLD 0.0316 vs 0.0329); 16K 5.6042 -> 5.6003. GGML_CUDA_NO_GDN_CHUNKED=1.
+- **Result:** 705 / 691 / 589 -> 747 / 756 / 701 t/s (-ub 2048), 769 / 783 / 724 with -ub 4096. halogen: 1,246 at 8K,
+  1,424 at 32K. Left: expert GEMM (LDS-bound MMQ, the largest term), hc_down GEMM shape (7 TFLOPS), hc element-wise
+  traffic at prefill widths, the QSA mask build (fill/set_rows/add over n_kv x 2048), a WMMA GDN scan.
