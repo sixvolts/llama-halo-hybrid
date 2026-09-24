@@ -6132,7 +6132,8 @@ struct ggml_cuda_optimer {
             acc & a = by_key[keys[i]]; a.n++; a.us += ms * 1000.0;
         }
         used = 0; keys.clear(); graphs++;
-        if (graphs % 200 == 0) {
+        static const uint64_t every = getenv("GGML_CUDA_TIME_OPS_EVERY") ? (uint64_t) atoll(getenv("GGML_CUDA_TIME_OPS_EVERY")) : 200;
+        if (graphs % every == 0) {
             std::vector<std::pair<std::string, acc>> v(by_key.begin(), by_key.end());
             std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
             double tot = 0; uint64_t n = 0; for (auto & e : v) { tot += e.second.us; n += e.second.n; }
