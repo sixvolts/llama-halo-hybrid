@@ -10229,6 +10229,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 640, n, 2560, 1, false, true));
     }
 
+    // Qwen3.8-Flash-Next expert GEMMs at prefill widths, correctness of the MMQ subtile / K-tail skips (TBO_Q38_MOE_EVAL=1):
+    //     gate/up q4_K [2560 -> 640], down q5_1 / q8_0 [640 -> 2560] (K = 640: the last K iteration is half padding)
+    if (getenv("TBO_Q38_MOE_EVAL") != nullptr) {
+        for (int64_t n : {1, 3, 37, 256, 1024, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,  640,  n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+        }
+        return test_cases;
+    }
+
     // GLM-5.3-Flash shapes at prefill widths, correctness of the RDNA3.5 MMQ configs (TBO_GLM_EVAL=1)
     if (getenv("TBO_GLM_EVAL") != nullptr) {
         for (int64_t n : {1, 3, 128, 1024, 2048}) {

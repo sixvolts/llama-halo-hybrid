@@ -10,8 +10,11 @@
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+#define MMQ_OPT_SUBTILE_SKIP 1 // mul_mat_q opt_flags, see mmq_opt_flags()
+#define MMQ_OPT_KTAIL_SKIP   2
+
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
-typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
+typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
     float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max);
 
@@ -933,10 +936,12 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_prefetch_whitelist(ggml_
     // halo-hybrid: Q4_K at J=16/32 too (the MoE column hint picks J=32 at a 1024-token ubatch; the expert GEMMs of
     //     GLM-5.3-Flash are q4_K) with the weight tile staged as well (ggml_cuda_mmq_x_regs): gfx1151 288 experts x
     //     2048x4096, n=1024 9.8 -> 8.5 ms. Staging the Q5_K weight tile measured no gain over its activation-only
-    //     prefetch, so Q5_K keeps J=32 activation-only.
+    //     prefetch, so Q5_K keeps J=32 activation-only. Q5_1 (Qwen3.8's K = 640 expert down projection) up to J=64,
+    //     activation-only: gfx1151 512 experts x 2560x640, n=2048 5.18 -> 5.06 ms, n=1024 3.80 -> 3.79.
     return (type == GGML_TYPE_Q8_0    && (J == 48 || J == 128) && !fallback) ||
            (type == GGML_TYPE_Q6_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q5_K    && (J == 32 || J == 64))  ||
+           (type == GGML_TYPE_Q5_1    && J <= 64)               ||
            (type == GGML_TYPE_Q4_K    && (J == 16 || J == 32 || J == 48 || J == 64)) ||
            (type == GGML_TYPE_IQ2_S   &&  J == 128)             ||
            (type == GGML_TYPE_IQ3_XXS &&  J == 128);
@@ -972,7 +977,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int opt_flags) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -1002,6 +1007,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+
+    // halo-hybrid (see MMQ_OPT_*): the vec_dot skips 16-column subtiles past j_skip, and an iteration whose second
+    //     half lies entirely past the end of K (K % ITER_K <= ITER_K/2, e.g. the K = 640 expert down projection)
+    //     neither loads nor multiplies that half; both only drop work on zero padding or discarded columns
+    const int  j_skip    = (opt_flags & MMQ_OPT_SUBTILE_SKIP) ? tile_y_max_j : J;
+    const bool ktail_opt = (opt_flags & MMQ_OPT_KTAIL_SKIP) != 0;
+    auto has_half2 = [&](const int kb0) -> bool {
+        return !ktail_opt || (kb0_stop - kb0)*qk > ITER_K/2;
+    };
 
     if constexpr (ggml_cuda_mmq_use_prefetch<type, J, fallback>()) {
         // RDNA3.5 software prefetch: with 64 KiB of LDS per CU only 1-2 blocks are resident, so the
@@ -1084,21 +1098,23 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 }
             }
 
-            vec_dot(tile_x, tile_y, sum, 0);
+            vec_dot(tile_x, tile_y, sum, 0, j_skip);
 
-            if constexpr (!y_double) {
-                __syncthreads();
+            if (has_half2(kb0)) {
+                if constexpr (!y_double) {
+                    __syncthreads();
 
-                store_y_regs(tile_y1, yr1);
+                    store_y_regs(tile_y1, yr1);
 
-                __syncthreads();
+                    __syncthreads();
 
-                if (has_next) {
-                    load_y_regs(yr1, kb0 + blocks_per_iter, 1);
+                    if (has_next) {
+                        load_y_regs(yr1, kb0 + blocks_per_iter, 1);
+                    }
                 }
-            }
 
-            vec_dot(tile_x, tile_y1, sum, MMQ_TILE_NE_K);
+                vec_dot(tile_x, tile_y1, sum, MMQ_TILE_NE_K, j_skip);
+            }
 
             __syncthreads();
         };
@@ -1138,9 +1154,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, 0);
+        vec_dot(tile_x, tile_y, sum, 0, j_skip);
 
         __syncthreads();
+
+        if (!has_half2(kb0)) {
+            continue; // last iteration: the second half is K padding
+        }
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
@@ -1154,7 +1174,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K, j_skip);
 
         __syncthreads();
     }
@@ -1178,7 +1198,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const int32_t * __restrict__ tile_list) {
+        const uint3 ntx, const int32_t * __restrict__ tile_list, const int opt_flags) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1287,7 +1307,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, opt_flags);
         return;
     }
 
@@ -1381,7 +1401,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, opt_flags);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1465,7 +1485,7 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, J, fallback, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, opt_flags);
 }
 
 template <ggml_type type, int J, int fallback>
@@ -1677,6 +1697,20 @@ static bool mmq_moe_use_tile_list() {
     return use;
 }
 
+// halo-hybrid inner-loop options (both exact: they only drop multiplications whose results are discarded or zero)
+//     GGML_CUDA_MMQ_SUBTILE_SKIP=0 disables the 16-column subtile skip, GGML_CUDA_MMQ_KTAIL_SKIP=0 the K-tail skip
+static int mmq_opt_flags() {
+    static const int flags = [] {
+        auto on = [](const char * name) {
+            const char * env = getenv(name);
+            return env == nullptr || atoi(env) != 0;
+        };
+        return (on("GGML_CUDA_MMQ_SUBTILE_SKIP") ? MMQ_OPT_SUBTILE_SKIP : 0) |
+               (on("GGML_CUDA_MMQ_KTAIL_SKIP")   ? MMQ_OPT_KTAIL_SKIP   : 0);
+    }();
+    return flags;
+}
+
 template <ggml_type type, int J, int fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1729,7 +1763,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, tile_list.ptr);
+             ntx_fd, tile_list.ptr, mmq_opt_flags());
         return;
     }
 
@@ -1758,7 +1792,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, nullptr);
+         ntx_fd, nullptr, mmq_opt_flags());
 
     if (!fixup_needed) {
         return;
