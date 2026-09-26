@@ -342,7 +342,11 @@ bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_ten
     const int64_t blocks128 = ((M + 127) / 128) * ((N + 127) / 128);
     const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
     const bool big     = blocks128 >= 2 * nsm;
-    const bool prepass = M * K > (int64_t) 16 * 1024 * 1024;
+    // (halo-hybrid, 2026-09-26: 16M -> 8M. Qwen3.8's 2560 x 6144 ssm_out / attn_output and 6144 x 2560 attn_gate
+    //  (15.7M each) read f32 in-kernel at 17.7 / 28 TFLOPS; with the pre-pass 2.49 vs 3.45 ms and 2.09 vs 2.40 ms per
+    //  2048 tokens on gfx1151. The f16 rounding of the activations is the same either way.)
+    static const int64_t prepass_min = getenv("GGML_CUDA_Q8_WMMA_PREPASS_MIN") ? atoll(getenv("GGML_CUDA_Q8_WMMA_PREPASS_MIN")) : (int64_t) 8 * 1024 * 1024;
+    const bool prepass = M * K > prepass_min;
     if ((mode >= 2 && mode <= 10) || (mode <= 1 && prepass)) {
         ggml_cuda_pool_alloc<half> x16(ctx.pool(), (size_t) N * K);
         const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
