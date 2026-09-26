@@ -279,3 +279,20 @@ at 2048 / 4096 tokens, slower below ~1K tokens and on GLM's 2048 x 4096 experts,
 754/792/733 -> 787/817/752 t/s; 804/847/777 with -ub 4096 (recommended for Qwen3.8 on the APU). GLM unchanged.
 Not ported yet from gufo: the paired gate/up variant with the SwiGLU written as F16 for the down projection (removes the
 f32 intermediate and a conversion), the dense Q8->F16 WMMA with fused HC/conv/attention epilogues, HC combine kernels.
+
+## 2026-09-26: dense GEMMs and hyper-connection passes at prefill (ae85dfdb3)
+- **Dense q8_0 GEMMs:** our WMMA kernel already reaches gufo's 30-36 TFLOPS on the wide shapes (attn_qkv 35.9, attn_q
+  36.0); a port was not needed. The slow shapes were ssm_out / attn_output (2560 x 6144) and attn_gate (6144 x 2560) at
+  17.7 / 28 TFLOPS: at 15.7M weights they fell just under the 16M cutoff for the f16 activation pre-pass and re-read
+  f32 activations per 128-row tile. Cutoff 8M (ae85dfdb3): 3.45 -> 2.49 and 2.40 -> 2.09 ms per 2048 tokens,
+  bit-identical. Prefill 787/817/752 -> 813/824/761 t/s (852/857/788 at -ub 4096).
+- **Split-K for the 320 x 10240 HC down-projection: measured, rejected.** 1 split 1.46 ms, 2-8 splits 1.56-1.77 ms. The
+  shape is bound by re-reading its 84 MB f32 input (10240 per token) once per 128-row tile (~250 MB for 13 GFLOP), not
+  by grid parallelism. Its fix is fusion with the producer (rms_norm) or reading the input as f16 once.
+- **Hyper-connection element-wise work (25% of a 16K prefill) is already fused and bandwidth-bound:** k_hc_combine_norm,
+  k_hc_mix and k_mul_sigmoid run at ~210 GB/s (k_hc_mix: 189 MB in 0.89 ms per 2048 tokens). What remains are the
+  84 MB f32 intermediates between kernels (the up-projection's gate, the normalized streams). gufo removes them by
+  computing the mix in the up-projection GEMM's epilogue (DenseF16GEMMKernel kHcMix); for us that needs the w_up rows
+  permuted so the four streams of one channel land in one tile, plus a GEMM epilogue - a multi-day change.
+- **Note:** the F16 routed expert path's auto rule needs >= 40 rows per expert: a 1.9K-token prompt (18.6K rows over
+  512 experts) stays on MMQ.
