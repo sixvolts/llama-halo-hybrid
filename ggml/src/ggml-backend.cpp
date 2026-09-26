@@ -2487,6 +2487,62 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
         GGML_ASSERT(sched_a->backends[i] == sched_b->backends[i]);
     }
 
+    // halo-hybrid: the interleaving below is only safe when both lanes have the same split structure (split i of a
+    // and of b cover the same layers on the same backend, so a's writes to the KV / recurrent state of a layer are
+    // queued before b's reads). Different structures (e.g. a different ubatch width changing placement) fall back to
+    // running a completely, then b - still correct, just without overlap.
+    {
+        // same layers per split = same backend and the same first and last node (by name); node COUNTS may differ
+        // legitimately (e.g. Qwen3.8's QSA indexer scoring only exists once a lane's ubatch sees > 2051 KV cells)
+        auto node_name = [](const ggml_backend_sched_split & sp, bool last) -> const char * {
+            return sp.graph.n_nodes > 0 ? sp.graph.nodes[last ? sp.graph.n_nodes - 1 : 0]->name : "";
+        };
+        bool same = sched_a->n_splits == sched_b->n_splits;
+        for (int i = 0; same && i < sched_a->n_splits; i++) {
+            const ggml_backend_sched_split & xa = sched_a->splits[i];
+            const ggml_backend_sched_split & xb = sched_b->splits[i];
+            same = xa.backend_id == xb.backend_id && strcmp(node_name(xa, false), node_name(xb, false)) == 0 &&
+                   strcmp(node_name(xa, true), node_name(xb, true)) == 0;
+        }
+        if (!same) {
+            static int n_logged = 0;
+            if (n_logged++ < 4) {
+                GGML_LOG_WARN("%s: the two lanes have different split structures (%d vs %d splits): running them one after the other\n",
+                    __func__, sched_a->n_splits, sched_b->n_splits);
+                const int n = std::max(sched_a->n_splits, sched_b->n_splits);
+                for (int i = 0; i < n; i++) {
+                    const ggml_backend_sched_split * xa = i < sched_a->n_splits ? &sched_a->splits[i] : nullptr;
+                    const ggml_backend_sched_split * xb = i < sched_b->n_splits ? &sched_b->splits[i] : nullptr;
+                    const bool diff = !xa || !xb || xa->backend_id != xb->backend_id ||
+                        (xa->graph.n_nodes && xb->graph.n_nodes && (strcmp(xa->graph.nodes[0]->name, xb->graph.nodes[0]->name) != 0 ||
+                         strcmp(xa->graph.nodes[xa->graph.n_nodes-1]->name, xb->graph.nodes[xb->graph.n_nodes-1]->name) != 0));
+                    if (diff) {
+                        GGML_LOG_WARN("  split %d: a %s %d nodes (%s .. %s) | b %s %d nodes (%s .. %s)\n", i,
+                            xa ? ggml_backend_name(sched_a->backends[xa->backend_id]) : "-", xa ? xa->i_end - xa->i_start : 0,
+                            xa && xa->graph.n_nodes ? xa->graph.nodes[0]->name : "-", xa && xa->graph.n_nodes ? xa->graph.nodes[xa->graph.n_nodes-1]->name : "-",
+                            xb ? ggml_backend_name(sched_b->backends[xb->backend_id]) : "-", xb ? xb->i_end - xb->i_start : 0,
+                            xb && xb->graph.n_nodes ? xb->graph.nodes[0]->name : "-", xb && xb->graph.n_nodes ? xb->graph.nodes[xb->graph.n_nodes-1]->name : "-");
+                    }
+                }
+            }
+            ggml_backend_sched_compute_state st;
+            for (int split_id = 0; split_id < sched_a->n_splits; split_id++) {
+                enum ggml_status ec = ggml_backend_sched_compute_split(sched_a, split_id, st);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+            }
+            ggml_backend_sched_compute_state st2;
+            for (int split_id = 0; split_id < sched_b->n_splits; split_id++) {
+                enum ggml_status ec = ggml_backend_sched_compute_split(sched_b, split_id, st2);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
     // Splits are submitted alternately: a0 b0 a1 b1 ... Each backend runs its own in-order stream, so
     // while a1 (say, the experts on the second device) waits for a0, b0 already runs on the first device.
     // Cross-graph ordering (b reads the KV/recurrent state a writes at the same layer) follows from a's
