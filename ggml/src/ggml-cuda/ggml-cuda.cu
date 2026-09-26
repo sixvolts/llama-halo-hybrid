@@ -3977,6 +3977,33 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
                 }
             }
         }
+        {   // rev/decode-profile: GGML_CUDA_HC_DEBUG=<n> reports the first n boundary declines (combine not joined with the norm)
+            static const int dbg = getenv("GGML_CUDA_HC_DEBUG") ? atoi(getenv("GGML_CUDA_HC_DEBUG")) : 0;
+            static int logged = 0;
+            if (dbg > 0 && logged < dbg) {
+                logged++;
+                const int j6 = hc_next(cgraph, j5 + 1);
+                const int j7 = j6 < n ? hc_next(cgraph, j6 + 1) : n;
+                const ggml_tensor * t6 = j6 < n ? cgraph->nodes[j6] : nullptr;
+                const ggml_tensor * t7 = j7 < n ? cgraph->nodes[j7] : nullptr;
+                int why = 0;
+                if (!t6 || t6->op != GGML_OP_RMS_NORM) { why = 1; }
+                else if (t6->src[0] != add) { why = 2; }
+                else if (!hc_uses1(cgraph, j6)) { why = 3; }
+                else if (!t7 || t7->op != GGML_OP_MUL || t7->src[0] != t6) { why = 4; }
+                else {
+                    const ggml_tensor * xn = t7; const ggml_tensor * gamma = xn->src[1];
+                    auto sod = [](const ggml_tensor * o, const ggml_tensor * in) { return o->data == in->data || hc_disjoint(o, in); };
+                    if (!(gamma->type == GGML_TYPE_F32 && ggml_is_contiguous(gamma) && gamma->ne[0] == n_embd && (gamma->ne[1] == 1 || gamma->ne[1] == hc))) { why = 5; }
+                    else if (!hc_views_belong(cgraph, i, j7, { sc2, add, t6, hc_root(gamma) })) { why = 6; }
+                    else if (!sod(add, x)) { why = 7; } else if (!sod(xn, x)) { why = 8; } else if (!hc_disjoint(xn, add)) { why = 9; }
+                    else if (!hc_disjoint(xn, b) || !hc_disjoint(xn, inj)) { why = 10; } else if (!hc_disjoint(xn, gamma)) { why = 11; }
+                    else { why = 12; }
+                }
+                GGML_LOG_WARN("hc-debug dev %d: combine %s (%d nodes) not joined: reason %d; next %s(%s) %s(%s)\n", cuda_ctx->device, add->name,
+                    cgraph->n_nodes, why, t6 ? ggml_op_name(t6->op) : "-", t6 ? t6->name : "-", t7 ? ggml_op_name(t7->op) : "-", t7 ? t7->name : "-");
+            }
+        }
         ggml_cuda_op_hc_combine(*cuda_ctx, x, b, inj, n_embd, hc, nt,
                 hc_param(sc1, 0), hc_param(sc1, 1), hc_param(sc2, 0), hc_param(sc2, 1), add);
         return j5 - i;
@@ -6433,6 +6460,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    {   // rev/decode-profile: GGML_CUDA_DISABLE_GRAPHS_DEV=<n> runs device n's splits eagerly (the others keep graphs)
+        static const int no_graph_dev = getenv("GGML_CUDA_DISABLE_GRAPHS_DEV") ? atoi(getenv("GGML_CUDA_DISABLE_GRAPHS_DEV")) : -1;
+        if (cuda_ctx->device == no_graph_dev) {
+            graph->disable_due_to_gpu_arch = true;
+        }
+    }
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
             if (!graph->disable_due_to_gpu_arch) {
@@ -6519,6 +6552,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    {   // halo-hybrid (rev/decode-profile): GGML_CUDA_GRAPH_STATS=<n> prints, per device every n graph computes, how many
+        // were replayed, captured or run directly, and the size of the graph cache
+        static const int every = getenv("GGML_CUDA_GRAPH_STATS") ? atoi(getenv("GGML_CUDA_GRAPH_STATS")) : 0;
+        if (every > 0) {
+            static uint64_t n_replay[GGML_CUDA_MAX_DEVICES], n_capture[GGML_CUDA_MAX_DEVICES], n_direct[GGML_CUDA_MAX_DEVICES];
+            const int d = cuda_ctx->device;
+            if (use_cuda_graph && !cuda_graph_update_required) { n_replay[d]++; } else if (use_cuda_graph) { n_capture[d]++; } else { n_direct[d]++; }
+            const uint64_t tot = n_replay[d] + n_capture[d] + n_direct[d];
+            if (tot % every == 0) {
+                GGML_LOG_WARN("graph-stats dev %d: %llu computes: replay %llu capture %llu direct %llu, cache %zu\n", d, (unsigned long long) tot,
+                    (unsigned long long) n_replay[d], (unsigned long long) n_capture[d], (unsigned long long) n_direct[d], cuda_ctx->cuda_graphs.size());
+            }
+        }
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

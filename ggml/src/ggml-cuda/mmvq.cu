@@ -2080,6 +2080,20 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
     if (type == GGML_TYPE_COUNT) {
         return false;                              // all-f32 groups keep the existing mul_mat_vec_f path
     }
+    {   // rev/decode-profile: GGML_CUDA_GEMV_GROUP_MINROWS=<n> leaves a group whose quantized members have fewer than n
+        // rows in total to the per-matrix path (one wave per row starves a 64-CU part: hc_down is 320 rows x K=10240)
+        static const int64_t min_rows = getenv("GGML_CUDA_GEMV_GROUP_MINROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_MINROWS")) : 0;
+        if (min_rows > 0) {
+            int64_t rows = 0;
+            for (int k = 0; k < n; ++k) {
+                const ggml_tensor * mm = nodes[k]->op == GGML_OP_GLU ? nodes[k]->src[0] : nodes[k];
+                if (mm->src[0]->type != GGML_TYPE_F32) { rows += mm->src[0]->ne[1]; }
+            }
+            if (rows < min_rows) {
+                return false;
+            }
+        }
+    }
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     if (ne11 < 1 || ne11 > 4 || ne10 % ggml_blck_size(type) != 0) {

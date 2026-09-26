@@ -1498,7 +1498,12 @@ struct ggml_backend_cuda_context {
 
     // a cuda graph instance is only valid for the shapes it captured, so a caller that
     // alternates shapes needs one instance per shape to stay on the graph path
-    static const size_t max_cuda_graphs = 64;
+    // halo-hybrid (rev/decode-profile): GGML_CUDA_MAX_GRAPHS=<n> overrides the per-device cache size. A hybrid
+    // decode step submits ~76 card splits (plus the draft's), so a 64-entry LRU evicts every key before its reuse.
+    static size_t max_cuda_graphs_n() {
+        static const size_t n = getenv("GGML_CUDA_MAX_GRAPHS") ? (size_t) atoi(getenv("GGML_CUDA_MAX_GRAPHS")) : 64;
+        return n;
+    }
 
     // q8_1 side copies of single-row f32 activations, written by the fused kernels in hc.cu in the
     // same launch that produces the f32 value, and consumed by mul_mat_vec_q instead of a separate
@@ -1534,7 +1539,7 @@ struct ggml_backend_cuda_context {
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
             // a workload with many distinct shapes must not grow this without bound
-            while (cuda_graphs.size() >= max_cuda_graphs) {
+            while (cuda_graphs.size() >= max_cuda_graphs_n()) {
                 auto lru = cuda_graphs.begin();
                 for (auto c = cuda_graphs.begin(); c != cuda_graphs.end(); ++c) {
                     if (c->second->last_used_time < lru->second->last_used_time) {

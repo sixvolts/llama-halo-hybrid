@@ -378,7 +378,11 @@ int ggml_cuda_mul_mat_q_gate_up(ggml_backend_cuda_context & ctx, const ggml_tens
     // only where ggml_cuda_mul_mat_id would take MMQ for both
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t n_tokens = src1->ne[2];
-    if (n_tokens <= MMVQ_MAX_BATCH_SIZE || !ggml_cuda_should_use_mmq(src0_g->type, cc, n_tokens, src0_g->ne[2])) {
+    // rev/decode-profile: GGML_CUDA_MMQ_GATEUP_DECODE=1 also takes the verify widths at which mul_mat_id already runs MMQ
+    // (n_tokens above the type's MMVQ cap: 3..8 for q4_K on RDNA3.5), instead of two separately prepared GEMMs
+    static const bool decode_widths = getenv("GGML_CUDA_MMQ_GATEUP_DECODE") != nullptr && atoi(getenv("GGML_CUDA_MMQ_GATEUP_DECODE")) > 0;
+    const bool vec_width = decode_widths ? n_tokens <= get_mmvq_mmid_max_batch(src0_g->type, cc) : n_tokens <= MMVQ_MAX_BATCH_SIZE;
+    if (vec_width || !ggml_cuda_should_use_mmq(src0_g->type, cc, n_tokens, src0_g->ne[2])) {
         return 0;
     }
     if (blackwell_mma_available(cc) && (src0_g->type == GGML_TYPE_MXFP4 || src0_g->type == GGML_TYPE_NVFP4)) {
