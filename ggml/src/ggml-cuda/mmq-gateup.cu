@@ -153,7 +153,7 @@ static __global__ void mul_mat_q_gate_up(
                     load_y_regs(yr0, kb0 + blocks_per_iter, 0);
                 }
 
-                vec_dot(tile_x, tile_y, sum, 0);
+                vec_dot(tile_x, tile_y, sum, 0, J);
 
                 __syncthreads();
 
@@ -165,7 +165,7 @@ static __global__ void mul_mat_q_gate_up(
                     load_y_regs(yr1, kb0 + blocks_per_iter, 1);
                 }
 
-                vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+                vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K, J);
 
                 __syncthreads();
             }
@@ -184,7 +184,7 @@ static __global__ void mul_mat_q_gate_up(
 
                 __syncthreads();
 
-                vec_dot(tile_x, tile_y, sum, 0);
+                vec_dot(tile_x, tile_y, sum, 0, J);
 
                 __syncthreads();
 
@@ -192,7 +192,7 @@ static __global__ void mul_mat_q_gate_up(
 
                 __syncthreads();
 
-                vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+                vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K, J);
 
                 __syncthreads();
             }
