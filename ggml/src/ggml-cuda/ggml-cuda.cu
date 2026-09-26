@@ -34,6 +34,7 @@
 #include "ggml-cuda/ewchain.cuh"
 #include "ggml-cuda/persist.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmid-f16.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -2068,6 +2069,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
+        // halo-hybrid: F16-WMMA routed expert GEMM on RDNA3/3.5 at prefill widths (mmid-f16.cu, GGML_CUDA_MMID_F16=1)
+        if (ggml_cuda_mmid_f16(ctx, src0, src1, ids, dst)) {
+            return;
+        }
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -5876,7 +5881,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             // halo-hybrid: MoE gate/up at MMQ widths: one quantize + expert sort for both, and where supported one
             //     kernel for gate, up and the GLU (mmq-gateup.cu). Returns 2 when the GLU node is left to run.
-            if (op == GGML_OP_MUL_MAT_ID) {
+            if (op == GGML_OP_MUL_MAT_ID && !ggml_cuda_mmid_f16_takes(*cuda_ctx, gate)) {
                 const int n = ggml_cuda_mul_mat_q_gate_up(*cuda_ctx, gate, up, glu);
                 if (n > 0) {
                     fused_mul_mat_vec = true;
