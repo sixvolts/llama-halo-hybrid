@@ -247,3 +247,25 @@ path only turns on above 65,536 cells). Measured with GGML_CUDA_TIME_OPS_EVERY=1
 - **Result:** 705 / 691 / 589 -> 747 / 756 / 701 t/s (-ub 2048), 769 / 783 / 724 with -ub 4096. halogen: 1,246 at 8K,
   1,424 at 32K. Left: expert GEMM (LDS-bound MMQ, the largest term), hc_down GEMM shape (7 TFLOPS), hc element-wise
   traffic at prefill widths, the QSA mask build (fill/set_rows/add over n_kv x 2048), a WMMA GDN scan.
+
+## 2026-09-25/26: Qwen3.8 expert GEMMs (fb5ea41df, 5f9972fc0, b4ecb3a55)
+Isolated (TBO_Q38_MOE, one call over 512 experts x 10 used): bandwidth-bound (205-212 GB/s) up to ~1K tokens, then
+compute-bound at ~15-16 TOPS (q4_K gate/up) and ~12 TOPS (q5_1 down, K = 640) against ~59 TOPS peak.
+- **Gate/up (fb5ea41df, GGML_CUDA_MMQ_GATEUP=0/1/2, default 2):** one quantize + expert sort for both; a fused gate+up+GLU
+  kernel (two half-height MMQ blocks stacked, GLU in the epilogue). Bit-identical (per-chunk perplexity, KLD tables,
+  greedy). Isolated MOE_GATE_UP graph -10 to -12% at 1-4K tokens; end to end ~+1%. Lesson: full-height halves (twice the
+  weight LDS per activation tile) were 1.2-1.6x SLOWER - on gfx1151 fewer resident blocks cost more than halving
+  activation-tile loads. Reviewer: the fused GEMM itself is +6% vs two unfused ones; the net gain is the removed
+  launches; at GLM's J=16 on gfx1151 mode 1 is 1.5-2.5% faster than mode 2 (follow-up: route small J to mode 1).
+- **Inner loop (5f9972fc0, GGML_CUDA_MMQ_SUBTILE_SKIP / GGML_CUDA_MMQ_KTAIL_SKIP, default on; Q5_1 RDNA3.5 tiles
+  compile-time):** counters (gfx1151 offers no WMMA/wait counters): q4_K J=48 runs 4 waves/SIMD (LDS-limited), issue slots
+  ~70% busy, LDS bank conflicts 8%, DRAM ~141 GB/s; ablations say load/barrier-bound at 2048 tokens, issue-bound at 4096.
+  Exact fixes: skip 16-column subtiles past the last real column (MoE tiles sized to the mean are ~68% full), skip the
+  K-tail half-iteration (K = 640 spent 1/6 of the down projection on padding), Q5_1 on 64-row tiles with prefetch.
+  q4_K -16% and q5_1 -24% at 4096 tokens; GLM q4_K/q5_K -8/-9% at 2048 on gfx1151. Dropped: dot2 min-term (lost
+  dual issue, spills), larger J (spills). Plan for the real redesign: min term as one f16 WMMA per C tile, q4_K nibbles
+  packed in LDS (half the A bytes, 5+ blocks/WGP), per-type MoE column tile - compare with gufo's RoutedF16GEMMKernel.
+  Measurements: ~/bench/results/mmq-inner-loop-0925/.
+- **Merged result:** greedy identical, perplexity per chunk identical (7.1541 / 5.5909). Server prefill 747/756/701 ->
+  754/794/735 t/s (4K noisy). GLM two-host unchanged (887 t/s, 94.4 ms/step, same hash) once the TTM pool is drained -
+  a run started with the pool full read 742 t/s and 169.5 ms/step; sweep_0922.sh now drains before each server start.
