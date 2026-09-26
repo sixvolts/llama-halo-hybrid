@@ -269,3 +269,13 @@ compute-bound at ~15-16 TOPS (q4_K gate/up) and ~12 TOPS (q5_1 down, K = 640) ag
 - **Merged result:** greedy identical, perplexity per chunk identical (7.1541 / 5.5909). Server prefill 747/756/701 ->
   754/794/735 t/s (4K noisy). GLM two-host unchanged (887 t/s, 94.4 ms/step, same hash) once the TTM pool is drained -
   a run started with the pool full read 742 t/s and 169.5 ms/step; sweep_0922.sh now drains before each server start.
+
+## 2026-09-26: F16-WMMA routed expert GEMM ported from gufo (8defd8fb4)
+gufo (github.com/gufo-org/gufo, MIT) runs this model's prefill at 2x ours on the same box; its routed expert GEMM keeps
+the codes packed in LDS and dequantizes to F16 per wave (no per-32 scale VALU), with F16 activations. Ported as
+ggml/src/ggml-cuda/mmid-f16.cu behind MUL_MAT_ID (attribution in the header). Isolated vs our MMQ: q4_K -16% / -19%
+at 2048 / 4096 tokens, slower below ~1K tokens and on GLM's 2048 x 4096 experts, so an auto rule (small experts,
+>= 40 rows per expert, RDNA3.5) decides. KLD 0.0295 vs MMQ (below the ~0.032 of a 1e-6 perturbation). Prefill
+754/792/733 -> 787/817/752 t/s; 804/847/777 with -ub 4096 (recommended for Qwen3.8 on the APU). GLM unchanged.
+Not ported yet from gufo: the paired gate/up variant with the SwiGLU written as F16 for the down projection (removes the
+f32 intermediate and a conversion), the dense Q8->F16 WMMA with fused HC/conv/attention epilogues, HC combine kernels.
