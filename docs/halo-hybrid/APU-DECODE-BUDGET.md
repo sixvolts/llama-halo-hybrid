@@ -310,5 +310,9 @@ Measured on gibson, same model files and prompts (gufo via ~/bench/gufo_probe.sh
 
 Layout: `-dev ROCm0,ROCm1 -ts 1,0`, experts of layers 11-47 on ROCm1 (`-ot 'blk\.(11|...|47)\.ffn_(gate|up|down)_exps=ROCm1'`),
 dense trunk, layers 0-10 experts and the MTP draft on the R9700, `-b 4096 -ub 2048`, `LLAMA_PREFILL_LANES=2`. Greedy text
-identical with 1 and 2 lanes. VRAM-bound: 12+ expert layers on the card, 4096 or 3072-token ubatches with 2 lanes, or
-4 lanes do not fit with the draft; 4 lanes at -ub 1024 is slower (1,315 / 1,545 / 1,520).
+identical with 1 and 2 lanes (bit-exact only with -ctxcp 0: the server picks different checkpoint boundaries per lane
+count). Corrections (review workflow 2026-09-26, ~/bench/results/q38rev-0926/PLAN.md): the probe drains the page cache
+before each server start, so these are COLD numbers (warm 4K is 1,829-1,950; steady-state MTP decode ~51 t/s, 47.8 was
+one cold request); LLAMA_PREFILL_LANES=4 only adds lanes with a remote device - locally it runs 2 lanes, so the
+"4 lanes at -ub 1024" run (1,315 / 1,545 / 1,520) was 2 lanes at -ub 1024; the 12+ expert-layer and -ub 3072/4096
+failures were the MTP draft's KV / compute buffers (the draft inherits the target's n_ubatch), not the target layout.
