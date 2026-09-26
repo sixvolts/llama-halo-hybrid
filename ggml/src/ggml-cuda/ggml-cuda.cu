@@ -853,6 +853,10 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+        // halo-hybrid: issue the copy with the SOURCE device current. On an APU + dGPU host a card -> APU copy issued
+        // with the APU current (hipMemcpyPeer, D2D memcpy, or a kernel pull alike) returns zeros with no error; the same
+        // copy issued from the card is correct (bench/results/q38rev-0926/code-review/peerbw/ptscheck.out)
+        ggml_cuda_set_device(src_ctx->device);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
@@ -2760,6 +2764,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src, 
                 k_peer_copy_bytes<<<grid, block, 0, cuda_ctx_src->stream()>>>((const uint4 *) src->data, (uint4 *) dst->data, n16);
                 CUDA_CHECK(cudaGetLastError());
             } else {
+                ggml_cuda_set_device(cuda_ctx_src->device);   // source device current: see ggml_backend_cuda_buffer_cpy_tensor
                 CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, nbytes, cuda_ctx_src->stream()));
             }
 #endif // GGML_CUDA_NO_PEER_COPY
