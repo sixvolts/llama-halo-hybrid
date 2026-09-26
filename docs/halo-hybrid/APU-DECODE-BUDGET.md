@@ -296,3 +296,19 @@ f32 intermediate and a conversion), the dense Q8->F16 WMMA with fused HC/conv/at
   permuted so the four streams of one channel land in one tile, plus a GEMM epilogue - a multi-day change.
 - **Note:** the F16 routed expert path's auto rule needs >= 40 rows per expert: a 1.9K-token prompt (18.6K rows over
   512 experts) stays on MMQ.
+
+## 2026-09-26: Qwen3.8 APU + R9700 vs gufo APU-only (the parity bar)
+Target set by the user: gufo owns single-APU; our APU + R9700 configuration must at least match gufo's APU-only numbers.
+Measured on gibson, same model files and prompts (gufo via ~/bench/gufo_probe.sh, ours via ~/bench/q38_hybrid_srv.sh):
+
+| | prefill 4K / 16K / 32K (t/s) | MTP decode (t/s) |
+|---|---|---|
+| gufo, APU only | 1,359 / 1,431 / 1,410 | 34.8 |
+| ours, APU only (-ub 2048) | 813 / 824 / 761 | 33-37 |
+| ours, APU + R9700, 1 lane | 1,059 / 1,218 / 1,191 | 47.3 |
+| ours, APU + R9700, 2 prefill lanes | **1,491 / 1,781 / 1,719** | **47.8** |
+
+Layout: `-dev ROCm0,ROCm1 -ts 1,0`, experts of layers 11-47 on ROCm1 (`-ot 'blk\.(11|...|47)\.ffn_(gate|up|down)_exps=ROCm1'`),
+dense trunk, layers 0-10 experts and the MTP draft on the R9700, `-b 4096 -ub 2048`, `LLAMA_PREFILL_LANES=2`. Greedy text
+identical with 1 and 2 lanes. VRAM-bound: 12+ expert layers on the card, 4096 or 3072-token ubatches with 2 lanes, or
+4 lanes do not fit with the draft; 4 lanes at -ub 1024 is slower (1,315 / 1,545 / 1,520).
