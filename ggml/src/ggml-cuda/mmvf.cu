@@ -512,6 +512,23 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
 
+    // halo-hybrid: gfx1201's dispatch cliff (see mmvq.cu) also sits at multiples of its 2048 wave slots: Qwen3.8's
+    // 512-row f32 router launched 512 blocks x 8 waves = 4096 waves and ran 23.5 us vs 7.9 us at 513 rows. Step the
+    // block down a warp until the wave count is clear of it.
+    static const bool no_cliff_guard = getenv("GGML_CUDA_MMVF_NO_CLIFF") != nullptr;
+    if (!no_cliff_guard && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
+        const int64_t slots    = (int64_t) ggml_cuda_info().devices[device].nsm * 64;
+        const int64_t launches = nrows * nchannels_dst * nsamples_or_ntokens;
+        const auto on_cliff = [&](int64_t bs) {
+            const int64_t waves = launches * (bs / warp_size);
+            const int64_t r     = waves % slots;
+            return waves >= slots - 12 && (r >= slots - 12 || r <= 3);
+        };
+        while (block_size_best > warp_size && on_cliff(block_size_best)) {
+            block_size_best -= warp_size;
+        }
+    }
+
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
