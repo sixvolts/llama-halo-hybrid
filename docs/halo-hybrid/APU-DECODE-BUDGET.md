@@ -420,5 +420,8 @@ bit-identical except 21 ssm_a with a 1-ulp exp() difference in one of 48 values 
 | q8_0 trunk (2 runs) | 1877-1907 | 1902-1903 | 1764 | 55.3 / 55.5 (41 ms/step) | 7.2907 / 7.3107 |
 | q8_0 trunk, -ub 2560 -b 5120 | 1919 | 1994 | 1836 | | |
 
+(The Q4_K_M decode row was measured just before 43d424a53; decode never enters the N >= 64 WMMA path, so it stands.
+Base-model gate after 43d424a53: greedy hashes unchanged (5741ae8aed8d / 1b969dc886b0, APU-only text), prefill
+1891/1915/1776 and APU-only 922/853/776. GLM-5.3's dense weights are all q8_0/f32, so the kernel does not touch it.)
 APU-only q8_0 trunk: 902/847/772, decode 26.8 (Q4_K_M: 871/808/739, 31.3). The q8_0 trunk costs ~3% hybrid decode and
 ~14% APU-only decode (more trunk bytes per token) for a 3% lower perplexity.
