@@ -381,3 +381,6 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# batched eager copies at a split boundary (needs two GPUs; skips otherwise)
+llama_build(test-peer-copy-batch.cpp)

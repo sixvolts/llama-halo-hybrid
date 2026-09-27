@@ -2820,6 +2820,115 @@ static bool ggml_backend_cuda_cpy_tensor_async_nowait(ggml_backend_t backend_src
     return ggml_backend_cuda_cpy_tensor_async_impl(backend_src, backend_dst, src, dst, /*wait_dst=*/false);
 }
 
+// Several small cross-device copies in ONE kernel launch (the scheduler's eager copies of a split boundary: at a MoE
+// boundary the ffn_norm output, the expert weights and the ids go card -> APU together). Each segment is a
+// k_peer_copy_bytes of its own; a block finds its segment by the block prefix sums (at most 8, uniform per block).
+#define GGML_CUDA_PEER_COPY_MULTI_MAX 8
+
+struct ggml_cuda_peer_copy_seg {
+    const uint4 * src;
+    uint4       * dst;
+    uint32_t      n16;
+    uint32_t      block0; // first block of this segment
+    uint32_t      tail;   // bytes after the n16 vectors (< 16), copied by the thread after them
+};
+
+struct ggml_cuda_peer_copy_segs {
+    ggml_cuda_peer_copy_seg s[GGML_CUDA_PEER_COPY_MULTI_MAX];
+    int n;
+};
+
+static __global__ void k_peer_copy_multi(const ggml_cuda_peer_copy_segs segs) {
+    int j = 0;
+    while (j + 1 < segs.n && blockIdx.x >= segs.s[j + 1].block0) {
+        j++;
+    }
+    const uint4 * src = segs.s[j].src;
+    uint4       * dst = segs.s[j].dst;
+    const uint32_t i  = (blockIdx.x - segs.s[j].block0) * blockDim.x + threadIdx.x;
+    if (i < segs.s[j].n16) {
+        dst[i] = src[i];
+    } else if (i == segs.s[j].n16 && segs.s[j].tail > 0) {
+        const char * s = (const char *) (src + i);
+        char       * d = (char       *) (dst + i);
+        for (uint32_t b = 0; b < segs.s[j].tail; ++b) {
+            d[b] = s[b];
+        }
+    }
+}
+
+// all or nothing: returns false before enqueuing anything when any copy is not a device -> device peer copy between
+// two distinct physical CUDA/HIP devices; the scheduler then falls back to one cpy_tensor_async_nowait per tensor.
+// Copies above GGML_CUDA_KERNEL_COPY_MAX or misaligned ones go through cudaMemcpyPeerAsync as in the single path.
+// GGML_CUDA_NO_PEER_COPY_BATCH=1 disables it.
+static bool ggml_backend_cuda_cpy_tensors_async_nowait(ggml_backend_t backend_src, ggml_backend_t backend_dst, int n, const ggml_tensor ** srcs, ggml_tensor ** dsts) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED_VARS(backend_src, backend_dst, n, srcs, dsts);
+    return false;
+#else
+    static const bool disabled = getenv("GGML_CUDA_NO_PEER_COPY_BATCH") != nullptr ||
+                                 getenv("GGML_SCHED_LAZY_INPUTS") != nullptr; // the lazy-inputs wait is per copy
+    if (disabled || n <= 0 || backend_src == backend_dst ||
+            !ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+    const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
+    const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
+    if (src_physical == dst_physical) {
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        ggml_backend_buffer_t buf_src = srcs[i]->view_src ? srcs[i]->view_src->buffer : srcs[i]->buffer;
+        ggml_backend_buffer_t buf_dst = dsts[i]->view_src ? dsts[i]->view_src->buffer : dsts[i]->buffer;
+        if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst) ||
+                ((ggml_backend_cuda_buffer_context *) buf_src->context)->device != cuda_ctx_src->device ||
+                ((ggml_backend_cuda_buffer_context *) buf_dst->context)->device != cuda_ctx_dst->device) {
+            return false;
+        }
+    }
+    const bool peer = ggml_cuda_ensure_peer_access(src_physical, dst_physical);
+
+    ggml_cuda_set_device(cuda_ctx_src->device);
+    cudaStream_t stream = cuda_ctx_src->stream();
+    const int block = 256;
+    ggml_cuda_peer_copy_segs segs;
+    segs.n = 0;
+    uint32_t n_blocks = 0;
+    auto flush = [&]() {
+        if (segs.n > 0) {
+            k_peer_copy_multi<<<n_blocks, block, 0, stream>>>(segs);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        segs.n   = 0;
+        n_blocks = 0;
+    };
+    for (int i = 0; i < n; i++) {
+        const size_t nbytes = ggml_nbytes(dsts[i]);
+        if (nbytes == 0) {
+            continue;
+        }
+        const bool kernel_copy = peer && nbytes <= ggml_cuda_kernel_copy_max() &&
+            ((uintptr_t) srcs[i]->data % 16 == 0) && ((uintptr_t) dsts[i]->data % 16 == 0);
+        if (!kernel_copy) {
+            CUDA_CHECK(cudaMemcpyPeerAsync(dsts[i]->data, dst_physical, srcs[i]->data, src_physical, nbytes, stream));
+            continue;
+        }
+        if (segs.n == GGML_CUDA_PEER_COPY_MULTI_MAX) {
+            flush();
+        }
+        const uint32_t n16  = (uint32_t) (nbytes / 16);
+        const uint32_t tail = (uint32_t) (nbytes % 16);
+        segs.s[segs.n] = { (const uint4 *) srcs[i]->data, (uint4 *) dsts[i]->data, n16, n_blocks, tail };
+        segs.n++;
+        n_blocks += (n16 + (tail > 0) + block - 1) / block;
+    }
+    flush();
+    return true;
+#endif // GGML_CUDA_NO_PEER_COPY
+}
+
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
@@ -7048,6 +7157,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
     /* .cpy_tensor_async_nowait = */ ggml_backend_cuda_cpy_tensor_async_nowait,
+    /* .cpy_tensors_async_nowait = */ ggml_backend_cuda_cpy_tensors_async_nowait,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

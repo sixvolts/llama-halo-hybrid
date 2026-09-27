@@ -2001,6 +2001,11 @@ struct ggml_backend_sched_compute_state {
     int n_remote_send = 0; int64_t t_remote_send_us = 0;
     int n_remote_wait = 0; int64_t t_remote_wait_us = 0;
     int n_remote_fetch = 0;
+    // eager copies: inputs pushed, batched calls among them, host time in the eager loop
+    int n_eager = 0; int n_eager_batch = 0; int64_t t_eager_us = 0;
+    std::vector<int> eager_k;
+    std::vector<const ggml_tensor *> eager_src;
+    std::vector<ggml_tensor *> eager_dst;
 };
 
 static bool ggml_backend_sched_trace_waits() {
@@ -2010,9 +2015,10 @@ static bool ggml_backend_sched_trace_waits() {
 
 static void ggml_backend_sched_trace_report(const char * tag, ggml_backend_sched_t sched, const ggml_backend_sched_compute_state & st) {
     if (ggml_backend_sched_trace_waits()) {
-        GGML_LOG_INFO("sched-trace %s: splits %d, host waits: no-input %d, input-copy %d, sync-copy %d, submit %.1f ms (copies %.1f, compute %.1f); remote send %d (%.1f ms), fetch %d, fetch-wait %d (%.1f ms)\n",
+        GGML_LOG_INFO("sched-trace %s: splits %d, host waits: no-input %d, input-copy %d, sync-copy %d, submit %.1f ms (copies %.1f, compute %.1f); remote send %d (%.1f ms), fetch %d, fetch-wait %d (%.1f ms); eager %d in %d batches (%lld us)\n",
             tag, sched->n_splits, st.n_wait_noinput, st.n_wait_input, st.n_wait_cpyfail, st.t_submit_us/1000.0, st.t_copy_us/1000.0, st.t_comp_us/1000.0,
-            st.n_remote_send, st.t_remote_send_us/1000.0, st.n_remote_fetch, st.n_remote_wait, st.t_remote_wait_us/1000.0);
+            st.n_remote_send, st.t_remote_send_us/1000.0, st.n_remote_fetch, st.n_remote_wait, st.t_remote_wait_us/1000.0,
+            st.n_eager, st.n_eager_batch, (long long) st.t_eager_us);
     }
 }
 
@@ -2066,6 +2072,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                 return ggml_backend_sched_is_input(t) && t->buffer && ggml_backend_buffer_is_host(t->buffer);
             });
         }
+        ggml_backend_event_t last_input_ev = NULL;
         for (int oi = 0; oi < split->n_inputs; oi++) {
             const int input_id = ord[oi];
             if (trace_sends) { send_offs[oi] = ggml_time_us() - t_copy_start; }
@@ -2079,8 +2086,12 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
             }
 
             if (split->input_events && split->input_events[input_id] != NULL) {
-                // already copied right after its producer (eager copies): only order this backend after that copy
-                ggml_backend_event_wait(split_backend, split->input_events[input_id]);
+                // already copied right after its producer (eager copies): only order this backend after that copy.
+                // A batched eager copy shares one event among the inputs it moved: wait on it once.
+                if (split->input_events[input_id] != last_input_ev) {
+                    ggml_backend_event_wait(split_backend, split->input_events[input_id]);
+                    last_input_ev = split->input_events[input_id];
+                }
                 split->input_events[input_id] = NULL;
                 continue;
             }
@@ -2387,14 +2398,25 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
         }
 
         // eager copies: push this split's outputs that later splits on other backends consume, now, on this
-        // backend's queue (right behind their producer), and leave the consumer an event to wait on
+        // backend's queue (right behind their producer), and leave the consumer an event to wait on.
+        // Batched (cpy_tensors_async_nowait): all the inputs of one consumer split go in one call (CUDA: one peer copy
+        // kernel) behind ONE event record shared by those inputs; the consumer waits on it once. At a MoE boundary
+        // (ffn_norm output, expert weights, ids -> the expert device) that is 1 launch + 1 record + 1 wait instead of
+        // 3 + 3 + 3; on gfx1201 -> gfx1151 each record/wait pair costs ~10 us of queue time even when the host is ahead
+        // (producer end -> expert start 45.6 -> 25.9 us, test-peer-copy-batch perf). The event is recorded once and
+        // only this consumer split waits on it, so sharing it does not create the re-record serialisation of a
+        // per-device event. GGML_SCHED_NO_COPY_BATCH=1 disables it.
         if (sched->eager_copies && split_backend->iface.cpy_tensor_async_nowait) {
+            static const bool no_batch = getenv("GGML_SCHED_NO_COPY_BATCH") != nullptr;
+            const bool batch = !no_batch && split_backend->iface.cpy_tensors_async_nowait != NULL;
+            const int64_t t_eager_start = ggml_time_us();
             for (int c = split_id + 1; c < sched->n_splits; c++) {
                 struct ggml_backend_sched_split * cs = &sched->splits[c];
                 if (cs->backend_id == split_backend_id) {
                     continue;
                 }
                 ggml_backend_t dst_backend = sched->backends[cs->backend_id];
+                st.eager_k.clear();
                 for (int k = 0; k < cs->n_inputs; k++) {
                     struct ggml_tensor * x = cs->inputs[k];
                     if (ggml_backend_sched_is_input(x) || ggml_nbytes(x) == 0 || cs->input_events[k] != NULL) {
@@ -2411,6 +2433,36 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                     if (ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         continue;
                     }
+                    st.eager_k.push_back(k);
+                }
+                const int n_k = (int) st.eager_k.size();
+                if (n_k == 0) {
+                    continue;
+                }
+                if (batch && n_k > 1) {
+                    ggml_backend_event_t ev = ggml_backend_sched_next_copy_event(sched, split_backend_id);
+                    if (ev != NULL) {
+                        st.eager_src.resize(n_k);
+                        st.eager_dst.resize(n_k);
+                        for (int i = 0; i < n_k; i++) {
+                            st.eager_src[i] = cs->inputs[st.eager_k[i]];
+                            st.eager_dst[i] = tensor_copy(cs->inputs[st.eager_k[i]], cs->backend_id, sched->cur_copy);
+                        }
+                        if (split_backend->iface.cpy_tensors_async_nowait(split_backend, dst_backend, n_k,
+                                st.eager_src.data(), st.eager_dst.data())) {
+                            ggml_backend_event_record(ev, split_backend);
+                            for (int i = 0; i < n_k; i++) {
+                                cs->input_events[st.eager_k[i]] = ev;
+                            }
+                            st.n_eager += n_k;
+                            st.n_eager_batch++;
+                            continue;
+                        }
+                    }
+                }
+                for (int i = 0; i < n_k; i++) {
+                    const int k = st.eager_k[i];
+                    struct ggml_tensor * x = cs->inputs[k];
                     ggml_backend_event_t ev = ggml_backend_sched_next_copy_event(sched, split_backend_id);
                     if (ev == NULL) {
                         continue;
@@ -2421,8 +2473,10 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                     }
                     ggml_backend_event_record(ev, split_backend);
                     cs->input_events[k] = ev;
+                    st.n_eager++;
                 }
             }
+            st.t_eager_us += ggml_time_us() - t_eager_start;
         }
 
         // record the event of this split

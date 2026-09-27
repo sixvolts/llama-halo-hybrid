@@ -159,6 +159,11 @@ extern "C" {
         // wait on it when the copy is consumed (ggml_backend_sched eager copies). Appended last so that the
         // positional initializers of the other backends stay valid (they get NULL).
         bool (*cpy_tensor_async_nowait)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+
+        // (optional) n copies of cpy_tensor_async_nowait from backend_src to backend_dst in one go (CUDA: one peer copy
+        // kernel for all the small ones). All or nothing: on false nothing was enqueued and the caller copies them one
+        // by one. The eager-copies loop records ONE event after it for all the inputs of one consumer split.
+        bool (*cpy_tensors_async_nowait)(ggml_backend_t backend_src, ggml_backend_t backend_dst, int n, const struct ggml_tensor ** srcs, struct ggml_tensor ** dsts);
     };
 
     struct ggml_backend {
