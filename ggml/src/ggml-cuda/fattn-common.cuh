@@ -1133,6 +1133,31 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+#ifdef GGML_USE_HIP
+    // HIP's occupancy calculator assumes regsPerMultiprocessor = 32768 on RDNA2, a quarter of a
+    // WGP's real register file (4 SIMDs x 1024 VGPRs x 32 lanes in wave32). It therefore reports 0
+    // blocks for kernels above 128 VGPRs that the hardware runs, and too few blocks for the rest,
+    // which starves the KV-split decode kernels of parallelism. Compute it from the kernel's
+    // registers and LDS against the WGP instead.
+    if (GGML_CUDA_CC_IS_RDNA2(cc) && warp_size == 32) {
+        hipFuncAttributes attr;
+        CUDA_CHECK(hipFuncGetAttributes(&attr, (const void *) fattn_kernel));
+        const int nthreads        = block_dim.x * block_dim.y * block_dim.z;
+        const int waves_per_block = (nthreads + warp_size - 1) / warp_size;
+        const int vgprs           = std::max(8, (attr.numRegs + 7) / 8 * 8);
+        // at most 8 waves/SIMD: measured on the split-KV decode kernels, more resident blocks than
+        // that (e.g. 22 instead of 16 for a 2-wave block) choose a worse KV split and run slower
+        const int waves_per_simd  = std::min(8, 1024 / vgprs);
+        const size_t lds          = attr.sharedSizeBytes + nbytes_shared;
+        int blocks = 4*waves_per_simd / waves_per_block;
+        if (lds > 0) {
+            blocks = std::min(blocks, int((128*1024) / lds));
+        }
+        if (attr.maxThreadsPerBlock >= nthreads && blocks > max_blocks_per_sm) {
+            max_blocks_per_sm = blocks;
+        }
+    }
+#endif // GGML_USE_HIP
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 

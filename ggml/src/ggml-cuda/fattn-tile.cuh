@@ -313,12 +313,13 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 }
 
 // RDNA2 (gfx1030) overrides. RDNA2 has no WMMA, so every flash-attention call lands on the
-// tile kernel, and its register file cannot hold the resident blocks the RDNA table asks for
-// at D=128/256/512/576: cudaOccupancyMaxActiveBlocksPerMultiprocessor returns 0 and
-// fattn-common aborts on GGML_ASSERT(max_blocks_per_sm > 0). Occupancy 1 always fits (and
-// D=256 ncols=32 also drops nbatch_fa 64 -> 32). Found with test-backend-ops FLASH_ATTN_EXT
-// on a V620. The RDNA table is left as upstream tuned it: RDNA3/4 also use the tile kernel
-// for decode and small batches, and have the larger register file those values assume.
+// tile kernel. The occupancy-1 entries date from when HIP's occupancy query (which undercounts
+// the RDNA2 register file, see launch_fattn) made larger configs abort; launch_fattn now
+// computes RDNA2 occupancy itself. The D=256 ncols 8/16/32 entries were re-tuned after that
+// on a V620 with the Qwen3.5 shape (24 Q heads over 4 KV heads): nbatch_fa 64 instead of 32,
+// +31% on prefill attention, -17% / -30% time on 8- and 4-token verify batches at 64k.
+// The RDNA table is left as upstream tuned it: RDNA3/4 also use the tile kernel for decode
+// and small batches, and have the larger register file those values assume.
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_rdna2(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 1,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 1,  64,  64)
@@ -329,9 +330,9 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 1,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 1,  32, 256)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 1,  32, 256)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 1,  32, 256)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 1,  32, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 1,  64, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 1,  64, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 1,  64,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 1,  64,  64)
