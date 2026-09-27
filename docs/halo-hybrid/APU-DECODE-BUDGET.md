@@ -445,3 +445,26 @@ Greedy output is byte-identical (verification is unchanged): Q8T 841b89707654 / 
 The subset head works (loader logs "MTP head over a reduced vocabulary") but self-generated held-out coverage is
 only 87% at 32K and 94% at 64K tokens (English prose 15-20% misses at 32K: the corpus is code-heavy and 59K
 generated tokens are too few), and the full-vocabulary scatter eats the smaller read. Needs a large chat corpus.
+
+### Decode items D2, D3, D6, D5 (bd8ad77a7 .. 68d8b7f80)
+
+Real-content decode (probe_real, T=0.7, 400 tokens, n-max 2), ms/step, hybrid two lanes:
+
+| change | Swift Q8T + q4_K draft head | base + shared head |
+|---|---|---|
+| start of this round (shared q8_0 head for Swift) | 40.5-40.8 | 40.2-40.3 |
+| own q4_K draft head (Swift) | 39.5-39.7 | - |
+| kernel peer copies take byte tails (120 B ids / weights) | 39.4-39.5 | 40.0 |
+| eager copies for decode graphs (local only) | 38.1-38.4 | 38.8-39.0 |
+| batched eager copies (one kernel + event per split boundary) | 37.8-38.0 | 38.5-38.7 |
+| grouped MoE GEMV on by default, + q5_0 / q5_1 | 36.6-36.9 | 37.3-37.7 |
+| GEMV groups < 512 rows -> per-matrix (hc_down 18 -> 4 us) | 36.1-36.2 | 37.0-37.1 |
+| MMVF steps around the gfx1201 cliff (router 23.5 -> 7.1 us) | 36.0 | 36.5-36.7 |
+
+Swift Q8T decode is now ~62 t/s real content (was 55.6-56.2). Greedy text is unchanged by the copy changes; the
+grouped GEMV and the router block size change summation order: KLD at ub 3 vs the old path 0.042 / 0.038 (the
+model's perturbation floor is ~0.032), perplexity within error, acceptance within seed noise over 3-5 seeds.
+New greedy references (launcher prompt): Swift Q8T d1a9781806fd after the grouped GEMV; base cdfc2aa3aa56 /
+62b45bb3f58a after the router change. One transient slow window (15:18-15:22, both models, prefill included, no
+kernel fault) coincided with R9700 runtime-PM resumes; later runs with ~10 resumes were normal.
+Deferred: folding the shared-expert gate into the router as a 513th row (~0.15 ms/step).
