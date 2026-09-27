@@ -2517,8 +2517,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // (a qwen4exp MTP block with a nonzero compress ratio - LLAMA_MTP_QSA - attends through QSA and needs the
+                //  hybrid memory with an indexer cache for its layer, as glm5next's MTP does)
+                const bool mtp_qsa_qwen4exp = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                    hparams.n_layer_all > hparams.n_layer() && hparams.dsv4_compress_ratios[hparams.n_layer()] > 0;
                 const bool mtp_on_hybrid_qwen =
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !mtp_qsa_qwen4exp &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
                      arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
 
@@ -2558,7 +2562,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // the draft runs only the NextN block, so it gets a cache for that one layer. the trunk's
                         // cache would let the KDA layers take cells it can never roll back (n_rs_seq = 0), and a
                         // rejected draft then fails seq_rm
-                        const bool mtp_ctx = arch == LLM_ARCH_GLM5NEXT &&
+                        const bool mtp_ctx = (arch == LLM_ARCH_GLM5NEXT || arch == LLM_ARCH_QWEN4EXP) &&
                             cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                             hparams.n_layer_all > hparams.n_layer();
 
@@ -2592,8 +2596,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
-                            filter_idx = [&](uint32_t il) {
+                            // QSA runs on the dense-attention layers only (the MTP context: its own block only)
+                            filter_idx = [&, mtp_ctx](uint32_t il) {
+                                if (mtp_ctx) {
+                                    return il >= hparams.n_layer() && il < hparams.n_layer_all;
+                                }
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
                         }

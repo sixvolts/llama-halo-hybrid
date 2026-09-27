@@ -77,6 +77,19 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
+    // halo-hybrid: the MTP block carries its own indexer, but the converter writes ratio 0 for it (dense, see
+    // graph_mtp). LLAMA_MTP_QSA=1 gives it the trunk's ratio so the draft attends through QSA (opt-in: measured worse).
+    {
+        static const bool mtp_qsa = getenv("LLAMA_MTP_QSA") != nullptr && atoi(getenv("LLAMA_MTP_QSA")) != 0;
+        if (mtp_qsa && hparams.n_layer_nextn > 0) {
+            uint32_t r_trunk = 0;
+            for (uint32_t il = 0; il < hparams.n_layer() && r_trunk == 0; ++il) { r_trunk = hparams.dsv4_compress_ratios[il]; }
+            for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+                if (hparams.dsv4_compress_ratios[il] == 0) { hparams.dsv4_compress_ratios[il] = r_trunk; }
+            }
+        }
+    }
+
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
     hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
@@ -540,10 +553,12 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 // reusing the trunk's LM head. The wide post-block residual is exported as t_h_nextn so the
 // speculative driver can feed it straight back in for the next draft step.
 //
-// v1 simplification: the block attends densely. The trunk's QSA only prunes context past a
-// 2048-token budget, so dense is a numerical superset; drafts are verified by the target
-// either way. The indexer tensors are still loaded so the GGUF stays complete.
-// TODO: wire up QSA here for long-context draft fidelity.
+// The block attends densely by default. The trunk's QSA only prunes context past a 2048-token budget, so dense is a
+// numerical superset; drafts are verified by the target either way. LLAMA_MTP_QSA=1 runs the block through the
+// trunk's QSA path instead (its own indexer, hybrid memory with an indexer cache for this layer). Measured
+// 2026-09-27 on Swift 1.5 Q8T, APU + R9700, 19-23K-token contexts: acceptance 0.759 dense vs 0.732 QSA, 43.6 vs 45.3
+// ms/step, and the per-ubatch ingest is slower on the R9700 (dense FA is tuned there): so the head appears to have
+// been trained dense and QSA stays opt-in.
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
@@ -589,7 +604,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // QSA draft (LLAMA_MTP_QSA): the context then carries the hybrid memory with an indexer cache for this layer
+    const bool mtp_qsa = hparams.dsv4_compress_ratios[il] > 0;
+    llm_graph_input_attn_kv * inp_attn = nullptr;
+    const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
+    if (mtp_qsa) {
+        auto * inp_mem = build_inp_mem_hybrid();
+        mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_mem->mctx);
+        inp_attn = inp_mem->get_attn();
+    } else {
+        inp_attn = build_attn_inp_kv();
+    }
 
     // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
@@ -631,58 +656,64 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
-    // ---- dense attention, mirroring the trunk's full-attention branch ----
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    if (mtp_qsa) {
+        // the trunk's full-attention layer as-is (QSA top-k from this block's indexer, then sparse attention)
+        cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
+        cb(cur, "mtp_attn_out", il);
+    } else {
+        // ---- dense attention, mirroring the trunk's full-attention branch ----
+        const int64_t n_embd_head = hparams.n_embd_head_v();
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
-    cb(Qcur_full, "mtp_Qcur_full", il);
+        ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
+        cb(Qcur_full, "mtp_Qcur_full", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
-    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Qcur, "mtp_Qcur_normed", il);
+        ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+        Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "mtp_Qcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "mtp_gate", il);
+        ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        cb(gate, "mtp_gate", il);
 
-    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Kcur, "mtp_Kcur_normed", il);
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "mtp_Kcur_normed", il);
 
-    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-    cb(Vcur, "mtp_Vcur", il);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, "mtp_Vcur", il);
 
-    // IMRoPE, same convention and freq_base as the trunk
-    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    cb(Qcur, "mtp_Qcur", il);
-    cb(Kcur, "mtp_Kcur", il);
+        // IMRoPE, same convention and freq_base as the trunk
+        Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Qcur, "mtp_Qcur", il);
+        cb(Kcur, "mtp_Kcur", il);
 
-    const float kq_scale = hparams.f_attention_scale == 0.0f
-            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+        const float kq_scale = hparams.f_attention_scale == 0.0f
+                ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "mtp_attn_pregate", il);
+        cur = build_attn(inp_attn,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(cur, "mtp_attn_pregate", il);
 
-    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
-    cb(cur, "mtp_attn_gated", il);
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+        cb(cur, "mtp_attn_gated", il);
 
-    cur = build_lora_mm(layer.wo, cur, layer.wo_s);
-    cb(cur, "mtp_attn_out", il);
+        cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+        cb(cur, "mtp_attn_out", il);
+    }
 
     if (inp_out_ids) {
         cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
