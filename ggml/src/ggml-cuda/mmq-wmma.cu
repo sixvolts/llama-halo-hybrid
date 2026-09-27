@@ -76,11 +76,41 @@ static __device__ __forceinline__ uint32_t mmqw_dq2(const uint32_t qx, const uin
     return *(const uint32_t *) &r;
 }
 
-template <int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32>
+// k-quant staging (q4_K / q5_K / q6_K): a unit is 16 consecutive weights of one row, 16-aligned in K, so it lies in one
+// 16-element scale group of q6_K and one 32-element sub-block of q4_K / q5_K. The raw bytes are fetched in load_stage
+// (with a small word of unit geometry), decoded at the LDS store. A code byte q (< 64) becomes a half through the
+// exponent trick (0x6400 | q = 1024 + q exactly); one exact packed subtract and one packed fma then give
+// w = (q - c) * s + b, rounded once to f16.
+static __device__ __forceinline__ uint32_t mmqw_kq2(const uint32_t qx, const uint32_t sel, const half2 c2, const half2 s2, const half2 b2) {
+#if defined(AMD_WMMA_AVAILABLE)
+    const uint32_t bits = __builtin_amdgcn_perm(0x64006400u, qx, sel);
+#else
+    const uint32_t bits = 0; GGML_UNUSED_VARS(qx, sel);
+#endif
+    const half2 h = __hsub2(*(const half2 *) &bits, c2);
+    const half2 r = __hfma2(h, s2, b2);
+    return *(const uint32_t *) &r;
+}
+
+// byte i of a 16-byte q4_K / q5_K header (d, dmin, scales[12])
+static __device__ __forceinline__ uint32_t mmqw_hb(const uint4 & h, const int i) {
+    const uint32_t w = i < 4 ? h.x : i < 8 ? h.y : i < 12 ? h.z : h.w;
+    return (w >> (8 * (i & 3))) & 0xFFu;
+}
+
+template <ggml_type WT> struct mmqw_wtraits;
+template <> struct mmqw_wtraits<GGML_TYPE_Q8_0> { static constexpr int QK = 32;  static constexpr int BYTES = 34;  };
+template <> struct mmqw_wtraits<GGML_TYPE_Q4_K> { static constexpr int QK = 256; static constexpr int BYTES = 144; };
+template <> struct mmqw_wtraits<GGML_TYPE_Q5_K> { static constexpr int QK = 256; static constexpr int BYTES = 176; };
+template <> struct mmqw_wtraits<GGML_TYPE_Q6_K> { static constexpr int QK = 256; static constexpr int BYTES = 210; };
+
+template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32>
 static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
         const void * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ dst,
         const int M, const int N, const int K, const int64_t ldx, const int64_t ldd) {
     static_assert(KT % 32 == 0, "K tile must cover whole q8_0 blocks");
+    constexpr bool KQ = WT != GGML_TYPE_Q8_0;
+    static_assert(!KQ || 256 % KT == 0, "a K tile must not straddle k-quant superblocks");
     static_assert(BN % (16 * WN) == 0 && BM % (16 * WM) == 0, "warp grid must tile the block");
     static_assert(PF == 1 || PF == 2, "register prefetch depth");
     constexpr int TN      = BN / (16 * WN);   // fragments per warp along n
@@ -117,6 +147,8 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
 
     const block_q8_0 * __restrict__ Wq = (const block_q8_0 *) W;
     const int nbk = K / 32;                               // blocks per weight row
+    const char * __restrict__ Wb = (const char *) W;
+    const int64_t row_bytes = (int64_t) (K / mmqw_wtraits<WT>::QK) * mmqw_wtraits<WT>::BYTES;
 
     floatx8_t acc[TN][TM];
 #pragma unroll
@@ -132,8 +164,11 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
 
     // staging registers, PF tiles deep (tile t lives in stage t % PF)
     uint4    ra[PF][XAR];
-    uint4    rw[PF][XW];
+    uint4    rw[PF][XW];              // q8_0: 16 int8 of a half-block; k-quants: 16 code bytes (ql / qs)
     half     rd[PF][XW];
+    uint4    rh[PF][KQ ? XW : 1];     // q4_K / q5_K: header; q6_K: .x = d | scale << 16
+    uint4    rq[PF][KQ ? XW : 1];     // q5_K / q6_K: 16 high-bit bytes (qh)
+    int      rm[PF][KQ ? XW : 1];     // unit geometry: q4/q5_K: sub-block j | nibble << 3 | qh bit << 4; q6_K: quarter qd
 
     auto load_stage = [&](const int k0, const int st) {
 #pragma unroll
@@ -158,9 +193,38 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
             const int row = blk / KB;
             const int kb  = blk % KB;
             const int m   = min(m0 + row, M - 1);
+            if constexpr (!KQ) {
             const block_q8_0 * b = Wq + (int64_t) m * nbk + k0 / 32 + kb;
             rd[st][x] = b->d;
             rw[st][x] = *(const uint4 *) (b->qs + 16 * hf);   // 2-byte aligned: AMD runs unaligned dwordx4 loads
+            } else {
+            // unit x: row = idx / (KT/16), 16-weight slot u = idx % (KT/16) (same count as the q8_0 half-blocks)
+            const int urow = idx / (KT / 16);
+            const int u    = idx % (KT / 16);
+            const int mm   = min(m0 + urow, M - 1);
+            const int k    = k0 + 16 * u;
+            const char * sb = Wb + (int64_t) mm * row_bytes + (int64_t) (k / 256) * mmqw_wtraits<WT>::BYTES;
+            const int o    = k % 256;
+            if constexpr (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) {
+                constexpr int QS = WT == GGML_TYPE_Q4_K ? 16 : 48;
+                const int g = o / 64, w = o % 64;
+                rh[st][x] = *(const uint4 *) sb;
+                rw[st][x] = *(const uint4 *) (sb + QS + 32 * g + (w % 32));
+                if constexpr (WT == GGML_TYPE_Q5_K) {
+                    rq[st][x] = *(const uint4 *) (sb + 16 + (w % 32));
+                }
+                rm[st][x] = (o / 32) | ((w >= 32) << 3) | ((2 * g + (w >= 32)) << 4);
+            } else {
+                const int n = o / 128, r = o % 128, qd = r / 32, l0 = r % 32;
+                rw[st][x] = *(const uint4 *) (sb + 64 * n + 32 * (qd % 2) + l0);   // unaligned (210-byte blocks)
+                rq[st][x] = *(const uint4 *) (sb + 128 + 32 * n + l0);
+                const uint32_t d  = *(const uint16_t *) (sb + 208);
+                const uint32_t sc = (uint8_t) sb[192 + 8 * n + l0 / 16 + 2 * qd];
+                rh[st][x].x = d | (sc << 16);
+                rm[st][x] = qd;
+            }
+            GGML_UNUSED_VARS(blk, hf, row, kb, m);
+            }
         }
     };
 
@@ -188,11 +252,69 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
             const int hf  = idx % 2;
             const int row = blk / KB;
             const int kb  = blk % KB;
+            uint4 out[2];
+            if constexpr (KQ) {
+                const int urow = idx / (KT / 16);
+                const int u    = idx % (KT / 16);
+                const uint32_t w4[4] = {rw[st][x].x, rw[st][x].y, rw[st][x].z, rw[st][x].w};
+                uint32_t q[4];
+                float sc_f, b_f, c_f;
+                if constexpr (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) {
+                    const int j = rm[st][x] & 7, hi = (rm[st][x] >> 3) & 1, bit = rm[st][x] >> 4;
+                    const uint4 h = rh[st][x];
+                    uint32_t sc, mn;
+                    if (j < 4) {
+                        sc = mmqw_hb(h, 4 + j) & 63;
+                        mn = mmqw_hb(h, 8 + j) & 63;
+                    } else {
+                        sc = (mmqw_hb(h, 8 + j) & 0xF) | ((mmqw_hb(h, j) >> 6) << 4);
+                        mn = (mmqw_hb(h, 8 + j) >> 4)  | ((mmqw_hb(h, 4 + j) >> 6) << 4);
+                    }
+                    const float d = __half2float(__ushort_as_half((unsigned short) (h.x & 0xFFFF)));
+                    const float dm = __half2float(__ushort_as_half((unsigned short) (h.x >> 16)));
+                    sc_f = d * (float) sc; b_f = -dm * (float) mn; c_f = 1024.0f;
+                    const uint32_t qh4[4] = {rq[st][x].x, rq[st][x].y, rq[st][x].z, rq[st][x].w};
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        q[i] = (w4[i] >> (4 * hi)) & 0x0F0F0F0Fu;
+                        if constexpr (WT == GGML_TYPE_Q5_K) {
+                            q[i] |= ((qh4[i] >> bit) & 0x01010101u) << 4;
+                        } else {
+                            GGML_UNUSED(qh4); GGML_UNUSED(bit);
+                        }
+                    }
+                } else {
+                    const int qd = rm[st][x];
+                    const float d = __half2float(__ushort_as_half((unsigned short) (rh[st][x].x & 0xFFFF)));
+                    const int8_t sc = (int8_t) (rh[st][x].x >> 16);
+                    sc_f = d * (float) sc; b_f = 0.0f; c_f = 1056.0f;
+                    const uint32_t qh4[4] = {rq[st][x].x, rq[st][x].y, rq[st][x].z, rq[st][x].w};
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        q[i] = ((w4[i] >> (4 * (qd / 2))) & 0x0F0F0F0Fu) | (((qh4[i] >> (2 * qd)) & 0x03030303u) << 4);
+                    }
+                }
+                const half2 c2 = __float2half2_rn(c_f);
+                const half2 s2 = __float2half2_rn(sc_f);
+                const half2 b2 = __float2half2_rn(b_f);
+                out[0].x = mmqw_kq2(q[0], 0x07010500u, c2, s2, b2);
+                out[0].y = mmqw_kq2(q[0], 0x07030502u, c2, s2, b2);
+                out[0].z = mmqw_kq2(q[1], 0x07010500u, c2, s2, b2);
+                out[0].w = mmqw_kq2(q[1], 0x07030502u, c2, s2, b2);
+                out[1].x = mmqw_kq2(q[2], 0x07010500u, c2, s2, b2);
+                out[1].y = mmqw_kq2(q[2], 0x07030502u, c2, s2, b2);
+                out[1].z = mmqw_kq2(q[3], 0x07010500u, c2, s2, b2);
+                out[1].w = mmqw_kq2(q[3], 0x07030502u, c2, s2, b2);
+                half * p = bs + urow * PITCH + 16 * u;
+                *(uint4 *) (p)     = out[0];
+                *(uint4 *) (p + 8) = out[1];
+                GGML_UNUSED_VARS(blk, hf, row, kb);
+                continue;
+            }
             const float df = __half2float(rd[st][x]);
             const half2 d2  = __float2half2_rn(df);
             const half2 nd2 = __float2half2_rn(-1152.0f * df);
             const uint32_t q[4] = {rw[st][x].x ^ 0x80808080u, rw[st][x].y ^ 0x80808080u, rw[st][x].z ^ 0x80808080u, rw[st][x].w ^ 0x80808080u};
-            uint4 out[2];
             out[0].x = mmqw_dq2(q[0], 0x07010500u, d2, nd2);   // bytes 0,1 -> halves 0,1
             out[0].y = mmqw_dq2(q[0], 0x07030502u, d2, nd2);   // bytes 2,3
             out[0].z = mmqw_dq2(q[1], 0x07010500u, d2, nd2);
@@ -291,44 +413,19 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
     }
 }
 
-template <int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32>
+template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32>
 static void launch_mul_mat_q8_0_wmma(const void * W, const void * X, float * dst, int M, int N, int K, int64_t ldx, int64_t ldd, cudaStream_t stream) {
     constexpr int PITCH = KT + 8;
     constexpr size_t smem = (size_t) NBUF * (BN + BM) * PITCH * sizeof(half);
     const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
-    mul_mat_q8_0_wmma<BN, BM, KT, WN, WM, NBUF, PF, XF32><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd);
+    mul_mat_q8_0_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd);
     CUDA_CHECK(cudaGetLastError());
 }
-#endif // MMQ_WMMA_ENABLED
-
-bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-#ifndef MMQ_WMMA_ENABLED
-    GGML_UNUSED_VARS(ctx, src0, src1, dst);
-    return false;
-#else
-    // GGML_CUDA_Q8_WMMA: 0 = off (MMQ), 1 = auto (default on RDNA3; RDNA4's int8 WMMA rate keeps MMQ ahead there, so
-    // off unless asked), 2-10 fixed configs on an f16 pre-pass, 11-13 fixed configs reading f32 (tuning knobs)
-    static const int mode = getenv("GGML_CUDA_Q8_WMMA") ? atoi(getenv("GGML_CUDA_Q8_WMMA")) : -1;
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (mode == 0 || !(GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) || (mode < 0 && !GGML_CUDA_CC_IS_RDNA3(cc))) {
-        return false;
-    }
-    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
-        return false;
-    }
-    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
-        return false;
-    }
+template <ggml_type WT>
+static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const int mode) {
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
-    if (K % 64 != 0 || N < 64 || M < 128 || M > (1 << 30) || N > (1 << 30)) {
-        return false;
-    }
-
     cudaStream_t stream = ctx.stream();
     const int64_t ldd = dst->nb[1] / sizeof(float);
     const float * x32 = (const float *) src1->data;
@@ -337,8 +434,8 @@ bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_ten
     // in-kernel unless the re-read volume is large (every m-tile re-reads its n-tile; at M*K > 16M the 2 MB f32
     // tile thrashes gfx1151's L2 and the kernel drops to 22 TFLOPS), then a f16 pre-pass (0.1 ms at 1024x4096).
     // 2-way split-K for the sub-4-wave grids was tried: the memset + atomics cost more than the tail it recovers.
-#define MMQW_LAUNCH16(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q8_0_wmma<BN, BM, KT, WN, WM, NBUF, PF, false>(src0->data, x16.get(), (float *) dst->data, M, N, K, K, ldd, stream)
-#define MMQW_LAUNCH32(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q8_0_wmma<BN, BM, KT, WN, WM, NBUF, PF, true>(src0->data, x32, (float *) dst->data, M, N, K, K, ldd, stream)
+#define MMQW_LAUNCH16(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q8_0_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, false>(src0->data, x16.get(), (float *) dst->data, M, N, K, K, ldd, stream)
+#define MMQW_LAUNCH32(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q8_0_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, true>(src0->data, x32, (float *) dst->data, M, N, K, K, ldd, stream)
     const int64_t blocks128 = ((M + 127) / 128) * ((N + 127) / 128);
     const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
     const bool big     = blocks128 >= 2 * nsm;
@@ -374,5 +471,54 @@ bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_ten
 #undef MMQW_LAUNCH16
 #undef MMQW_LAUNCH32
     return true;
+}
+
+#endif // MMQ_WMMA_ENABLED
+
+bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+#ifndef MMQ_WMMA_ENABLED
+    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    return false;
+#else
+    // GGML_CUDA_Q8_WMMA: 0 = off (MMQ), 1 = auto (default on RDNA3; RDNA4's int8 WMMA rate keeps MMQ ahead there, so
+    // off unless asked), 2-10 fixed configs on an f16 pre-pass, 11-13 fixed configs reading f32 (tuning knobs)
+    static const int mode = getenv("GGML_CUDA_Q8_WMMA") ? atoi(getenv("GGML_CUDA_Q8_WMMA")) : -1;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!(GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+        return false;
+    }
+    // k-quants (q4_K / q5_K / q6_K): GGML_CUDA_KQ_WMMA = 0 off (MMQ), unset / 1 on for RDNA3 / RDNA4. MMQ applies a float
+    // scale per 16 (q6_K) or 32 (q4_K / q5_K) K per output element; on gfx1201 that leaves q6_K at 37 and q4_K at 67 TFLOPS
+    // against 88 for q8_0, while this kernel runs every type at the q8_0 rate.
+    static const int kq_mode = getenv("GGML_CUDA_KQ_WMMA") ? atoi(getenv("GGML_CUDA_KQ_WMMA")) : -1;
+    const bool kq = src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K;
+    if (kq) {
+        if (kq_mode == 0 || !(GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+            return false;
+        }
+    } else if (src0->type != GGML_TYPE_Q8_0 || mode == 0 || (mode < 0 && !GGML_CUDA_CC_IS_RDNA3(cc))) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const int64_t K = src0->ne[0];
+    const int64_t M = src0->ne[1];
+    const int64_t N = src1->ne[1];
+    if (K % (kq ? 256 : 64) != 0 || N < 64 || M < 128 || M > (1 << 30) || N > (1 << 30)) {
+        return false;
+    }
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K: return mmqw_launch<GGML_TYPE_Q4_K>(ctx, src0, src1, dst, mode);
+        case GGML_TYPE_Q5_K: return mmqw_launch<GGML_TYPE_Q5_K>(ctx, src0, src1, dst, mode);
+        case GGML_TYPE_Q6_K: return mmqw_launch<GGML_TYPE_Q6_K>(ctx, src0, src1, dst, mode);
+        default:             return mmqw_launch<GGML_TYPE_Q8_0>(ctx, src0, src1, dst, mode);
+    }
 #endif
 }
