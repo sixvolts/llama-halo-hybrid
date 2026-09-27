@@ -3277,7 +3277,22 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // (the same for the hyper-connection flat norm: it has no weights, so the scheduler runs it where its input
         // was produced and ships the [n_embd*hc, n] result across the host link on top of the residual that crosses
         // anyway; on the layer's device it reads the routed view of that residual instead: -64 MiB per 1024 tokens)
-        const bool mask_dev = il != -1 && (strncmp(name, "kq_mask_dev", 11) == 0 || strcmp(name, "hc_flat_norm") == 0);
+        // halo-hybrid (P4): the f16 -> f32 cast of the MoE input runs on the experts' device (the f16 cast stays on the
+        // layer's device with the mask-device rule below), so only the f16 copy crosses the host link
+        if (il != -1 && strcmp(name, "moe_in_f32") == 0) {
+            const ggml_tensor * we = model.layers[il].ffn_gate_exps ? model.layers[il].ffn_gate_exps : model.layers[il].ffn_gate_up_exps;
+            if (we && we->buffer) {
+                ggml_backend_dev_t dev_exp = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(we->buffer));
+                for (const auto & backend : backends) {
+                    if (ggml_backend_get_device(backend.get()) == dev_exp && ggml_backend_supports_op(backend.get(), cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched_build ? sched_build : sched.get(), cur, backend.get());
+                    }
+                }
+            }
+            return;
+        }
+        const bool mask_dev = il != -1 && (strncmp(name, "kq_mask_dev", 11) == 0 || strcmp(name, "hc_flat_norm") == 0 ||
+                                           strcmp(name, "moe_in_f16") == 0);
         if (ubatch.n_tokens < 32 || full_offload || mask_dev) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || mask_dev)) {
                 const auto & dev_layer = model.dev_layer(il);

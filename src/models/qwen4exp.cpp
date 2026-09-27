@@ -1346,8 +1346,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // halo-hybrid (P4): when the routed experts live on another device than the layer (APU + card), send them the
+    // input as f16 (half the host-link bytes; the F16 expert path converts to f16 anyway): router logits from the f32
+    // input on the layer's device, the experts read cast(cast(x, f16), f32) with the f16 cast pinned to the layer's
+    // device and the f32 cast to the experts' (llama-context's graph callback). On by default (Swift Q8T hybrid prefill
+    // 16K/32K +2.2-2.4%; bit-identical where the F16 expert path takes the ubatch, KLD 0.0275 at ub 1024 where MMQ
+    // reads the f16-rounded input); LLAMA_MOE_F16_CROSS=0 disables.
+    ggml_tensor * exp_in = cur;
+    ggml_tensor * logits = nullptr;
+    {
+        static const bool f16_cross = getenv("LLAMA_MOE_F16_CROSS") == nullptr || atoi(getenv("LLAMA_MOE_F16_CROSS")) != 0;
+        const ggml_tensor * we = model.layers[il].ffn_gate_exps ? model.layers[il].ffn_gate_exps : model.layers[il].ffn_gate_up_exps;
+        ggml_backend_dev_t dev_exp = (we && we->buffer) ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(we->buffer)) : nullptr;
+        if (f16_cross && n_tokens >= 256 && dev_exp && dev_exp != model.dev_layer(il)) {
+            logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+            cb(logits, "ffn_moe_logits", il);
+            ggml_tensor * x16 = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+            cb(x16, "moe_in_f16", il);
+            exp_in = ggml_cast(ctx0, x16, GGML_TYPE_F32);
+            cb(exp_in, "moe_in_f32", il);
+        }
+    }
+
     ggml_tensor * moe_out =
-        build_moe_ffn(cur,
+        build_moe_ffn(exp_in,
             model.layers[il].ffn_gate_inp,
             model.layers[il].ffn_up_exps,
             model.layers[il].ffn_gate_exps,
@@ -1357,7 +1379,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
+            logits, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
