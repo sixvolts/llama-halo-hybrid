@@ -10229,6 +10229,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_shared(GGML_TYPE_Q4_K, 640, n, 2560, 1, false, true));
     }
 
+    // thin bf16 / f16 / f32 weights at prefill widths (Swift-1.5's hc_*_inject: 4 x 10240), TBO_THIN_W=1
+    if (getenv("TBO_THIN_W") != nullptr) {
+        for (ggml_type t : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
+            for (int64_t n : {3, 64, 1199, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4, n, 10240, {1, 1}, {1, 1}));
+            }
+        }
+        return test_cases;
+    }
+
     // Qwen3.8-Flash-Next expert GEMMs at prefill widths, correctness of the MMQ subtile / K-tail skips (TBO_Q38_MOE_EVAL=1):
     //     gate/up q4_K [2560 -> 640], down q5_1 / q8_0 [640 -> 2560] (K = 640: the last K iteration is half padding)
     if (getenv("TBO_Q38_MOE_EVAL") != nullptr) {
@@ -10236,6 +10246,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,  640,  n, 2560));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));   // Swift 1.5 Q4_K_M down
         }
         return test_cases;
     }
@@ -12808,11 +12819,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3.8-Flash-Next prefill expert GEMMs (halo-hybrid): 512 experts, 10 used; gate/up q4_K [2560 -> 640]
     // with the broadcast src1, down q8_0 [640 -> 2560]
+    if (getenv("TBO_THIN_W") != nullptr) {
+        for (ggml_type t : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
+            for (int64_t n : {1199, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4, n, 10240, {1, 1}, {1, 1}));
+            }
+        }
+        return test_cases;
+    }
+
     if (getenv("TBO_Q38_MOE") != nullptr) {
         for (int64_t n_tokens : {256, 512, 1024, 2048, 4096}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,  640,  n_tokens, 2560));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));   // the model's down (most layers)
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));   // Swift 1.5 Q4_K_M down
             // gate + up + SwiGLU as one graph (ggml_cuda_mul_mat_q_gate_up; GGML_CUDA_MMQ_GATEUP=0/1/2 to compare)
             test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 512, 10, true, 640, n_tokens, 2560));
         }

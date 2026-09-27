@@ -27,6 +27,7 @@
 namespace {
 
 enum class WeightType : std::uint32_t {
+  kQ5_0 = 6,
   kQ5_1 = 7,
   kQ8_0 = 8,
   kQ4_K = 12,
@@ -112,6 +113,7 @@ __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
   return kType == WeightType::kQ4_K   ? (k / 256) * sizeof(Q4KBlock)
          : kType == WeightType::kQ5_K ? (k / 256) * kQ5KBlockBytes
          : kType == WeightType::kQ5_1 ? (k / 32) * sizeof(Q5_1Block)
+         : kType == WeightType::kQ5_0 ? (k / 32) * 22
                                       : (k / 32) * sizeof(Q8_0Block);
 }
 
@@ -163,7 +165,8 @@ __launch_bounds__(256) __global__
   static_assert(BK == 2, "one stage is one 32-byte Q4_K nibble group");
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = BM / 128;  // 16-row tiles per wave
-  constexpr bool kQ5 = kType == WeightType::kQ5_1;
+  constexpr bool kQ50 = kType == WeightType::kQ5_0;
+  constexpr bool kQ5 = kType == WeightType::kQ5_1 || kQ50;
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
   constexpr bool kQ8 = kType == WeightType::kQ8_0;
   constexpr bool kKQuant = kType == WeightType::kQ4_K || kQ5K;
@@ -287,7 +290,13 @@ __launch_bounds__(256) __global__
   const auto fetch_stage = [&](int kb0) {
 #pragma unroll
     for (int u = 0; u < kWaveRowTiles; ++u) {
-      if constexpr (kQ5) {
+      if constexpr (kQ50) {
+        // block_q5_0 is 22 bytes (d, qh[4], qs[16]), so the loads are 2-byte aligned
+        const auto* blk = f_ptr[u] + ((kb0 + f_c) * 22);
+        f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
+        __builtin_memcpy(&f_high[u], blk + 2, 4);
+        __builtin_memcpy(&f_codes[u], blk + 6, 16);
+      } else if constexpr (kQ5) {
         const int kb = kb0 + f_c;
         const auto* words = reinterpret_cast<const uint2*>(f_ptr[u]) + (kb * 3);
         const uint2 w0 = words[0];
@@ -374,7 +383,8 @@ __launch_bounds__(256) __global__
         s_high[(f_c * BM) + row] = f_high[u];
         const __half2 dm = __builtin_bit_cast(__half2, f_dm[u]);
         const float d = f_live[u] ? __low2float(dm) : 0.0F;
-        const float mn = f_live[u] ? __high2float(dm) : 0.0F;
+        // q5_0: w = (q - 16) d, i.e. bias -16 d (exact in half: a power-of-two multiple)
+        const float mn = !f_live[u] ? 0.0F : kQ50 ? -16.0F * d : __high2float(dm);
         scale_bias =
             __builtin_bit_cast(std::uint32_t, __floats2half2_rn(d, mn));
       } else {
@@ -767,6 +777,7 @@ static bool mmid_f16_check(ggml_backend_cuda_context & ctx, const ggml_tensor * 
   switch (src0->type) {
     case GGML_TYPE_Q4_K: type = WeightType::kQ4_K; break;
     case GGML_TYPE_Q5_K: type = WeightType::kQ5_K; break;
+    case GGML_TYPE_Q5_0: type = WeightType::kQ5_0; break;
     case GGML_TYPE_Q5_1: type = WeightType::kQ5_1; break;
     case GGML_TYPE_Q8_0: type = WeightType::kQ8_0; break;
     default: return false;
@@ -785,10 +796,10 @@ static bool mmid_f16_check(ggml_backend_cuda_context & ctx, const ggml_tensor * 
   // auto: measured on gfx1151 (test-backend-ops perf, one call over all experts) - faster than MMQ for Qwen3.8's
   // small experts (640 x 2560, 512 experts, 10 used) once experts see ~40+ tokens on average (q4_K -16% at 2048 tokens,
   // -19% at 4096), slower for GLM-5.3's 2048 x 4096 experts at every width it uses (q4_K +15-35%, q5_K +30%) - so only
-  // small expert matrices, q4_K / q5_1 / q8_0, and >= 40 rows per expert
+  // small expert matrices, q4_K / q5_0 / q5_1 / q8_0, and >= 40 rows per expert
   if (ggml_cuda_mmid_f16_mode() < 0) {
     const bool small  = k*m <= (int64_t) 4*1024*1024;
-    const bool typeok = type == WeightType::kQ4_K || type == WeightType::kQ5_1 || type == WeightType::kQ8_0;
+    const bool typeok = type == WeightType::kQ4_K || type == WeightType::kQ5_0 || type == WeightType::kQ5_1 || type == WeightType::kQ8_0;
     if (!GGML_CUDA_CC_IS_RDNA3_5(cc) || !small || !typeok || n_rows < 40*n_experts) {
       return false;
     }
@@ -842,6 +853,7 @@ bool ggml_cuda_mmid_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src
   switch (type) {
     case WeightType::kQ4_K: MMID_F16_CASE(WeightType::kQ4_K); break;
     case WeightType::kQ5_K: MMID_F16_CASE(WeightType::kQ5_K); break;
+    case WeightType::kQ5_0: MMID_F16_CASE(WeightType::kQ5_0); break;
     case WeightType::kQ5_1: MMID_F16_CASE(WeightType::kQ5_1); break;
     case WeightType::kQ8_0: MMID_F16_CASE(WeightType::kQ8_0); break;
   }
