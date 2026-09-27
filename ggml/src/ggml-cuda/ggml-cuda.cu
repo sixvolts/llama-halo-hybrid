@@ -2675,10 +2675,18 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 // With peer access enabled the source device can write straight into the destination's
 // memory over PCIe (posted writes), and a 12 KB kernel write takes a few microseconds.
 // GGML_CUDA_KERNEL_COPY_MAX (bytes, default 262144) sets the threshold; 0 disables.
-static __global__ void k_peer_copy_bytes(const uint4 * __restrict__ src, uint4 * __restrict__ dst, const size_t n16) {
+// A size that is not a multiple of 16 (the MoE crossing's 120-byte expert ids and weights) copies its last < 16 bytes
+// in the thread after the vectors, so every small crossing is a kernel, not an SDMA blit (~6 us each on the queue).
+static __global__ void k_peer_copy_bytes(const uint4 * __restrict__ src, uint4 * __restrict__ dst, const size_t n16, const int tail) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n16) {
         dst[i] = src[i];
+    } else if (i == n16 && tail > 0) {
+        const char * s = (const char *) (src + n16);
+        char       * d = (char       *) (dst + n16);
+        for (int b = 0; b < tail; ++b) {
+            d[b] = s[b];
+        }
     }
 }
 
@@ -2770,15 +2778,16 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src, 
                 CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), ev_dst, 0));
             }
             const size_t nbytes = ggml_nbytes(dst);
-            const bool kernel_copy = nbytes > 0 && nbytes <= ggml_cuda_kernel_copy_max() && nbytes % 16 == 0 &&   // an empty copy would launch a zero-block grid
+            const bool kernel_copy = nbytes > 0 && nbytes <= ggml_cuda_kernel_copy_max() &&   // an empty copy would launch a zero-block grid
                 ((uintptr_t) src->data % 16 == 0) && ((uintptr_t) dst->data % 16 == 0) &&
                 ggml_cuda_ensure_peer_access(src_physical, dst_physical);
             if (kernel_copy) {
                 ggml_cuda_set_device(cuda_ctx_src->device);
-                const size_t n16 = nbytes / 16;
+                const size_t n16  = nbytes / 16;
+                const int    tail = (int) (nbytes % 16);
                 const int block = 256;
-                const int grid  = (int) ((n16 + block - 1) / block);
-                k_peer_copy_bytes<<<grid, block, 0, cuda_ctx_src->stream()>>>((const uint4 *) src->data, (uint4 *) dst->data, n16);
+                const int grid  = (int) ((n16 + (tail > 0) + block - 1) / block);
+                k_peer_copy_bytes<<<grid, block, 0, cuda_ctx_src->stream()>>>((const uint4 *) src->data, (uint4 *) dst->data, n16, tail);
                 CUDA_CHECK(cudaGetLastError());
             } else {
                 ggml_cuda_set_device(cuda_ctx_src->device);   // source device current: see ggml_backend_cuda_buffer_cpy_tensor
