@@ -305,7 +305,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // qwen4exp sets mtp_use_dedicated_embeddings=false, so these are absent and the
         // head falls back to the trunk's embedding table and LM head
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
+        // halo-hybrid: a reduced-vocabulary draft head. A draft file may carry its own nextn.shared_head_head over a
+        // subset of the vocabulary plus `d2t` (I64, the target token id of each head row), as EAGLE-3 does: drafting
+        // then reads ~n_draft rows instead of the full LM head, and verification still uses the full one.
+        int64_t n_head_rows = n_vocab;
+        if (const ggml_tensor * d2t_meta = ml.get_tensor_meta(tn(LLM_TENSOR_D2T).str().c_str())) {
+            n_head_rows = d2t_meta->ne[0];
+            d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_head_rows }, 0);
+            LLAMA_LOG_INFO("%s: MTP head over a reduced vocabulary: %lld of %lld tokens\n", __func__, (long long) n_head_rows, (long long) n_vocab);
+        }
+        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_head_rows },
+                flags | (n_head_rows == n_vocab ? TENSOR_NOT_REQUIRED : 0));
     }
 }
 
@@ -717,6 +727,19 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
     cur = build_lora_mm(head_w, cur, head_s);
+    if (model.d2t) {
+        // reduced-vocabulary head: scatter its rows into a full-vocabulary row at -inf, as EAGLE-3 does, so the
+        // samplers and the verification see ordinary logits (tokens outside the subset are never drafted)
+        const int64_t n_rows    = cur->ne[0];
+        const int64_t n_outputs = cur->ne[1];
+        const int64_t n_vocab   = (int64_t) model.vocab.n_tokens();
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == n_rows);
+        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+        cur = ggml_set_rows(ctx0, logits,
+                ggml_reshape_3d(ctx0, cur,       1,      n_rows, n_outputs),
+                ggml_reshape_3d(ctx0, model.d2t, n_rows, 1,      1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
