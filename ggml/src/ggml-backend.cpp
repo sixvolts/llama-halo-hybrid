@@ -2683,10 +2683,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
         // synchronize unless pipeline parallelism asks for events.
         static const bool no_events = getenv("GGML_SCHED_NO_EVENTS") != nullptr;
         ggml_backend_dev_t dev = backends[b]->device;
-        // rev/decode-profile: an integrated GPU (the Strix Halo APU reports IGPU) is the same local HIP backend with
-        // the same stream-ordered copies, but was left without events, so every split reading an input on it did a
-        // host hipStreamSynchronize of its stream. GGML_SCHED_IGPU_EVENTS=1 gives it events (experiment switch).
-        static const bool igpu_events = getenv("GGML_SCHED_IGPU_EVENTS") != nullptr && atoi(getenv("GGML_SCHED_IGPU_EVENTS")) > 0;
+        // halo-hybrid: an integrated GPU (the Strix Halo APU reports IGPU) is the same local HIP backend with the same
+        // stream-ordered copies, but was left without events, so every split reading an input on it did a host
+        // hipStreamSynchronize of its stream. On by default (hybrid decode +6%, greedy text and perplexity identical);
+        // GGML_SCHED_IGPU_EVENTS=0 restores the old behaviour. Remote (RPC) backends stay excluded: no cpy_tensor_async_nowait.
+        static const bool igpu_events = getenv("GGML_SCHED_IGPU_EVENTS") == nullptr || atoi(getenv("GGML_SCHED_IGPU_EVENTS")) > 0;
         const bool eligible = dev != NULL && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
             (igpu_events && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) &&
             backends[b]->iface.cpy_tensor_async_nowait != NULL;

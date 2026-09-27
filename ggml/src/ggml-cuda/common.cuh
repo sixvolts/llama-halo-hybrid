@@ -1498,10 +1498,10 @@ struct ggml_backend_cuda_context {
 
     // a cuda graph instance is only valid for the shapes it captured, so a caller that
     // alternates shapes needs one instance per shape to stay on the graph path
-    // halo-hybrid (rev/decode-profile): GGML_CUDA_MAX_GRAPHS=<n> overrides the per-device cache size. A hybrid
-    // decode step submits ~76 card splits (plus the draft's), so a 64-entry LRU evicts every key before its reuse.
+    // halo-hybrid: a hybrid decode step submits ~76 card splits (plus the draft's), so the old 64-entry LRU evicted
+    // every key before its reuse (4% replays). Default 256; GGML_CUDA_MAX_GRAPHS=<n> overrides the per-device size.
     static size_t max_cuda_graphs_n() {
-        static const size_t n = getenv("GGML_CUDA_MAX_GRAPHS") ? (size_t) atoi(getenv("GGML_CUDA_MAX_GRAPHS")) : 64;
+        static const size_t n = getenv("GGML_CUDA_MAX_GRAPHS") ? (size_t) atoi(getenv("GGML_CUDA_MAX_GRAPHS")) : 256;
         return n;
     }
 
