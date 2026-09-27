@@ -1952,10 +1952,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // run MMVF with the operands swapped (the activations are the "weights", the rows the batch) into a
     // [ne11, ne01] scratch and transpose it into dst. hipBLASLt runs this shape at a fifth of the bandwidth.
     static const bool no_mmvf_swap = getenv("GGML_CUDA_NO_MMVF_SWAP") != nullptr && atoi(getenv("GGML_CUDA_NO_MMVF_SWAP")) != 0;
+    // A thin bf16 / f16 weight (Swift-1.5's hc_*_inject: 4 x 10240 bf16) is widened to f32 first (exact, one tiny launch)
+    // and takes the same path; otherwise it lands on a generic GEMM at ~10x the time.
     if (!no_mmvf_swap && ne01 > 1 && ne01 <= MMVF_MAX_BATCH_SIZE && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
-            && src0->type == GGML_TYPE_F32
+            && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16)
             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
             && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ ne01)) {
+        ggml_cuda_pool_alloc<float> w32(ctx.pool());
+        ggml_tensor src0_f32;
+        if (src0->type != GGML_TYPE_F32) {
+            w32.alloc(ggml_nelements(src0));
+            const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+            to_fp32(src0->data, w32.get(), ggml_nelements(src0), ctx.stream());
+            src0_f32 = *src0;
+            src0_f32.type = GGML_TYPE_F32;
+            src0_f32.data = w32.get();
+            src0_f32.nb[0] = sizeof(float);
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) { src0_f32.nb[i] = src0_f32.nb[i-1]*src0_f32.ne[i-1]; }
+            src0_f32.buffer = nullptr;
+            src0_f32.view_src = nullptr;
+            src0 = &src0_f32;
+        }
         ggml_cuda_pool_alloc<float> tmp(ctx.pool(), ne01*ne11);
 
         ggml_tensor dst_t = *dst;            // [ne11, ne01]: one row of dot products per token
