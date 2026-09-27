@@ -473,3 +473,16 @@ Deferred: folding the shared-expert gate into the router as a 513th row (~0.15 m
 is bit-identical (greedy hashes equal with and without GGML_SCHED_ZERO_BUFFERS) and removes ~2,860 of 3,856 decode
 declines, but runs 12 rows serially in one block: decode 36.0 -> 37.8 ms/step. Patch kept in
 bench/results/d7-hc-1b/d7_one_block.patch. A parallel version changes the reduction order; not worth ~0.4-0.8 ms.
+
+### Prefill items P6 and P4(a) (180b9325a, a819ecb91)
+
+Cold prefill 4K / 16K / 32K (launcher probe), hybrid = 2 lanes EXP_FROM=11 ub 2048:
+
+| build | Swift Q8T APU-only | Swift Q8T hybrid | base APU-only | base hybrid |
+|---|---|---|---|---|
+| before P6 | 904 / 839 / 763 | 1915 / 1901 / 1764 | 922 / 853 / 776 | 1901 / 1915 / 1775 |
+| P6 paired gate/up + down on F16 | 936 / 884 / 799 | 1994-2012 / 1985-1993 / 1833-1840 | 949 / 894 / 812 | 1986 / 1951 / 1801 |
+| + P4(a) f16 expert-input crossing | (not taken) | 1807-2002 / 2019-2041 / 1877-1882 | (not taken) | 1948 / 2084 / 1936 |
+
+P6: KLD vs unfused at ub 2048 0.0185 (base) / 0.0146 (Swift). P4(a): bit-identical where the F16 expert path takes
+the ubatch, KLD 0.0275 at ub 1024. APU-only Swift Q8T prefill vs gufo (1359/1431/1410): 69% / 62% / 57%.
