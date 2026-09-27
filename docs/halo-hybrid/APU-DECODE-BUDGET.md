@@ -316,3 +316,24 @@ before each server start, so these are COLD numbers (warm 4K is 1,829-1,950; ste
 one cold request); LLAMA_PREFILL_LANES=4 only adds lanes with a remote device - locally it runs 2 lanes, so the
 "4 lanes at -ub 1024" run (1,315 / 1,545 / 1,520) was 2 lanes at -ub 1024; the 12+ expert-layer and -ub 3072/4096
 failures were the MTP draft's KV / compute buffers (the draft inherits the target's n_ubatch), not the target layout.
+
+## 2026-09-27: review pass 0926, first items (bb282bd3e, 609f0944c, 9375f16ec)
+
+- **Peer copy with the source device current** (bb282bd3e). A card -> APU copy issued while the APU was current
+  returned zeros without an error.
+- **Pair-lane guard** (609f0944c). The paired two-lane walk now checks that both lanes have the same split backends
+  and the same first and last node per split; on a mismatch it logs and runs the lanes one after the other. Node
+  counts are allowed to differ: the first ubatch skips QSA indexer scoring (58 nodes per QSA layer).
+- **Scheduler events for the APU plus a 256-entry graph cache** (9375f16ec). Card graph replays went from 4% to 85%.
+
+Hybrid (EXP_FROM=11, 2 lanes, -ctxcp 0, cold, 4K / 16K / 32K prefill, 256-token MTP decode):
+
+| build | prefill t/s | decode t/s |
+|---|---|---|
+| before (2 runs) | 1554-1558 / 1800-1801 / 1729-1730 | 48.0-48.5 |
+| D1 on (3 runs incl. defaults) | 1559-1571 / 1797-1810 / 1725-1735 | 51.2-52.0 |
+
+Greedy text identical in every run (5741ae8aed8d short, 28e9e3446f1f long), with and without the overlap cut.
+Perplexity (8 chunks, ub 512) is bit-identical with D1 on and off, APU-only (7.1541) and hybrid (7.1907). APU-only
+at -b 4096 -ub 2048: 814/832/768 off, 813/827/762 on, decode 26.3 both (neutral). Opt-outs:
+GGML_SCHED_IGPU_EVENTS=0, GGML_CUDA_MAX_GRAPHS=64.
