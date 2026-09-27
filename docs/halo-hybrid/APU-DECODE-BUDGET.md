@@ -400,3 +400,25 @@ base 897/848/773, 27.4: the k-quant trunk misses the q8_0 WMMA prefill path but 
 2.9 ms per 2048-token call vs 1.35 ms q8_0 (+480 ms), attn_q/attn_gate/hc_down in q4_K/q6_K (+~270 ms). The APU's
 expert time is unchanged. Options: a q8_0 trunk (needs the bf16 trunk tensors, range-fetchable like the MTP head, and
 a re-assembled GGUF = disk: 27 GB free), or faster k-quant MMQ on gfx1201.
+
+### k-quant dense GEMM on WMMA (43d424a53) and a q8_0-trunk Swift build
+
+**Kernel:** mmq-wmma.cu now takes q4_K / q5_K / q6_K (16-weight staging units, (q - c) * s + b with one rounding).
+At 2048 tokens: gfx1201 q4_K 62-68 -> 81-92, q5_K 71-78 -> 75-89, q6_K 36-38 -> 74-83 TFLOPS (q8_0 MMQ: 84-95);
+gfx1151 q4_K 20-23 -> 23-32, q5_K 21-24 -> 22-30, q6_K 17-28 -> 20-29. Default on for RDNA3/4, GGML_CUDA_KQ_WMMA=0
+reverts. Swift Q4_K_M perplexity 7.5703 -> 7.5247 (f16 activations instead of q8_1).
+
+**q8_0-trunk Swift** (~/models/swift15-flash-next/Q8T, 121 GB): trunk tensors range-fetched from the bf16 checkpoint
+(9.4 GB, fetch_mtp.py with an exclude pattern), converted with convert_hf_to_gguf.py --no-mtp --outtype f32, merged by
+tools/merge_trunk.py: every tensor from ukisai's Q4_K_M except those whose type in unsloth's UD-Q4_K_XL differs
+(359 matrices -> q8_0, inject bf16 -> f32); experts and the PLE table unchanged. f32 tensors both files share are
+bit-identical except 21 ssm_a with a 1-ulp exp() difference in one of 48 values (kept ukisai's).
+
+| Swift build (hybrid 2 lanes, cold) | 4K | 16K | 32K | real-content decode | ppl (8 chunks, hybrid / APU) |
+|---|---|---|---|---|---|
+| Q4_K_M + k-quant WMMA | 1887 | 1907 | 1769 | 57.1 / 58.2 (40 ms/step) | 7.5247 / 7.5320 |
+| q8_0 trunk (2 runs) | 1877-1907 | 1902-1903 | 1764 | 55.3 / 55.5 (41 ms/step) | 7.2907 / 7.3107 |
+| q8_0 trunk, -ub 2560 -b 5120 | 1919 | 1994 | 1836 | | |
+
+APU-only q8_0 trunk: 902/847/772, decode 26.8 (Q4_K_M: 871/808/739, 31.3). The q8_0 trunk costs ~3% hybrid decode and
+~14% APU-only decode (more trunk bytes per token) for a 3% lower perplexity.
