@@ -2089,7 +2089,10 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
     }
     {   // rev/decode-profile: GGML_CUDA_GEMV_GROUP_MINROWS=<n> leaves a group whose quantized members have fewer than n
         // rows in total to the per-matrix path (one wave per row starves a 64-CU part: hc_down is 320 rows x K=10240)
-        static const int64_t min_rows = getenv("GGML_CUDA_GEMV_GROUP_MINROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_MINROWS")) : 0;
+        // default 512 (2026-09-27): Qwen3.8's hc_attn/ffn_down group (320 rows x K=10240 + the f32 inject) ran ~18 us in the
+        // group kernel vs ~4 us per-matrix on gfx1201 (the group kernel's one wave per row leaves most CUs idle):
+        // Swift Q8T decode 36.7 -> 36.2 ms/step. 0 = always group.
+        static const int64_t min_rows = getenv("GGML_CUDA_GEMV_GROUP_MINROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_MINROWS")) : 512;
         if (min_rows > 0) {
             int64_t rows = 0;
             for (int k = 0; k < n; ++k) {
