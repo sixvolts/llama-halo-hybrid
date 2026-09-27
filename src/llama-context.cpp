@@ -2012,8 +2012,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // halo-hybrid: with two prefill lanes a batch of fewer than two full ubatches would leave a lopsided pair
+    // (2048 + 687) or a lone ubatch that runs on one device at a time; split it into two ubatches, the first taking
+    // LLAMA_LANES_SPLIT_FRAC of it (rounded up to 64 tokens, the chunked-GDN chunk). Only batches of at least
+    // LLAMA_LANES_SPLIT_MIN tokens (default 1024); LLAMA_LANES_SPLIT_MIN=0 disables. Batches above 2 x n_ubatch keep
+    // the plain split.
+    uint32_t n_ubatch_eff = cparams.n_ubatch;
+    if (cparams.prefill_lanes >= 2 && sched_lane && cparams.cb_eval == nullptr) {
+        static const uint32_t split_min  = getenv("LLAMA_LANES_SPLIT_MIN") ? (uint32_t) atoi(getenv("LLAMA_LANES_SPLIT_MIN")) : 1024;
+        static const double   split_frac = getenv("LLAMA_LANES_SPLIT_FRAC") ? atof(getenv("LLAMA_LANES_SPLIT_FRAC")) : 0.55;
+        const uint32_t n = (uint32_t) n_tokens_all;
+        if (split_min > 0 && n >= split_min && n < 2*cparams.n_ubatch) {
+            n_ubatch_eff = std::min(cparams.n_ubatch, (uint32_t) GGML_PAD((uint32_t) (n*split_frac + 0.5), 64));
+        }
+    }
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
         if (!mctx) {
             return -2;
         }
