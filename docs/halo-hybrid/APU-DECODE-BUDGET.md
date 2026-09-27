@@ -362,6 +362,7 @@ acceptance 0.63).
 **OPEN: one APU page fault + hang (2026-09-27 00:57).** First request (3696 tokens) of a hybrid two-lane server
 with all of the above: amdgpu c5:00.0 (Strix Halo) gfxhub page fault at address 0, SQC instruction fetch
 (PERMISSION_FAULTS 0xb), no GPU reset, and llama-server never aborted: it waited until the client's 2 h timeout. First
-fault of the boot across ~40 runs. APU scheduler events (9375f16ec) are the prime suspect but unproven; a soak of the
-exact first request is running. Bisection order if it reproduces: GGML_SCHED_IGPU_EVENTS=0, GGML_CUDA_MAX_GRAPHS=64,
+fault of the boot across ~40 runs. APU scheduler events (9375f16ec) are the prime suspect but unproven. Soak of the exact first
+request (fresh server, cold caches, 2 lanes, same build and flags): 0 hangs in 50, plus 0 in 11 at a 1873-token first
+request, so the rate is below ~1/60 and it stays open as an intermittent. Bisection order if it reproduces: GGML_SCHED_IGPU_EVENTS=0, GGML_CUDA_MAX_GRAPHS=64,
 LLAMA_PLE_WILLNEED=0 LLAMA_PLE_THREADS=1, LLAMA_LANES_SPLIT_MIN=0.
