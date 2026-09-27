@@ -505,3 +505,13 @@ length from the server) or an asynchronous ingest overlapping the next pair (no 
 the card is).
 Not re-tested this round: the two-host GLM path. Eager decode copies are gated on !prefill_pipeline (off with a
 remote device), but mainframe needs a smoke run before any of this is pushed.
+
+### Async (deferred) MTP ingest (see the commit after cbbc6bf9e)
+
+Per pair of 2048-token ubatches the draft ingest cost: a full-card synchronize (the whole pair) and 45-80 ms of host
+blocking in the draft's decode per ubatch (grows with depth: dense draft attention), during which nothing else was
+submitted. Deferring the hook past the next submission helps only when one llama_decode holds several pairs, and
+even then only ~1.8% (-b 16384), because the ingest is card work and the card is the busy device in a pair. With
+the server's 4096-token batches: +0.5%. A q8_0-expert draft does not make the ingest cheaper (prefill same, decode
+-1%). Remaining ingest levers change what the draft computes: sparse (QSA) draft attention at depth, or a windowed
+ingest - both need an acceptance gate.
