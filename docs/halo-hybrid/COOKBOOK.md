@@ -296,9 +296,9 @@ Two builds, both with the fine-tune's own MTP head (the published GGUF has none)
 | file | trunk | hybrid prefill 4K/16K/32K | real-content decode | ppl (8 chunks) |
 |---|---|---|---|---|
 | ukisai Q4_K_M | q4_K/q5_K/q6_K | 1887 / 1907 / 1769 | 57-58 t/s | 7.52 |
-| Q8T (this recipe) | q8_0 (unsloth UD types) | 1877-1907 / 1902 / 1764 | 55 t/s | 7.29 |
+| Q8T (this recipe) | q8_0 (unsloth UD types) | 1877-1907 / 1902 / 1764 | 57-58 t/s with the q4_K draft head (55-56 shared) | 7.29 |
 
-Q8T is the better model (3% lower perplexity) for 3% less hybrid decode; APU-only it decodes 14% slower than the
+Q8T is the better model (3% lower perplexity) at the same hybrid decode once the draft has its own q4_K head; APU-only it decodes 14% slower than the
 Q4_K_M (26.8 vs 31.3 t/s without a draft), so APU-only users may prefer the Q4_K_M.
 
 ```bash
@@ -308,10 +308,17 @@ python3 $S/fetch_hf_tensors.py $R mtp-src
 python convert_hf_to_gguf.py mtp-src --mtp --mtp-shared-embd --outtype bf16 --outfile mtp-bf16.gguf
 llama-quantize --tensor-type indexer=bf16 --tensor-type ffn_gate_exps=q4_K --tensor-type ffn_up_exps=q4_K \
   --tensor-type ffn_down_exps=q5_1 mtp-bf16.gguf mtp-shared-exps-q4k.gguf Q8_0
+# recommended: give the draft its own q4_K LM head (drafting reads 341 MB instead of the 680 MB q8_0 output layer
+# twice per step; verification keeps output.weight). Swift Q8T: 40.6 -> 39.6 ms/step at unchanged acceptance.
+# (lm_head.weight comes from the bf16 trunk conversion below; on base Qwen3.8 the same head lowers acceptance
+#  0.66 -> 0.62-0.64 and nets out even, so base keeps the shared head)
+python3 $S/add_draft_head.py mtp-bf16.gguf trunk-f32.gguf output.weight mtp-head-f32.gguf
+llama-quantize --tensor-type indexer=bf16 --tensor-type ffn_gate_exps=q4_K --tensor-type ffn_up_exps=q4_K \
+  --tensor-type ffn_down_exps=q5_1 --tensor-type shared_head_head=q4_K mtp-head-f32.gguf mtp-shared-exps-q4k-head-q4_K.gguf Q8_0
 # q8_0 trunk (9.4 GB fetch, 20 GB f32 intermediate, 121 GB output)
 python3 $S/fetch_hf_tensors.py $R trunk-src . 'mlp\.experts\.|ngram_embedding\.shard_|^model\.visual\.|^mtp\.'
 python convert_hf_to_gguf.py trunk-src --no-mtp --outtype f32 --outfile trunk-f32.gguf
 python3 $S/merge_trunk.py Swift-...-Q4_K_M-00001-of-00003.gguf trunk-f32.gguf Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   Q8T/Swift-1.5-Qwen3.8-Flash-Next-Q8trunk.gguf --name="Swift 1.5 Qwen3.8-Flash-Next (q8_0 trunk, ukisai Q4_K_M experts)"
-# run: q38_hybrid_srv.sh with M=<Q8T shard 1> MD=<mtp-shared-exps-q4k.gguf>, LLAMA_PREFILL_LANES=2 EXP_FROM=11
+# run: q38_hybrid_srv.sh with M=<Q8T shard 1> MD=<mtp-shared-exps-q4k-head-q4_K.gguf>, LLAMA_PREFILL_LANES=2 EXP_FROM=11
 ```

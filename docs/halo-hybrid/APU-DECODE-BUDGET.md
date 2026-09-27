@@ -425,3 +425,23 @@ Base-model gate after 43d424a53: greedy hashes unchanged (5741ae8aed8d / 1b969dc
 1891/1915/1776 and APU-only 922/853/776. GLM-5.3's dense weights are all q8_0/f32, so the kernel does not touch it.)
 APU-only q8_0 trunk: 902/847/772, decode 26.8 (Q4_K_M: 871/808/739, 31.3). The q8_0 trunk costs ~3% hybrid decode and
 ~14% APU-only decode (more trunk bytes per token) for a 3% lower perplexity.
+
+### Draft-only LM head (a5fef593a)
+
+The shared-embedding MTP head drafted through the target's q8_0 output.weight (680 MB, read twice per step). A draft
+file can now carry its own nextn.shared_head_head (add_draft_head.py + llama-quantize), used only for drafting.
+Greedy output is byte-identical (verification is unchanged): Q8T 841b89707654 / 07091463e3ea, base 5741ae8aed8d /
+1b969dc886b0. Real-content decode, 2 seeds (x2 runs):
+
+| model, draft head | ms/step | acceptance | t/s |
+|---|---|---|---|
+| Swift Q8T, shared q8_0 | 40.5-40.8 | 0.64 | 55.6-56.2 |
+| Swift Q8T, own q6_K | 40.2 | 0.64-0.65 | 56.4-57.0 |
+| Swift Q8T, own q4_K | 39.5-39.7 | 0.64-0.66 | 57.3-58.1 |
+| Swift Q8T, 64K-token subset (d2t) | 39.7 | 0.63-0.65 | 56.4-57.7 |
+| base, shared q8_0 | 40.2-40.3 | 0.66 | 57.2-57.5 |
+| base, own q4_K (from bf16) | 39.2-39.3 | 0.62-0.64 | 56.9-57.9 |
+
+The subset head works (loader logs "MTP head over a reduced vocabulary") but self-generated held-out coverage is
+only 87% at 32K and 94% at 64K tokens (English prose 15-20% misses at 32K: the corpus is code-heavy and 59K
+generated tokens are too few), and the full-vocabulary scatter eats the smaller read. Needs a large chat corpus.
