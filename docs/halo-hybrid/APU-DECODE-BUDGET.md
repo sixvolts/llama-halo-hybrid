@@ -515,3 +515,12 @@ even then only ~1.8% (-b 16384), because the ingest is card work and the card is
 the server's 4096-token batches: +0.5%. A q8_0-expert draft does not make the ingest cheaper (prefill same, decode
 -1%). Remaining ingest levers change what the draft computes: sparse (QSA) draft attention at depth, or a windowed
 ingest - both need an acceptance gate.
+
+### QSA for the MTP draft (tried; opt-in LLAMA_MTP_QSA=1)
+
+The draft block now can attend through the trunk's QSA path (its own indexer, an indexer cache for its layer). It is
+not a win on this box: the per-ubatch ingest is slower on the R9700 at 16-32K (126 vs 110 ms per 2048-token ubatch at
+~30K; dense FA on gfx1201 is tuned, sparse FA only reached parity at 13K in the GLM work), prefill unchanged, and at
+19-23K-token contexts (long_accept.sh: 3 prompts x 2 seeds, T=0.7) acceptance drops 0.759 -> 0.732 and decode 57.4 ->
+54.0 t/s. The head looks trained dense; the converter's ratio 0 for the MTP block was right. The draft ingest's ~11%
+of hybrid prefill stays; a windowed ingest is the remaining lever and trades long-prompt acceptance.
