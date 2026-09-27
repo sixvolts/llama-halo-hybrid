@@ -277,16 +277,12 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 32, 256, 2,  32,  56)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 64, 256, 2,  32,  56)
 
-    // RDNA2 (gfx1030, wave32) also overflows at D=128: cols_per_block 16/32/64 with
-    // occupancy 3 (and the occ=8 small-col rows) exceed the per-block register budget
-    // so cudaOccupancyMaxActiveBlocksPerMultiprocessor returns 0 (abort). Drop occupancy
-    // to 1. Found via test-backend-ops FLASH_ATTN_EXT on V620; RDNA3/4 use WMMA.
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 1,  32,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 1,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 1,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 1, 128, 128)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 1, 128,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 64, 256, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 8,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 8,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 8,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 3, 128, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 3, 128,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 64, 256, 3,  64,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128,  2,  64, 8,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128,  4, 128, 6,  32,  64)
@@ -294,41 +290,68 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128, 16, 256, 5,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 128, 32, 256, 3,  64,  64)
 
-    // RDNA2 (gfx1030, no WMMA) reaches this tile path for D=256; the RDNA3/4-tuned
-    // occupancy 3-8 is infeasible on wave32 (occupancy query returns 0 -> abort at
-    // fattn-common GGML_ASSERT(max_blocks_per_sm > 0)). Drop occupancy to 1 (and the
-    // ncols=32 nbatch_fa 64->32) so one block always fits. RDNA3/4 use WMMA and never
-    // reach here. See also the ncols2<=2 cap for RDNA D=256 in switch_ncols2.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 8,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 6,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2, 128,  64)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 2,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 2,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 4,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 2, 128,  64)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 2,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 4,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 2, 128,  64)
+
+    return 0;
+}
+
+// RDNA2 (gfx1030) overrides. RDNA2 has no WMMA, so every flash-attention call lands on the
+// tile kernel, and its register file cannot hold the resident blocks the RDNA table asks for
+// at D=128/256/512/576: cudaOccupancyMaxActiveBlocksPerMultiprocessor returns 0 and
+// fattn-common aborts on GGML_ASSERT(max_blocks_per_sm > 0). Occupancy 1 always fits (and
+// D=256 ncols=32 also drops nbatch_fa 64 -> 32). Found with test-backend-ops FLASH_ATTN_EXT
+// on a V620. The RDNA table is left as upstream tuned it: RDNA3/4 also use the tile kernel
+// for decode and small batches, and have the larger register file those values assume.
+static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_rdna2(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 1,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 1,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 1, 128, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 1, 128,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 64, 256, 1,  64,  64)
+
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 1,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 1,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 1,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 1,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 1,  32, 128)
 
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2, 128,  64)
-
-    // D=512 (Gemma global attention) on RDNA2/gfx1030: DV=512 accumulators blow the
-    // wave32 VGPR budget at occupancy>1, so force occupancy=1 here; switch_ncols1 also
-    // caps cols_per_block<=8 for RDNA D=512 so the accumulator set fits.
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 1, 128,  64)
 
-    // D=576/DV=512 (DeepSeek MLA) on RDNA2: occupancy 2-4 demands resident blocks that
-    // exceed the wave32 VGPR budget (query returns 0 -> abort). occupancy=1 fits; the
-    // heaviest 576 kernel is ~62 KB LDS (1 block/wg in 64 KB). RDNA3/4 use WMMA.
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 1,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 1, 128,  64)
 
-    return 0;
+    return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
 }
 
 static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
+        if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+            return ggml_cuda_fattn_tile_get_config_amd_rdna2(DKQ, DV, ncols);
+        }
         if (GGML_CUDA_CC_IS_RDNA(cc)) {
             return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
         }
@@ -342,11 +365,13 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
 
 static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols) {
 #ifdef GGML_USE_HIP
-#ifdef RDNA
+#if defined(RDNA2)
+    return ggml_cuda_fattn_tile_get_config_amd_rdna2(DKQ, DV, ncols);
+#elif defined(RDNA)
     return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
 #else
     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
-#endif // RDNA
+#endif // RDNA2 / RDNA
 #else
 #ifdef FAST_FP16_AVAILABLE
     return ggml_cuda_fattn_tile_get_config_nvidia_fp16(DKQ, DV, ncols);
@@ -1170,22 +1195,20 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
     constexpr size_t nbytes_shared = 0;
 
-    // RDNA2 (gfx1030, no WMMA) runs the D=512 global-attention tile kernel. At
-    // cols_per_block 16/32 the DV=512 accumulators exceed the wave32 VGPR budget
-    // (occupancy query returns 0 -> abort); the ncols2<=2 kernels that would help are
-    // not instantiated for DV=512, so force cols_per_block<=8 here. RDNA3/4 use WMMA.
-    const bool rdna512 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 512;
-    // RDNA2 (gfx1030) D=128: cols_per_block 16/32/64 need 33-43 KB LDS (occupancy
-    // query returns 0 -> abort). Cap to cols_per_block<=8 (with ncols2<=2 from
-    // switch_ncols2) so only the light-LDS kernels are used. RDNA3/4 use WMMA.
-    const bool rdna_d128 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 128;
-    // D=576/DV=512 (DeepSeek MLA) on RDNA2: cols_per_block=32 (kernel <512,8,4>) still
-    // fails the occupancy query at occ=1; cap to cols_per_block<=16 (the <=16 kernels fit).
-    const bool rdna576 = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 576;
-    // D=256 MHA/odd-GQA (ncols2==1) on RDNA2: cols_per_block=32 is the heavy <256,32,1>
-    // kernel (occupancy query returns 0). Cap to cols_per_block<=16; the GQA ncols2>=2
-    // path keeps the working cols_per_block=32 (<256,16,2>) tile. cols_per_block<=8.
-    const bool rdna256_mha = GGML_CUDA_CC_IS_RDNA(cc) && DKQ == 256 && ncols2 == 1;
+    // RDNA2 (gfx1030): even at occupancy 1 (see ggml_cuda_fattn_tile_get_config_amd_rdna2),
+    // some wide-column kernels still fail the occupancy query and abort, so cap cols_per_block:
+    //   D=512 (Gemma global attention): the ncols2<=2 kernels are not instantiated for
+    //     DV=512, so cap cols_per_block<=8 to keep the accumulator set in registers.
+    //   D=128: cols_per_block 16/32/64 need 33-43 KB LDS; cap to <=8 (with ncols2<=2 from
+    //     switch_ncols2).
+    //   D=576/DV=512 (DeepSeek MLA): cols_per_block=32 (kernel <512,8,4>) fails; cap to <=16.
+    //   D=256 MHA/odd GQA (ncols2==1): <256,32,1> fails; cap to <=8. The GQA ncols2>=2 path
+    //     keeps its working cols_per_block=32 (<256,16,2>) tile.
+    const bool rdna2       = GGML_CUDA_CC_IS_RDNA2(cc);
+    const bool rdna512     = rdna2 && DKQ == 512;
+    const bool rdna_d128   = rdna2 && DKQ == 128;
+    const bool rdna576     = rdna2 && DKQ == 576;
+    const bool rdna256_mha = rdna2 && DKQ == 256 && ncols2 == 1;
 
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
@@ -1285,11 +1308,10 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // RDNA2 (gfx1030, no WMMA) runs the D=256 tile kernel; its ncols2>=4 variants carry
-    // 4+ DV=256 accumulators per thread and overflow the wave32 VGPR budget (occupancy
-    // query returns 0 -> abort). Cap ncols2<=2 for RDNA D=256 (2-head GQA chunks). GCN
-    // (wave64) fits the wider kernels; RDNA3/4 use WMMA and never reach this path.
-    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA(device_cc) && (DKQ == 256 || DKQ == 128);
+    // RDNA2 (gfx1030): the D=128/256 ncols2>=4 variants carry 4+ DV accumulators per thread and
+    // overflow the register file (occupancy query returns 0 -> abort), so cap ncols2<=2.
+    // Wave64 GCN fits the wider kernels, and RDNA3/4 keep upstream's selection.
+    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA2(device_cc) && (DKQ == 256 || DKQ == 128);
 
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
