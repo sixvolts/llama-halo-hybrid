@@ -468,3 +468,8 @@ New greedy references (launcher prompt): Swift Q8T d1a9781806fd after the groupe
 62b45bb3f58a after the router change. One transient slow window (15:18-15:22, both models, prefill included, no
 kernel fault) coincided with R9700 runtime-PM resumes; later runs with ~10 resumes were normal.
 Deferred: folding the shared-expert gate into the router as a 513th row (~0.15 ms/step).
+
+**D7 tried and dropped:** a one-block HC boundary kernel that stages b / inj in LDS (so xn may reuse their memory)
+is bit-identical (greedy hashes equal with and without GGML_SCHED_ZERO_BUFFERS) and removes ~2,860 of 3,856 decode
+declines, but runs 12 rows serially in one block: decode 36.0 -> 37.8 ms/step. Patch kept in
+bench/results/d7-hc-1b/d7_one_block.patch. A parallel version changes the reduction order; not worth ~0.4-0.8 ms.
