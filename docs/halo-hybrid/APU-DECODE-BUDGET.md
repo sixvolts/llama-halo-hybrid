@@ -486,3 +486,22 @@ Cold prefill 4K / 16K / 32K (launcher probe), hybrid = 2 lanes EXP_FROM=11 ub 20
 
 P6: KLD vs unfused at ub 2048 0.0185 (base) / 0.0146 (Swift). P4(a): bit-identical where the F16 expert path takes
 the ubatch, KLD 0.0275 at ub 1024. APU-only Swift Q8T prefill vs gufo (1359/1431/1410): 69% / 62% / 57%.
+
+### State at the end of the 2026-09-27 round (reference for the next gate)
+
+Current greedy references (q38_hybrid_srv.sh launcher, LLAMA_PREFILL_LANES=2 EXP_FROM=11 -ctxcp 0):
+- Swift Q8T + mtp-Swift1.5-shared-exps-q4k-head-q4_K.gguf: short 0e61acbea328, long-prompt c30330dde10b
+- base UD-Q4_K_XL + mtp-...-shared-exps-q4k.gguf: short cdfc2aa3aa56, long-prompt 34bb40f4d6f1
+
+APU-only real-content MTP decode (sw_accept_apu.sh, seeds 1-2): Swift Q8T + q4_K head 56.7 ms/step, 39.3-39.5 t/s
+(gufo APU-only 34.8); base 57.8-58.2 ms/step, 38.5-38.9 t/s (with GGML_CUDA_MMVQ_GROUPED=0 and
+GGML_CUDA_GEMV_GROUP_MINROWS=0: 60.2-60.4).
+
+Tried and reverted: MTP eh_proj as a 2D GEMM at ingest widths only (> 8 tokens): prefill +0.5%, within noise.
+Draft ingest cost: without the draft head hybrid Swift Q8T prefill is 2274/2283/2122 vs ~2000/2050/1910, so the MTP
+ingest (dense draft attention over the whole context + the draft's expert GEMMs on the card, per ubatch) is ~11-12%
+of prefill. Open options: a windowed ingest (constant cost; acceptance risk on long prompts; needs the total prompt
+length from the server) or an asynchronous ingest overlapping the next pair (no quality change; capped by how busy
+the card is).
+Not re-tested this round: the two-host GLM path. Eager decode copies are gated on !prefill_pipeline (off with a
+remote device), but mainframe needs a smoke run before any of this is pushed.
