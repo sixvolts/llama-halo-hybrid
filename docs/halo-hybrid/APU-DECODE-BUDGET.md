@@ -366,3 +366,37 @@ fault of the boot across ~40 runs. APU scheduler events (9375f16ec) are the prim
 request (fresh server, cold caches, 2 lanes, same build and flags): 0 hangs in 50, plus 0 in 11 at a 1873-token first
 request, so the rate is below ~1/60 and it stays open as an intermittent. Bisection order if it reproduces: GGML_SCHED_IGPU_EVENTS=0, GGML_CUDA_MAX_GRAPHS=64,
 LLAMA_PLE_WILLNEED=0 LLAMA_PLE_THREADS=1, LLAMA_LANES_SPLIT_MIN=0.
+
+## 2026-09-27: Swift 1.5 Qwen3.8-Flash-Next (ukisai fine-tune) bring-up (bc65067c5, 70b145d40)
+
+**Files** (~/models/swift15-flash-next): ukisai's Q4_K_M GGUF (3 shards, 111.4 GiB, sha256 checked against HF), plus
+an MTP head extracted from the fine-tune's bf16 safetensors. The GGUF has no MTP tensors; fetch_mtp.py range-reads only
+the `mtp.*` tensors (4.97 GB of the 330 GB checkpoint) and `convert_hf_to_gguf.py --mtp --mtp-shared-embd` makes a
+shared head. The same pipeline on base Qwen3.8 reproduces unsloth's shared-Q8_0 head byte for byte except the two
+indexer projections, which unsloth keeps bf16 (we now do too: `llama-quantize --tensor-type indexer=bf16`).
+Heads: shared-Q8_0 (2.79 GB) and shared-exps-q4k (1.69 GB, experts q4_K/q5_1): same acceptance, use the q4k one.
+
+**Quant mix differs from unsloth's UD-Q4_K_XL** and that decides speed: dense trunk q4_K/q5_K/q6_K (not q8_0),
+expert down q5_0/q8_0 (not q5_1), hc inject / output_hc bf16, PLE table q5_0 (32.8 GiB, lazy on disk).
+Two code fixes, both general:
+- q5_0 in the F16 routed expert GEMM (-17% at 2048/4096 tokens on gfx1151).
+- thin bf16/f16 weights at prefill widths (4 x 10240 hc_*_inject) take the swapped-MMVF path: 1243 -> 147 us per
+  call on the card. Exact f32 dots: perplexity 7.6218 -> 7.5703 and real-content acceptance slightly up.
+
+Hybrid (EXP_FROM=11, 2 lanes, -ctxcp 0, cold), Swift with its own q4k draft:
+
+| build | 4K | 16K | 32K | decode (launcher) |
+|---|---|---|---|---|
+| first load | 1730 | 1714 | 1603 | 58.6 |
+| + q5_0 F16 experts | 1774 | 1719 | 1607 | 58.6 |
+| + thin bf16 fix (2 runs) | 1866-1873 | 1828-1834 | 1701-1704 | 56.8 (text changed; see acceptance) |
+| same, -ub 2560 -b 5120 | 1872 | 1904 | 1759 | 56.7 |
+
+Real-content acceptance (probe_real, T=0.7, 400 tokens, seeds 1/2, n-max 2): Swift head 0.65/0.67 (57.1/58.2 t/s),
+base head on Swift 0.62/0.63 (56.6/56.8). APU-only (-b 4096 -ub 2048, no draft): Swift 851/807/739, decode 31.1 vs
+base 897/848/773, 27.4: the k-quant trunk misses the q8_0 WMMA prefill path but moves fewer bytes per token.
+
+**What is left of the gap to base (1933/1919/1778):** the card's dense trunk. 16K op timer, card: attn_qkv q6_K
+2.9 ms per 2048-token call vs 1.35 ms q8_0 (+480 ms), attn_q/attn_gate/hc_down in q4_K/q6_K (+~270 ms). The APU's
+expert time is unchanged. Options: a q8_0 trunk (needs the bf16 trunk tensors, range-fetchable like the MTP head, and
+a re-assembled GGUF = disk: 27 GB free), or faster k-quant MMQ on gfx1201.
