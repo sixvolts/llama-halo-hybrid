@@ -416,6 +416,14 @@ private:
     // halo-hybrid: per-ubatch completion hook (llama_set_ubatch_done_callback)
     llama_ubatch_done_callback ubatch_done_cb = nullptr;
     void *                     ubatch_done_ud = nullptr;
+
+    // halo-hybrid: deferred early ingest - the hook runs after the NEXT ubatch (pair) is submitted, ordered on an event
+    // recorded behind this ubatch's h_nextn copy instead of a full device synchronize (see decode)
+    struct ingest_pending_t { ggml_backend_event_t ev; int32_t i0; int32_t n; };
+    std::vector<ingest_pending_t>     ingest_pending;
+    std::vector<ggml_backend_event_t> ingest_ev_free;
+    std::vector<ggml_backend_event_t> ingest_ev_all;
+    void ingest_flush(bool run);
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

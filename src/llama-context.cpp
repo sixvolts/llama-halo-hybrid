@@ -562,7 +562,29 @@ llama_context::llama_context(
     }
 }
 
+void llama_context::ingest_flush(bool run) {
+    for (const auto & pi : ingest_pending) {
+        if (run) {
+            static const bool ing_dbg = getenv("LLAMA_MTP_INGEST_DEBUG") != nullptr;
+            const int64_t t0 = ing_dbg ? ggml_time_us() : 0;
+            ggml_backend_event_synchronize(pi.ev);
+            const int64_t t1 = ing_dbg ? ggml_time_us() : 0;
+            ubatch_done_cb(ubatch_done_ud, embd_nextn.data, pi.i0, pi.n);
+            if (ing_dbg) {
+                LLAMA_LOG_INFO("ingest-debug: deferred %d tokens at %d: event wait %.1f ms, draft call %.1f ms\n",
+                    pi.n, pi.i0, (t1 - t0) / 1000.0, (ggml_time_us() - t1) / 1000.0);
+            }
+        }
+        ingest_ev_free.push_back(pi.ev);
+    }
+    ingest_pending.clear();
+}
+
 llama_context::~llama_context() {
+    ingest_pending.clear();
+    for (auto * ev : ingest_ev_all) {
+        ggml_backend_event_free(ev);
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -2003,12 +2025,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
+    static const bool dec_timing = getenv("LLAMA_DECODE_TIMING") != nullptr;
+    const bool dec_t = dec_timing && n_tokens_all >= 256;
+    const int64_t td0 = dec_t ? ggml_time_us() : 0;
     sched_reserve();
+    const int64_t td1 = dec_t ? ggml_time_us() : 0;
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
     memory_update(false);
+    const int64_t td2 = dec_t ? ggml_time_us() : 0;
+    struct dec_timing_report {
+        bool on; int64_t t0, t1, t2; const llama_context * ctx; int32_t n;
+        ~dec_timing_report() {
+            if (on) {
+                LLAMA_LOG_INFO("decode-timing ctx %p, %d tokens: reserve %.1f ms, memory_update %.1f ms, rest %.1f ms\n",
+                    (const void *) ctx, n, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (ggml_time_us() - t2) / 1000.0);
+            }
+        }
+    } dec_rep { dec_t, td0, td1, td2, this, (int32_t) n_tokens_all };
 
     llama_memory_context_ptr mctx;
 
@@ -2097,7 +2133,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     };
 
     // a ubatch failed or was aborted -> remove all positions of the given ubatches from the memory module
+    bool ingest_defer_active = false;   // set below once the lanes are known to be local (deferred early ingest)
     auto handle_failure = [&](std::initializer_list<const llama_ubatch *> ubatches, ggml_status status) -> int {
+        ingest_flush(false);   // the draft catches up after llama_decode for whatever was not ingested
         llama_pos pos_min[LLAMA_MAX_SEQ];
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             pos_min[s] = std::numeric_limits<llama_pos>::max();
@@ -2260,8 +2298,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
             ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sch, t_h_nextn);
             if (backend_h && !ggml_backend_sched_backend_is_remote_ext(backend_h)) {
+                // deferred (two local lanes): record an event behind the h rows' copy; the hook runs after the next
+                // pair is submitted, so the draft overlaps it instead of stalling both devices (LLAMA_MTP_INGEST_DEFER=0)
+                static const bool defer_env = getenv("LLAMA_MTP_INGEST_DEFER") == nullptr || atoi(getenv("LLAMA_MTP_INGEST_DEFER")) != 0;
+                if (defer_env && ingest_defer_active) {
+                    ggml_backend_event_t ev = nullptr;
+                    if (!ingest_ev_free.empty()) {
+                        ev = ingest_ev_free.back();
+                        ingest_ev_free.pop_back();
+                    } else {
+                        ev = ggml_backend_event_new(ggml_backend_get_device(backend_h));
+                        if (ev) { ingest_ev_all.push_back(ev); }
+                    }
+                    if (ev) {
+                        ggml_backend_event_record(ev, backend_h);
+                        ingest_pending.push_back({ ev, (int32_t) n_tokens_prev, (int32_t) ubatch.n_tokens });
+                        n_outputs_prev += n_outputs;
+                        n_tokens_prev  += ubatch.n_tokens;
+                        return;
+                    }
+                }
+                static const bool ing_dbg = getenv("LLAMA_MTP_INGEST_DEBUG") != nullptr;
+                const int64_t t_i0 = ing_dbg ? ggml_time_us() : 0;
                 ggml_backend_synchronize(backend_h);
+                const int64_t t_i1 = ing_dbg ? ggml_time_us() : 0;
                 ubatch_done_cb(ubatch_done_ud, embd_nextn.data, (int32_t) n_tokens_prev, (int32_t) ubatch.n_tokens);
+                if (ing_dbg) {
+                    LLAMA_LOG_INFO("ingest-debug: ubatch %u tokens at %d: target sync %.1f ms, draft call %.1f ms\n",
+                        ubatch.n_tokens, (int) n_tokens_prev, (t_i1 - t_i0) / 1000.0, (ggml_time_us() - t_i1) / 1000.0);
+                }
             }
         }
 
@@ -2273,6 +2338,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // computed with their splits interleaved, so the experts of one on the second device overlap the
     // attention of the other on the first (see llama_context constructor)
     const bool use_lanes = cparams.prefill_lanes >= 2 && sched_lane && cparams.cb_eval == nullptr;
+    ingest_defer_active = use_lanes && !prefill_pipeline && ubatch_done_cb != nullptr;
 
     // pipeline state (see the pipeline branch below): the ubatch whose head is submitted and whose tail is due
     bool               pipe_pending   = false;
@@ -2594,6 +2660,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     LLAMA_LOG_ERROR("%s: failed to compute graph pair, compute status: %d\n", __func__, status);
                     return handle_failure({&ubatch, &ubatch_b}, status);
                 }
+                ingest_flush(true);   // the previous pair's deferred draft ingest, now overlapping this pair
 
                 if (lanes_debug) {
                     ggml_backend_sched_synchronize(sched.get());
@@ -2618,21 +2685,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
                 return handle_failure({&ubatch}, status);
             }
+            ingest_flush(true);
 
             extract_outputs(res_a, ubatch, n_outputs_a, sched.get());
             continue;
         }
 
+        const int64_t tpu0 = dec_t ? ggml_time_us() : 0;
         const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status);
+        if (dec_t) {
+            LLAMA_LOG_INFO("decode-timing ctx %p: process_ubatch %u tokens %.1f ms\n", (const void *) this, ubatch.n_tokens, (ggml_time_us() - tpu0) / 1000.0);
+        }
 
         if (!res) {
             return handle_failure({&ubatch}, status);
         }
+        ingest_flush(true);
 
         extract_outputs(res, ubatch, n_outputs_a, sched.get());
 
         more = mctx->next();
     }
+
+    ingest_flush(true);   // the last pair's deferred draft ingest
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
