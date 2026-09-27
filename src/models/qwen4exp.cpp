@@ -1,4 +1,11 @@
 #include "models.h"
+
+#include <algorithm>
+#include <thread>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "llama-impl.h"
 
 #include "ggml-backend.h"
@@ -596,7 +603,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
     cb(concat, "mtp_concat", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    // LLAMA_MTP_EH_PROJ_2D=1: one 2D GEMM over hc*n_tokens columns instead of n_tokens batched 4-column products.
+    // Opt-in: hybrid prefill +0.5-1% but MTP acceptance 0.63 -> 0.62 and decode -1% (2026-09-27)
+    static const bool eh_3d = !(getenv("LLAMA_MTP_EH_PROJ_2D") && atoi(getenv("LLAMA_MTP_EH_PROJ_2D")) > 0);
+    ggml_tensor * res_hc;
+    if (eh_3d) {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    } else {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_reshape_2d(ctx0, concat, concat->ne[0], hc*n_tokens), layer.nextn.eh_proj_s);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, res_hc->ne[0], hc, n_tokens);
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
@@ -1456,8 +1472,48 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         const auto *        tt = ggml_get_type_traits(w->type);   // same dequant the CPU get_rows uses
         const int64_t       hd = hp.ple_head_dim;
         std::vector<float> out(idx.size() * hd);
-        for (size_t r = 0; r < idx.size(); ++r) {
-            tt->to_float((const char *) w->data + (size_t) idx[r] * w->nb[1], out.data() + r*hd, hd);
+        const char * base = (const char *) w->data;
+        const size_t row_bytes = ggml_row_size(w->type, hd);
+#if defined(__linux__)
+        // the table is mmapped and mostly cold: ask for every page this ubatch reads up front, so the kernel reads
+        // them in parallel instead of one fault at a time inside the dequant loop (adjacent pages merged per call)
+        static const bool willneed = !getenv("LLAMA_PLE_WILLNEED") || atoi(getenv("LLAMA_PLE_WILLNEED")) > 0;
+        if (willneed) {
+            static const long pg = sysconf(_SC_PAGESIZE);
+            std::vector<uintptr_t> pages;
+            pages.reserve(idx.size() * 2);
+            for (size_t r = 0; r < idx.size(); ++r) {
+                const uintptr_t a = (uintptr_t) (base + (size_t) idx[r] * w->nb[1]);
+                for (uintptr_t p0 = a & ~(uintptr_t) (pg - 1); p0 < a + row_bytes; p0 += pg) {
+                    pages.push_back(p0);
+                }
+            }
+            std::sort(pages.begin(), pages.end());
+            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+            for (size_t i = 0; i < pages.size(); ) {
+                size_t j = i + 1;
+                while (j < pages.size() && pages[j] == pages[j - 1] + pg) { ++j; }
+                madvise((void *) pages[i], (j - i) * pg, MADV_WILLNEED);
+                i = j;
+            }
+        }
+#endif
+        // dequant on a few threads: page faults that the read-ahead has not satisfied yet then overlap
+        static const int n_thr_env = getenv("LLAMA_PLE_THREADS") ? atoi(getenv("LLAMA_PLE_THREADS")) : 8;
+        const int n_thr = (int) std::max<int64_t>(1, std::min<int64_t>(n_thr_env, (int64_t) idx.size() / 256));
+        auto work = [&](int t) {
+            const size_t r0 = idx.size() * t / n_thr, r1 = idx.size() * (t + 1) / n_thr;
+            for (size_t r = r0; r < r1; ++r) {
+                tt->to_float(base + (size_t) idx[r] * w->nb[1], out.data() + r*hd, hd);
+            }
+        };
+        if (n_thr == 1) {
+            work(0);
+        } else {
+            std::vector<std::thread> thr;
+            for (int t = 1; t < n_thr; ++t) { thr.emplace_back(work, t); }
+            work(0);
+            for (auto & th : thr) { th.join(); }
         }
         ggml_backend_tensor_set(emb, out.data(), 0, out.size()*sizeof(float));
         return;
