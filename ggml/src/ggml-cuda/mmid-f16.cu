@@ -189,7 +189,9 @@ __launch_bounds__(256) __global__
   // The epilogue transposes one 16x16 tile per wave through the same
   // bytes (8 KB), which the narrow tile's stages do not reach.
   constexpr int kStageBytes = kCodeBytes + kHighBytes + kScaleBytes + kActBytes;
-  constexpr int kLdsBytes = kStageBytes > 8 * 1024 ? kStageBytes : 8 * 1024;
+  // (paired tiles pair the gate and up accumulators through 8 x 16 x 18 floats of it)
+  constexpr int kLdsMin = kPair ? 8 * 16 * 18 * 4 : 8 * 1024;
+  constexpr int kLdsBytes = kStageBytes > kLdsMin ? kStageBytes : kLdsMin;
   __shared__ __attribute__((aligned(16))) std::uint8_t lds[kLdsBytes];
   auto* s_codes = reinterpret_cast<uint4*>(lds);
   auto* s_high = reinterpret_cast<std::uint32_t*>(lds + kCodeBytes);
@@ -743,6 +745,17 @@ __global__ void mmid_f16_convert_src1(const char * __restrict__ src1, __half * _
 }
 
 template <WeightType kType, int BN>
+static void mmid_f16_launch_pair(const void * w_gate, const void * w_up, const __half * x, const int32_t * tiles, int n_tiles,
+                                 const int32_t * bounds, const int32_t * rows_in, const int32_t * rows_out, __half * out_half,
+                                 size_t m, size_t k, cudaStream_t stream) {
+  constexpr int kBM = 128;   // 64 gate rows + the 64 matching up rows per block
+  constexpr int kBK = 2;
+  const dim3 grid((unsigned) ((m + kBM / 2 - 1) / (kBM / 2)), (unsigned) n_tiles);
+  RoutedF16GEMMKernel<kType, kBM, BN, kBK, true><<<grid, kThreads, 0, stream>>>(
+      w_gate, x, tiles, bounds, rows_in, rows_out, nullptr, nullptr, out_half, m, k, w_up);
+}
+
+template <WeightType kType, int BN>
 static void mmid_f16_launch(const void * w, const __half * x, const int32_t * tiles, int n_tiles, const int32_t * bounds,
                             const int32_t * rows_in, const int32_t * rows_out, float * out, size_t m, size_t k,
                             cudaStream_t stream) {
@@ -851,6 +864,80 @@ bool ggml_cuda_mmid_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src
   if (bn == 48) mmid_f16_launch<T, 48>(src0->data, x16.get(), tiles.get(), cap, bounds.get(), ids_src1.get(), ids_dst.get(), out, m, k, stream); \
   else          mmid_f16_launch<T, 16>(src0->data, x16.get(), tiles.get(), cap, bounds.get(), ids_src1.get(), ids_dst.get(), out, m, k, stream);
   switch (type) {
+    case WeightType::kQ4_K: MMID_F16_CASE(WeightType::kQ4_K); break;
+    case WeightType::kQ5_K: MMID_F16_CASE(WeightType::kQ5_K); break;
+    case WeightType::kQ5_0: MMID_F16_CASE(WeightType::kQ5_0); break;
+    case WeightType::kQ5_1: MMID_F16_CASE(WeightType::kQ5_1); break;
+    case WeightType::kQ8_0: MMID_F16_CASE(WeightType::kQ8_0); break;
+  }
+#undef MMID_F16_CASE
+  CUDA_CHECK(cudaGetLastError());
+  return true;
+}
+
+// halo-hybrid: the whole routed MoE block (P6): MUL_MAT_ID(gate) + MUL_MAT_ID(up) + GLU(swiglu) + MUL_MAT_ID(down).
+// gate and up run as one paired kernel (gufo's kPair: 4 waves of gate rows, 4 of the matching up rows, SwiGLU in the
+// epilogue) writing F16 activations straight into the down projection's F16 input layout, so neither the gate/up
+// F32 outputs nor the GLU output are written and down skips its conversion. The three skipped nodes must have no other
+// reader (the caller checks). GGML_CUDA_MMID_F16_PAIR=0 disables.
+bool ggml_cuda_mmid_f16_moe(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
+                            const ggml_tensor * glu, ggml_tensor * down) {
+  static const bool disabled = getenv("GGML_CUDA_MMID_F16_PAIR") != nullptr && atoi(getenv("GGML_CUDA_MMID_F16_PAIR")) == 0;
+  if (disabled) {
+    return false;
+  }
+  const ggml_tensor * wg = gate->src[0], * wu = up->src[0], * src1 = gate->src[1], * ids = gate->src[2];
+  WeightType tg, tu, td;
+  if (up->src[1] != src1 || up->src[2] != ids || down->src[2] != ids || down->src[1] != glu ||
+      glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+      glu->src[0] != gate || glu->src[1] != up || !ggml_are_same_shape(wg, wu) ||
+      !mmid_f16_check(ctx, wg, src1, ids, gate, tg) || !mmid_f16_check(ctx, wu, src1, ids, up, tu) ||
+      !mmid_f16_check(ctx, down->src[0], glu, ids, down, td) || tg != tu ||
+      !(tg == WeightType::kQ4_K || tg == WeightType::kQ5_K) || src1->ne[1] != 1 ||
+      down->src[0]->ne[0] != wg->ne[1] || !ggml_is_contiguous(glu)) {
+    return false;
+  }
+  cudaStream_t stream = ctx.stream();
+  const int64_t k = wg->ne[0], m = wg->ne[1], n_experts = wg->ne[2];
+  const int64_t n_used = ids->ne[0], n_tokens = ids->ne[1];
+  const int64_t n_rows = n_used*n_tokens;
+  const int64_t m_down = down->src[0]->ne[1];
+
+  ggml_cuda_pool_alloc<__half>  x16(ctx.pool(), n_tokens*k);
+  ggml_cuda_pool_alloc<__half>  act(ctx.pool(), n_rows*m);          // down's F16 input, row = token*n_used + slot
+  ggml_cuda_pool_alloc<int32_t> in_g(ctx.pool(), n_rows), out_g(ctx.pool(), n_rows);
+  ggml_cuda_pool_alloc<int32_t> in_d(ctx.pool(), n_rows), out_d(ctx.pool(), n_rows);
+  ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1), bounds_d(ctx.pool(), n_experts + 1);
+
+  mmid_f16_convert_src1<<<(unsigned) n_tokens, 256, 0, stream>>>((const char *) src1->data, x16.get(), k, 1,
+                                                                src1->nb[1], src1->nb[2]);
+  const int si1 = (int) (ids->nb[1] / sizeof(int32_t));
+  ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, in_g.get(), out_g.get(), bounds.get(),
+      (int) n_experts, (int) n_tokens, (int) n_used, 1, si1, 1, /*write_inverse =*/ false, stream);
+  ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, in_d.get(), out_d.get(), bounds_d.get(),
+      (int) n_experts, (int) n_tokens, (int) n_used, (int) n_used, si1, (int) n_used, /*write_inverse =*/ false, stream);
+
+  const int64_t mean = n_rows / n_experts;
+  const int bn = mean >= 40 ? 48 : 16;
+  const int cap = (int) (n_rows / bn + n_experts);
+  ggml_cuda_pool_alloc<int32_t> tiles(ctx.pool(), cap);
+  if (bn == 48) {
+    mmid_f16_tile_list<48><<<1, 1024, 0, stream>>>(bounds.get(), (int) n_experts, tiles.get(), cap);
+  } else {
+    mmid_f16_tile_list<16><<<1, 1024, 0, stream>>>(bounds.get(), (int) n_experts, tiles.get(), cap);
+  }
+#define MMID_F16_PAIR_CASE(T) \
+  if (bn == 48) mmid_f16_launch_pair<T, 48>(wg->data, wu->data, x16.get(), tiles.get(), cap, bounds.get(), in_g.get(), out_g.get(), act.get(), m, k, stream); \
+  else          mmid_f16_launch_pair<T, 16>(wg->data, wu->data, x16.get(), tiles.get(), cap, bounds.get(), in_g.get(), out_g.get(), act.get(), m, k, stream);
+  if (tg == WeightType::kQ4_K) { MMID_F16_PAIR_CASE(WeightType::kQ4_K) } else { MMID_F16_PAIR_CASE(WeightType::kQ5_K) }
+#undef MMID_F16_PAIR_CASE
+
+  // down over the F16 activations (same buckets and tiles; its own row maps: src1 rows are token*n_used + slot)
+  float * out = (float *) down->data;
+#define MMID_F16_CASE(T) \
+  if (bn == 48) mmid_f16_launch<T, 48>(down->src[0]->data, act.get(), tiles.get(), cap, bounds_d.get(), in_d.get(), out_d.get(), out, m_down, m, stream); \
+  else          mmid_f16_launch<T, 16>(down->src[0]->data, act.get(), tiles.get(), cap, bounds_d.get(), in_d.get(), out_d.get(), out, m_down, m, stream);
+  switch (td) {
     case WeightType::kQ4_K: MMID_F16_CASE(WeightType::kQ4_K); break;
     case WeightType::kQ5_K: MMID_F16_CASE(WeightType::kQ5_K); break;
     case WeightType::kQ5_0: MMID_F16_CASE(WeightType::kQ5_0); break;

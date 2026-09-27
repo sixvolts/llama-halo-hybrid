@@ -6046,6 +6046,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
+            // halo-hybrid (P6): gate + up + swiglu + down of a routed MoE block as the paired F16 kernel and down on its
+            //     F16 output (mmid-f16.cu), when down follows the GLU and nothing else reads gate, up or the GLU
+            if (op == GGML_OP_MUL_MAT_ID && i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_MUL_MAT_ID &&
+                    cgraph->nodes[i + 3]->src[1] == glu && ggml_node_get_use_count(cgraph, i) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 1) == 1 && ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                    ggml_cuda_mmid_f16_moe(*cuda_ctx, gate, up, glu, cgraph->nodes[i + 3])) {
+                fused_mul_mat_vec = true;
+                fused_node_count  = 4;
+                break;
+            }
             // halo-hybrid: MoE gate/up at MMQ widths: one quantize + expert sort for both, and where supported one
             //     kernel for gate, up and the GLU (mmq-gateup.cu). Returns 2 when the GLU node is left to run.
             if (op == GGML_OP_MUL_MAT_ID && !ggml_cuda_mmid_f16_takes(*cuda_ctx, gate)) {
