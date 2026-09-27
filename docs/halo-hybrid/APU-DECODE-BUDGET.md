@@ -337,3 +337,31 @@ Greedy text identical in every run (5741ae8aed8d short, 28e9e3446f1f long), with
 Perplexity (8 chunks, ub 512) is bit-identical with D1 on and off, APU-only (7.1541) and hybrid (7.1907). APU-only
 at -b 4096 -ub 2048: 814/832/768 off, 813/827/762 on, decode 26.3 both (neutral). Opt-outs:
 GGML_SCHED_IGPU_EVENTS=0, GGML_CUDA_MAX_GRAPHS=64.
+
+### P1 and P2 (f18e30ce3, c9bb9635f, fca6d3183)
+
+Hybrid, 2 lanes, -ctxcp 0, cold, repeated runs (min-max). "q4k draft" is the MTP head with its experts
+requantised to q4_K/q5_1 (models/qwen38-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-exps-q4k.gguf, 1050 MiB less VRAM,
+acceptance 0.63).
+
+| config | 4K | 16K | 32K | decode |
+|---|---|---|---|---|
+| before, q4k draft | 1525-1544 | 1795-1799 | 1728 | 52.5 |
+| + PLE gather read-ahead + threads | 1912-1940 | 1870-1872 | 1743-1745 | 56.1 |
+| + 55/45 split of short batches (default now) | 1933 | 1919 | 1778 | 56.0 |
+| same, -ub 2560 -b 5120 | 1892-1942 | 2008-2017 | 1844-1854 | 56.0-56.1 |
+
+- **PLE gather** is the biggest item: the cold first ubatch spent 389 ms in set_inputs faulting table rows in one
+  at a time. Output identical; APU-only 4K 818 -> 915, decode 26.6 -> 27.0.
+- **Short-batch split:** 50/50 was slower than the lopsided 2048 + 1648 pair (1735 vs 1668 ms): a smaller second
+  ubatch shortens the pipeline drain. 55/45 keeps 4K and gains 2% at 16K/32K.
+- **Draft n_ubatch cap** (LLAMA_SPEC_DRAFT_UB) costs 1.5-3% prefill at 512 or 1024: opt-in for VRAM only.
+- **2D eh_proj** (LLAMA_MTP_EH_PROJ_2D=1): prefill +0.5-1%, acceptance 0.63 -> 0.62, decode -1%: opt-in.
+- Perplexity (APU-only, 8 chunks) unchanged at 7.1541.
+
+**OPEN: one APU page fault + hang (2026-09-27 00:57).** First request (3696 tokens) of a hybrid two-lane server
+with all of the above: amdgpu c5:00.0 (Strix Halo) gfxhub page fault at address 0, SQC instruction fetch
+(PERMISSION_FAULTS 0xb), no GPU reset, and llama-server never aborted: it waited until the client's 2 h timeout. First
+fault of the boot across ~40 runs. APU scheduler events (9375f16ec) are the prime suspect but unproven; a soak of the
+exact first request is running. Bisection order if it reproduces: GGML_SCHED_IGPU_EVENTS=0, GGML_CUDA_MAX_GRAPHS=64,
+LLAMA_PLE_WILLNEED=0 LLAMA_PLE_THREADS=1, LLAMA_LANES_SPLIT_MIN=0.
