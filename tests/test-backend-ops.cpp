@@ -6169,6 +6169,67 @@ struct test_moe_gate_up : public test_case {
     }
 };
 
+// halo-hybrid (A3): a whole routed MoE block, gate + up + SWIGLU + down, as one graph with the down output as the only
+// result - the shape the CUDA P6 fusion (paired F16 gate/up + GLU + down, mmid-f16.cu) takes when experts see >= 40 rows
+struct test_moe_block : public test_case {
+    const ggml_type type_gu;
+    const ggml_type type_down;
+    const int n_mats;
+    const int n_used;
+    const int64_t m; // n_ff (gate/up rows, down K)
+    const int64_t n; // tokens
+    const int64_t k; // n_embd
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_BLOCK";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_gu, type_down, n_mats, n_used, m, n, k);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    test_moe_block(ggml_type type_gu, ggml_type type_down, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : type_gu(type_gu), type_down(type_down), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gates = ggml_new_tensor_3d(ctx, type_gu,   k, m, n_mats);
+        ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type_gu,   k, m, n_mats);
+        ggml_tensor * downs = ggml_new_tensor_3d(ctx, type_down, m, k, n_mats);
+        ggml_set_name(gates, "gates");
+        ggml_set_name(ups, "ups");
+        ggml_set_name(downs, "downs");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gates, x, ids);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ups,   x, ids);
+        ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * out  = ggml_mul_mat_id(ctx, downs, glu, ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -10248,6 +10309,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));   // Swift 1.5 Q4_K_M down
         }
+        // whole Qwen3.8 MoE blocks through P6 (>= 2048 tokens) and just below it
+        for (int64_t n : {1024, 2048, 3696}) {
+            for (ggml_type td : {GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_moe_block(GGML_TYPE_Q4_K, td, 512, 10, 640, n, 2560));
+            }
+        }
         return test_cases;
     }
 
@@ -12372,6 +12439,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 32, 4, b, 256, n_tokens, 512));
         }
     }
+    // halo-hybrid (A3): whole MoE blocks (P6 takes n = 512: 4096 rows >= 40 per expert; n = 64 stays below it), partial
+    // 192-row tiles, zero-row experts (64 experts, 8 used), and the other expert-GEMV/GEMM edges of the round
+    for (int64_t n_tokens : {64, 512}) {
+        test_cases.emplace_back(new test_moe_block(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 64, 8, 256, n_tokens, 512));
+        test_cases.emplace_back(new test_moe_block(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 64, 8, 256, n_tokens, 512));
+        for (ggml_type td : {GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_moe_block(GGML_TYPE_Q4_K, td, 64, 8, 192, n_tokens, 512));
+            test_cases.emplace_back(new test_moe_block(GGML_TYPE_Q8_0, td, 64, 8, 192, n_tokens, 512));
+        }
+        test_cases.emplace_back(new test_moe_block(GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, 64, 8, 256, n_tokens, 512));
+    }
+    // dense k-quant / q8_0 WMMA at shapes off the 256 x 512 grid
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (auto [m, n, k] : std::vector<std::tuple<int64_t,int64_t,int64_t>>{{1000, 65, 2560}, {2560, 200, 1024}, {129, 64, 10240}}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+    }
+    // f32 weights at decode widths (MMVF dispatch-cliff guard, thin-weight swap)
+    for (int64_t n = 3; n <= 8; n++) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, n, 2560, {1, 1}, {1, 1}));
+    }
+    // expert GEMV wider than the grouped kernel's 256-pair table (40 used x 8 tokens): per-pair path within its launch max
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 64, 40, true, 256, 8, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 64, 40, false, 256, 8, 512));
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
         for (int64_t m_batch : {32, 200, 1000}) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 640, 512,
