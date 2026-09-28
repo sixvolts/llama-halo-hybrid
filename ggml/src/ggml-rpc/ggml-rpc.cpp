@@ -2146,6 +2146,15 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
     return true;
 }
 
+// halo-hybrid: the server-side scheduler (card + APU behind ggml-rpc) keeps the pre-9375f16ec behaviour for the APU -
+// a host synchronize of its stream before its split inputs instead of scheduler events. With APU events this
+// scheduler faulted on the APU at the first decode graph of GLM-5.3 two-host (out-of-range expert reads by the grouped
+// MoE GEMV; gone with serialized kernels or GGML_SCHED_IGPU_EVENTS=0; root cause open, 2026-09-28). The server step
+// measured the same without them (90-92 ms). An explicit GGML_SCHED_IGPU_EVENTS in the environment still wins.
+static void rpc_server_sched_defaults() {
+    setenv("GGML_SCHED_IGPU_EVENTS", "0", /*overwrite=*/ 0);
+}
+
 bool rpc_server::run_sched_graph(stored_graph & sg, bool fresh) {
     if (sg.slot == 1) {
         // the small-graph slot: its own scheduler, so the main graph's plan survives in `sched` for its RECOMPUTE
@@ -2156,6 +2165,7 @@ bool rpc_server::run_sched_graph(stored_graph & sg, bool fresh) {
             }
             std::vector<ggml_backend_t> sb = backends;
             sb.push_back(sched_cpu);
+            rpc_server_sched_defaults();
             sched_small = ggml_backend_sched_new(sb.data(), nullptr, (int) sb.size(), 4096, false, false);
             GGML_ASSERT(sched_small != nullptr);
         }
@@ -2173,12 +2183,14 @@ bool rpc_server::run_sched_graph(stored_graph & sg, bool fresh) {
         }
         std::vector<ggml_backend_t> sb = backends;
         sb.push_back(sched_cpu);
+        rpc_server_sched_defaults();
         sched = ggml_backend_sched_new(sb.data(), nullptr, (int) sb.size(), 32768, false, false);
         GGML_ASSERT(sched != nullptr);
         GGML_LOG_INFO("[%s] server-side scheduler over %zu device backend(s) + CPU\n", __func__, backends.size());
     }
     return run_sched_graph_on(sched, sg, fresh);
 }
+
 
 bool rpc_server::run_sched_graph_on(ggml_backend_sched_t sched, stored_graph & sg, bool fresh) {
     // ggml_backend_sched_graph_compute = compute_async + ggml_backend_sched_synchronize, which drains EVERY backend
