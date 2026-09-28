@@ -1463,8 +1463,10 @@ static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
     const int max_cols = n_tokens <= 4 ? 4 : MMVQ_GRP_MAX_COLS;
     GGML_ASSERT(n_pairs <= MMVQ_GRP_MAX_PAIRS && n_tokens <= MMVQ_GRP_MAX_COLS);
 
-    ggml_cuda_pool_alloc<int32_t> grp(ctx.pool(), 1 + (size_t) n_pairs*(2 + max_cols));
-    mmvq_moe_group_ids<<<1, MMVQ_GRP_MAX_PAIRS, 0, stream>>>(ids, grp.get(), n_tokens, n_slots, ids_stride, max_cols);
+    // the persistent table (stream-ordered reuse across launches); the pool only if it could not be allocated
+    ggml_cuda_pool_alloc<int32_t> grp_pool(ctx.pool());
+    int32_t * grp = ctx.mmvq_grp ? ctx.mmvq_grp : grp_pool.alloc(1 + (size_t) n_pairs*(2 + max_cols));
+    mmvq_moe_group_ids<<<1, MMVQ_GRP_MAX_PAIRS, 0, stream>>>(ids, grp, n_tokens, n_slots, ids_stride, max_cols);
     CUDA_CHECK(cudaGetLastError());
 
     const int device    = ggml_cuda_get_device();
@@ -1474,11 +1476,11 @@ static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
 #define MMVQ_GRP_CASE(T) \
     case T: \
         if (max_cols == 4) { \
-            mul_mat_vec_q_moe_grouped_launch_cols<T, 4>(vx, vy, grp.get(), fusion, dst, ncols_x, nchannels_y_fd, nrows_x, \
+            mul_mat_vec_q_moe_grouped_launch_cols<T, 4>(vx, vy, grp, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, \
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
                 n_pairs, warp_size, stream); \
         } else { \
-            mul_mat_vec_q_moe_grouped_launch_cols<T, MMVQ_GRP_MAX_COLS>(vx, vy, grp.get(), fusion, dst, ncols_x, nchannels_y_fd, nrows_x, \
+            mul_mat_vec_q_moe_grouped_launch_cols<T, MMVQ_GRP_MAX_COLS>(vx, vy, grp, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, \
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
                 n_pairs, warp_size, stream); \
         } \
@@ -2636,4 +2638,17 @@ void ggml_cuda_mmvq_moe_tail(ggml_backend_cuda_context & ctx,
     }
     GGML_ASSERT(ok);   // ggml_cuda_mmvq_moe_tail_supported() checked the pair
     CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mmvq_grp_init(ggml_backend_cuda_context & ctx) {
+    if (ctx.mmvq_grp != nullptr) {
+        return;
+    }
+    const size_t bytes = (1 + (size_t) MMVQ_GRP_MAX_PAIRS*(2 + MMVQ_GRP_MAX_COLS)) * sizeof(int32_t);
+    void * p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    ctx.mmvq_grp = (int32_t *) p;
 }

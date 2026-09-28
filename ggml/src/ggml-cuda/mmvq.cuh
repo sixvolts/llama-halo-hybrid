@@ -35,3 +35,6 @@ void ggml_cuda_mmvq_moe_tail(ggml_backend_cuda_context & ctx,
         const ggml_tensor * down_exps, const ggml_tensor * act, const ggml_tensor * ids,
         const ggml_tensor * weights, const ggml_tensor * expert_scale,
         const ggml_tensor * down_shexp, const ggml_tensor * sact, const ggml_tensor * g, ggml_tensor * dst);
+
+// halo-hybrid: allocate ctx.mmvq_grp (the grouped MoE GEMV's expert-group table) once, outside graph capture
+void ggml_cuda_mmvq_grp_init(ggml_backend_cuda_context & ctx);

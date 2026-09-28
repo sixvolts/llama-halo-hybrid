@@ -1519,6 +1519,11 @@ struct ggml_backend_cuda_context {
     // (reset by the last block of every launch, so graph replays find them at zero) and the per-block partial dots
     void * hc_mix_scratch = nullptr;
 
+    // halo-hybrid: persistent table of the grouped MoE GEMV's expert groups (mmvq.cu), allocated before any capture:
+    // a pool allocation captured into a CUDA graph dangles once the legacy pool frees its cache on an allocation
+    // failure (clear_pool), and a replay then reads freed memory (GLM two-host decode on the APU, 2026-09-28)
+    int32_t * mmvq_grp = nullptr;
+
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {

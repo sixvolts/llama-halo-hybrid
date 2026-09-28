@@ -729,6 +729,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(q8_arena));
     }
+    if (mmvq_grp != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(mmvq_grp));
+    }
     if (hc_mix_scratch != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(hc_mix_scratch));
@@ -6632,6 +6636,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_q8_side_reset(*cuda_ctx);   // per-graph registry of producer-side q8_1 activation copies
     ggml_cuda_dsv4_hc_mix_scratch_init(*cuda_ctx);   // once per context, before any capture
+    ggml_cuda_mmvq_grp_init(*cuda_ctx);              // once per context, before any capture
 
     {   // halo-hybrid: GGML_CUDA_PAD_KERNELS=<n> appends n empty dependent kernels to every graph. The slope of
         // tok/s against n is the marginal cost of one kernel boundary in the real decode loop, which is what any
