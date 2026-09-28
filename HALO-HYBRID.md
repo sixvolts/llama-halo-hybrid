@@ -222,7 +222,7 @@ prefill 627 → 736 and 634 → 747, decode 48.9 → 50.2 and 66.6 → 63.1 (tha
 processed at one to two decode calls per 4K, so the gain grows with prompt length up to the point where the
 32K attention cost dominates.
 
-## GLM-5.3-Flash across two hosts (on `main`; the pre-rewrite history is on branch `glm53-flash`)
+## GLM-5.3-Flash across two hosts (on `main`)
 
 GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB; 45 layers + 1 MTP block, 288 experts / 8 used, 34 KDA linear-attention
 layers, 11 DSA sparse-attention layers, mHC hyper-connections) does not fit one box, so it runs across gibson and a
