@@ -603,6 +603,7 @@ extern "C" {
 
         GGML_OP_DSV4_HC_MIX,   // halo-hybrid: appended last so the ids above stay wire-stable
         GGML_OP_KQ_MASK_BUILD, // halo-hybrid (2026-09-23): masks built on the device from per-cell/per-query ints
+        GGML_OP_QSA_TOP_K,     // halo-hybrid (2026-09-28): block-level top-k of the qwen4exp QSA indexer
 
         GGML_OP_COUNT,
     };
@@ -2738,6 +2739,21 @@ extern "C" {
     //   mode 2 (CAND): keep iff visible && (pool_of[j] < bo_vis[i] || pos_kv[j] >= tail_start[i])
     // pool_of [n_kv] i32 (-1 = no pool), tail_start / bo_vis [n_tokens] i32; only read by modes 1-2 (NULL for mode 0)
     // result [n_kv, n_tokens] of `type` (F16 or F32): 0 keeps, -INFINITY drops. Comparisons on -1 are unsigned, as on the host.
+    // halo-hybrid: the cell-level top-k of qwen4exp's block-sparse attention (QSA), computed from block scores.
+    // Layout: cell j holds position j (one sequence, no holes); block b is cells [b*ratio, b*ratio + ratio).
+    // For query row i (position q = q_pos[i]) cell j is scored iff j < n_bid*ratio and j <= q, with value
+    // score[j/ratio, i]; every other cell is -inf. The result [width, n_q] (I32) is the set of the width largest cell
+    // values with ties taken in ascending cell index (-inf cells last, also in ascending index) - exactly what
+    // ggml_top_k returns over the expanded per-cell scores - listed in ascending cell index.
+    //   score: F32 [n_blocks, n_q]   q_pos: I32 [n_q]   n_bid: I32 [1] (complete blocks)
+    GGML_API struct ggml_tensor * ggml_qsa_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * n_bid,
+            int32_t               width,
+            int32_t               ratio);
+
     GGML_API struct ggml_tensor * ggml_kq_mask_build(
             struct ggml_context * ctx,
             struct ggml_tensor  * pos_kv,

@@ -7738,6 +7738,61 @@ struct test_argsort : public test_case {
 };
 
 // GGML_OP_TOP_K
+// halo-hybrid: GGML_OP_QSA_TOP_K - block-level top-k of the QSA indexer, exact against the CPU reference (same set,
+// same ascending order); `ties` quantizes the scores so whole runs of blocks tie at the threshold
+struct test_qsa_top_k : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_q;
+    const int32_t n_bid;
+    const int32_t width;
+    const int32_t ratio;
+    const int32_t pos0;   // first query position
+    const bool    ties;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_TOP_K"; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_blocks, n_q, n_bid, width, ratio, pos0, ties);
+    }
+
+    double max_err() override { return 0.0; }
+
+    test_qsa_top_k(int64_t n_blocks, int64_t n_q, int32_t n_bid, int32_t width, int32_t ratio, int32_t pos0, bool ties)
+        : n_blocks(n_blocks), n_q(n_q), n_bid(n_bid), width(width), ratio(ratio), pos0(pos0), ties(ties) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_blocks, n_q);
+        ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);
+        ggml_tensor * nbid  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(score, "score");
+        ggml_set_name(q_pos, "q_pos");
+        ggml_set_name(nbid,  "n_bid");
+        ggml_tensor * out = ggml_qsa_top_k(ctx, score, q_pos, nbid, width, ratio);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234 + n_blocks + n_q);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "score") == 0) {
+                std::vector<float> v(ggml_nelements(t));
+                std::uniform_real_distribution<float> d(0.0f, 8.0f);
+                for (auto & x : v) { x = ties ? std::floor(d(rng)) : d(rng); }
+                // the tail bias of the real graph: some blocks far above the rest
+                for (int64_t i = 0; i < n_q; ++i) { v[i*n_blocks + (i % n_blocks)] += 1e9f; }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                std::vector<int32_t> v(n_q);
+                for (int64_t i = 0; i < n_q; ++i) { v[i] = pos0 + (int32_t) i; }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "n_bid") == 0) {
+                ggml_backend_tensor_set(t, &n_bid, 0, sizeof(int32_t));
+            }
+        }
+    }
+};
+
 struct test_top_k : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -12438,6 +12493,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n_tokens : {17, 300}) {
             test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 32, 4, b, 256, n_tokens, 512));
         }
+    }
+    // halo-hybrid: QSA block-level top-k (qwen4exp prefill / decode shapes, with and without ties at the threshold)
+    for (bool ties : {false, true}) {
+        test_cases.emplace_back(new test_qsa_top_k(2560, 64, 2400, 2051, 4, 9000, ties));    // ~10K window, prefill rows
+        test_cases.emplace_back(new test_qsa_top_k(2560, 64, 2400, 2051, 4, 400, ties));     // early rows: F <= width
+        test_cases.emplace_back(new test_qsa_top_k(8192, 3, 8190, 2051, 4, 32760, ties));    // 32K decode verify
+        test_cases.emplace_back(new test_qsa_top_k(700, 33, 690, 257, 4, 2600, ties));       // odd sizes
+        test_cases.emplace_back(new test_qsa_top_k(300, 17, 290, 101, 3, 1000, ties));       // ratio 3
     }
     // halo-hybrid (A3): whole MoE blocks (P6 takes n = 512: 4096 rows >= 40 per expert; n = 64 stays below it), partial
     // 192-row tiles, zero-row experts (64 experts, 8 used), and the other expert-GEMV/GEMM edges of the round

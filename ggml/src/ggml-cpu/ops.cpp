@@ -12329,3 +12329,39 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// halo-hybrid: GGML_OP_QSA_TOP_K (see ggml.h). Reference: expand the block scores to cells, stable-sort by value
+// descending (ties keep ascending cell index), take `width`, list them in ascending cell index.
+void ggml_compute_forward_qsa_top_k(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const ggml_tensor * score = dst->src[0];
+    const ggml_tensor * q_pos = dst->src[1];
+    const ggml_tensor * n_bid = dst->src[2];
+
+    const int32_t width = ggml_get_op_params_i32(dst, 0);
+    const int32_t r     = ggml_get_op_params_i32(dst, 1);
+    const int64_t n_blocks = score->ne[0];
+    const int64_t n_q      = score->ne[1];
+    const int64_t nb       = std::min<int64_t>(((const int32_t *) n_bid->data)[0], n_blocks);
+
+    std::vector<int32_t> order;
+    std::vector<float>   val;
+    for (int64_t i = params->ith; i < n_q; i += params->nth) {
+        const int64_t q = ((const int32_t *) q_pos->data)[i];
+        const int64_t F = std::max<int64_t>(0, std::min<int64_t>(nb*r, q + 1));   // cells [0, F) are scored
+        const int64_t n_cells = std::max<int64_t>(F, width);
+        const float * srow = (const float *) ((const char *) score->data + i*score->nb[1]);
+        val.resize(n_cells);
+        order.resize(n_cells);
+        for (int64_t j = 0; j < n_cells; ++j) {
+            val[j]   = j < F ? srow[j / r] : -INFINITY;
+            order[j] = (int32_t) j;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return val[a] > val[b]; });
+        order.resize(width);
+        std::sort(order.begin(), order.end());
+        int32_t * out = (int32_t *) ((char *) dst->data + i*dst->nb[1]);
+        for (int32_t k = 0; k < width; ++k) {
+            out[k] = order[k];
+        }
+    }
+}

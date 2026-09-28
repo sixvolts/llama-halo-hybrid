@@ -1102,9 +1102,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "DSV4_HC_MIX",
     "KQ_MASK_BUILD",
+    "QSA_TOP_K",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1220,9 +1221,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "dsv4_hc_mix(x, hc_fn, scale, base)",
     "kq_mask_build(pos_kv, pos_q, pool_of, tail_start, bo_vis)",
+    "qsa_top_k(score, q_pos, n_bid)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6616,6 +6618,31 @@ struct ggml_tensor * ggml_kq_mask_build(
     result->src[2] = mode > 0 ? pool_of    : NULL;
     result->src[3] = mode > 0 ? tail_start : NULL;
     result->src[4] = mode > 0 ? bo_vis     : NULL;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_qsa_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * n_bid,
+        int32_t               width,
+        int32_t               ratio) {
+    GGML_ASSERT(score->type == GGML_TYPE_F32 && q_pos->type == GGML_TYPE_I32 && n_bid->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(score) && score->ne[2] == 1 && score->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(q_pos) >= score->ne[1] && ggml_nelements(n_bid) == 1);
+    GGML_ASSERT(width > 0 && ratio > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, score->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, width);
+    ggml_set_op_params_i32(result, 1, ratio);
+
+    result->op     = GGML_OP_QSA_TOP_K;
+    result->src[0] = score;
+    result->src[1] = q_pos;
+    result->src[2] = n_bid;
 
     return result;
 }
