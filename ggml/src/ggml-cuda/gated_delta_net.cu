@@ -908,11 +908,33 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 }
 
+// halo-hybrid (gate floors): GGML_CUDA_GDN_PERTURB=<eps> scales every GDN attention output by (1 + eps) - a numerically
+// meaningless change whose KLD against an unperturbed run is the noise floor a numerics change must stay under
+// (e.g. eps = 1e-6, -1e-6, 3e-6). Debug only; unset = no extra launch.
+static __global__ void gdn_perturb_kernel(float * __restrict__ x, const int64_t n, const float f) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] *= f;
+    }
+}
+
+static void gdn_perturb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const float eps = getenv("GGML_CUDA_GDN_PERTURB") ? (float) atof(getenv("GGML_CUDA_GDN_PERTURB")) : 0.0f;
+    if (eps == 0.0f) {
+        return;
+    }
+    const ggml_tensor * v = dst->src[2];
+    const int64_t n = v->ne[0] * v->ne[1] * v->ne[2] * v->ne[3];   // the attention output rows; the state after them is untouched
+    gdn_perturb_kernel<<<(n + 255) / 256, 256, 0, ctx.stream()>>>((float *) dst->data, n, 1.0f + eps);
+}
+
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
+    gdn_perturb(ctx, dst);
 }
 
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+    gdn_perturb(ctx, dst);
 }
