@@ -67,3 +67,8 @@ static __device__ __forceinline__ void q8_side_store(block_q8_1 * q8, const int6
 }
 
 void ggml_cuda_pad_kernels(ggml_backend_cuda_context & ctx, int n);   // measurement aid, see hc.cu
+
+// halo-hybrid: producer-side MMQ q8_1 copies of prefill activations (one slot per context, reset per graph)
+struct block_q8_1_mmq;
+block_q8_1_mmq * ggml_cuda_mmq_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * prod, int64_t ne0, int64_t ne1);
+const char * ggml_cuda_mmq_side_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0);

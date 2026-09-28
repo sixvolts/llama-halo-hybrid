@@ -1524,6 +1524,15 @@ struct ggml_backend_cuda_context {
     // failure (clear_pool), and a replay then reads freed memory (GLM two-host decode on the APU, 2026-09-28)
     int32_t * mmvq_grp = nullptr;
 
+    // halo-hybrid: one producer-side MMQ q8_1 copy (block_q8_1_mmq, D4 layout) of a prefill activation, written by the
+    // producer (k_hc_combine_norm) and consumed by the next q8_0 MMQ GEMM on the same stream instead of its quantize
+    // pass (hc.cu / mmq.cu). One slot: each copy is consumed a few nodes after it is written. Reset per graph.
+    char *              mmq_side_buf  = nullptr;
+    size_t              mmq_side_cap  = 0;
+    const ggml_tensor * mmq_side_prod = nullptr;   // producing tensor (the matmul reads a reshape of it)
+    int64_t             mmq_side_ne0  = 0;          // K of the consumer (ne10, unpadded == padded)
+    int64_t             mmq_side_ne1  = 0;          // tokens
+
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {

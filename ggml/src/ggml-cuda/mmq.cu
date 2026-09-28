@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "hc.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "mmvq.cuh"
@@ -291,6 +292,7 @@ void ggml_cuda_mul_mat_q(
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        const char * src1_q8_1_pre = nullptr;
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
@@ -307,6 +309,14 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (const char * pre = ggml_cuda_mmq_side_find(ctx, src1, src0->type)) {
+                // halo-hybrid: the producer already wrote this exact copy (hc.cu, k_hc_combine_norm)
+                src1_q8_1_pre = pre;
+                static int n_dbg = getenv("GGML_CUDA_MMQ_SIDE_DEBUG") ? 4 : 0;
+                if (n_dbg > 0) {
+                    n_dbg--;
+                    GGML_LOG_WARN("mmq-side: %s [%lld x %lld] took the producer's q8_1 copy\n", dst->name, (long long) ne10, (long long) ne11);
+                }
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -321,7 +331,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) (src1_q8_1_pre ? src1_q8_1_pre : src1_q8_1.ptr), nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,

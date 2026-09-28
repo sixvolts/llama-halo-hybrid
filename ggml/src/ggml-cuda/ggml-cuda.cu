@@ -729,6 +729,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(q8_arena));
     }
+    if (mmq_side_buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(mmq_side_buf));
+    }
     if (mmvq_grp != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(mmvq_grp));

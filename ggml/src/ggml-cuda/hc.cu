@@ -1,4 +1,5 @@
 #include "hc.cuh"
+#include "mmq.cuh"
 
 #include <cstdlib>
 
@@ -27,6 +28,7 @@ static bool q8_side_disabled() {
 
 void ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx) {
     ctx.q8_side.clear();
+    ctx.mmq_side_prod = nullptr;
     ctx.q8_arena_used = 0;
     if (ctx.q8_arena == nullptr && !q8_side_disabled()) {
         ctx.q8_arena_size = 32u << 20;  // a 3-token verify step registers ~10 activations per layer at ~35 KB each
@@ -39,7 +41,9 @@ void ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx) {
 
 // reserve a q8_1 side buffer for `dst` if it is a single row of n elements; nullptr if not applicable
 block_q8_1 * ggml_cuda_q8_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t n) {
-    if (q8_side_disabled() || ctx.q8_arena == nullptr || n % QK8_1 != 0 || n > (int64_t) 65535 * HC_BLOCK) {
+    // (a consumer GEMV reads at most 8 columns: anything larger is a prefill-width activation nobody reads as q8_1, and
+    // writing it would only spend bandwidth and arena - 8 columns of a 32K-wide row is the most any model here needs)
+    if (q8_side_disabled() || ctx.q8_arena == nullptr || n % QK8_1 != 0 || n > (int64_t) 65535 * HC_BLOCK || n > (int64_t) 8 * 32768) {
         return nullptr;
     }
     const size_t bytes = (size_t) (n / QK8_1) * sizeof(block_q8_1);
@@ -101,6 +105,76 @@ const char * ggml_cuda_q8_side_find(ggml_backend_cuda_context & ctx, const ggml_
 }
 
 
+
+// halo-hybrid: producer-side MMQ copies (see ggml_backend_cuda_context::mmq_side_*). GGML_CUDA_NO_MMQ_SIDE=1 disables.
+static bool mmq_side_disabled() {
+    static const bool d = getenv("GGML_CUDA_NO_MMQ_SIDE") != nullptr && atoi(getenv("GGML_CUDA_NO_MMQ_SIDE")) != 0;
+    return d;
+}
+
+// bytes of a [ne0 x ne1] block_q8_1_mmq copy, plus the tail the MMQ kernel may read past the last token (the same
+// J_max padding ggml_cuda_mul_mat_q adds to its own buffer; 128 tokens of blocks covers every config)
+static size_t mmq_side_bytes(int64_t ne0, int64_t ne1) {
+    return (size_t) (ne0 / QK8_1_MMQ) * ne1 * sizeof(block_q8_1_mmq) + 128 * sizeof(block_q8_1_mmq);
+}
+
+block_q8_1_mmq * ggml_cuda_mmq_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * prod, int64_t ne0, int64_t ne1) {
+    if (mmq_side_disabled() || ne0 % QK8_1_MMQ != 0 || ne0 % MATRIX_ROW_PADDING != 0) {
+        return nullptr;
+    }
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(ctx.stream(), &cs) != hipSuccess || cs != hipStreamCaptureStatusNone) {
+#else
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(ctx.stream(), &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+#endif
+        (void) cudaGetLastError();
+        return nullptr;   // never allocate inside a capture; prefill-width graphs are not captured anyway
+    }
+    const size_t need = mmq_side_bytes(ne0, ne1);
+    if (need > ctx.mmq_side_cap) {
+        ggml_cuda_set_device(ctx.device);
+        if (ctx.mmq_side_buf != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));   // the previous copy may still be read
+            CUDA_CHECK(cudaFree(ctx.mmq_side_buf));
+            ctx.mmq_side_buf = nullptr; ctx.mmq_side_cap = 0;
+        }
+        void * p = nullptr;
+        if (cudaMalloc(&p, need) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        ctx.mmq_side_buf = (char *) p; ctx.mmq_side_cap = need;
+    }
+    ctx.mmq_side_prod = prod; ctx.mmq_side_ne0 = ne0; ctx.mmq_side_ne1 = ne1;
+    return (block_q8_1_mmq *) ctx.mmq_side_buf;
+}
+
+const char * ggml_cuda_mmq_side_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0) {
+    const ggml_tensor * e = ctx.mmq_side_prod;
+    {
+        static int n_dbg = getenv("GGML_CUDA_MMQ_SIDE_DEBUG") ? 12 : 0;
+        if (n_dbg > 0 && src1->ne[1] > 8) {
+            n_dbg--;
+            GGML_LOG_WARN("mmq-side find: src1 %s [%lld,%lld] data %p view_src %s | prod %s data %p ne0 %lld ne1 %lld\n", src1->name,
+                (long long) src1->ne[0], (long long) src1->ne[1], src1->data, src1->view_src ? src1->view_src->name : "-",
+                e ? e->name : "-", e ? e->data : nullptr, (long long) ctx.mmq_side_ne0, (long long) ctx.mmq_side_ne1);
+        }
+    }
+    if (e == nullptr || mmq_side_disabled() || mmq_get_q8_1_ds_layout(type_src0) != MMQ_Q8_1_DS_LAYOUT_D4 ||
+            src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            src1->ne[0] != ctx.mmq_side_ne0 || src1->ne[1] != ctx.mmq_side_ne1) {
+        return nullptr;
+    }
+    // the same producer data: the tensor itself or a reshape/view of it at offset 0
+    const ggml_tensor * r0 = src1->view_src ? src1->view_src : src1;
+    const ggml_tensor * r1 = e->view_src    ? e->view_src    : e;
+    const bool same = src1 == e || (src1->data == e->data && (r0 == r1 || r0 == e) && ggml_is_contiguous(e) &&
+            ggml_nelements(src1) == ggml_nelements(e));
+    return same ? ctx.mmq_side_buf : nullptr;
+}
+
 static __global__ void k_scale_silu(const float * x, float * dst, block_q8_1 * q8, const float scale, const float bias, const int64_t n) {
     const int64_t stride = (int64_t) blockDim.x * gridDim.x;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
@@ -111,7 +185,7 @@ static __global__ void k_scale_silu(const float * x, float * dst, block_q8_1 * q
     }
 }
 
-static __global__ void k_hc_mix(const float * xn, const float * g, float * dst, block_q8_1 * q8,
+static __global__ void k_hc_mix(const float * xn, const float * g, float * dst, block_q8_1 * q8, block_q8_1_mmq * mmq,
         const int64_t n_embd, const int64_t hc, const int64_t nt, const float scale, const float bias) {
     const int64_t n      = n_embd * nt;
     const int64_t stride = (int64_t) blockDim.x * gridDim.x;
@@ -127,6 +201,16 @@ static __global__ void k_hc_mix(const float * xn, const float * g, float * dst, 
         const float r = scale * acc + bias;
         dst[idx] = r;
         if (q8) { q8_side_store(q8, idx, r); }
+        if (mmq) {   // MMQ q8_1 copy of [n_embd, nt], exactly as quantize_mmq_q8_1<D4> (see k_hc_combine_norm)
+            const float amax  = warp_reduce_max<32>(fabsf(r));
+            const float d_inv = 127.0f / amax;
+            block_q8_1_mmq * y = mmq + (i / QK8_1_MMQ)*nt + t;
+            const int iq = (int) (i % QK8_1_MMQ);
+            y->qs[iq] = (int8_t) roundf(r*d_inv);
+            if (iq % 32 == 0) {
+                y->d4[iq/32] = 1.0f / d_inv;
+            }
+        }
     }
 }
 
@@ -168,7 +252,12 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * xn
     GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(g) && ggml_is_contiguous(dst));
     const int64_t n = n_embd * nt;
     block_q8_1 * q8 = nt == 1 ? ggml_cuda_q8_side_reserve(ctx, dst, n) : nullptr;
-    k_hc_mix<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) xn->data, (const float *) g->data, (float *) dst->data, q8,
+    // prefill widths on an MMQ device: the q8_1 copy the next q8_0 GEMM (attn_qkv / ssm in-projections) would quantize
+    block_q8_1_mmq * mmq = nullptr;
+    if (nt > 8 && n_embd % QK8_1_MMQ == 0 && n_embd % MATRIX_ROW_PADDING == 0 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) {
+        mmq = ggml_cuda_mmq_side_reserve(ctx, dst, n_embd, nt);
+    }
+    k_hc_mix<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) xn->data, (const float *) g->data, (float *) dst->data, q8, mmq,
             n_embd, hc, nt, scale, bias);
 }
 
@@ -189,7 +278,7 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_tensor 
 // alias x at the same base; b and inj must be disjoint from both (checked by the matcher).
 template <int block_size>
 static __global__ void k_hc_combine_norm(const float * x, const float * b, const float * inj, const float * gamma,
-        float * res, float * xn, block_q8_1 * q8, const int n_embd, const int hc, const int gamma_rows,
+        float * res, float * xn, block_q8_1 * q8, block_q8_1_mmq * mmq, const int nt, const int n_embd, const int hc, const int gamma_rows,
         const float s1, const float b1, const float s2, const float b2, const float eps) {
     const int c   = blockIdx.x;
     const int t   = blockIdx.y;
@@ -223,6 +312,20 @@ static __global__ void k_hc_combine_norm(const float * x, const float * b, const
         if (q8) {
             q8_side_store(q8, row*n_embd + col, v);
         }
+        if (mmq) {
+            // the MMQ q8_1 copy of the consumer's [hc*n_embd, nt] view, exactly as quantize_mmq_q8_1<D4> writes it:
+            // per 32 values amax, d_inv = 127/amax, q = roundf(v*d_inv), d = 1/d_inv; block (k/128, token) at
+            // k_block*nt + t. A warp holds 32 consecutive columns here (n_embd and block_size are multiples of 32).
+            const float amax  = warp_reduce_max<32>(fabsf(v));
+            const float d_inv = 127.0f / amax;
+            const int64_t k   = (int64_t) c*n_embd + col;
+            block_q8_1_mmq * y = mmq + (k / QK8_1_MMQ)*nt + t;
+            const int iq = (int) (k % QK8_1_MMQ);
+            y->qs[iq] = (int8_t) roundf(v*d_inv);
+            if (iq % 32 == 0) {
+                y->d4[iq/32] = 1.0f / d_inv;
+            }
+        }
     }
 }
 
@@ -233,19 +336,34 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_te
     GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(res) && ggml_is_contiguous(gamma));
     // the same q8_1 registration as ggml_cuda_op_rms_norm_fused: rows for 2..8 unpadded rows, else one flat row
     const int64_t nrows = hc*nt;
+    // (only at decode / verify widths: a GEMV consumer takes <= 8 columns; at prefill widths the flat copy fit the arena
+    // up to ~2.6K tokens and was written for nothing)
     block_q8_1 * q8 = (nrows >= 2 && nrows <= 8 && n_embd == GGML_PAD(n_embd, MATRIX_ROW_PADDING))
             ? ggml_cuda_q8_side_reserve_rows(ctx, xn, n_embd, nrows, n_embd)
-            : ggml_cuda_q8_side_reserve(ctx, xn, ggml_nelements(xn));
+            : (nt <= 8 ? ggml_cuda_q8_side_reserve(ctx, xn, ggml_nelements(xn)) : nullptr);
+    // prefill widths on a device whose q8_0 GEMMs run MMQ (RDNA4 here: gfx1151 uses the q8_0 WMMA path): also write the
+    // MMQ q8_1 copy the hc down-projection would otherwise quantize from xn (bit-identical, see the kernel)
+    block_q8_1_mmq * mmq = nullptr;
+    if (!q8 && nrows > 8 && n_embd % QK8_1_MMQ == 0 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) {
+        mmq = ggml_cuda_mmq_side_reserve(ctx, xn, hc*n_embd, nt);
+    }
+    {
+        static int n_dbg = getenv("GGML_CUDA_MMQ_SIDE_DEBUG") ? 6 : 0;
+        if (n_dbg > 0 && nt > 8) {
+            n_dbg--;
+            GGML_LOG_WARN("mmq-side producer: %s dev %d nt %lld q8 %p mmq %p\n", xn->name, ctx.device, (long long) nt, (void *) q8, (void *) mmq);
+        }
+    }
     const dim3 grid(hc, nt, 1);
     const int gamma_rows = (int) gamma->ne[1];
     if (n_embd < 1024) {
         k_hc_combine_norm<256><<<grid, 256, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
                 (const float *) inj->data, (const float *) gamma->data, (float *) res->data, (float *) xn->data, q8,
-                (int) n_embd, (int) hc, gamma_rows, s1, b1, s2, b2, eps);
+                mmq, (int) nt, (int) n_embd, (int) hc, gamma_rows, s1, b1, s2, b2, eps);
     } else {
         k_hc_combine_norm<1024><<<grid, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
                 (const float *) inj->data, (const float *) gamma->data, (float *) res->data, (float *) xn->data, q8,
-                (int) n_embd, (int) hc, gamma_rows, s1, b1, s2, b2, eps);
+                mmq, (int) nt, (int) n_embd, (int) hc, gamma_rows, s1, b1, s2, b2, eps);
     }
 }
 
