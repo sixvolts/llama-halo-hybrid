@@ -20,6 +20,7 @@ template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_so
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
+        [[maybe_unused]] const char * Q_h2_ptr,
         const char * K_ptr,
         const char * V_ptr,
         const char * mask_ptr,

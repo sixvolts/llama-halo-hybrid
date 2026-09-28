@@ -1823,6 +1823,7 @@ template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
+        [[maybe_unused]] const char * Q_h2_ptr,
         const char * K_ptr,
         const char * V_ptr,
         const char * mask_ptr,

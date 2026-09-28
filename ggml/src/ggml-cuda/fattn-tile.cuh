@@ -524,6 +524,8 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
     bool use_logit_softcap, bool oob_check, typename T_vec_dot>
 static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+        const half2 * __restrict__ Qg_base, // Q as half2 in global memory (see launch_fattn), or nullptr
+        const int   * __restrict__ q_row,   // per Q column of this warp: row index into Qg_base
         T_vec_dot   * const Q_tmp,
         const half2 * const __restrict__ K_h2,
         T_vec_dot   * const KV_tmp,
@@ -544,38 +546,91 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
-    static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
+    // Wide kernels read Q from global memory (Qg_base, see launch_fattn). Each Q row is the same for
+    // every lane of a warp, so those loads are served from one cache line per wave instead of going
+    // through the LDS, which the K reads already saturate (RDNA2: removing them measured +30% on the
+    // 512-column kernel). Narrow kernels keep the original loop over Q_tmp: they are bound by
+    // streaming K/V and the extra cached reads cost them more than the LDS reads did.
+    constexpr bool q_global = DKQ <= 256 && ncols1*ncols2 >= 16;
+    if constexpr (q_global) {
+        static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
+        constexpr int nsteps = (nbatch_K/2) / cpy_ne;
+        constexpr int nrows  = nbatch_fa/(np*warp_size);
 #pragma unroll
-    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += cpy_ne) {
-        __align__(16) half2 K_k[nbatch_fa/(np*warp_size)][cpy_ne];
-        __align__(16) half2 Q_k[cpw][cpy_ne];
+        for (int step = 0; step < nsteps; ++step) {
+            const int k_KQ_1 = step*cpy_ne;
+            __align__(16) half2 K_k[nrows][cpy_ne];
+            __align__(16) half2 Q_k[cpw][cpy_ne];
+#pragma unroll
+            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
+                ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1]);
+            }
+#pragma unroll
+            for (int jc0 = 0; jc0 < cpw; ++jc0) {
+                ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Qg_base[(int64_t) q_row[jc0]*(DKQ/2) + k_KQ_0/2 + k_KQ_1]);
+            }
+#pragma unroll
+            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+#pragma unroll
+                for (int jc0 = 0; jc0 < cpw; ++jc0) {
+#pragma unroll
+                    for (int k = 0; k < cpy_ne; ++k) {
+                        ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
+                    }
+                }
+            }
+        }
+    } else {
+        static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += cpy_ne) {
+            __align__(16) half2 K_k[nbatch_fa/(np*warp_size)][cpy_ne];
+            __align__(16) half2 Q_k[cpw][cpy_ne];
+
+#pragma unroll
+            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
+
+                ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1]);
+            }
+#pragma unroll
+            for (int jc0 = 0; jc0 < cpw; ++jc0) {
+                const int jc = jc0 + (threadIdx.y / np)*cpw;
+
+                ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Q_tmp[jc*(DKQ/2) + k_KQ_0/2 + k_KQ_1]);
+            }
+
+#pragma unroll
+            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+#pragma unroll
+                for (int jc0 = 0; jc0 < cpw; ++jc0) {
+#pragma unroll
+                    for (int k = 0; k < cpy_ne; ++k) {
+                        ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
+                    }
+                }
+            }
+        }
+    }
 #else
     static_assert(nbatch_K % cpy_ne == 0, "bad nbatch_K");
 #pragma unroll
     for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K; k_KQ_1 += cpy_ne) {
         __align__(16) float K_k[nbatch_fa/(np*warp_size)][cpy_ne];
         __align__(16) float Q_k[cpw][cpy_ne];
-#endif // FAST_FP16_AVAILABLE
 
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
             const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
 
-#ifdef FAST_FP16_AVAILABLE
-            ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1]);
-#else
             ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K   + cpy_ne) + k_KQ_1]);
-#endif // FAST_FP16_AVAILABLE
         }
 #pragma unroll
         for (int jc0 = 0; jc0 < cpw; ++jc0) {
             const int jc = jc0 + (threadIdx.y / np)*cpw;
 
-#ifdef FAST_FP16_AVAILABLE
-            ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Q_tmp[jc*(DKQ/2) + k_KQ_0/2 + k_KQ_1]);
-#else
             ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Q_tmp[jc* DKQ    + k_KQ_0   + k_KQ_1]);
-#endif // FAST_FP16_AVAILABLE
         }
 
 #pragma unroll
@@ -589,6 +644,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
             }
         }
     }
+#endif // FAST_FP16_AVAILABLE
 
     if (k_KQ_0 + nbatch_K < DKQ) {
         __syncthreads(); // Sync not needed on last iteration.
@@ -599,6 +655,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
     bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc>
 static __device__ __forceinline__ void flash_attn_tile_iter(
+        const half2 * __restrict__ Qg_base,
+        const int   * __restrict__ q_row,
         T_vec_dot * const Q_tmp,
         const half2 * const __restrict__ K_h2,
         const half2 * const __restrict__ V_h2,
@@ -649,12 +707,12 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
     }
     if (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -833,6 +891,7 @@ template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D =
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
+        [[maybe_unused]] const char * Q_h2_ptr,
         const char * K_ptr,
         const char * V_ptr,
         const char * mask_ptr,
@@ -923,7 +982,7 @@ static __global__ void flash_attn_tile(
     // KQ == SRAM buffer to hold KQ fragments between KQ and VKQ matrix multiplications.
     // VKQ == Accumulators in registers for the final VKQ result.
 #ifdef FAST_FP16_AVAILABLE
-    __shared__ half2 Q_tmp[ncols * DKQ/2];
+    __shared__ half2 Q_tmp[(DKQ <= 256 && ncols >= 16) ? 2 : ncols * DKQ/2]; // unused when Q comes from Q_h2
     __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
     __shared__ half  KQ[ncols * nbatch_fa];
     __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
@@ -943,8 +1002,34 @@ static __global__ void flash_attn_tile(
 
     ggml_cuda_pdl_sync();
 
-    // Load Q data, convert to FP16 if fast:
+#ifdef FAST_FP16_AVAILABLE
+    // Q comes pre-converted from Q_h2 (see launch_fattn) for the wide kernels, where the reads amortize
+    // over many columns and the LDS traffic they replace is the limiter. The narrow decode kernels are
+    // bound by streaming K/V and the extra cached reads cost them more than the LDS reads did.
+    constexpr bool q_global = DKQ <= 256 && ncols >= 16;
+#else
+    constexpr bool q_global = false;
+#endif // FAST_FP16_AVAILABLE
+    const half2 * Qg_base = nullptr;
+    [[maybe_unused]] int q_row[cpw];
+    if constexpr (q_global) {
+        Qg_base = (const half2 *) Q_h2_ptr + ((int64_t) sequence*ne02 + head0)*ne01.z*(DKQ/2);
 #pragma unroll
+        for (int jc0 = 0; jc0 < cpw; ++jc0) {
+            const int jc  = jc0 + (threadIdx.y / np)*cpw;
+            const int row = (jc % ncols2)*ne01.z + (int) fastmodulo(col_Q_0 + jc / ncols2, ne01);
+            // the row is the same for every lane of the warp; make that visible to the compiler so
+            // the loads in the KQ loop are issued once per wave
+#ifdef GGML_USE_HIP
+            q_row[jc0] = __builtin_amdgcn_readfirstlane(row);
+#else
+            q_row[jc0] = __shfl_sync(0xFFFFFFFF, row, 0);
+#endif // GGML_USE_HIP
+        }
+    }
+
+    // Load Q data, convert to FP16 if fast:
+    if constexpr (!q_global) {
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
         const int jc = jc0 + (threadIdx.y / np)*cpw;
 
@@ -988,6 +1073,7 @@ static __global__ void flash_attn_tile(
             }
         }
     }
+    }
 
     __syncthreads();
 
@@ -999,14 +1085,14 @@ static __global__ void flash_attn_tile(
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
     } else {
@@ -1014,7 +1100,7 @@ static __global__ void flash_attn_tile(
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
     }
@@ -1219,7 +1305,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
+                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1235,7 +1322,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
+                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1247,7 +1335,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
+                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1259,7 +1348,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
+                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1271,7 +1361,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
+                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1282,7 +1373,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
         fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
         launch_fattn<DV, cols_per_block/ncols2, ncols2>
-            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
+                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
         return;
     }
 

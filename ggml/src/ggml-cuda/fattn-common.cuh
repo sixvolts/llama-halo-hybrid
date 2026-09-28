@@ -20,6 +20,7 @@
 
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
+        const char * __restrict__ Q_h2,
         const char * __restrict__ K,
         const char * __restrict__ V,
         const char * __restrict__ mask,
@@ -977,11 +978,30 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Q pre-scaled and converted to half2 pairs, contiguous as [ne03][ne02][ne01][ne00/2]. The tile
+// kernel reads Q from here with warp-uniform loads through the cache instead of staging it in
+// shared memory; the conversion is the one the kernel did itself (scale in fp32, then to half).
+static __global__ void flash_attn_q_to_half2(
+        const char * __restrict__ Q, half2 * __restrict__ Q_h2, const float scale,
+        const int ne00, const int ne01, const int ne02, const int64_t nb01, const int64_t nb02, const int64_t nb03) {
+    const int64_t row  = blockIdx.x; // (seq*ne02 + head)*ne01 + pos
+    const int     pos  = row % ne01;
+    const int     head = (row / ne01) % ne02;
+    const int64_t seq  = row / ((int64_t) ne01*ne02);
+
+    const float * q   = (const float *) (Q + seq*nb03 + head*nb02 + pos*nb01);
+    half2       * out = Q_h2 + row*(ne00/2);
+
+    for (int i = threadIdx.x; i < ne00/2; i += blockDim.x) {
+        out[i] = make_half2(q[2*i + 0]*scale, q[2*i + 1]*scale);
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool q_h2 = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1017,6 +1037,7 @@ void launch_fattn(
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+    ggml_cuda_pool_alloc<half2>  Q_h2(pool);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1264,9 +1285,19 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+        if (q_h2) {
+            const int64_t n_rows = Q->ne[1]*Q->ne[2]*Q->ne[3];
+            Q_h2.alloc(n_rows*(Q->ne[0]/2));
+            const ggml_cuda_kernel_launch_params lp_q(dim3(n_rows, 1, 1), dim3(128, 1, 1), 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_q_to_half2, lp_q, (const char *) Q->data, Q_h2.ptr, scale,
+                (int) Q->ne[0], (int) Q->ne[1], (int) Q->ne[2], (int64_t) Q->nb[1], (int64_t) Q->nb[2], (int64_t) Q->nb[3]);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
         ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
+        q_h2 ? (const char *) Q_h2.ptr : nullptr,
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
