@@ -604,3 +604,13 @@ turns them on): LLAMA_QSA_ALWAYS_SCORE, GGML_CUDA_NO_GDN_CHUNKED.
   Not bit-identical (the old top-k broke ties inside the cut block arbitrarily): KLD 0.0014 / 0.0013 at 16K, floors
   0.0096 / 0.0089. APU-only prefill 16K 852-860 -> 891, 32K 762-768 -> 820-822; hybrid 32K 2041 -> 2107-2116.
 - RPC proto 7.7 (the op): both GLM hosts must run it.
+
+### End of the 09-28 round: full sweep on f05fe5f29 (gibson, ~/bench/results/q38-final/sweep.txt)
+
+| config / model | prefill 4K / 16K / 32K (t/s, cold) | decode short (ms/step, t/s) | decode ~20K (ms/step, t/s) |
+|---|---|---|---|
+| hybrid, base | 2078 / 2300 / 2141 | 35.3-35.4, 63.0-63.1 | 40.0, 61.9 |
+| hybrid, Swift Q8T | 2052 / 2285 / 2129 | 35.8-35.9, 60.5-63.8 | 40.4, 60.3 |
+| APU-only, base | 954 / 892 / 821 | 55.7-56.2, 40.1-40.6 | 62.8, 39.1 |
+| APU-only, Swift Q8T | 964 / 893 / 823 | 56.5-56.8, 39.4 | 63.7, 38.8 |
+| GLM-5.3 two-host (gate) | 12.7K 783, 25.8K 896 | - | 92.2 at 25.8K, 30.3 |
