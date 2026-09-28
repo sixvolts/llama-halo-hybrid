@@ -575,3 +575,19 @@ after A2: 4K a18289237479 (sum lp -0.021129), 9K 5fa5e1bdc18e, 16K and 32K 0c4db
 
 Opt-in: LLAMA_SPEC_DRAFT_UB, LLAMA_MTP_EH_PROJ_2D, LLAMA_MTP_QSA. Presence-tested switches (any value, including 0,
 turns them on): LLAMA_QSA_ALWAYS_SCORE, GGML_CUDA_NO_GDN_CHUNKED.
+
+### 09-28, later: GLM re-gate, soak, calibration, producer-side MMQ copies
+
+- **GLM two-host (A1):** passes on 880d979de with all defaults - 25.8K prefill 898 t/s, 92.9 ms/step, 30.1 t/s, acc 0.90,
+  greedy aa0b8bd157cde3d8 (new reference). The first attempts crashed mainframe's rpc-server at the first decode: the
+  grouped MoE GEMV with APU scheduler events in the SERVER's own ggml_backend_sched. Bisected on the server's env;
+  a race (gone under AMD_SERIALIZE_KERNEL). 585b06b4e (source waits on an APU destination before a copy) is correct but
+  not the fix; 880d979de keeps the server's scheduler on host syncs for the APU (step unchanged). Root cause open.
+- **Soak (A7):** 120/120 fresh hybrid servers served a 4.4K first request + the 1.9K long prompt, no hang (3.1-4.0 s).
+- **Kernel boundary cost:** GGML_CUDA_PAD_KERNELS=4 (~460 empty kernels per verify step) costs +0.6-0.7 ms/step, i.e.
+  ~1.5-2 us per boundary on the decode critical path. B8 (more q8_1 side copies) measured nothing; a fused hc
+  up+mix kernel (B7) was 4 ms/step slower APU-only (80 blocks of serial work lose to the tuned GEMV) and its f32
+  activations moved KLD above the floor (Swift C 0.031 vs 0.023) - dropped.
+- **Producer-side MMQ copies (ea92b2d17):** combine_norm and hc_mix write the block_q8_1_mmq copy their q8_0 MMQ
+  consumers would quantize (bit-identical); flat q8_1 side copies capped at decode widths (prefill wrote ~30 MB per
+  combine_norm for nothing). Hybrid 16K 2208-2217 -> 2230-2235, 32K 2020-2023 -> 2032-2039; refs identical.
