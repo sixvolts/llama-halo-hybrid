@@ -31,6 +31,19 @@ typedef __attribute__((ext_vector_type(8)))  float   floatx8_t;
 typedef __attribute__((ext_vector_type(16))) _Float16 halfx16_t;
 typedef __attribute__((ext_vector_type(8)))  _Float16 halfx8_t;
 
+// halo-hybrid (A4): saturating f32 -> f16 for activations narrowed inside these kernels (|x| > 65504 would become inf and
+// poison a whole output row); NaN passes through
+static __device__ __forceinline__ float f16_sat(const float x) {
+    return x != x ? x : fminf(fmaxf(x, -65504.0f), 65504.0f);
+}
+
+static __global__ void mmqw_f32_to_f16_sat(const float * __restrict__ x, half * __restrict__ y, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = __float2half(f16_sat(x[i]));
+    }
+}
+
 #if defined(RDNA4)
 typedef halfx8_t  mmqw_frag_t;   // gfx12: lane l holds 8 k of row l%16, k offset 8*(l/16)
 #else
@@ -239,7 +252,7 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
             if constexpr (XF32) {
                 const float4 f0 = *(const float4 *) &ra[st][2*x + 0];
                 const float4 f1 = *(const float4 *) &ra[st][2*x + 1];
-                half2 h[4] = {__floats2half2_rn(f0.x, f0.y), __floats2half2_rn(f0.z, f0.w), __floats2half2_rn(f1.x, f1.y), __floats2half2_rn(f1.z, f1.w)};
+                half2 h[4] = {__floats2half2_rn(f16_sat(f0.x), f16_sat(f0.y)), __floats2half2_rn(f16_sat(f0.z), f16_sat(f0.w)), __floats2half2_rn(f16_sat(f1.x), f16_sat(f1.y)), __floats2half2_rn(f16_sat(f1.z), f16_sat(f1.w))};
                 *(uint4 *) (as + row * PITCH + col) = *(const uint4 *) h;
             } else {
                 *(uint4 *) (as + row * PITCH + col) = ra[st][x];
@@ -446,8 +459,7 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     const bool prepass = M * K > prepass_min;
     if ((mode >= 2 && mode <= 10) || (mode <= 1 && prepass)) {
         ggml_cuda_pool_alloc<half> x16(ctx.pool(), (size_t) N * K);
-        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-        to_fp16(src1->data, x16.get(), N * K, stream);
+        mmqw_f32_to_f16_sat<<<(N * K + 255) / 256, 256, 0, stream>>>((const float *) src1->data, x16.get(), N * K);
         switch (mode) {
             case 2:  MMQW_LAUNCH16( 64, 128, 64, 2, 2, 1, 1); break;
             case 3:  MMQW_LAUNCH16( 64,  64, 32, 2, 2, 2, 1); break;

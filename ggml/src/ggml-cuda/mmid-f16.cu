@@ -26,6 +26,12 @@
 
 namespace {
 
+// halo-hybrid (A4): saturating f32 -> f16 for activations narrowed inside these kernels (|x| > 65504 would become inf and
+// poison a whole output row); NaN passes through
+static __device__ __forceinline__ float f16_sat(const float x) {
+    return x != x ? x : fminf(fmaxf(x, -65504.0f), 65504.0f);
+}
+
 enum class WeightType : std::uint32_t {
   kQ5_0 = 6,
   kQ5_1 = 7,
@@ -587,7 +593,7 @@ __launch_bounds__(256) __global__
               asm volatile("" : "+v"(product));
               float value = product * SigmoidF(base[idx + v]);
               asm volatile("" : "+v"(value));
-              values[v] = __float2half(value);
+              values[v] = __float2half(f16_sat(value));
             }
             const auto offset = static_cast<std::size_t>(dst) * m + r_block + r;
             if (m % 2 == 0 && r_block + r + 1 < m_i) {
@@ -642,11 +648,11 @@ __launch_bounds__(256) __global__
               }
               if (m % 2 == 0 && r + 1 < m)
                 *reinterpret_cast<__half2*>(out_half + o) =
-                    __floats2half2_rn(v.x, v.y);
+                    __floats2half2_rn(f16_sat(v.x), f16_sat(v.y));
               else {
-                out_half[o] = __float2half(v.x);
+                out_half[o] = __float2half(f16_sat(v.x));
                 if (r + 1 < m)
-                  out_half[o + 1] = __float2half(v.y);
+                  out_half[o + 1] = __float2half(f16_sat(v.y));
               }
             }
           }
@@ -682,8 +688,8 @@ __launch_bounds__(256) __global__
                                   static_cast<std::size_t>(r);
             float v = tile_scratch[flat];
             if (out_half != nullptr) {
-              out_half[o] = __float2half(
-                  swiglu_gate != nullptr ? v * SiluF(swiglu_gate[o]) : v);
+              out_half[o] = __float2half(f16_sat(
+                  swiglu_gate != nullptr ? v * SiluF(swiglu_gate[o]) : v));
             } else {
               out[o] = v;
             }
@@ -740,7 +746,7 @@ __global__ void mmid_f16_convert_src1(const char * __restrict__ src1, __half * _
   const float * x = (const float *) (src1 + i12*nb12 + i11*nb11);
   __half * y = dst + row*ne10;
   for (int64_t i = threadIdx.x; i < ne10; i += blockDim.x) {
-    y[i] = __float2half(x[i]);
+    y[i] = __float2half(f16_sat(x[i]));
   }
 }
 
