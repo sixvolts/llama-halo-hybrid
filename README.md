@@ -13,10 +13,10 @@ but with a little more RAM (~160GB, obv with caveats), and it's a regular 16-cor
 ![The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU](docs/halo-hybrid/build.jpeg)
 
 So, the kicker is that it works. The model this tree is built around is **Qwen3.8-Flash-Next** (unsloth
-UD-Q4_K_XL, 111 GB): on the Strix Halo plus the R9700 it decodes at **63 tok/s** (real content, T=0.7) with the
-model's own MTP draft head and prefills at **~2,200 tok/s** at 16K, where stock llama.cpp on the same layout does
-27-28 tok/s. On the Strix Halo alone it does ~40 tok/s and ~870 tok/s. The
-same tree also runs the 200 GB GLM-5.3-Flash across two of these boxes over a 100G link. (The setup was put
+UD-Q4_K_XL, 111 GB, and the Swift 1.5 fine-tune of it): on the Strix Halo plus the R9700 it decodes at **63 tok/s**
+(real content, T=0.7) with the model's own MTP draft head and prefills at **~2,300 tok/s** at 16K, where stock
+llama.cpp on the same layout does 27-28 tok/s. On the Strix Halo alone it does ~40 tok/s and ~890 tok/s. The same
+tree also runs the 200 GB GLM-5.3-Flash across two of these boxes over a 100G link at 30 tok/s. (The setup was put
 together on Qwen3.5-122B, 24 → 49 tok/s; 3.8 came out the week it was working, and the numbers below are 3.8's.)
 
 Here's how it works. We can't just slap part of the model on the R9700 and expect it to be good though. It's
@@ -30,7 +30,50 @@ many whole expert layers as fit. This all works because only a few KB of data pe
 x4 4.0 link, so as long as the latency isn't bad, it doesn't matter. Trying to do something like Tensor Parallelism
 across these two would not work well because of that bottleneck.
 
-The launch line for that layout:
+## What this fork is for
+
+There are good engines for a single Strix Halo already (gufo, halogen), and they are fast at what they do. This
+tree is about the setups they don't cover, without giving up the one they do:
+
+- **One box, APU + a discrete GPU.** The card has to earn its slot: with the R9700 the box must beat the best
+  APU-only engine, not just this tree's own APU-only numbers. It does, by about 1.6x on prefill and 1.8x on decode.
+- **Several boxes.** Models bigger than one box's memory (GLM-5.3-Flash, 200 GB) split across hosts over RPC,
+  with and without cards.
+- **One box, APU only, still first-class.** Every change is measured on the iGPU alone too, and the APU-only numbers
+  are meant to keep closing on the dedicated engines.
+- **General paths, not model hacks.** Ideas borrowed from other engines land as ggml backend paths (per-device
+  kernels, scheduler changes, new ops with CPU references), so other models and layouts get them as well.
+- **Quality gates.** A change has to keep greedy output bit-identical, or pass KLD against frozen baselines at the
+  width it affects, with a noise floor measured the same way. No IQ quants, and the verification output layer stays
+  at the model's own precision.
+
+## Where it stands (2026-09-28, commit f05fe5f29)
+
+Measured on this box (Framework Strix Halo 128 GB + R9700 on PCIe 4.0 x4). Prefill is cold, fresh server, record
+prompts; decode is real-content chat at T=0.7 with the MTP draft (6 prompts x 2 seeds short, 3 prompts x 2 seeds at
+~20K context).
+
+| Config | Model | Prefill 4K / 16K / 32K (tok/s) | Decode, short | Decode, ~20K context |
+|---|---|---|---|---|
+| Strix Halo + R9700 | Qwen3.8-Flash-Next UD-Q4_K_XL | 2078 / 2300 / 2141 | 63 tok/s (35.4 ms/step) | 62 tok/s (40.0 ms/step) |
+| Strix Halo + R9700 | Swift 1.5 (q8_0 trunk) | 2052 / 2285 / 2129 | 62 tok/s (35.9 ms/step) | 60 tok/s (40.4 ms/step) |
+| Strix Halo only | Qwen3.8-Flash-Next UD-Q4_K_XL | 954 / 892 / 821 | 40 tok/s (56 ms/step) | 39 tok/s (62.8 ms/step) |
+| Strix Halo only | Swift 1.5 (q8_0 trunk) | 964 / 893 / 823 | 39 tok/s (56.7 ms/step) | 39 tok/s (63.7 ms/step) |
+| 2x (Strix Halo + R9700) | GLM-5.3-Flash UD-Q4_K_XL | 783 at 12.7K, 896 at 25.8K | - | 30 tok/s at 25.8K (92 ms/step) |
+
+For reference, on the same box: gufo (APU-only) 1359 / 1431 / 1410 prefill and 34.8 tok/s MTP decode; halogen
+(APU-only, its own 4-bit format) 1246 at 8K / 1424 at 32K prefill and 44.8 tok/s MTP decode on prose.
+
+What that means:
+
+- **With the card**, prefill is 1.5-1.6x the best APU-only engine and decode ~1.8x, and long context barely costs
+  anything (63 -> 62 tok/s at 20K).
+- **APU only**, decode is ahead of gufo and behind halogen; prefill is still 30-42% behind gufo, and the gap grows
+  with context. What's left there is the hyper-connection memory traffic and the sparse-attention kernel itself.
+- **Swift 1.5 with a q8_0 trunk** runs at the base model's speed within a few percent (and at ~3% lower perplexity
+  than the fine-tune's published Q4_K_M).
+
+The launch line for the Strix Halo + R9700 layout:
 
 ```
 LLAMA_PREFILL_LANES=2 \
@@ -42,10 +85,46 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --host 0.0.0.0 --port 8080
 ```
 
+On the Strix Halo alone: `-dev ROCm0` (the iGPU when it's the only device), no `-ot`, `-b 4096 -ub 4096`, and the
+same draft on the iGPU. The draft head gets its own q4_K output layer (commands in the cookbook, recipe 6).
+
+Where the model lives: the weights sit in the R9700's VRAM (dense trunk, KV cache, experts of the first 11 layers,
+the draft head) and in the APU's GTT (the rest of the experts, ~51 GB). The 26.8 GB n-gram / per-layer-embedding
+table stays on the CPU side and is read through the page cache (lazy mode, the default): it is mapped, only the ~16
+rows a token needs are read, and once touched those pages stay in host RAM, so nothing streams from disk in steady
+state. Don't force a resident copy with `-ot per_layer_token_embd=CPU` / `-lzm off` - that adds a 26.8 GB anonymous
+allocation for no speed, and on the Strix Halo alone it is the difference between ~39 GB and ~12 GB of free memory.
+
+### Long context: 256K on the Strix Halo + R9700
+
+The model's full 256K window fits on the hybrid layout, but not with the settings above: the KV cache is small
+(~27 KiB per token, ~7 GB at 256K - only 12 of the 48 layers are attention), what grows is the prefill scratch on the
+card, which scales with context x ubatch. For 256K, move six more expert layers to the APU and use smaller ubatches
+(the card is then full, 32.6 GB used):
+
+```
+LLAMA_PREFILL_LANES=2 \
+llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 262144 -b 2048 -ub 1024 -np 1 \
+  -ot 'blk\.([5-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
+  -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
+  --spec-type draft-mtp --spec-draft-n-max 2
+```
+
+| Prompt | Prefill | Time to first token | Decode |
+|---|---|---|---|
+| 77K | 1386 tok/s | 56 s | 58.5 tok/s (47.7 ms/step) |
+| 155K | 1161 tok/s | 134 s | 46.6 tok/s (51.9 ms/step) |
+| 251K | 979 tok/s | 4.3 min | 43.8 tok/s (56.7 ms/step) |
+
+(One run per depth on a synthetic records prompt, T=0.7; acceptance varies with the content. At `-ub 2560` the
+scratch needs 8.9 GB per lane and does not fit, and one lane at the default layout does not fit either.)
+
 I kept going on tuning, and tried to reduce the number of kernel launches, which seemed to be holding back
 performance. I wasn't hitting anywhere near the right numbers per the theoretical bandwidth for each device. The
-kernel and scheduler changes that came out of that are listed in [HALO-HYBRID.md](HALO-HYBRID.md), and every one
-of them is measured on the iGPU alone as well, because the tree has to stay useful on a Strix Halo with no card.
+kernel and scheduler changes that came out of that are listed in [HALO-HYBRID.md](HALO-HYBRID.md), and the running
+log of the latest rounds, with every number and what didn't work, is in
+[APU-DECODE-BUDGET.md](docs/halo-hybrid/APU-DECODE-BUDGET.md).
 
 ## Which configuration?
 
@@ -55,30 +134,22 @@ the [cookbook](docs/halo-hybrid/COOKBOOK.md); the kernel and scheduler changes b
 
 | Hardware | Model it runs here | Status | Numbers |
 |---|---|---|---|
-| [One Strix Halo, nothing else](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~870 tok/s prefill at 16K |
-| [One Strix Halo + one R9700](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Qwen3.5-122B | production | 63 tok/s, ~2,200 tok/s prefill at 16K (Qwen3.8) |
-| [Two Strix Halos over RDMA](docs/halo-hybrid/COOKBOOK.md#3-two-strix-halos-over-rdma) | GLM-5.3-Flash (200 GB) | derived, not measured | |
-| [Two Strix Halos + one R9700 on the head node](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node) | GLM-5.3-Flash | production | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K |
-| [Two Strix Halos + one R9700 on each](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each) | GLM-5.3-Flash | planned, card ordered | estimate 23-25 tok/s |
-
-## Qwen3.8-Flash-Next: one box, with or without the card
-
-The hybrid-N table for different context budgets, the per-stream numbers with and without the draft head, and the
-iGPU-only baseline are in the cookbook: [recipe 1](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) (no
-card) and [recipe 2](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) (with the R9700). The draft head is
-the MTP head from the unsloth repo's `MTP/` folder with q4_K experts and its own q4_K LM head (recipe 6 has the
-commands); it borrows the target's embeddings. The 26.8 GB n-gram table is read on demand; don't pin it to the CPU.
+| [One Strix Halo, nothing else](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~890 tok/s prefill at 16K |
+| [One Strix Halo + one R9700](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Swift 1.5, Qwen3.5-122B | production | 63 tok/s, ~2,300 tok/s prefill at 16K (Qwen3.8) |
+| [Two Strix Halos over the 100G link](docs/halo-hybrid/COOKBOOK.md#3-two-strix-halos-over-rdma) | GLM-5.3-Flash (200 GB) | derived, not measured | |
+| [Two Strix Halos + one R9700 on the head node](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node) | GLM-5.3-Flash | superseded by the next row | 517 tok/s prefill / 20.5 tok/s decode at 13K (09-08) |
+| [Two Strix Halos + one R9700 on each](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each) | GLM-5.3-Flash | production | 896 tok/s prefill / 30 tok/s decode at 25.8K |
 
 ## GLM-5.3-Flash across two Strix Halo boxes
 
 The 200 GB GLM-5.3-Flash (unsloth UD-Q4_K_XL) runs split between two 128 GB Strix Halo boxes over a direct 100G
-link (Intel E810) with llama.cpp's RPC backend over RDMA, with an R9700 on the head node: KV and the MTP draft
-head on the R9700, layers 0-24 on the head node (dense trunk on the card, experts on the iGPU), layers 25-44 on
-the second box's unified memory. Single stream, 128K context: 20.5 tok/s decode at 13K with the model's own MTP
-head (14 without it), 517 tok/s prefill. It took two scheduler fixes, an RDMA transport fix and a loader fix,
-all on `main` (upstream's GLM-5.3-Flash PR is not merged yet). Launch lines, the rpc-server unit and the
-operating rules: [cookbook, recipe 4](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node);
-the draft-head export and the fixes: [HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
+link (Intel E810) with llama.cpp's RPC backend, with an R9700 on each box: on the head node KV, the dense trunk of
+the first 26 layers and the MTP draft head on the card, their experts on the iGPU; the second box schedules its own
+half across its card and iGPU. Single stream, 128K context: 30 tok/s decode and 896 tok/s prefill at a 25.8K prompt,
+with the model's own MTP head. The link currently runs over TCP (RDMA is off after
+E810 resets under load). Launch lines, the rpc-server unit and the operating rules:
+[cookbook, recipe 4](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node); the draft-head
+export and the fixes: [HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
 
 ---
 
