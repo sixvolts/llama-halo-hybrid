@@ -819,11 +819,79 @@ public:
     }
     virtual ~llm_graph_input_qsa() = default;
 
+    // halo-hybrid (C6): 0 = no block-key cache, 1 = full re-pool that refreshes the cache, 2 = recompute only the
+    // n_re trailing blocks [first, n_bid) and score against the cache
+    static int blk_mode_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
+            int32_t n_re, int32_t & n_bid, int32_t & first) {
+        n_bid = 0; first = 0;
+        const llama_memory_hybrid_idx * mem = mctx ? mctx->get_mem() : nullptr;
+        if (!scores || mem == nullptr) {
+            return 0;
+        }
+        bool usable = false;
+        const bool incr = mem->qsa_blk_plan(ub, ratio, n_re, n_bid, first, usable);
+        return !usable ? 0 : (incr ? 2 : 1);
+    }
+    static int32_t n_re_for(uint32_t n_tokens, uint32_t ratio) {
+        return (int32_t) ((n_tokens + ratio - 1)/ratio) + 1;
+    }
+
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        if (scores) {
-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        // the incremental graph (blk_mode 2) does not read blk_cells / blk_pos, so the scheduler leaves them unallocated:
+        // fill host shadows instead (the re_* inputs are taken from them below)
+        ggml_tensor bc_shadow, bp_shadow, cb_shadow;
+        ggml_tensor * bc = blk_cells;
+        ggml_tensor * bp = blk_pos;
+        ggml_tensor * cbk = cell_blk;
+        if (scores && cell_blk->data == nullptr) {   // the block-level top-k (C4) does not read it either
+            cell_blk_host.resize(ggml_nelements(cell_blk));
+            cb_shadow = *cell_blk; cb_shadow.data = cell_blk_host.data(); cbk = &cb_shadow;
         }
+        if (scores && blk_cells->data == nullptr) {
+            blk_cells_host.resize(ggml_nelements(blk_cells));
+            bc_shadow = *blk_cells; bc_shadow.data = blk_cells_host.data(); bc = &bc_shadow;
+        }
+        if (scores && blk_pos->data == nullptr) {
+            blk_pos_host.resize(ggml_nelements(blk_pos));
+            bp_shadow = *blk_pos; bp_shadow.data = blk_pos_host.data(); bp = &bp_shadow;
+        }
+        if (scores) {
+            mctx->set_input_qsa(cbk, bc, bp, bias, ubatch, ratio, blk_bias);
+        }
+        if (blk_topk) {
+            int32_t nb = 0;
+            GGML_ASSERT(blk_topk_for(mctx, *ubatch, ratio, scores, blk_bias, 1, nb) && "qsa block top-k: the layout changed between graph build and set_input");
+            GGML_ASSERT(ggml_backend_buffer_is_host(n_bid_t->buffer));
+            ((int32_t *) n_bid_t->data)[0] = nb;
+        }
+        if (blk_mode == 0) {
+            return;
+        }
+        int32_t n_bid = 0, first = 0;
+        const int mode = blk_mode_for(mctx, *ubatch, ratio, scores, n_re, n_bid, first);
+        GGML_ASSERT(mode == blk_mode && "qsa block-key cache: the plan changed between graph build and set_input");
+        if (blk_mode == 2) {
+            // hole-free single sequence: block id == position / ratio == the bid set_input_qsa numbered, so the cells of
+            // block b are row b of blk_cells
+            GGML_ASSERT(ggml_backend_buffer_is_host(re_cells->buffer) && bc->data != nullptr);
+            const int32_t * bcd = (const int32_t *) bc->data;
+            int32_t * rc = (int32_t *) re_cells->data;
+            int64_t * ri = (int64_t *) re_ids->data;
+            int32_t * rp = (int32_t *) re_pos->data;
+            for (int32_t k = 0; k < n_re; ++k) {
+                const int32_t b = first + k;
+                for (uint32_t m = 0; m < ratio; ++m) {
+                    rc[k*ratio + m] = bcd[(int64_t) b*ratio + m];
+                }
+                ri[k] = b;
+                for (int sec = 0; sec < 4; ++sec) {
+                    rp[sec*n_re + k] = b*(int32_t) ratio;
+                }
+            }
+        }
+        // after this graph the cache holds every complete block
+        const_cast<llama_memory_hybrid_idx *>(mctx->get_mem())->qsa_valid_pos = (llama_pos) n_bid * (llama_pos) ratio;
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -854,6 +922,21 @@ public:
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
 
+        int32_t nb = 0, fi = 0;
+        const int mode_now = blk_mode_for(mctx, params.ubatch, ratio, scores, n_re_for(params.ubatch.n_tokens, ratio), nb, fi);
+        {
+            static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 40 : 0;
+            if (n_dbg > 0 && (mode_now != blk_mode || !res)) {
+                n_dbg--;
+                LLAMA_LOG_WARN("qsa-blk can_reuse: n_tokens %u mode built %d now %d, other checks %d, n_bid %d first %d valid_pos %d\n",
+                    params.ubatch.n_tokens, blk_mode, mode_now, (int) res, nb, fi, (int) mctx->get_mem()->qsa_valid_pos);
+            }
+        }
+        res &= mode_now == blk_mode;
+        res &= n_re == n_re_for(params.ubatch.n_tokens, ratio);
+        int32_t nbt = 0;
+        res &= blk_topk_for(mctx, params.ubatch, ratio, scores, blk_bias, n_stream, nbt) == blk_topk;
+
         return res;
     }
 
@@ -871,6 +954,25 @@ public:
     const bool blk_bias;
     const bool scores;       // halo-hybrid: false = keys only (top-k would return every cell)
     const uint32_t top_k;
+
+    // halo-hybrid (C6): block-key cache mode and, for mode 2, the blocks to recompute
+    int     blk_mode = 0;
+    int32_t n_re     = 0;
+    ggml_tensor * re_cells = nullptr;   // I32 [ratio*n_re]  cells of each recomputed block
+    ggml_tensor * re_ids   = nullptr;   // I64 [n_re]        their block ids (rows of the cache)
+    ggml_tensor * re_pos   = nullptr;   // I32 [4*n_re]      mrope position rows of their first token
+
+    std::vector<int32_t> blk_cells_host, blk_pos_host, cell_blk_host;   // shadows when the graph does not allocate them
+
+    // halo-hybrid (C4): block-level top-k (ggml_qsa_top_k) instead of expanding the scores to every cell
+    bool          blk_topk  = false;
+    ggml_tensor * n_bid_t   = nullptr;   // I32 [1]
+    static bool blk_topk_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
+            bool blk_bias, int64_t n_stream, int32_t & n_bid) {
+        static const bool enabled = getenv("LLAMA_QSA_BLOCK_TOPK") == nullptr || atoi(getenv("LLAMA_QSA_BLOCK_TOPK")) != 0;
+        n_bid = 0;
+        return enabled && scores && blk_bias && n_stream == 1 && mctx && mctx->get_mem() && mctx->get_mem()->qsa_identity(ub, ratio, n_bid);
+    }
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -925,6 +1027,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->blk_cells);
             ggml_set_input(qsa->blk_pos);
             ggml_set_input(qsa->bias);
+
+            int32_t n_bid = 0, first = 0;
+            qsa->n_re     = llm_graph_input_qsa::n_re_for(n_tokens, (uint32_t) r);
+            qsa->blk_mode = n_stream == 1 && mctx_hyb->get_mem()->get_qsa_blk_k(il) != nullptr
+                ? llm_graph_input_qsa::blk_mode_for(mctx_hyb, ubatch, (uint32_t) r, scores, qsa->n_re, n_bid, first) : 0;
+            {
+                int32_t nbt = 0;
+                qsa->blk_topk = llm_graph_input_qsa::blk_topk_for(mctx_hyb, ubatch, (uint32_t) r, scores, blk_bias, n_stream, nbt);
+                if (qsa->blk_topk) {
+                    qsa->n_bid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+                    ggml_set_input(qsa->n_bid_t);
+                }
+            }
+            {
+                static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 40 : 0;
+                if (n_dbg > 0) {
+                    n_dbg--;
+                    LLAMA_LOG_WARN("qsa-blk build: n_tokens %u n_kv %lld mode %d n_bid %d first %d valid_pos %d\n", ubatch.n_tokens,
+                        (long long) n_kv, qsa->blk_mode, n_bid, first, (int) mctx_hyb->get_mem()->qsa_valid_pos);
+                }
+            }
+            if (qsa->blk_mode == 2) {
+                qsa->re_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*qsa->n_re);
+                qsa->re_ids   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, qsa->n_re);
+                qsa->re_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*qsa->n_re);
+                ggml_set_input(qsa->re_cells);
+                ggml_set_input(qsa->re_ids);
+                ggml_set_input(qsa->re_pos);
+            }
         }
 
         inp = qsa.get();
@@ -950,31 +1081,52 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    // gathers per stream: blk_cells row s indexes stream s's own cells
-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+    // pool (mean of the r member keys), norm and rotate nb blocks whose member cells are `cells` [r*nb, ns]
+    auto pool_blocks = [&](ggml_tensor * cells, ggml_tensor * pos, int64_t nb, int64_t ns) {
+        // gathers per stream: blk_cells row s indexes stream s's own cells
+        ggml_tensor * members = ggml_get_rows(ctx0, k_all, cells);
+        members = ggml_reshape_4d(ctx0, members, idx_dim, r, nb, ns);
 
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+        // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+        ggml_tensor * pooled = nullptr;
+        for (int64_t i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_cont(ctx0,
+                    ggml_view_3d(ctx0, members, idx_dim, nb, ns,
+                            members->nb[2], members->nb[3], i*members->nb[1]));
+            pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+        }
+        pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+        cb(pooled, "indexer_k_pooled", il);
+
+        // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, nb*ns, 1);
+        pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+
+        // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, nb*ns);
+        pooled = ggml_rope_multi(ctx0, pooled, pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        return ggml_reshape_3d(ctx0, pooled, idx_dim, nb, ns);
+    };
+
     ggml_tensor * pooled = nullptr;
-    for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+    // halo-hybrid (C6): the finished block keys persist across graphs (llama_memory_hybrid_idx::get_qsa_blk_k); a
+    // decode step recomputes only the trailing blocks its tokens touch. Every step is per block row (pool, norm, rope),
+    // so the cached rows equal the ones a full re-pool computes and the scores are bit-identical.
+    ggml_tensor * blk_k = inp->blk_mode != 0 ? mctx_hyb->get_mem()->get_qsa_blk_k(il) : nullptr;
+    if (blk_k != nullptr && inp->blk_mode == 2) {
+        ggml_tensor * fresh = pool_blocks(inp->re_cells, inp->re_pos, inp->n_re, 1);
+        ggml_tensor * upd = ggml_set_rows(ctx0, blk_k, ggml_reshape_2d(ctx0, fresh, idx_dim, inp->n_re), inp->re_ids);
+        pooled = ggml_view_3d(ctx0, upd, idx_dim, n_blocks, 1, upd->nb[1], upd->nb[1]*n_blocks, 0);
+    } else {
+        pooled = pool_blocks(inp->blk_cells, inp->blk_pos, n_blocks, n_stream);
+        if (blk_k != nullptr) {
+            // refresh the cache for the steps that follow (rows past the complete blocks are never read as valid)
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, pooled, idx_dim, n_blocks),
+                    ggml_view_2d(ctx0, blk_k, idx_dim, n_blocks, blk_k->nb[1], 0)));
+        }
     }
-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
-    cb(pooled, "indexer_k_pooled", il);
-
-    // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
-
-    // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
     cb(pooled, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
@@ -1008,6 +1160,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         score = ggml_add(ctx0, score, inp->bias);
     }
 
+    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+    // halo-hybrid (C4): one sequence laid out cell j = position j: the cell-level top-k follows from the block scores
+    // (ggml_qsa_top_k, exact), without the [n_kv, n_tokens] expansion, its permutes, the mask add and a radix top-k
+    // over every cell. LLAMA_QSA_BLOCK_TOPK=0 restores the expansion.
+    if (inp->blk_topk) {
+        ggml_tensor * qp = ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
+        ggml_tensor * tk = ggml_qsa_top_k(ctx0, ggml_reshape_2d(ctx0, score, n_blocks, n_tps), qp, inp->n_bid_t, (int32_t) width, (int32_t) r);
+        tk = ggml_reshape_4d(ctx0, tk, width, n_tps, 1, n_stream);
+        cb(tk, "indexer_top_k", il);
+        return tk;
+    }
+
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
     ggml_tensor * expanded = ggml_get_rows(ctx0,
             ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
@@ -1021,9 +1187,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         expanded = ggml_add(ctx0, expanded, inp->bias);
     }
     cb(expanded, "indexer_score_tokens", il);
-
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
 

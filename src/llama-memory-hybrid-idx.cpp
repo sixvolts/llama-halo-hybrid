@@ -65,7 +65,125 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // halo-hybrid (C6): the block-key cache, one sequence only (a unified cache with several sequences pools per
+    // sequence set, which this indexing by position cannot follow; qsa_blk_plan then declines)
+    static const bool enabled = getenv("LLAMA_QSA_BLK_CACHE") == nullptr || atoi(getenv("LLAMA_QSA_BLK_CACHE")) != 0;
+    if (!enabled || !mem_idx || mem_idx->get_n_stream() != 1 || model.hparams.no_alloc) {
+        return;
+    }
+    const int64_t idx_dim = model.hparams.indexer_head_size;
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
+    for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+        const uint32_t r = model.hparams.dsv4_compress_ratios[il];
+        if (r == 0 || !filter_idx(il)) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(model.dev_layer(il)) : ggml_backend_cpu_buffer_type();
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = { /*.mem_size =*/ 64*ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
+            it = ctx_map.emplace(buft, ggml_context_ptr(ggml_init(params))).first;
+        }
+        ggml_tensor * t = ggml_new_tensor_2d(it->second.get(), GGML_TYPE_F32, idx_dim, (int64_t) kv_size/r + 1);
+        ggml_format_name(t, "qsa_blk_k_l%u", il);
+        qsa_blk_k[(int32_t) il] = t;
+    }
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            qsa_blk_k.clear();
+            qsa_ctxs_bufs.clear();
+            LLAMA_LOG_WARN("%s: could not allocate the QSA block-key cache; decode re-pools every block\n", __func__);
+            return;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        LLAMA_LOG_INFO("%s: %10s QSA block-key cache = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        qsa_ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+}
+
+bool llama_memory_hybrid_idx::qsa_identity(const llama_ubatch & ubatch, uint32_t ratio, int32_t & n_bid) const {
+    int32_t first = 0;
+    bool usable = false;
+    // (the plan also answers for layers without a block-key cache; n_re only matters for its own verdict)
+    qsa_blk_plan_cells(ubatch, ratio, 1, n_bid, first, usable);
+    if (!usable) {
+        return false;
+    }
+    const auto & cells = mem_idx->get_cells(ubatch.seq_id[0][0]);
+    const uint32_t used = cells.get_used();
+    for (uint32_t j = 0; j < used; ++j) {
+        if (cells.is_empty(j) || cells.pos_get(j) != (llama_pos) j) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ggml_tensor * llama_memory_hybrid_idx::get_qsa_blk_k(int32_t il) const {
+    const auto it = qsa_blk_k.find(il);
+    return it == qsa_blk_k.end() ? nullptr : it->second;
+}
+
+bool llama_memory_hybrid_idx::qsa_blk_plan(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re,
+        int32_t & n_bid, int32_t & first, bool & usable) const {
+    if (qsa_blk_k.empty()) {
+        n_bid = 0; first = 0; usable = false;
+        return false;
+    }
+    return qsa_blk_plan_cells(ubatch, ratio, n_re, n_bid, first, usable);
+}
+
+bool llama_memory_hybrid_idx::qsa_blk_plan_cells(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re,
+        int32_t & n_bid, int32_t & first, bool & usable) const {
+    n_bid = 0; first = 0; usable = false;
+    {
+        static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 6 : 0;
+        if (n_dbg > 0) {
+            n_dbg--;
+            LLAMA_LOG_WARN("qsa-blk plan entry: have_cache %d mem_idx %d ratio %u n_tokens %u pos_2d %d\n", (int) !qsa_blk_k.empty(),
+                (int) (mem_idx != nullptr), ratio, ubatch.n_tokens, (int) ubatch.is_pos_2d());
+        }
+    }
+    // (qwen4exp's text positions are 4-section mrope rows, so is_pos_2d() holds for every batch; what matters is that no
+    // position repeats - set_input_qsa ranks cells only then - and the hole-free check below already guarantees it)
+    if (!mem_idx || ratio == 0 || ubatch.n_tokens == 0) {
+        return false;
+    }
+    // exactly one sequence in the cells and in the ubatch
+    const llama_seq_id seq = ubatch.seq_id[0][0];
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq) {
+            return false;
+        }
+    }
+    const auto & cells = mem_idx->get_cells(seq);
+    for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+        if (sq != seq && cells.seq_pos_min(sq) >= 0) {
+            return false;
+        }
+    }
+    const llama_pos pmin = cells.seq_pos_min(seq);
+    const llama_pos pmax = cells.seq_pos_max(seq);
+    {
+        static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 12 : 0;
+        if (n_dbg > 0) {
+            n_dbg--;
+            LLAMA_LOG_WARN("qsa-blk plan: seq %d pmin %d pmax %d used %u size %u\n", seq, pmin, pmax, cells.get_used(), cells.size());
+        }
+    }
+    // hole-free from position 0: then the complete blocks are exactly 0 .. (pmax+1)/r - 1, and block id = position / r
+    if (pmin != 0 || pmax < 0 || (int64_t) cells.get_used() != (int64_t) pmax + 1) {
+        return false;
+    }
+    usable = true;
+    n_bid  = (pmax + 1) / (llama_pos) ratio;
+    first  = n_bid - n_re;
+    // the incremental graph recomputes [first, n_bid): everything before must already be current
+    return first >= 0 && (llama_pos) first * (llama_pos) ratio <= qsa_valid_pos;
+}
+
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -142,6 +260,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
+    qsa_valid_pos = 0;
 
     if (mem_idx) {
         mem_idx->clear(data);
@@ -157,12 +276,14 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
     }
+    qsa_valid_pos = p0 < 0 ? 0 : std::min(qsa_valid_pos, p0);
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    qsa_valid_pos = 0;
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -171,6 +292,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     llama_memory_hybrid::seq_keep(seq_id);
+    qsa_valid_pos = 0;
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
@@ -179,6 +301,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
+    qsa_valid_pos = 0;
 
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
@@ -187,6 +310,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
+    qsa_valid_pos = 0;
 
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
@@ -227,6 +351,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
+    qsa_valid_pos = 0;
+
     try {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
@@ -251,6 +377,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+    qsa_valid_pos = 0;
+
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
         clear(true);
@@ -281,7 +409,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    GGML_ASSERT(cell_blk->data != nullptr && (cell_blk->buffer == nullptr || ggml_backend_buffer_is_host(cell_blk->buffer)));   // (a host shadow when the graph does not read it)
 
     const int64_t n_kv     = cell_blk->ne[0];
     const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch

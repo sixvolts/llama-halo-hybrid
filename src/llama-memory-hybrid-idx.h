@@ -3,6 +3,7 @@
 #include "llama-memory-hybrid.h"
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 //
@@ -75,6 +76,26 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // halo-hybrid (C6): per QSA layer, the finished (pooled, normed, roped) indexer key of every complete block of the one
+    // sequence, [idx_dim, qsa_blk_max] f32, row = block index (position / ratio). A decode step then recomputes only the
+    // trailing blocks its tokens touch instead of re-pooling the whole window. nullptr when absent (several streams,
+    // no indexer, LLAMA_QSA_BLK_CACHE=0).
+    ggml_tensor * get_qsa_blk_k(int32_t il) const;
+
+    // what the next graph can do with that cache, for a ubatch already applied to the cells:
+    //   n_bid   complete blocks after this ubatch (the one sequence covers positions [0, n) with no holes)
+    //   first   first block the incremental graph recomputes (n_bid - n_re), valid only when the call returns true
+    // false: the cells are not one hole-free sequence from position 0 (then the cache is not used at all, *usable = false),
+    // or blocks before n_bid - n_re are stale (full recompute, which refreshes the cache).
+    bool qsa_blk_plan(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re, int32_t & n_bid, int32_t & first, bool & usable) const;
+
+    // halo-hybrid (C4): usable (see above) and every used cell j holds position j - the layout ggml_qsa_top_k assumes
+    bool qsa_identity(const llama_ubatch & ubatch, uint32_t ratio, int32_t & n_bid) const;
+
+    // blocks whose first `qsa_valid_pos` positions hold cells that the cache reflects; raised after a graph computes them,
+    // lowered by seq_rm, zeroed by any other edit of the cells or their positions
+    mutable llama_pos qsa_valid_pos = 0;
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
@@ -97,6 +118,11 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    bool qsa_blk_plan_cells(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re, int32_t & n_bid, int32_t & first, bool & usable) const;
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_ctxs_bufs;
+    std::unordered_map<int32_t, ggml_tensor *> qsa_blk_k;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -137,6 +163,9 @@ public:
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+
+    // the memory itself (the QSA block-key cache and its plan live there)
+    const llama_memory_hybrid_idx * get_mem() const { return mem; }
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
