@@ -148,7 +148,7 @@ the first 26 layers and the MTP draft head on the card, their experts on the iGP
 half across its card and iGPU. Single stream, 128K context: 30 tok/s decode and 896 tok/s prefill at a 25.8K prompt,
 with the model's own MTP head. The link currently runs over TCP (RDMA is off after
 E810 resets under load). Launch lines, the rpc-server unit and the operating rules:
-[cookbook, recipe 4](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node); the draft-head
+[cookbook, recipe 5](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each); the draft-head
 export and the fixes: [HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
 
 ---

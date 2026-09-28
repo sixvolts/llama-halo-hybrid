@@ -9,8 +9,8 @@ everywhere; only the device list changes.
 | 1 | One Strix Halo, nothing else | measured (2026-09-28) | Qwen3.8-Flash-Next: 40-41 tok/s with the MTP head (55-56 ms/step, real content, T=0.7); prefill 940 / 870 / 780 tok/s at 4K / 16K / 32K | [1](#1-one-strix-halo-by-itself) |
 | 2 | One Strix Halo + one R9700 | production (Qwen3.8-Flash-Next, 2026-09-28) | 63 tok/s decode (35.4 ms/step, real content, T=0.7); prefill 2,090 / 2,220 / 2,030 tok/s at 4K / 16K / 32K | [2](#2-one-strix-halo--one-r9700) |
 | 3 | Two Strix Halos over RDMA, no dGPU | derived, not measured | see 4 minus the R9700 | [3](#3-two-strix-halos-over-rdma) |
-| 4 | Two Strix Halos + one R9700 on the head node | production (GLM-5.3-Flash, 200 GB) | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K | [4](#4-two-strix-halos--one-r9700-on-the-head-node) |
-| 5 | Two Strix Halos + one R9700 on each | planned (card ordered) | estimate 23-25 tok/s decode | [5](#5-two-strix-halos--one-r9700-on-each) |
+| 4 | Two Strix Halos + one R9700 on the head node | superseded by 5 (GLM-5.3-Flash, 200 GB) | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K (09-08) | [4](#4-two-strix-halos--one-r9700-on-the-head-node) |
+| 5 | Two Strix Halos + one R9700 on each | production (GLM-5.3-Flash, 200 GB) | 896 tok/s prefill / 30 tok/s decode at 25.8K | [5](#5-two-strix-halos--one-r9700-on-each) |
 
 Device names in the recipes are what ROCm enumerates on the box: on the head node `ROCm0` is the R9700 and `ROCm1`
 the iGPU (gfx1151); check the order in the startup log before copying a line. `RPC0`/`RPC1` are the remote
@@ -275,26 +275,41 @@ Rules that cost a day each to learn:
 
 ## 5. Two Strix Halos + one R9700 on each
 
-Planned; the second card is ordered. The intent is to mirror recipe 4 on the second box: its dense trunk, KV
-and attention on its R9700, its experts on its iGPU, both devices behind one `ggml-rpc-server`:
+Production for GLM-5.3-Flash since 2026-09-21 (measured 2026-09-28 at f05fe5f29): **896 tok/s prefill and 30 tok/s
+decode at a 25.8K prompt** (92 ms/step, acceptance 0.90), 783 tok/s at 12.7K; single stream, 128K context, MTP head
+with two drafts.
+
+Layout ("v3s", `~/bench/glm/run_glm_v3s.sh` with `LOCAL=26 KM=6`):
+
+| | R9700 | iGPU |
+|---|---|---|
+| head node (gibson) | dense trunk + KV of layers 0-25, experts of 0-4, MTP draft head, output head | experts of layers 5-25 |
+| second box (mainframe) | dense trunk + KV of layers 26-46, experts of 26-31 | experts of layers 32-45 |
+
+The second box runs one rpc-server over both of its GPUs and schedules its half itself (composite mode: the client
+sends the graph, the server's own `ggml_backend_sched` places it across its card and iGPU):
 
 ```
-ggml-rpc-server -H 10.100.100.2 -p 50052 -d ROCm0,ROCm1 -t 16        # exposes RPC0 (R9700) and RPC1 (iGPU)
+# second box
+GGML_RPC_NO_RDMA=1 ggml-rpc-server -H 10.100.100.2 -p 50052 -d ROCm0,ROCm1 -t 16
+
+# head node (what run_glm_v3s.sh expands to, abbreviated)
+GGML_RPC_NO_RDMA=1 GGML_RPC_COMPOSITE=1 LLAMA_PREFILL_LANES=4 LLAMA_UBATCH_TAPER=3 \
+llama-server -m GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf --rpc 10.100.100.2:50052 \
+  -dev ROCm0,ROCm1,RPC0 -ts 26,0,21 --fit off -fa on -ngl 999 -c 131072 -b 32768 -ub 1024 \
+  -ot 'blk\.(5|...|25)\.ffn_(gate|up|down)_exps=ROCm1,blk\.(32|...|45)\.ffn_(gate|up|down)_exps=RPC1[10.100.100.2:50052],^output\.weight$=ROCm0,^output_norm\.weight$=ROCm0,^token_embd\.weight$=CPU' \
+  -md GLM-5.3-Flash-mtp-UD-Q4_K_XL-q40head.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max 2
 ```
 
-and on the head node `-dev ROCm0,RPC0,ROCm1,RPC1` with a split that assigns layers 25..44 to RPC0 and an override
-that moves their experts to RPC1. Expected: the second box's lane is the critical path at 13K prefill and 80% of
-its decode share is expert streaming, so the estimate is 23-25 tok/s decode and a noticeably shorter prefill lane.
-
-Two things are known before the card arrives:
-
-* **rocBLAS serves one GPU architecture per process.** Its lazily loaded Tensile library is cached for the first
-  architecture that calls it, and a later GEMM on the other architecture fails with "no kernel image is available
-  for execution on the device". The head node only works because its iGPU never calls rocBLAS (experts are MMQ);
-  the same must hold inside the second box's rpc-server: every dense and MLA tensor on the R9700, experts only on
-  the iGPU. The fork's whole-layer-on-iGPU experiment died on exactly this.
-* **The rpc multi-device path is untested here**; it can be dry-run on the head node alone by pointing a local
-  `ggml-rpc-server -d ROCm0,ROCm1` at its own two GPUs before the hardware lands.
+* **Four prefill lanes** run as a rolling pipeline across the link: the remote half works on ubatch k while the head
+  node runs k+1. `LLAMA_UBATCH_TAPER=3` makes the first ubatch partial so the pipeline fills sooner.
+* **Both hosts must run the same commit** (the RPC handshake compares the protocol version, 7.7 at f05fe5f29, which
+  includes the op table).
+* **The link runs over TCP.** RDMA is disabled on both hosts since 2026-09-23 (E810 "HMC Error" PF resets under load).
+* **The server's scheduler keeps host syncs for its iGPU** (880d979de): with scheduler events on the APU, the
+  composite server faulted at the first decode step under the grouped MoE GEMV. The client keeps the events.
+* **rocBLAS serves one GPU architecture per process**: every dense tensor on each box's R9700, experts only on the
+  iGPUs; a dense GEMM on the iGPU in the same process as one on the card fails with "no kernel image".
 
 ## 6. Swift 1.5 Qwen3.8-Flash-Next on Strix Halo + R9700 (2026-09-27)
 
