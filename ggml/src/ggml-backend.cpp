@@ -2277,9 +2277,19 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                     // halo-hybrid (GGML_SCHED_OVERLAP_CUT): a cut split may still be running on this destination, and the
                     // copy's buffer may alias memory it uses; the copy runs on the source's queue, so make that queue
                     // wait for everything already queued here (decode graphs with the cut only)
+                    // The same write-after-read hazard exists whenever this split backend has scheduler events: the wait
+                    // above then only orders the destination's own stream, while the copy is issued on the source's
+                    // stream and can overwrite input_cpy (or memory the allocator aliased with it) while the destination
+                    // still reads it. Without events the host synchronize above covered it. With the APU on events
+                    // (9375f16ec) a server-side scheduler (card + APU behind ggml-rpc, no overlap cut) had the card
+                    // overwrite the APU's expert ids mid-read: out-of-range experts, APU page faults at GLM decode.
                     {
                         static const bool oc = getenv("GGML_SCHED_OVERLAP_CUT") == nullptr || atoi(getenv("GGML_SCHED_OVERLAP_CUT")) > 0;
-                        if (oc && sched->overlap_cut_ok && input_backend != split_backend &&
+                        // (scoped to an integrated-GPU destination, the case 9375f16ec moved onto events; discrete-GPU
+                        // destinations have run on events since before the lanes and keep their measured ordering)
+                        const bool dst_events = sched->events[split_backend_id][sched->cur_copy] != NULL && split_backend->device != NULL &&
+                                ggml_backend_dev_type(split_backend->device) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+                        if (((oc && sched->overlap_cut_ok) || dst_events) && input_backend != split_backend &&
                                 !ggml_backend_sched_backend_is_remote(input_backend) && !ggml_backend_sched_backend_is_remote(split_backend) &&
                                 input_backend->iface.event_wait != NULL) {
                             ggml_backend_event_t ev = ggml_backend_sched_next_copy_event(sched, split_backend_id);
