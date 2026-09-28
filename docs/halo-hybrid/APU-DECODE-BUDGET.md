@@ -591,3 +591,16 @@ turns them on): LLAMA_QSA_ALWAYS_SCORE, GGML_CUDA_NO_GDN_CHUNKED.
 - **Producer-side MMQ copies (ea92b2d17):** combine_norm and hc_mix write the block_q8_1_mmq copy their q8_0 MMQ
   consumers would quantize (bit-identical); flat q8_1 side copies capped at decode widths (prefill wrote ~30 MB per
   combine_norm for nothing). Hybrid 16K 2208-2217 -> 2230-2235, 32K 2020-2023 -> 2032-2039; refs identical.
+
+### 09-28, C6 + C4: the QSA indexer at depth (782542e4e)
+
+- **C6 block-key cache:** the finished indexer key of every complete block persists per QSA layer; decode recomputes
+  only the trailing blocks its tokens touch (fixed count, so graphs stay reusable). ~20K contexts, T=0.7: hybrid
+  42.9 -> 40.9 ms/step, APU-only 67.5 -> 64.4. Bit-identical on the APU; on the card within the hybrid's run-to-run
+  noise (KLD 0.0065 vs 0.0070 for the unchanged build). Traps met: Qwen3.8's text positions are 4-section mrope rows, so
+  ubatch.is_pos_2d() is always true (the plan tests "no repeated position" via the hole-free check instead); inputs the
+  new graph no longer reads (blk_cells, blk_pos, cell_blk) are unallocated and set_input fills host shadows.
+- **C4 block-level top-k:** GGML_OP_QSA_TOP_K replaces the per-cell expansion + radix top-k when cell j = position j.
+  Not bit-identical (the old top-k broke ties inside the cut block arbitrarily): KLD 0.0014 / 0.0013 at 16K, floors
+  0.0096 / 0.0089. APU-only prefill 16K 852-860 -> 891, 32K 762-768 -> 820-822; hybrid 32K 2041 -> 2107-2116.
+- RPC proto 7.7 (the op): both GLM hosts must run it.
