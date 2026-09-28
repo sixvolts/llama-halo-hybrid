@@ -1381,18 +1381,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     // input as f16 (half the host-link bytes; the F16 expert path converts to f16 anyway): router logits from the f32
     // input on the layer's device, the experts read cast(cast(x, f16), f32) with the f16 cast pinned to the layer's
     // device and the f32 cast to the experts' (llama-context's graph callback). On by default (Swift Q8T hybrid prefill
-    // 16K/32K +2.2-2.4%; bit-identical where the F16 expert path takes the ubatch, KLD 0.0275 at ub 1024 where MMQ
-    // reads the f16-rounded input); LLAMA_MOE_F16_CROSS=0 disables.
+    // 16K/32K +2.2-2.4%); gated to the ubatches the F16 expert path takes, where it is bit-identical (it fired at >= 256 tokens
+    // before, where MMQ read the f16-rounded input: KLD 0.0275 at ub 1024). LLAMA_MOE_F16_CROSS=0 disables.
     ggml_tensor * exp_in = cur;
     ggml_tensor * logits = nullptr;
     {
         static const bool f16_cross = getenv("LLAMA_MOE_F16_CROSS") == nullptr || atoi(getenv("LLAMA_MOE_F16_CROSS")) != 0;
         const ggml_tensor * we = model.layers[il].ffn_gate_exps ? model.layers[il].ffn_gate_exps : model.layers[il].ffn_gate_up_exps;
-        ggml_backend_dev_t dev_exp = (we && we->buffer) ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(we->buffer)) : nullptr;
-        if (f16_cross && n_tokens >= 256 && dev_exp && dev_exp != model.dev_layer(il)) {
+        ggml_backend_buffer_type_t buft_exp = (we && we->buffer) ? ggml_backend_buffer_get_type(we->buffer) : nullptr;
+        ggml_backend_dev_t dev_exp = buft_exp ? ggml_backend_buft_get_device(buft_exp) : nullptr;
+        // only where the f16 expert GEMM takes the batch (ggml-cuda mmid-f16 auto rule: >= 40 rows per expert), so the
+        // crossing is bit-identical, and only for experts in GPU memory (CPU-resident or host-pinned experts would pay
+        // a round trip for nothing)
+        const bool exp_gpu = dev_exp && !ggml_backend_buft_is_host(buft_exp) &&
+            (ggml_backend_dev_type(dev_exp) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev_exp) == GGML_BACKEND_DEVICE_TYPE_IGPU);
+        const bool f16_rows = (int64_t) n_tokens*n_expert_used >= 40*(int64_t) n_expert;
+        // the cast pair exists for every prefill-sized ubatch (>= 256 tokens) so the two prefill lanes of a pair (e.g.
+        // 2560 + 1143 tokens) keep the same split structure (the pair guard runs mismatched lanes one after the other);
+        // below the f16 rows threshold it crosses as f32 (exact)
+        if (f16_cross && n_tokens >= 256 && exp_gpu && dev_exp != model.dev_layer(il)) {
             logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
             cb(logits, "ffn_moe_logits", il);
-            ggml_tensor * x16 = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+            ggml_tensor * x16 = ggml_cast(ctx0, cur, f16_rows ? GGML_TYPE_F16 : GGML_TYPE_F32);
             cb(x16, "moe_in_f16", il);
             exp_in = ggml_cast(ctx0, x16, GGML_TYPE_F32);
             cb(exp_in, "moe_in_f32", il);
