@@ -1879,7 +1879,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc, dst->ne[1])) {
         return false;
     }
 
@@ -2036,7 +2036,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc, dst->ne[1])) {
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
@@ -2072,7 +2072,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc, dst->ne[1]);
                 // halo-hybrid: the expert down-projection at decode width eats the f32 GLU output (f32act.cu)
                 //     instead of quantizing the selected rows in a launch of their own
                 if (GGML_CUDA_CC_IS_AMD(cc) && ggml_cuda_mul_mat_id_vec_q8_f32act(ctx, src0, src1, ids, dst)) {
@@ -6051,6 +6051,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (op == GGML_OP_MUL_MAT_ID && i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_MUL_MAT_ID &&
                     cgraph->nodes[i + 3]->src[1] == glu && ggml_node_get_use_count(cgraph, i) == 1 &&
                     ggml_node_get_use_count(cgraph, i + 1) == 1 && ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                    !(glu->flags & GGML_TENSOR_FLAG_OUTPUT) && glu->view_src == nullptr &&
+                    (cgraph->nodes[i + 3]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                     ggml_cuda_mmid_f16_moe(*cuda_ctx, gate, up, glu, cgraph->nodes[i + 3])) {
                 fused_mul_mat_vec = true;
                 fused_node_count  = 4;

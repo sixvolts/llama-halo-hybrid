@@ -6,7 +6,8 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
-int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+// n_used: experts per token (dst->ne[1]); the grouped kernel only widens the batch while n_tokens*n_used fits its pair table
+int get_mmvq_mmid_max_batch(ggml_type type, int cc, int64_t n_used = 1);
 
 // src1_q8_1_pre: optional src1 already quantized to q8_1 (layout of quantize_row_q8_1_cuda with
 // ne10 padded to MATRIX_ROW_PADDING); used by the grouped mul_mat_vec_q path to quantize a

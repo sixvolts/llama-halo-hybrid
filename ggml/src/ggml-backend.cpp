@@ -853,6 +853,7 @@ struct ggml_backend_sched {
     int pipe_first_remote;
     ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPY_EVENTS];
     int copy_event_next[GGML_SCHED_MAX_BACKENDS];
+    int copy_event_used[GGML_SCHED_MAX_BACKENDS]; // taken since the last sched synchronize (ring wrap guard)
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor ** graph_inputs;
@@ -1978,8 +1979,13 @@ static bool ggml_backend_sched_is_input(const struct ggml_tensor * t) {
 static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sched_t sched, int backend_id) {
     ggml_backend_event_t & ev = sched->copy_events[backend_id][sched->copy_event_next[backend_id]];
     sched->copy_event_next[backend_id] = (sched->copy_event_next[backend_id] + 1) % GGML_SCHED_COPY_EVENTS;
+    const bool wrapped = ++sched->copy_event_used[backend_id] > GGML_SCHED_COPY_EVENTS;
     if (ev == NULL) {
         ev = ggml_backend_event_new(sched->backends[backend_id]->device);
+    } else if (wrapped) {
+        // the ring wrapped without a synchronize: a wait may still be queued on this slot's previous record, and a
+        // re-record would rebind it (HIP binds a wait to the latest record) - let the old record complete first
+        ggml_backend_event_synchronize(ev);
     }
     return ev;
 }
@@ -2506,8 +2512,19 @@ static bool ggml_backend_sched_trace_splits_now(ggml_backend_sched_t sched) {
     return true;
 }
 
+// halo-hybrid: input events are set by eager copies at their producer and consumed (reset) by the consumer split; an
+// aborted compute can leave some set, and a reused graph would then wait on a stale event and skip its copy - clear
+// them at every compute entry
+static void ggml_backend_sched_clear_input_events(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_splits; i++) {
+        ggml_backend_sched_split & sp = sched->splits[i];
+        if (sp.input_events) { memset(sp.input_events, 0, sp.inputs_capacity * sizeof(ggml_backend_event_t)); }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    ggml_backend_sched_clear_input_events(sched);
     ggml_backend_sched_compute_state st;
     if (ggml_backend_sched_trace_splits_now(sched)) {
         for (int i = 0; i < sched->n_splits; i++) {
@@ -2540,6 +2557,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
     for (int i = 0; i < sched_a->n_backends; i++) {
         GGML_ASSERT(sched_a->backends[i] == sched_b->backends[i]);
     }
+    ggml_backend_sched_clear_input_events(sched_a);
+    ggml_backend_sched_clear_input_events(sched_b);
 
     // halo-hybrid: the interleaving below is only safe when both lanes have the same split structure (split i of a
     // and of b cover the same layers on the same backend, so a's writes to the KV / recurrent state of a layer are
@@ -2900,6 +2919,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+        sched->copy_event_used[i] = 0;
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
@@ -2972,6 +2992,7 @@ int ggml_backend_sched_last_remote_split(ggml_backend_sched_t sched) {
 enum ggml_status ggml_backend_sched_graph_compute_async_head(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched && sched->is_alloc && !sched->callback_eval);
     GGML_ASSERT(sched->pipe_state == NULL && "head called twice without tail");
+    ggml_backend_sched_clear_input_events(sched);
     // cut after the LAST remote split: GLM's graph emits a six-node recurrent-state split for the first remote
     // layer before the last local layer's expert tail, so the first remote split is not the heavy one. A local
     // split between two remote splits only stalls the head if it consumes a remote output (fetch-wait; the
@@ -3011,6 +3032,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async_head_pair(ggml_backend_s
     GGML_ASSERT(sa && sb && sa != sb && sa->is_alloc && sb->is_alloc && !sa->callback_eval && !sb->callback_eval);
     GGML_ASSERT(sa->pipe_state == NULL && sb->pipe_state == NULL && "head called twice without tail");
     GGML_ASSERT(sa->n_backends == sb->n_backends);
+    ggml_backend_sched_clear_input_events(sa);
+    ggml_backend_sched_clear_input_events(sb);
     const int ra = ggml_backend_sched_last_remote_split(sa);
     const int rb = ggml_backend_sched_last_remote_split(sb);
     const int fa = ggml_backend_sched_first_remote_split(sa);
@@ -3078,6 +3101,7 @@ void ggml_backend_sched_synchronize_local(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         if (!ggml_backend_sched_backend_is_remote(sched->backends[i])) {
             ggml_backend_synchronize(sched->backends[i]);
+            sched->copy_event_used[i] = 0;
         }
     }
     if (!sched->is_alloc) {

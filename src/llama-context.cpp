@@ -581,12 +581,13 @@ void llama_context::ingest_flush(bool run) {
 }
 
 llama_context::~llama_context() {
+    // wait for any pending asynchronous copies into the output buffers before they are freed, and for the deferred
+    // MTP ingest's recorded events before they are destroyed
+    synchronize();
     ingest_pending.clear();
     for (auto * ev : ingest_ev_all) {
         ggml_backend_event_free(ev);
     }
-    // wait for any pending asynchronous copies into the output buffers before they are freed
-    synchronize();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2411,11 +2412,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // small graphs (decode, verify batches) on lane 0 run without eager copies and remote fetch: both are
         // tuned for the multi-token pipeline and halved the decode rate with the draft head when left on
         if (use_lanes) {
-            // halo-hybrid: without a remote device (card + APU on one host) eager copies help decode too: the
+            // halo-hybrid: without a remote device (card + APU on one host) eager copies help decode too (keyed on
+            //     has_remote_backend, not prefill_pipeline: LLAMA_PREFILL_LANES_RPC=1 keeps a remote without the pipeline): the
             // crossing copies go out right behind their producer (base Qwen3.8 real-content decode 40.0 -> 39.0
             // ms/step). LLAMA_LANES_SMALL_EAGER=0/1 forces it off/on.
             static const char * small_eager_env = getenv("LLAMA_LANES_SMALL_EAGER");
-            const bool small_eager = small_eager_env ? atoi(small_eager_env) != 0 : !prefill_pipeline;
+            const bool small_eager = small_eager_env ? atoi(small_eager_env) != 0 : !has_remote_backend;
             const bool big = ubatch.n_tokens >= pipe_min_tokens;
             ggml_backend_sched_set_eager_copies(sched.get(), big || small_eager);
             ggml_backend_sched_set_remote_fetch(sched.get(), prefill_pipeline && (big || small_eager) && remote_fetch_enabled);

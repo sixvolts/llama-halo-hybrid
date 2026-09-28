@@ -337,12 +337,15 @@ static int get_mmvq_mmid_max_batch_uncapped(ggml_type type, int cc);
 // Host function: returns the max batch size for the current arch+type at runtime.
 bool ggml_cuda_mmvq_moe_grouped_enabled(ggml_type type);
 
-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
-    if (ggml_cuda_mmvq_moe_grouped_enabled(type)) {
-        // halo-hybrid: the grouped MoE GEMV reads each distinct expert once, like MMQ, without MMQ's tile overhead
-        return MMVQ_MAX_BATCH_SIZE;
-    }
+int get_mmvq_mmid_max_batch(ggml_type type, int cc, int64_t n_used) {
     const int n = get_mmvq_mmid_max_batch_uncapped(type, cc);
+    if (ggml_cuda_mmvq_moe_grouped_enabled(type)) {
+        // halo-hybrid: the grouped MoE GEMV reads each distinct expert once, like MMQ, without MMQ's tile overhead;
+        //     only widths whose n_tokens*n_used fit its 256-pair table (MMVQ_GRP_MAX_PAIRS) - wider ones fall to the
+        //     per-pair kernel, which must stay within the arch's own max
+        const int64_t grp = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, 256 / std::max<int64_t>(1, n_used));
+        return std::max<int>(n, (int) grp);
+    }
     const int cap = get_mmvq_mmid_max_batch_env_cap(cc);
     const bool kquant = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
     return (cap > 0 && kquant) ? std::min(n, cap) : n;
@@ -2209,7 +2212,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc, dst->ne[1]));
         // halo-hybrid: up to 4 columns (the kernel's epilogue is generic over ncols_dst; a fused ADD operand is
         // either a [rows] bias or a [rows, n_tokens] tensor, see x_bias_stride_col)
         GGML_ASSERT(  ids || dst->ne[1] <= 4);
