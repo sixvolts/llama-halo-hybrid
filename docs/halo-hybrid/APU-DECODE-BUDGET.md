@@ -524,3 +524,54 @@ not a win on this box: the per-ubatch ingest is slower on the R9700 at 16-32K (1
 19-23K-token contexts (long_accept.sh: 3 prompts x 2 seeds, T=0.7) acceptance drops 0.759 -> 0.732 and decode 57.4 ->
 54.0 t/s. The head looks trained dense; the converter's ratio 0 for the MTP block was right. The draft ingest's ~11%
 of hybrid prefill stays; a windowed ingest is the remaining lever and trades long-prompt acceptance.
+
+## 2026-09-28: final round, step 1 (review 0927 plan, ~/bench/results/q38rev-0927/PLAN.md)
+
+**Zero-code wins, confirmed on the base model at 6ed31ea3c..e6bb60de4 (gibson, two runs / two seeds each):**
+
+| config | change | before | after |
+|---|---|---|---|
+| hybrid | `-ub 2560 -b 5120` + draft with its own q4_K head | 2074-2080 / 2097 / 1944-1946 tok/s, 36.5-36.6 ms/step | 2086-2088 / 2211-2227 / 2025-2031, 35.4-35.5 ms/step |
+| APU-only | `-ub 4096` (draft loaded) | 895-896 / 846-847 / 764-767 | 937-946 / 865-871 / 778-782 |
+| APU-only | draft with its own q4_K head | 58.3-58.7 ms/step, 38.3-38.5 t/s | 55.2-56.0 ms/step, 39.9-41.4 t/s |
+
+The base head is the target's q8_0 `output.weight` requantized to q4_K (COOKBOOK recipe 6); acceptance 0.62-0.65 vs
+0.63-0.64. The launchers now default to these (q38_hybrid_srv.sh: lanes 2, ub 2560, b 5120, q4_K-head draft;
+q38_prefill_srv.sh / sw_accept_apu.sh: ub 4096). Without `LLAMA_PREFILL_LANES=2` the hybrid is 1420-1490 at 16K.
+The review's "APU decode 34 t/s at ub 2048" lead was the one-request sanity check: 55.2-55.8 ms/step at ub 2048.
+
+**Correctness items (A2-A5), no perf change intended:**
+- P4 crossing (6ed31ea3c): f16 only where the F16 expert GEMM takes the ubatch (>= 40 rows per expert), experts in
+  GPU memory only; the cast pair stays (as f32) on smaller prefill ubatches so both lanes keep one split structure -
+  without that a 4K prompt's 2037 + 1666 lanes ran sequentially (2013 -> 1374 t/s).
+- f16 saturation in mmid-f16 / mmq-wmma (fc210e5b9); scheduler: input events cleared per compute, copy-event ring
+  wrap guard, P6 output/view checks, grouped-GEMV width bound, small-eager keyed on has_remote_backend, ingest
+  events freed after synchronize (e83948ad4); tests for the whole MoE block and the round's edge shapes (fde611e5f),
+  all pass on gfx1201 and gfx1151.
+- `GGML_CUDA_GDN_PERTURB=<eps>` (e6bb60de4) for KLD floors.
+
+**References (Swift Q8T + q4_K head, hybrid, lanes 2, -ctxcp 0, lanes_greedy.py, 48 tokens):** the 09-27 greedy
+references in this document (0e61acbea328 / c30330dde10b / cdfc2aa3aa56 / 34bb40f4d6f1) are stale. At ub 2560
+after A2: 4K a18289237479 (sum lp -0.021129), 9K 5fa5e1bdc18e, 16K and 32K 0c4db8b0c917 (bit-identical to
+27ad2f27a: -0.061230 / -0.220081). Files: ~/bench/results/q38r3-gate/runs/.
+
+**Default-on switches added since 09-24 (set to disable):**
+
+| switch | default | what |
+|---|---|---|
+| GGML_SCHED_IGPU_EVENTS=0 | on | scheduler events on the APU |
+| GGML_CUDA_MAX_GRAPHS | 256 | graph cache entries |
+| LLAMA_PLE_WILLNEED=0, LLAMA_PLE_THREADS | on, 8 | PLE gather read-ahead + threads |
+| LLAMA_LANES_SPLIT_FRAC / _MIN | 0.55 / 1024 | short-batch lane split |
+| GGML_CUDA_KQ_WMMA=0 | on (RDNA3/4) | k-quant dense GEMM on dequant-once WMMA |
+| GGML_CUDA_MMVQ_GROUPED=0 | on | grouped MoE GEMV |
+| GGML_CUDA_GEMV_GROUP_MINROWS | 512 | per-matrix kernels below it |
+| GGML_CUDA_MMVF_NO_CLIFF=0 | on | MMVF dispatch-cliff guard |
+| GGML_SCHED_NO_COPY_BATCH=1 | off (batching on) | batched eager copies |
+| LLAMA_LANES_SMALL_EAGER=0/1 | = !has_remote_backend | eager copies for decode graphs |
+| GGML_CUDA_MMID_F16_PAIR=0 | on (gfx11) | P6 paired gate/up + GLU + down |
+| LLAMA_MOE_F16_CROSS=0 | on | P4 f16 expert-input crossing |
+| LLAMA_MTP_INGEST_DEFER=0 | on (local lanes) | deferred MTP early ingest |
+
+Opt-in: LLAMA_SPEC_DRAFT_UB, LLAMA_MTP_EH_PROJ_2D, LLAMA_MTP_QSA. Presence-tested switches (any value, including 0,
+turns them on): LLAMA_QSA_ALWAYS_SCORE, GGML_CUDA_NO_GDN_CHUNKED.

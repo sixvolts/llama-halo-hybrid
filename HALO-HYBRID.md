@@ -23,8 +23,10 @@ llama-server -m model.gguf -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 \
 ```
 
 Repeated `-ot` flags accumulate and patterns may be comma-joined in one flag (`common/arg.cpp`); the first pattern that matches a tensor wins (`src/llama-model-loader.cpp`). The launchers comma-join into a single flag.
-For Qwen3.8-Flash-Next (unsloth GGUF: three expert tensors per layer) keep the 28.8 GB PLE n-gram
-table in host memory: `-ot 'blk\.(1[6-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU'`
+**Superseded (2026-09-28):** do not pin the PLE n-gram table to the CPU any more - it is read on demand from the page
+cache by default (lazy mode, a846a1e01), and the override below forces a resident 26.8 GB copy. Current launch lines:
+[COOKBOOK.md](docs/halo-hybrid/COOKBOOK.md) recipes 1-2. The history: for Qwen3.8-Flash-Next (unsloth GGUF: three
+expert tensors per layer) the table was kept in host memory with `-ot 'blk\.(1[6-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU'`
 (hybrid-16: 4.6 GB dense + 16 expert layers on the R9700, 26.9 t/s before the fusions below; 37.4 t/s with everything in this document, hybrid-14 36.7).
 The table's 16-row gather then runs on the host inside `set_input` (no CPU split, see below).
 It can also be placed on the APU (`per_layer_token_embd=ROCm1`) now that `get_rows` on IQ4_NL accepts
@@ -80,6 +82,9 @@ recurrent targets that cannot roll back) + the patch set above ported onto it. U
 reuse for the QSA/PLE inputs, QSA input sharing and a MoE weighted-reduction fusion of its own, so those
 parts of the old branch were dropped; so were the expert-parallel prototype and the DFlash dump
 diagnostics.
+
+(Superseded 2026-09-28: the draft now gets its own q4_K LM head and the line is `-c 40960 -b 5120 -ub 2560`,
+experts 11-47 on the iGPU, lanes 2, no PLE override - COOKBOOK.md recipe 2. The rest of this section is the 09-1x state.)
 
 Draft head: `unsloth/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2.6 GB). The
 `shared-` file borrows `token_embd` and `output` from the target, so the draft must live on the device

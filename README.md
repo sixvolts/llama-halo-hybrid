@@ -13,8 +13,9 @@ but with a little more RAM (~160GB, obv with caveats), and it's a regular 16-cor
 ![The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU](docs/halo-hybrid/build.jpeg)
 
 So, the kicker is that it works. The model this tree is built around is **Qwen3.8-Flash-Next** (unsloth
-UD-Q4_K_XL, 111 GB): on the Strix Halo plus the R9700 it decodes at **45 tok/s** (52 greedy) with the model's own
-MTP draft head and prefills at **~1,500 tok/s**, where stock llama.cpp on the same layout does 27-28 tok/s. The
+UD-Q4_K_XL, 111 GB): on the Strix Halo plus the R9700 it decodes at **63 tok/s** (real content, T=0.7) with the
+model's own MTP draft head and prefills at **~2,200 tok/s** at 16K, where stock llama.cpp on the same layout does
+27-28 tok/s. On the Strix Halo alone it does ~40 tok/s and ~870 tok/s. The
 same tree also runs the 200 GB GLM-5.3-Flash across two of these boxes over a 100G link. (The setup was put
 together on Qwen3.5-122B, 24 → 49 tok/s; 3.8 came out the week it was working, and the numbers below are 3.8's.)
 
@@ -34,9 +35,9 @@ The launch line for that layout:
 ```
 LLAMA_PREFILL_LANES=2 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --load-mode none -np 1 \
-  -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU' \
-  -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 40960 -b 5120 -ub 2560 -np 1 \
+  -ot 'blk\.(1[1-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
+  -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
   --spec-type draft-mtp --spec-draft-n-max 2 \
   --host 0.0.0.0 --port 8080
 ```
@@ -54,8 +55,8 @@ the [cookbook](docs/halo-hybrid/COOKBOOK.md); the kernel and scheduler changes b
 
 | Hardware | Model it runs here | Status | Numbers |
 |---|---|---|---|
-| [One Strix Halo, nothing else](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) | anything up to ~115 GB | runs | the baseline the hybrids are measured against (24 tok/s on Qwen3.5-122B) |
-| [One Strix Halo + one R9700](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Qwen3.5-122B | production | 45 tok/s (52 greedy), ~1,500 tok/s prefill |
+| [One Strix Halo, nothing else](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~870 tok/s prefill at 16K |
+| [One Strix Halo + one R9700](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Qwen3.5-122B | production | 63 tok/s, ~2,200 tok/s prefill at 16K (Qwen3.8) |
 | [Two Strix Halos over RDMA](docs/halo-hybrid/COOKBOOK.md#3-two-strix-halos-over-rdma) | GLM-5.3-Flash (200 GB) | derived, not measured | |
 | [Two Strix Halos + one R9700 on the head node](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node) | GLM-5.3-Flash | production | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K |
 | [Two Strix Halos + one R9700 on each](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each) | GLM-5.3-Flash | planned, card ordered | estimate 23-25 tok/s |
@@ -65,7 +66,8 @@ the [cookbook](docs/halo-hybrid/COOKBOOK.md); the kernel and scheduler changes b
 The hybrid-N table for different context budgets, the per-stream numbers with and without the draft head, and the
 iGPU-only baseline are in the cookbook: [recipe 1](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) (no
 card) and [recipe 2](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) (with the R9700). The draft head is
-the `shared-Q8_0` file in the unsloth repo's `MTP/` folder; it borrows the target's embeddings and lm head.
+the MTP head from the unsloth repo's `MTP/` folder with q4_K experts and its own q4_K LM head (recipe 6 has the
+commands); it borrows the target's embeddings. The 26.8 GB n-gram table is read on demand; don't pin it to the CPU.
 
 ## GLM-5.3-Flash across two Strix Halo boxes
 

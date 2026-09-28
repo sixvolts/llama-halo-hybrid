@@ -6,8 +6,8 @@ everywhere; only the device list changes.
 
 | # | Hardware | Status | Best numbers here | Recipe |
 |---|---|---|---|---|
-| 1 | One Strix Halo, nothing else | measured | Qwen3.8-Flash-Next: 26 tok/s serial, 34 greedy / 30 sampled with the MTP head; prefill 700 tok/s at 4.9K, 590 at 20K | [1](#1-one-strix-halo-by-itself) |
-| 2 | One Strix Halo + one R9700 | production (Qwen3.8-Flash-Next) | 45 tok/s decode (52 greedy), ~1,500 tok/s prefill | [2](#2-one-strix-halo--one-r9700) |
+| 1 | One Strix Halo, nothing else | measured (2026-09-28) | Qwen3.8-Flash-Next: 40-41 tok/s with the MTP head (55-56 ms/step, real content, T=0.7); prefill 940 / 870 / 780 tok/s at 4K / 16K / 32K | [1](#1-one-strix-halo-by-itself) |
+| 2 | One Strix Halo + one R9700 | production (Qwen3.8-Flash-Next, 2026-09-28) | 63 tok/s decode (35.4 ms/step, real content, T=0.7); prefill 2,090 / 2,220 / 2,030 tok/s at 4K / 16K / 32K | [2](#2-one-strix-halo--one-r9700) |
 | 3 | Two Strix Halos over RDMA, no dGPU | derived, not measured | see 4 minus the R9700 | [3](#3-two-strix-halos-over-rdma) |
 | 4 | Two Strix Halos + one R9700 on the head node | production (GLM-5.3-Flash, 200 GB) | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K | [4](#4-two-strix-halos--one-r9700-on-the-head-node) |
 | 5 | Two Strix Halos + one R9700 on each | planned (card ordered) | estimate 23-25 tok/s decode | [5](#5-two-strix-halos--one-r9700-on-each) |
@@ -39,13 +39,19 @@ if there is no R9700. ROCm 7.2 is what this tree is built and tested with.
   every `attn_output.weight`.
 * **Drain the iGPU's TTM pool before a big load**: `sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'`. Without it
   the kernel's OOM killer takes the loader on the second run.
-* **`--fit off -fa on -ngl 999 --load-mode none`** on every line: no automatic fitting, flash attention, everything
-  offloaded, no mmap.
+* **`--fit off -fa on -ngl 999`** on every line: no automatic fitting, flash attention, everything offloaded. For
+  Qwen3.8 leave the load mode alone and do NOT override `per_layer_token_embd` to CPU: the 26.8 GiB n-gram table is
+  read on demand from the page cache by default (lazy mode, a846a1e01); the old `-ot per_layer_token_embd=CPU` /
+  `--load-mode none` lines forced a resident 26.8 GiB copy.
 * **The MTP draft head** (`-md <draft.gguf> --spec-type draft-mtp --spec-draft-n-max 2 -devd <device>`) goes on the
-  device that holds the dense trunk; it borrows the target's embeddings and lm head, so `-devd` must name a device
-  that has them. n-max 2 measured best on both models here; 4 only for sampled code.
+  device that holds the dense trunk; it borrows the target's embeddings, so `-devd` must name a device that has them.
+  Give it its own q4_K LM head (recipe 6 shows how): drafting then reads 341 MB instead of the target's 680 MB q8_0
+  output layer twice per step (-1.1 ms/step hybrid, -3 ms/step APU-only, same acceptance); verification keeps the
+  target's output layer. n-max 2 measured best (3 loses 2.5%).
 * **`LLAMA_PREFILL_LANES=2`** runs consecutive ubatches on two schedulers so the iGPU's expert GEMMs overlap the
-  other device's attention (`-b` at least twice `-ub`). With a remote device it becomes the rolling prefill pipeline.
+  other device's attention (`-b` at least twice `-ub`). It needs two GPU devices: on the iGPU alone it is ignored.
+  With a remote device it becomes the rolling prefill pipeline. It is the whole hybrid prefill win (one lane:
+  ~1,450 tok/s at 16K instead of ~2,200).
 
 ## 1. One Strix Halo by itself
 
@@ -54,26 +60,31 @@ Gated-DeltaNet recurrence, WMMA flash attention for head sizes 256 and 512, the 
 dequantize-once q8_0 WMMA GEMM, per-layer launch fusion) all applies to this box; every change in the tree is
 measured on the iGPU too.
 
-Qwen3.8-Flash-Next, single stream, 8K context, draft head on the same device:
+Qwen3.8-Flash-Next, single stream, 40K context, draft head (own q4_K LM head, recipe 6) on the same device:
 
 ```
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'
-LLAMA_PREFILL_LANES=2 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -dev ROCm0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --load-mode none -np 1 \
-  -ot 'per_layer_token_embd=CPU' \
-  -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max 2 \
+  -dev ROCm0 --fit off -fa on -ngl 999 -c 40960 -b 4096 -ub 4096 -np 1 \
+  -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max 2 \
   --host 0.0.0.0 --port 8080
 ```
 
-(`ROCm0` is the iGPU when it is the only ROCm device.) Measured on this tree (same prompt and sampler as recipe 2's
-table; the R9700 was present but idle):
+(`ROCm0` is the iGPU when it is the only ROCm device; on gibson it is `ROCm1`.) `-ub 4096` beats 2048 by 5% / 2.5% /
+2% at 4K / 16K / 32K; decode is the same at either. Measured 2026-09-28 at e6bb60de4 (gibson, R9700 idle; prefill =
+fresh server, 4K/16K/32K record prompts; decode = six real-content prompts, T=0.7, 400 tokens, two seeds):
 
-| | prefill tok/s | decode greedy | decode, model-card sampler |
-|---|---|---|---|
-| no draft head | (short-prompt harness) | 26.3 | 26.2 |
-| MTP head, n-max 2 | (short-prompt harness) | 33.9 | 29.9 |
-| MTP head + `LLAMA_PREFILL_LANES=2` | 700 at 4.9K, 590 at 20K (cold and warm alike) | 34.7 | 30.4 |
+| | prefill 4K / 16K / 32K tok/s | decode |
+|---|---|---|
+| base UD-Q4_K_XL, draft with own q4_K head | 937-946 / 865-871 / 778-782 | 55.2-56.0 ms/step, 39.9-41.4 tok/s |
+| same, draft sharing the q8_0 output layer | - | 58.3-58.7 ms/step, 38.3-38.5 tok/s |
+| Swift 1.5 Q8T, draft with own q4_K head | 935-940 / 866-867 / 780-781 | - |
+
+gufo (APU-only engine) on the same box: prefill 1,359 / 1,431 / 1,410, MTP decode 34.8 tok/s on its own harness
+(temperature 0, not like for like). The prefill gap is hyper-connection traffic and the sparse-attention pipeline;
+experts, dense GEMMs and the GDN scan are at parity (see APU-DECODE-BUDGET.md).
+
+Older comparison (2026-09-16, before the 09-24..09-28 rounds):
 
 Same box, same HTTP bench tool (halogen's `halogen-bench.py`, tg128 = mean over its ten prompt shapes, pp = cold
 prefill), this tree on the iGPU against halogen-flash-server 0.11.1 on its own 4-bit checkpoint (2026-09-16):
@@ -101,55 +112,51 @@ expert layers on the card as VRAM allows. The launch line is in the README; the 
 
 ### Qwen3.8-Flash-Next
 
-New model, who dis. Same idea as above:
-dense trunk, KV cache and the draft head on the R9700, the routed experts of most layers on the Strix, the n-gram
-table in host RAM. This repo's `main` is upstream master plus the MTP work from unslothai/llama.cpp#144 and
-ggml-org#28118, plus the kernel and scheduler changes in [HALO-HYBRID.md](HALO-HYBRID.md). On this layout stock
-llama.cpp decodes at 27–28 tok/s; this branch does ~45 (52 greedy), and prefills at ~1,500 tok/s.
+Dense trunk, KV cache and the draft head on the R9700, the routed experts of layers 11-47 on the Strix, the n-gram
+table read on demand from the page cache. This repo's `main` is upstream master plus the MTP work from
+unslothai/llama.cpp#144 and ggml-org#28118, plus the kernel and scheduler changes in
+[HALO-HYBRID.md](../../HALO-HYBRID.md) and [APU-DECODE-BUDGET.md](APU-DECODE-BUDGET.md).
 
-Launch (single user, 8K context; ROCm0 is the R9700, ROCm1 the iGPU — check the device order in the startup log):
+Launch (single user, 40K context; ROCm0 is the R9700, ROCm1 the iGPU - check the device order in the startup log):
 
 ```
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
 
 LLAMA_PREFILL_LANES=2 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 8192 -b 4096 -ub 1024 --load-mode none -np 1 \
-  -ot 'blk\.(1[4-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU' \
-  -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -devd ROCm0 -ngld 999 \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 40960 -b 5120 -ub 2560 -np 1 \
+  -ot 'blk\.(1[1-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
+  -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
   --spec-type draft-mtp --spec-draft-n-max 2 \
   --host 0.0.0.0 --port 8080
 ```
 
-* **Model:** `unsloth/Qwen3.8-Flash-Next-GGUF` UD-Q4_K_XL (four shards, 111 GB). Draft head: the `shared-Q8_0` file
-  in that repo's `MTP/` folder (2.6 GB); it borrows the target's embeddings and lm head, so `-devd ROCm0` is required.
-* **Layout:** `-ot` sends the routed experts of layers N–47 to the iGPU ("hybrid-N") and keeps the n-gram table in
-  host RAM. Each layer kept on the R9700 costs it ~1.4 GB, so pick N by what has to fit next to the 2.6 GB head:
+This is `~/bench/q38_hybrid_srv.sh`'s default line. Measured 2026-09-28 at e6bb60de4 (gibson; prefill = fresh
+server, 4K/16K/32K record prompts, two servers; decode = six real-content prompts, T=0.7, 400 tokens, two seeds):
 
-  | context | layout | `-ot` pattern |
-  |---|---|---|
-  | 1 slot, 8K | hybrid-14 | `blk\.(1[4-9]\|[2-4][0-9])` |
-  | 1–2 slots, 16K each | hybrid-12 | `blk\.(1[2-9]\|[2-4][0-9])` |
-  | 2 slots, 32K each | hybrid-11 | `blk\.(1[1-9]\|[2-4][0-9])` |
-  | 64K+ (sparse-attention gather turns on by itself) | hybrid-10 | `blk\.(1[0-9]\|[2-4][0-9])` |
+| | prefill 4K / 16K / 32K tok/s | decode |
+|---|---|---|
+| base UD-Q4_K_XL, this line | 2086-2088 / 2211-2227 / 2025-2031 | 35.4-35.5 ms/step, 62.8-62.9 tok/s |
+| same with `-b 4096 -ub 2048` and the draft sharing the q8_0 output layer (the 09-27 line) | 2074-2080 / 2097 / 1944-1946 | 36.5-36.6 ms/step, 61.7-62.2 tok/s |
+| Swift 1.5 Q8T (recipe 6), this line | 1895-1936 / 2174-2181 / 1980-1981 | ~36.0 ms/step |
 
-  Without the head, 4 slots at 32K fit at hybrid-12. `-ctk q8_0 -ctv q8_0` halves the KV cost (1.1 GB per 32K slot).
-* **Prefill:** `LLAMA_PREFILL_LANES=2` runs consecutive ubatches on two schedulers so the iGPU's expert GEMMs
-  overlap the R9700's attention; with the MoE GEMM tile fixes and the R9700's f32 matmul paths (all on by
-  default) warm prefill at 3.7K / 15K / 30K is **1503 / 1258 / 1025** tok/s at `-ub 1024` and 1626 / 1324 / 1049
-  at `-ub 2048`, from 676 / 616 / 540 on the single-lane branch. The second lane costs a second set of compute
-  buffers on the R9700 (0.75 GB at `-ub 1024`, 1.5 GB at 2048), so with the head use `-ub 1024`; `-b` must be at
-  least twice `-ub`. Details and the scheduler fixes it needed: HALO-HYBRID.md, "Two-lane prefill".
-* **Decode:** `--spec-draft-n-max 2` (3 is the same within noise, 4 is worse). Acceptance is ~0.70 greedy and
-  ~0.51 with the model-card sampler (temperature 1.0, top-p 0.95, top-k 20), which is the whole difference between
-  52 and 45 tok/s. The head only pays at one or two streams; for more users leave the `-md`/`--spec-*` lines out.
+* **Model:** `unsloth/Qwen3.8-Flash-Next-GGUF` UD-Q4_K_XL (four shards, 111 GB). Draft: the MTP head from that repo's
+  `MTP/` folder with q4_K experts and its own q4_K LM head (recipe 6's commands, with the base model's
+  `output.weight` from shard 2 as the head source). It borrows the target's embeddings, so `-devd ROCm0` is required.
+* **`-ub 2560 -b 5120`:** every ubatch of a long prompt is >= 2048 tokens, where the iGPU's F16 expert GEMM takes
+  over from MMQ (+6% at 16K, +4% at 32K over `-ub 2048`). `-ub 4096` does not fit on the R9700 with two lanes.
+  Moving the expert split (layers 9-12) is a wash.
+* **Prefill lanes:** `LLAMA_PREFILL_LANES=2` is the whole win (one lane: 1,420-1,490 tok/s). `-b` must be at least
+  twice `-ub`.
+* **Decode:** `--spec-draft-n-max 2` (3 loses 2.5%). The head only pays at one or two streams; for more users leave
+  the `-md`/`--spec-*` lines out.
 * **API:** use `/v1/chat/completions` (a bare prompt on `/completion` stops after one token with this model). The
   model thinks by default; `"chat_template_kwargs": {"enable_thinking": false}` turns it off per request.
-* **Memory:**  ~51 GB of experts on the iGPU, the 28.8 GB table plus page cache in
-  host RAM, 23–26 GB plus the head on the R9700. Drain caches before launching after big file activity.
+* **Memory:** ~51 GB of experts on the iGPU, the n-gram table in page cache, 23-26 GB plus the head on the R9700.
+  Drain caches before launching after big file activity.
 
-Measured on this build (model-card sampler, 4K prompts, 256-token completions; `-b 4096 -ub 1024`,
-`LLAMA_PREFILL_LANES=2`; "agg" is the sum over streams, single-stream rows are the per-stream number; the prefill
+Older multi-stream measurements (2026-09-2x, `-b 4096 -ub 1024`, hybrid-12, shared-Q8_0 draft, model-card sampler;
+not re-measured since; 4K prompts, 256-token completions; `LLAMA_PREFILL_LANES=2`; "agg" is the sum over streams, single-stream rows are the per-stream number; the prefill
 column's first request of a fresh server is cold, warm numbers are 10–20% higher):
 
 | streams | layout | prefill, agg tok/s | decode, no draft | decode, MTP n-max 2 |
@@ -295,11 +302,12 @@ Two builds, both with the fine-tune's own MTP head (the published GGUF has none)
 
 | file | trunk | hybrid prefill 4K/16K/32K | real-content decode | ppl (8 chunks) |
 |---|---|---|---|---|
-| ukisai Q4_K_M | q4_K/q5_K/q6_K | 1887 / 1907 / 1769 | 57-58 t/s | 7.52 |
-| Q8T (this recipe) | q8_0 (unsloth UD types) | 1877-1907 / 1902 / 1764 | 57-58 t/s with the q4_K draft head (55-56 shared) | 7.29 |
+| ukisai Q4_K_M | q4_K/q5_K/q6_K | 1887 / 1907 / 1769 (09-27, `-ub 2048`) | 57-58 t/s (09-27) | 7.52 |
+| Q8T (this recipe) | q8_0 (unsloth UD types) | 1895-1936 / 2174-2181 / 1980-1981 (09-28, recipe 2's line) | ~36.0 ms/step, ~62 t/s with the q4_K draft head | 7.29 |
 
-Q8T is the better model (3% lower perplexity) at the same hybrid decode once the draft has its own q4_K head; APU-only it decodes 14% slower than the
-Q4_K_M (26.8 vs 31.3 t/s without a draft), so APU-only users may prefer the Q4_K_M.
+Q8T is the better model (3% lower perplexity) at the same hybrid decode once the draft has its own q4_K head. APU-only
+its q8_0 trunk costs decode bandwidth (26.8 vs 31.3 t/s for the Q4_K_M without a draft, 09-27), so APU-only users may
+prefer the Q4_K_M; prefill is the same (935-940 / 866-867 / 780-781 with `-ub 4096` and the draft).
 
 ```bash
 S=docs/halo-hybrid; R=ukisai/Swift1.5-Qwen3.8-Flash-Next
@@ -310,8 +318,10 @@ llama-quantize --tensor-type indexer=bf16 --tensor-type ffn_gate_exps=q4_K --ten
   --tensor-type ffn_down_exps=q5_1 mtp-bf16.gguf mtp-shared-exps-q4k.gguf Q8_0
 # recommended: give the draft its own q4_K LM head (drafting reads 341 MB instead of the 680 MB q8_0 output layer
 # twice per step; verification keeps output.weight). Swift Q8T: 40.6 -> 39.6 ms/step at unchanged acceptance.
-# (lm_head.weight comes from the bf16 trunk conversion below; on base Qwen3.8 the same head lowers acceptance
-#  0.66 -> 0.62-0.64 and nets out even, so base keeps the shared head)
+# (lm_head.weight comes from the bf16 trunk conversion below. For base Qwen3.8 use the target's q8_0 output.weight:
+#  add_draft_head.py mtp-Qwen3.8-Flash-Next-shared-exps-q4k.gguf Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf \
+#    output.weight mtp-head-q8.gguf, then the llama-quantize line below with --allow-requantize. Measured 09-28:
+#  hybrid 36.5 -> 35.4 ms/step, APU-only 58.5 -> 55.6, acceptance 0.63-0.64 -> 0.62-0.65.)
 python3 $S/add_draft_head.py mtp-bf16.gguf trunk-f32.gguf output.weight mtp-head-f32.gguf
 llama-quantize --tensor-type indexer=bf16 --tensor-type ffn_gate_exps=q4_K --tensor-type ffn_up_exps=q4_K \
   --tensor-type ffn_down_exps=q5_1 --tensor-type shared_head_head=q4_K mtp-head-f32.gguf mtp-shared-exps-q4k-head-q4_K.gguf Q8_0
@@ -320,5 +330,5 @@ python3 $S/fetch_hf_tensors.py $R trunk-src . 'mlp\.experts\.|ngram_embedding\.s
 python convert_hf_to_gguf.py trunk-src --no-mtp --outtype f32 --outfile trunk-f32.gguf
 python3 $S/merge_trunk.py Swift-...-Q4_K_M-00001-of-00003.gguf trunk-f32.gguf Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   Q8T/Swift-1.5-Qwen3.8-Flash-Next-Q8trunk.gguf --name="Swift 1.5 Qwen3.8-Flash-Next (q8_0 trunk, ukisai Q4_K_M experts)"
-# run: q38_hybrid_srv.sh with M=<Q8T shard 1> MD=<mtp-shared-exps-q4k-head-q4_K.gguf>, LLAMA_PREFILL_LANES=2 EXP_FROM=11
+# run: q38_hybrid_srv.sh with M=<Q8T shard 1> MD=<mtp-shared-exps-q4k-head-q4_K.gguf> (its defaults: lanes 2, -ub 2560 -b 5120, experts 11-47 on the iGPU)
 ```
