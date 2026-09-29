@@ -1841,6 +1841,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 llama_token id = cur_p->data[0].id;
 
+                // a corrupt candidate (an id outside the vocab) would fail the next draft decode and, through it, every
+                // sequence in the batch: stop drafting this sequence instead
+                if (id < 0 || id >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)))) {
+                    SPC_ERR("seq %d: draft candidate id %d outside the vocab, dropping the draft\n", seq_id, id);
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
+                }
+
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;

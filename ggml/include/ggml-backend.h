@@ -381,6 +381,9 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_tail(ggml_backend_sched_t sched);
     // synchronize the local backends only (a remote's queue is ordered by itself)
     GGML_API void                 ggml_backend_sched_synchronize_local(ggml_backend_sched_t sched);
+    // halo-hybrid: re-record the current copy's split events on every backend that has them, so they also cover work queued
+    // after the graph (the caller's async output reads); the next graph's user-input copies wait on these events
+    GGML_API void                 ggml_backend_sched_record_output_events(ggml_backend_sched_t sched);
     // a backend whose queue lives on another host (RPC): synchronizing it drains that host's whole command queue
     GGML_API bool                 ggml_backend_sched_backend_is_remote_ext(ggml_backend_t backend);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);

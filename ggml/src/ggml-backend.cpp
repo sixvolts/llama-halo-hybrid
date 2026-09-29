@@ -2939,6 +2939,16 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     }
 }
 
+void ggml_backend_sched_record_output_events(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_event_t ev = sched->events[i][sched->cur_copy];
+        if (ev != NULL) {
+            ggml_backend_event_record(ev, sched->backends[i]);
+        }
+    }
+}
+
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
     GGML_ASSERT(sched);
     sched->callback_eval = callback;

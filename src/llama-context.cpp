@@ -2292,6 +2292,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sch, &sampling.candidates_count);
         }
 
+        // halo-hybrid: the scheduler's split events (on by default for local GPUs, n_copies == 1) were recorded when
+        // the graph finished, before the output reads above were queued. The next ubatch's user-input copies only wait
+        // on those events, so a differently-allocated next graph could overwrite this ubatch's output tensors while
+        // their reads were still in flight (MTP drafts with several sequences read hidden-state floats as token ids).
+        // Re-record the events behind the reads. GGML_SCHED_NO_OUTPUT_EVENTS=1 restores the old behaviour.
+        {
+            static const bool no_out_ev = getenv("GGML_SCHED_NO_OUTPUT_EVENTS") != nullptr;
+            if (!no_out_ev) {
+                ggml_backend_sched_record_output_events(sch);
+            }
+        }
+
         // halo-hybrid: per-ubatch hook (the MTP draft's early ingest). The rows above are async copies: complete them
         // on their own device only - a remote backend's queue may already hold the next pipelined graph, so a
         // ubatch whose rows live there is skipped (the consumer then ingests it after llama_decode returns)

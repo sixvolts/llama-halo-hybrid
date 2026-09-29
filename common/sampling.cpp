@@ -159,6 +159,18 @@ struct common_sampler {
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+
+        // debug: LLAMA_SAMPLING_CHECK=1 validates the ids a backend sampler handed back
+        static const bool check = getenv("LLAMA_SAMPLING_CHECK") != nullptr;
+        if (check && sampled_ids) {
+            for (size_t i = 0; i < cur.size(); ++i) {
+                if (cur[i].id < 0 || cur[i].id >= n_vocab) {
+                    LOG_ERR("%s: bad backend candidate idx=%d i=%zu id=%d (as float %g) count=%zu probs=%d logits=%d\n", __func__,
+                            idx, i, cur[i].id, (double) *(const float *) &cur[i].id, cur.size(), sampled_probs != nullptr, sampled_logits != nullptr);
+                    break;
+                }
+            }
+        }
     }
 
     common_time_meas tm() {
