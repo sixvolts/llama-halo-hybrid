@@ -501,9 +501,9 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
     return d3*d8 * sumi;
 }
 
-// scale * dot-sum for the K-quant MMQ paths. The integer product is exact in fp32 (a scale of at
-// most 7 bits times a dot sum below 2^17), and on AMD v_mul_lo_u32 is quarter rate while the float
-// multiply is full rate, so do it in float there. Same result on both paths.
+// scale * dot-sum for the K-quant MMQ and MMVQ paths. The integer product is exact in fp32 (a scale
+// of at most 8 bits times a dot sum below 2^17), and on AMD v_mul_lo_u32 is quarter rate while the
+// float multiply is full rate, so do it in float there. Same result on both paths.
 static __device__ __forceinline__ float ggml_cuda_mmq_scale_sumi(const int sc, const int sumi) {
 #ifdef GGML_USE_HIP
     return (float) sc * (float) sumi;
@@ -531,8 +531,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+        sumf_d += d8[i] * ggml_cuda_mmq_scale_sumi(sc[i], dot1);
+        sumf_m += d8[i] * ggml_cuda_mmq_scale_sumi(m[i], dot2);  // multiply constant part of q4_K with sum of q8_1 values
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -593,8 +593,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * ggml_cuda_mmq_scale_sumi(sc[i], dot1);
+        sumf_m += d8[i] * ggml_cuda_mmq_scale_sumi(m[i], dot2);
 
     }
 
@@ -651,7 +651,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vi = __vsub4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * ggml_cuda_mmq_scale_sumi(sc, ggml_cuda_dp4a(vi, u[i], 0)); // SIMD dot product
     }
 
     return d*sumf;
