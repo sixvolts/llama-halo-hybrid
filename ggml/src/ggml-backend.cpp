@@ -2885,10 +2885,24 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    // debug: GGML_SCHED_TIME=1 prints the split and allocation time of every graph that takes over 1 ms
+    static const bool sched_time = getenv("GGML_SCHED_TIME") != nullptr;
+    const int64_t ts0 = sched_time ? ggml_time_us() : 0;
+
     ggml_backend_sched_split_graph(sched, graph);
+
+    const int64_t ts1 = sched_time ? ggml_time_us() : 0;
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+
+    if (sched_time) {
+        const int64_t ts2 = ggml_time_us();
+        if (ts2 - ts0 > 1000) {
+            GGML_LOG_WARN("sched-time: %d nodes, %d splits: split %lld us, alloc %lld us\n", graph->n_nodes, sched->n_splits,
+                (long long) (ts1 - ts0), (long long) (ts2 - ts1));
+        }
     }
 
     // halo-hybrid (diagnostic): GGML_SCHED_ZERO_BUFFERS=1 zeroes the local compute buffers after every allocation

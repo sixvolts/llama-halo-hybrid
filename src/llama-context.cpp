@@ -1663,6 +1663,12 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    static const int prep_debug_lvl = getenv("LLAMA_LANES_DEBUG") ? atoi(getenv("LLAMA_LANES_DEBUG")) : 0;
+    if (prep_debug && ubatch.n_tokens < 32 && prep_debug_lvl >= 2) {
+        const int64_t tp5 = ggml_time_us();
+        LLAMA_LOG_WARN("prep-debug-us: %u tokens: %s build %lld, alloc %lld, sync %lld, set_inputs %lld\n", ubatch.n_tokens,
+            reused ? "reused," : "new,", (long long) (tp2 - tp1), (long long) (tp3 - tp2), (long long) (tp4 - tp3), (long long) (tp5 - tp4));
+    }
     if (prep_debug && ubatch.n_tokens >= 32) {
         const int64_t tp5 = ggml_time_us();
         LLAMA_LOG_INFO("prep-debug: lane %d, %u tokens: apply %.0f ms, %s build %.0f ms, alloc %.0f ms, sync %.0f ms, set_inputs %.0f ms\n",
