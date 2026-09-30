@@ -129,6 +129,9 @@ Presets:
 - **128K concurrency preset:** experts 5-47 on the APU, `-ub 2560 -b 5120`.
 - **262K:** experts 5-47 on the APU, `-ub 2560`, with `LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512` (next section).
 
+The table is at `--spec-draft-n-max 2`. With `--spec-draft-n-max 3` (sampled requests are still capped at 2 drafts,
+`LLAMA_SPEC_NMAX_SAMPLED`), greedy decode on the prefill preset is 74.3 tok/s, 1.7x the Spark.
+
 Swift 1.5 on the 128K prefill preset measured 2,382 / 2,178 / 1,752 prefill and 67.1 tok/s decode.
 
 What that means:
