@@ -1889,9 +1889,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         }
                         q.resize(std::max<size_t>(1, keep));
                     }
+                    // the draft's own temperature need not equal the target's: any q keeps the verify lossless as long
+                    // as the draft token is drawn from it, and acceptance is sum(min(p, q)). LLAMA_SPEC_RS_TEMP_SCALE
+                    // scales the draft temperature (debug / calibration)
+                    static const double t_scale = getenv("LLAMA_SPEC_RS_TEMP_SCALE") ? atof(getenv("LLAMA_SPEC_RS_TEMP_SCALE")) : 1.0;
+                    const double t_d = dp.temp * t_scale;
                     double z = 0.0;
                     for (auto & c : q) {
-                        c.p = (float) std::exp((double) (c.logit - lmax) / dp.temp);
+                        c.p = (float) std::exp((double) (c.logit - lmax) / t_d);
                         z  += c.p;
                     }
                     for (auto & c : q) {
