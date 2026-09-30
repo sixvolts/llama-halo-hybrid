@@ -12365,3 +12365,30 @@ void ggml_compute_forward_qsa_top_k(const struct ggml_compute_params * params, s
         }
     }
 }
+
+// halo-hybrid: GGML_OP_QSA_HEAD_SUM (ggml.h)
+void ggml_compute_forward_qsa_head_sum(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * bias = dst->src[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t nb   = x->ne[0];
+    const int64_t nh   = x->ne[1];
+    const int64_t nrow = x->ne[2]*x->ne[3];
+
+    for (int64_t r = params->ith; r < nrow; r += params->nth) {
+        const int64_t t = r % x->ne[2];
+        const int64_t s = r / x->ne[2];
+        float * d = (float *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[2]);
+        const float * bi = bias ? (const float *) ((const char *) bias->data + t*bias->nb[1] + s*bias->nb[2]) : nullptr;
+        for (int64_t b = 0; b < nb; ++b) {
+            float acc = 0.0f;
+            for (int64_t h = 0; h < nh; ++h) {
+                const float v = *(const float *) ((const char *) x->data + b*x->nb[0] + h*x->nb[1] + t*x->nb[2] + s*x->nb[3]);
+                const float rv = v > 0.0f ? v : 0.0f;
+                acc = h == 0 ? rv : acc + rv;
+            }
+            d[b] = bi ? acc + bi[b] : acc;
+        }
+    }
+}

@@ -207,3 +207,52 @@ void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// halo-hybrid: GGML_OP_QSA_HEAD_SUM - relu per head, summed in head order, plus the optional bias; one read of each
+// head row and one write, where relu + a chain of adds + the bias add made ~4x the passes over [n_blocks, n_tok]
+template <int NH>
+static __global__ void k_qsa_head_sum(const float * __restrict__ x, const float * __restrict__ bias, float * __restrict__ dst,
+        const int64_t nb, const int nh_rt, const int64_t n_tok,
+        const int64_t sx1, const int64_t sx2, const int64_t sx3, const int64_t sb1, const int64_t sb2,
+        const int64_t sd1, const int64_t sd2) {
+    const int64_t b = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t t = blockIdx.y;
+    const int64_t s = blockIdx.z;
+    if (b >= nb) {
+        return;
+    }
+    const float * xr = x + t*sx2 + s*sx3 + b;
+    const int nh = NH > 0 ? NH : nh_rt;
+    float acc = fmaxf(xr[0], 0.0f);
+#pragma unroll
+    for (int h = 1; h < (NH > 0 ? NH : 64); ++h) {
+        if (NH == 0 && h >= nh) { break; }
+        acc = acc + fmaxf(xr[h*sx1], 0.0f);
+    }
+    if (bias) {
+        acc = acc + bias[t*sb1 + s*sb2 + b];
+    }
+    dst[t*sd1 + s*sd2 + b] = acc;
+}
+
+void ggml_cuda_op_qsa_head_sum(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * bias = dst->src[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
+    const int64_t nb = x->ne[0];
+    const int     nh = (int) x->ne[1];
+    const dim3 grid((unsigned) ((nb + 255) / 256), (unsigned) x->ne[2], (unsigned) x->ne[3]);
+    const int64_t sx1 = x->nb[1]/sizeof(float), sx2 = x->nb[2]/sizeof(float), sx3 = x->nb[3]/sizeof(float);
+    const int64_t sb1 = bias ? bias->nb[1]/sizeof(float) : 0, sb2 = bias ? bias->nb[2]/sizeof(float) : 0;
+    const int64_t sd1 = dst->nb[1]/sizeof(float), sd2 = dst->nb[2]/sizeof(float);
+    const float * bp = bias ? (const float *) bias->data : nullptr;
+    if (nh == 4) {
+        k_qsa_head_sum<4><<<grid, 256, 0, ctx.stream()>>>((const float *) x->data, bp, (float *) dst->data, nb, nh, x->ne[2],
+            sx1, sx2, sx3, sb1, sb2, sd1, sd2);
+    } else {
+        GGML_ASSERT(nh >= 1 && nh <= 64);
+        k_qsa_head_sum<0><<<grid, 256, 0, ctx.stream()>>>((const float *) x->data, bp, (float *) dst->data, nb, nh, x->ne[2],
+            sx1, sx2, sx3, sb1, sb2, sd1, sd2);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

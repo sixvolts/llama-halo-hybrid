@@ -2566,6 +2566,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_QSA_TOP_K:
             ggml_cuda_op_qsa_top_k(ctx, dst);
             break;
+        case GGML_OP_QSA_HEAD_SUM:
+            ggml_cuda_op_qsa_head_sum(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -7901,6 +7904,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_KQ_MASK_BUILD:
             return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && op->ne[1] <= 65535;
+        case GGML_OP_QSA_HEAD_SUM:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) && op->src[0]->ne[1] <= 64 &&
+                op->src[0]->ne[2] <= 65535 && op->src[0]->ne[3] <= 65535 &&
+                (op->src[1] == nullptr || (op->src[1]->type == GGML_TYPE_F32 && op->src[1]->nb[0] == sizeof(float)));
         case GGML_OP_QSA_TOP_K:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
                 op->ne[1] <= INT32_MAX;

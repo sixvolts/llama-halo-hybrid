@@ -7793,6 +7793,55 @@ struct test_qsa_top_k : public test_case {
     }
 };
 
+// halo-hybrid: GGML_OP_QSA_HEAD_SUM
+struct test_qsa_head_sum : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_head;
+    const int64_t n_tok;
+    const bool    with_bias;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_HEAD_SUM"; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_blocks, n_head, n_tok, with_bias);
+    }
+
+    double max_err() override { return 0.0; }
+
+    test_qsa_head_sum(int64_t n_blocks, int64_t n_head, int64_t n_tok, bool with_bias)
+        : n_blocks(n_blocks), n_head(n_head), n_tok(n_tok), with_bias(with_bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_blocks, n_head, n_tok, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * bias = nullptr;
+        if (with_bias) {
+            bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tok, 1);
+            ggml_set_name(bias, "bias");
+        }
+        ggml_tensor * out = ggml_qsa_head_sum(ctx, x, bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321 + n_blocks + n_tok);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "x") == 0) {
+                std::vector<float> v(ggml_nelements(t));
+                std::uniform_real_distribution<float> d(-2.0f, 2.0f);
+                for (auto & e : v) { e = d(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "bias") == 0) {
+                // the indexer's visibility bias: -inf (not visible), 0, 1e9 (tail)
+                std::vector<float> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) { v[i] = i % 7 == 0 ? -INFINITY : (i % 11 == 0 ? 1e9f : 0.0f); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 struct test_top_k : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -12503,6 +12552,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_top_k(300, 17, 290, 101, 3, 1000, ties));       // ratio 3
         test_cases.emplace_back(new test_qsa_top_k(28672, 32, 28600, 2051, 4, 114000, ties)); // 113K prefill rows
         test_cases.emplace_back(new test_qsa_top_k(65536, 8, 65530, 2051, 4, 262000, ties));  // 262K
+    }
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_qsa_head_sum(2560, 4, 64, b));
+        test_cases.emplace_back(new test_qsa_head_sum(28672, 4, 16, b));
+        test_cases.emplace_back(new test_qsa_head_sum(701, 3, 33, b));
     }
     // halo-hybrid (A3): whole MoE blocks (P6 takes n = 512: 4096 rows >= 40 per expert; n = 64 stays below it), partial
     // 192-row tiles, zero-row experts (64 experts, 8 used), and the other expert-GEMV/GEMM edges of the round

@@ -604,6 +604,7 @@ extern "C" {
         GGML_OP_DSV4_HC_MIX,   // halo-hybrid: appended last so the ids above stay wire-stable
         GGML_OP_KQ_MASK_BUILD, // halo-hybrid (2026-09-23): masks built on the device from per-cell/per-query ints
         GGML_OP_QSA_TOP_K,     // halo-hybrid (2026-09-28): block-level top-k of the qwen4exp QSA indexer
+        GGML_OP_QSA_HEAD_SUM,  // halo-hybrid (2026-09-30): the QSA indexer's rectified head sum (+ bias) in one pass
 
         GGML_OP_COUNT,
     };
@@ -2753,6 +2754,15 @@ extern "C" {
             struct ggml_tensor  * n_bid,
             int32_t               width,
             int32_t               ratio);
+
+    // halo-hybrid: the head reduction of qwen4exp's QSA indexer in one pass:
+    //   dst[b, t, s] = ((relu(x[b, 0, t, s]) + relu(x[b, 1, t, s])) + ...) + bias[b, t, s]
+    // summed in head order (the same float result as a relu followed by a chain of adds, then the bias add).
+    //   x: F32 [n_blocks, n_head, n_tok, n_stream]   bias: F32 [n_blocks, n_tok, n_stream] or NULL
+    GGML_API struct ggml_tensor * ggml_qsa_head_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias);
 
     GGML_API struct ggml_tensor * ggml_kq_mask_build(
             struct ggml_context * ctx,

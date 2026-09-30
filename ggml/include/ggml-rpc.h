@@ -15,13 +15,14 @@ extern "C" {
 //      would not have protected the pairing)
 // 7.5: GGML_OP_KQ_MASK_BUILD appended (masks built on the device; both hosts must carry the op)
 // 7.7: GGML_OP_QSA_TOP_K appended (qwen4exp block-level QSA top-k)
-#define RPC_PROTO_MINOR_VERSION 7
+// 7.8: GGML_OP_QSA_HEAD_SUM appended (qwen4exp QSA indexer head reduction)
+#define RPC_PROTO_MINOR_VERSION 8
 // 7.4.1: rpc_tensor.flags carries RPC_TENSOR_FLAG_WEIGHTS (client buffer usage WEIGHTS); the server marks the buffer so
 //        its scheduler places ops by their weights. Compatible both ways (an older peer ignores or never sets the bit).
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - bump RPC_PROTO_MINOR_VERSION (the handshake compares major/minor only)");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT has changed - bump RPC_PROTO_MINOR_VERSION (the handshake compares major/minor only)");
 static_assert(GGML_OP_COUNT <= 255, "GGML_OP_COUNT no longer fits the HELLO op_count byte - widen it");
 #endif
 

@@ -1142,7 +1142,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     // the head-summed block scores [n_blocks, n_c, n_stream] of the queries [c0, c0 + n_c) of every stream
-    auto score_heads = [&](int64_t c0, int64_t n_c) -> ggml_tensor * {
+    // halo-hybrid: GGML_OP_QSA_HEAD_SUM does the relu, the head sum and the bias add in one pass (the separate ops made
+    // ~4x the passes over [n_blocks, n_tokens] floats, the largest depth-growing elementwise cost). LLAMA_QSA_HEAD_SUM=0
+    // restores the separate ops. bias: added in the same pass when given (the caller then skips its own add)
+    static const bool fused_head_sum = getenv("LLAMA_QSA_HEAD_SUM") == nullptr || atoi(getenv("LLAMA_QSA_HEAD_SUM")) != 0;
+    auto score_heads = [&](int64_t c0, int64_t n_c, ggml_tensor * bias) -> ggml_tensor * {
         ggml_tensor * q_c = c0 == 0 && n_c == n_tps ? q : ggml_view_3d(ctx0, q, idx_dim, n_idx_h, n_c, q->nb[1], q->nb[2], c0*q->nb[2]);
 
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
@@ -1150,6 +1154,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
                 ggml_reshape_3d(ctx0, q_c, idx_dim, n_idx_h*n_c, n_stream));
         score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_c, n_stream);
+        if (fused_head_sum) {
+            return ggml_qsa_head_sum(ctx0, score, bias);
+        }
         score = ggml_relu_inplace(ctx0, score);
 
         // the heads sit side by side on ne[1] and there are only a few of them
@@ -1159,7 +1166,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                     score->nb[2], score->nb[3], h*score->nb[1]);
             summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
         }
-        return summed;
+        return bias ? ggml_add(ctx0, summed, bias) : summed;
     };
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary.
@@ -1205,15 +1212,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (n_chunk >= n_tps || inp->blk_topk) {
         // the block scores of all queries: [n_blocks, n_tps, n_stream] is a quarter of an n_kv x n_tokens tensor
         ggml_tensor * score = nullptr;
+        // one value per block, so it is cheaper to bias here than after the cells are expanded
+        bool biased = false;
         if (n_chunk >= n_tps) {
-            score = score_heads(0, n_tps);
+            score = score_heads(0, n_tps, blk_bias ? inp->bias : nullptr);
+            biased = blk_bias;
         } else {
             // chunks write their rows in place; the visibility bias is then added once, from the whole host input
             // (a slice of a host input is a separate synchronous upload per chunk and layer: -13% at 113K)
             // the destination must be a graph node, not a leaf: the allocator keeps leaves for the whole graph, and one
             // per QSA layer stacked up (4 GiB at 128K). A repeat of one element makes it a node freed after this layer.
             for (int64_t c0 = 0; c0 < n_tps; c0 += n_chunk) {
-                ggml_tensor * sc = score_heads(c0, std::min(n_chunk, n_tps - c0));
+                ggml_tensor * sc = score_heads(c0, std::min(n_chunk, n_tps - c0), nullptr);
                 if (score == nullptr) {
                     ggml_tensor * shape = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
                     score = ggml_repeat(ctx0, ggml_view_1d(ctx0, sc, 1, 0), shape);
@@ -1223,8 +1233,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         }
         cb(score, "indexer_score", il);
 
-        // one value per block, so it is cheaper to bias here than after the cells are expanded
-        if (blk_bias) {
+        if (blk_bias && !biased) {
             score = ggml_add(ctx0, score, inp->bias);
         }
 
@@ -1242,10 +1251,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // cannot take), so it slices its host inputs rather than keeping n_kv x n_tokens device copies
         for (int64_t c0 = 0; c0 < n_tps; c0 += n_chunk) {
             const int64_t n_c = std::min(n_chunk, n_tps - c0);
-            ggml_tensor * sc = score_heads(c0, n_c);
-            if (blk_bias) {
-                sc = ggml_add(ctx0, sc, ggml_view_2d(ctx0, inp->bias, n_blocks, n_c, inp->bias->nb[1], c0*inp->bias->nb[1]));
-            }
+            ggml_tensor * sc = score_heads(c0, n_c,
+                    blk_bias ? ggml_view_2d(ctx0, inp->bias, n_blocks, n_c, inp->bias->nb[1], c0*inp->bias->nb[1]) : nullptr);
             ggml_tensor * tk = expand_top_k(sc, c0, n_c);
             top_k = top_k ? ggml_concat(ctx0, top_k, tk, 1) : tk;
         }

@@ -1103,9 +1103,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_MIX",
     "KQ_MASK_BUILD",
     "QSA_TOP_K",
+    "QSA_HEAD_SUM",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1222,9 +1223,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_mix(x, hc_fn, scale, base)",
     "kq_mask_build(pos_kv, pos_q, pool_of, tail_start, bo_vis)",
     "qsa_top_k(score, q_pos, n_bid)",
+    "qsa_head_sum(x, bias)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6643,6 +6645,25 @@ struct ggml_tensor * ggml_qsa_top_k(
     result->src[0] = score;
     result->src[1] = q_pos;
     result->src[2] = n_bid;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_qsa_head_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
+    if (bias != NULL) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32 && bias->nb[0] == sizeof(float));
+        GGML_ASSERT(bias->ne[0] == x->ne[0] && bias->ne[1] == x->ne[2] && bias->ne[2] == x->ne[3] && bias->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[2], x->ne[3]);
+
+    result->op     = GGML_OP_QSA_HEAD_SUM;
+    result->src[0] = x;
+    result->src[1] = bias;
 
     return result;
 }
