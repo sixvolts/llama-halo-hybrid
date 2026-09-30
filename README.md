@@ -1,4 +1,4 @@
-#llama-halo-hybrid - Strix Halo + Radeon R9700 32GB
+# llama-halo-hybrid - Strix Halo + Radeon R9700 32GB
 
 This is a fork of llama.cpp that builds out support for Strix Halo with a GPU sidecar, initially targeting the R9700/Navi48. The idea is that you can take an R9700, or similar, and place dense parts of the model, KV, and some of the layers on the GPU and let the APU take the rest of the model. You can add the extra GPU through a PCIe extender (framework desktop), Occulink, or a thunderbolt dock depending on which machine you have. This is not some custom inference engine that requires a custom quant to run. This is llama.cpp modified to run whatever you want, albeit mostly tuned for Qwen and GLM families. 
 
