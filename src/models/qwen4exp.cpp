@@ -639,8 +639,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(concat, "mtp_concat", il);
 
     // LLAMA_MTP_EH_PROJ_2D=1: one 2D GEMM over hc*n_tokens columns instead of n_tokens batched 4-column products.
-    // Opt-in: hybrid prefill +0.5-1% but MTP acceptance 0.63 -> 0.62 and decode -1% (2026-09-27)
-    static const bool eh_3d = !(getenv("LLAMA_MTP_EH_PROJ_2D") && atoi(getenv("LLAMA_MTP_EH_PROJ_2D")) > 0);
+    // Always-on it cost decode (acceptance 0.63 -> 0.62, -1%, 2026-09-27), but the prompt ingest's batched product
+    // is n_tokens tiny GEMVs (51 ms per 4096-token ubatch on the R9700, 1.8 s of a 113K prefill): batches of at least
+    // LLAMA_MTP_EH_PROJ_2D_MIN tokens (default 256; 0 = never) take the 2D GEMM, decode keeps the batched product
+    static const bool eh_2d_all = getenv("LLAMA_MTP_EH_PROJ_2D") && atoi(getenv("LLAMA_MTP_EH_PROJ_2D")) > 0;
+    static const int  eh_2d_min = getenv("LLAMA_MTP_EH_PROJ_2D_MIN") ? atoi(getenv("LLAMA_MTP_EH_PROJ_2D_MIN")) : 256;
+    const bool eh_3d = !(eh_2d_all || (eh_2d_min > 0 && n_tokens >= eh_2d_min));
     ggml_tensor * res_hc;
     if (eh_3d) {
         res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
