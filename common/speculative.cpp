@@ -1388,6 +1388,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    // the position whose target hidden state pending_h holds (-1: none). The next ingested row pairs with it only if
+    // it sits at pending_pos + 1 - a new prompt, a cached-prefix reuse or any other jump starts from zeros instead
+    std::vector<llama_pos>          pending_pos; // [n_seq]
+    std::vector<llama_pos>          verify_pos0; // [n_seq] position of verify_h row 0
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1488,6 +1492,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos.assign(n_seq, -1);
+        verify_pos0.assign(n_seq, -1);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1541,17 +1547,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void process_begin(const llama_batch & batch_in) override {
         early = {};
 
-        // a sequence that restarts at position 0 has no previous hidden state: its first ingested row must not pair
-        // with the carry-over of whatever this slot served before (made a request's drafts depend on the previous
-        // request). Zero it, the same for the early-ingest and the post-decode path.
+        // a sequence whose first row here does not follow the position pending_h belongs to (a new prompt, a reused
+        // cached prefix) has no usable previous hidden state: pairing it with the carry-over of whatever this slot served
+        // before made a request's drafts depend on the previous request. Zero it (both the early-ingest and the
+        // post-decode path read it after this)
         if (batch_in.pos != nullptr && batch_in.seq_id != nullptr && batch_in.n_seq_id != nullptr) {
+            std::vector<bool> seen(n_seq, false);
             for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
-                if (batch_in.pos[k] == 0) {
-                    for (int32_t j = 0; j < batch_in.n_seq_id[k]; ++j) {
-                        const llama_seq_id sq = batch_in.seq_id[k][j];
-                        if (sq >= 0 && sq < (llama_seq_id) n_seq) {
-                            std::fill(pending_h[sq].begin(), pending_h[sq].end(), 0.0f);
-                        }
+                for (int32_t j = 0; j < batch_in.n_seq_id[k]; ++j) {
+                    const llama_seq_id sq = batch_in.seq_id[k][j];
+                    if (sq < 0 || sq >= (llama_seq_id) n_seq || seen[sq]) {
+                        continue;
+                    }
+                    seen[sq] = true;
+                    if (pending_pos[sq] < 0 || batch_in.pos[k] != pending_pos[sq] + 1) {
+                        std::fill(pending_h[sq].begin(), pending_h[sq].end(), 0.0f);
+                        pending_pos[sq] = -1;
                     }
                 }
             }
@@ -1764,6 +1775,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            verify_pos0[seq_id] = batch_in.pos[i_batch_beg[seq_id]];
+            pending_pos[seq_id] = batch_in.pos[i_batch_end[seq_id]];
         }
 
         return true;
@@ -1924,9 +1937,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     uint32_t & st = rs_rng[seq_id];
                     if (dp.rs_seed != 0 && dp.result->empty()) {
                         // derive the state from the request seed and the draft position (splitmix32), once per draft
-                        uint32_t z = dp.rs_seed ^ (0x9E3779B9u * (uint32_t) (dp.pos0 + 1));
-                        z = (z ^ (z >> 16)) * 0x85EBCA6Bu; z = (z ^ (z >> 13)) * 0xC2B2AE35u; z ^= z >> 16;
-                        st = z ? z : 0x2545F491u;
+                        uint32_t hs = dp.rs_seed ^ (0x9E3779B9u * (uint32_t) (dp.pos0 + 1));
+                        hs = (hs ^ (hs >> 16)) * 0x85EBCA6Bu; hs = (hs ^ (hs >> 13)) * 0xC2B2AE35u; hs ^= hs >> 16;
+                        st = hs ? hs : 0x2545F491u;
                     }
                     st ^= st << 13; st ^= st >> 17; st ^= st << 5;
                     double t = (st >> 8) * (1.0 / 16777216.0);
@@ -2016,6 +2029,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_pos[seq_id] = verify_pos0[seq_id] >= 0 ? verify_pos0[seq_id] + i_h : -1;
     }
 };
 

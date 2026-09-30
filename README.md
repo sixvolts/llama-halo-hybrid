@@ -47,7 +47,9 @@ tree is about the setups they don't cover, without giving up the one they do:
   width it affects, with a noise floor measured the same way. No IQ quants, and the verification output layer stays
   at the model's own precision.
 
-## Where it stands (2026-09-28, commit f05fe5f29)
+## Where it stands (2026-09-28)
+
+The 2026-09-30 numbers on the Spark's benchmark are in [Against a DGX Spark](#against-a-dgx-spark-2026-09-30) below.
 
 Measured on this box (Framework Strix Halo 128 GB + R9700 on PCIe 4.0 x4). Prefill is cold, fresh server, record
 prompts; decode is real-content chat at T=0.7 with the MTP draft (6 prompts x 2 seeds short, 3 prompts x 2 seeds at
@@ -98,9 +100,10 @@ allocation for no speed, and on the Strix Halo alone it is the difference betwee
 ### Against a DGX Spark (2026-09-30)
 
 The target: one Strix Halo + one R9700 should beat one NVIDIA DGX Spark (GB10, 128 GB, 273 GB/s) on the same model.
-The reference is the best published single-Spark setup for Qwen3.8-Flash-Next
-([tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark),
-vLLM with NVIDIA's NVFP4 checkpoint, an MTP3 draft, 262K context). We ran **its own scripts**:
+The reference is the fastest single-Spark result for Qwen3.8-Flash-Next that we know of
+([tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark)
+at commit 6ad1c8f, 2026-09-06: vLLM with NVIDIA's NVFP4 checkpoint, an MTP3 draft, 262K context). The Spark column
+below is copied from that repo's README and result files, not measured by us. We ran **its own scripts** on our box:
 `bench_categories.py` (40 prompts, 8 categories, T=0, thinking off) and `stress_prefill.py` (needle in a
 repeated filler, cold).
 
@@ -112,7 +115,9 @@ Token counts are matched: llama.cpp tokenizes the filler to 0.88x of vLLM's coun
 Spark's 7,060 / 28,255 / 112,738 tokens.
 
 Model: Qwen3.8-Flash-Next UD-Q4_K_XL (~4.8 bits per weight, against NVFP4's ~4.5), with the q4_K-head MTP draft.
-Two numbers in a cell mean two runs. The concurrency-preset prefill was measured before the fused head-sum op.
+Two numbers in a cell mean two runs; every other cell is a single run. The same preset's decode median varies by
+about ±3 tok/s between sessions (65.5 to 69.6 over four sessions on the prefill preset). The concurrency-preset
+prefill was measured before the fused head-sum op.
 
 | | DGX Spark | Strix Halo + R9700, 128K (prefill preset) | Strix Halo + R9700, 128K (concurrency preset) | Strix Halo + R9700, 262K | Strix Halo alone, 128K |
 |---|---|---|---|---|---|
@@ -129,10 +134,10 @@ Presets:
 - **128K concurrency preset:** experts 5-47 on the APU, `-ub 2560 -b 5120`.
 - **262K:** experts 5-47 on the APU, `-ub 2560`, with `LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512` (next section).
 
-The table is at `--spec-draft-n-max 2`. With `--spec-draft-n-max 3` (sampled requests are still capped at 2 drafts,
-`LLAMA_SPEC_NMAX_SAMPLED`), the per-prompt median on this bench rises from ~69.5 to ~74.9 tok/s (ABBA in one
-session). Short answers dominate that median; the token-weighted throughput barely moves (65.0 -> 65.8). Cells
-that aren't marked as two runs are single runs.
+The table is at `--spec-draft-n-max 2`. With `--spec-draft-n-max 3` on the prefill preset (sampled MTP requests are
+still capped at 2 drafts, `LLAMA_SPEC_NMAX_SAMPLED`), the per-prompt median on this bench rises from ~69.5 to ~74.9
+tok/s (ABBA in one session). Short answers dominate that median; the token-weighted throughput barely moves (65.0 ->
+65.8).
 
 Swift 1.5 on the 128K prefill preset measured 2,382 / 2,178 / 1,752 prefill and 67.1 tok/s decode.
 

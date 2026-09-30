@@ -1666,7 +1666,7 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
     static const int prep_debug_lvl = getenv("LLAMA_LANES_DEBUG") ? atoi(getenv("LLAMA_LANES_DEBUG")) : 0;
     if (prep_debug && ubatch.n_tokens < 32 && prep_debug_lvl >= 2) {
         const int64_t tp5 = ggml_time_us();
-        LLAMA_LOG_WARN("prep-debug-us: %u tokens: %s build %lld, alloc %lld, sync %lld, set_inputs %lld\n", ubatch.n_tokens,
+        LLAMA_LOG_INFO("prep-debug-us: %u tokens: %s build %lld, alloc %lld, sync %lld, set_inputs %lld\n", ubatch.n_tokens,
             reused ? "reused," : "new,", (long long) (tp2 - tp1), (long long) (tp3 - tp2), (long long) (tp4 - tp3), (long long) (tp5 - tp4));
     }
     if (prep_debug && ubatch.n_tokens >= 32) {
@@ -3225,10 +3225,10 @@ ggml_cgraph * llama_context::graph_reserve(
                 nodes.push_back(ggml_graph_node(gf, i));
             }
             std::sort(nodes.begin(), nodes.end(), [](ggml_tensor * a, ggml_tensor * b) { return ggml_nbytes(a) > ggml_nbytes(b); });
-            LLAMA_LOG_WARN("%s: lane %d, %u tokens, %zu nodes; largest:\n", __func__, lane, n_tokens, nodes.size());
+            LLAMA_LOG_INFO("%s: lane %d, %u tokens, %zu nodes; largest:\n", __func__, lane, n_tokens, nodes.size());
             for (int i = 0; i < n_dump && i < (int) nodes.size(); ++i) {
                 ggml_tensor * t = nodes[i];
-                LLAMA_LOG_WARN("  %8.1f MiB %-8s %-14s %s [%lld %lld %lld %lld]%s\n", ggml_nbytes(t) / 1048576.0, ggml_type_name(t->type),
+                LLAMA_LOG_INFO("  %8.1f MiB %-8s %-14s %s [%lld %lld %lld %lld]%s\n", ggml_nbytes(t) / 1048576.0, ggml_type_name(t->type),
                         ggml_op_desc(t), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
                         t->view_src ? " (view)" : "");
             }

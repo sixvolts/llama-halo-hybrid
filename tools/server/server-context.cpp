@@ -544,12 +544,15 @@ struct server_slot {
             }
         }
 
-        // halo-hybrid: sampled requests draft at most LLAMA_SPEC_NMAX_SAMPLED tokens (default 2; 0 = no cap). With
+        // halo-hybrid: sampled requests with an MTP draft draft at most LLAMA_SPEC_NMAX_SAMPLED tokens (default 2; 0 = no cap). With
         //     rejection sampling at T > 0 the acceptance drops (Qwen3.8 hybrid, real content at T = 0.7: 0.64 per
         //     token vs 0.81 greedy), so the third draft token no longer pays for its ~6.5 ms of verify: n-max 2 gives
         //     59.3 / 56.4 tok/s against 55.5 / 54.6 at n-max 3, while greedy gains 64.5 -> 74.4 on the Spark bench
         //     from n-max 3. Launch with --spec-draft-n-max 3 to get both.
-        if (task && task->params.sampling.temp > 0.0f) {
+        // (MTP drafts only: measured with the draft-mtp head and rejection sampling; other draft types keep their n-max)
+        const bool spec_mtp = task && std::find(task->params.speculative.types.begin(), task->params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != task->params.speculative.types.end();
+        if (task && spec_mtp && task->params.sampling.temp > 0.0f) {
             static const int nmax_sampled = getenv("LLAMA_SPEC_NMAX_SAMPLED") ? atoi(getenv("LLAMA_SPEC_NMAX_SAMPLED")) : 2;
             if (nmax_sampled > 0) {
                 // never below the draft's n_min: a shorter draft would be discarded entirely
@@ -4279,7 +4282,6 @@ private:
                 }
                 slot.spec_steps++;
                 slot.spec_steps_task++;
-
             }
 
             // add accepted tokens to the prompt

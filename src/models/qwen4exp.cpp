@@ -860,7 +860,6 @@ public:
             blk_pos_host.resize(ggml_nelements(blk_pos));
             bp_shadow = *blk_pos; bp_shadow.data = blk_pos_host.data(); bp = &bp_shadow;
         }
-
         if (scores) {
             mctx->set_input_qsa(cbk, bc, bp, bias, ubatch, ratio, blk_bias);
         }
