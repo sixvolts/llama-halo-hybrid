@@ -7799,25 +7799,32 @@ struct test_qsa_head_sum : public test_case {
     const int64_t n_head;
     const int64_t n_tok;
     const bool    with_bias;
+    const bool    strided_bias; // the bias a row slice of a wider tensor (the chunked fallback's view of the input)
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_HEAD_SUM"; }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_blocks, n_head, n_tok, with_bias);
+        return VARS_TO_STR5(n_blocks, n_head, n_tok, with_bias, strided_bias);
     }
 
     double max_err() override { return 0.0; }
 
-    test_qsa_head_sum(int64_t n_blocks, int64_t n_head, int64_t n_tok, bool with_bias)
-        : n_blocks(n_blocks), n_head(n_head), n_tok(n_tok), with_bias(with_bias) {}
+    test_qsa_head_sum(int64_t n_blocks, int64_t n_head, int64_t n_tok, bool with_bias, bool strided_bias = false)
+        : n_blocks(n_blocks), n_head(n_head), n_tok(n_tok), with_bias(with_bias), strided_bias(strided_bias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_blocks, n_head, n_tok, 1);
         ggml_set_name(x, "x");
         ggml_tensor * bias = nullptr;
         if (with_bias) {
-            bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tok, 1);
-            ggml_set_name(bias, "bias");
+            if (strided_bias) {
+                ggml_tensor * wide = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_blocks + 5, 2*n_tok);
+                ggml_set_name(wide, "bias");
+                bias = ggml_view_2d(ctx, wide, n_blocks, n_tok, wide->nb[1], 3*wide->nb[1]);
+            } else {
+                bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tok, 1);
+                ggml_set_name(bias, "bias");
+            }
         }
         ggml_tensor * out = ggml_qsa_head_sum(ctx, x, bias);
         ggml_set_name(out, "out");
@@ -12558,6 +12565,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_head_sum(28672, 4, 16, b));
         test_cases.emplace_back(new test_qsa_head_sum(701, 3, 33, b));
     }
+    test_cases.emplace_back(new test_qsa_head_sum(2560, 4, 64, true, true));
+    test_cases.emplace_back(new test_qsa_head_sum(701, 3, 33, true, true));
     // halo-hybrid (A3): whole MoE blocks (P6 takes n = 512: 4096 rows >= 40 per expert; n = 64 stays below it), partial
     // 192-row tiles, zero-row experts (64 experts, 8 used), and the other expert-GEMV/GEMM edges of the round
     for (int64_t n_tokens : {64, 512}) {

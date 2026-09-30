@@ -130,14 +130,17 @@ Presets:
 - **262K:** experts 5-47 on the APU, `-ub 2560`, with `LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512` (next section).
 
 The table is at `--spec-draft-n-max 2`. With `--spec-draft-n-max 3` (sampled requests are still capped at 2 drafts,
-`LLAMA_SPEC_NMAX_SAMPLED`), greedy decode on the prefill preset is 74.3 tok/s, 1.7x the Spark.
+`LLAMA_SPEC_NMAX_SAMPLED`), the per-prompt median on this bench rises from ~69.5 to ~74.9 tok/s (ABBA in one
+session). Short answers dominate that median; the token-weighted throughput barely moves (65.0 -> 65.8). Cells
+that aren't marked as two runs are single runs.
 
 Swift 1.5 on the 128K prefill preset measured 2,382 / 2,178 / 1,752 prefill and 67.1 tok/s decode.
 
 What that means:
 - **Decode:** the card wins clearly, 1.5x the Spark single-stream and 2x on prose. Even the Strix Halo alone is ahead.
 - **Prefill:** 1.7-1.8x at 7K and ~1.25x at 28K. At 113K it's a tie, between 1,707 and 1,790 across runs.
-- **Several streams:** we win at 2 and 4 streams and tie at 6. Every extra token in a decode step touches ~1 GB of
+- **Several streams:** we win at 2 and 4 streams. At 6 streams the concurrency preset ties (21.5 against 21.7) and
+  the prefill preset is 7% behind (20.2). Every extra token in a decode step touches ~1 GB of
   new experts, which is a memory-bandwidth wall the Spark shares.
 - **Where the time goes at long context:** the card's sparse attention (a 16-query tile walks ~12K cells, 6x what
   one query needs) and the indexer's top-k. Those are the levers left.
@@ -161,7 +164,8 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --spec-type draft-mtp --spec-draft-n-max 2
 ```
 
-On the Spark needle prompts at 7K / 28K / 113K it measures 2,081 / 2,108 / 1,671 tok/s, with 67.8 tok/s decode. The
+On the Spark needle prompts at 7K / 28K / 113K it measures 2,081 / 2,108 / 1,671 tok/s, with 67.8 tok/s decode.
+This preset is for one slot (`-np 1`): the chunking only applies to a single sequence's cache. The
 earlier 256K recipe (`-ub 1024`) read 1,386 tok/s at 77K, 1,161 at 155K and 979 at 251K. Those numbers are from before
 the chunking and top-k changes, and they're kept here for the record.
 

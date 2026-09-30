@@ -76,6 +76,9 @@ struct common_speculative_draft_params {
     // with probability min(1, p/q) (common_sampler_sample_and_accept_n_rs).
     float temp = 0.0f;
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+    // seed of the draft's sampling draws (the request's sampler seed): the state is derived from (rs_seed, pos0) at
+    // every draft, so a request's draft tokens do not depend on what the drafter served before. 0: legacy state
+    uint32_t rs_seed = 0;
     // the target's truncation (applied before temperature, as in the default sampler chain), mirrored on the draft
     // distribution so the drafter does not spend draws on tokens the target can never emit
     float top_p = 1.0f;

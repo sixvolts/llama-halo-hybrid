@@ -1541,6 +1541,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void process_begin(const llama_batch & batch_in) override {
         early = {};
 
+        // a sequence that restarts at position 0 has no previous hidden state: its first ingested row must not pair
+        // with the carry-over of whatever this slot served before (made a request's drafts depend on the previous
+        // request). Zero it, the same for the early-ingest and the post-decode path.
+        if (batch_in.pos != nullptr && batch_in.seq_id != nullptr && batch_in.n_seq_id != nullptr) {
+            for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
+                if (batch_in.pos[k] == 0) {
+                    for (int32_t j = 0; j < batch_in.n_seq_id[k]; ++j) {
+                        const llama_seq_id sq = batch_in.seq_id[k][j];
+                        if (sq >= 0 && sq < (llama_seq_id) n_seq) {
+                            std::fill(pending_h[sq].begin(), pending_h[sq].end(), 0.0f);
+                        }
+                    }
+                }
+            }
+        }
+
         static const int min_tokens = getenv("LLAMA_MTP_EARLY_MIN") ? atoi(getenv("LLAMA_MTP_EARLY_MIN")) : 256;
         if (min_tokens <= 0 || is_mem_shared || chain_heads || batch_in.n_tokens < min_tokens ||
                 batch_in.token == nullptr || batch_in.embd != nullptr || batch_in.pos == nullptr ||
@@ -1906,6 +1922,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         rs_rng.assign(n_seq, 0x2545F491u);
                     }
                     uint32_t & st = rs_rng[seq_id];
+                    if (dp.rs_seed != 0 && dp.result->empty()) {
+                        // derive the state from the request seed and the draft position (splitmix32), once per draft
+                        uint32_t z = dp.rs_seed ^ (0x9E3779B9u * (uint32_t) (dp.pos0 + 1));
+                        z = (z ^ (z >> 16)) * 0x85EBCA6Bu; z = (z ^ (z >> 13)) * 0xC2B2AE35u; z ^= z >> 16;
+                        st = z ? z : 0x2545F491u;
+                    }
                     st ^= st << 13; st ^= st >> 17; st ^= st << 5;
                     double t = (st >> 8) * (1.0 / 16777216.0);
                     id = q.back().id;

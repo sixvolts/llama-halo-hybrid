@@ -1882,6 +1882,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
         }
     }
 
+
+    // halo-hybrid: as in decode's extract_outputs - the reads above were queued after the split events were recorded
+    {
+        static const bool no_out_ev = getenv("GGML_SCHED_NO_OUTPUT_EVENTS") != nullptr;
+        if (!no_out_ev) {
+            ggml_backend_sched_record_output_events(sched.get());
+        }
+    }
     return 0;
 }
 

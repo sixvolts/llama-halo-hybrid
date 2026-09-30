@@ -1238,7 +1238,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         cb(score, "indexer_score", il);
 
         if (blk_bias && !biased) {
-            score = ggml_add(ctx0, score, inp->bias);
+            score = ggml_add_inplace(ctx0, score, inp->bias);
         }
 
         if (inp->blk_topk) {

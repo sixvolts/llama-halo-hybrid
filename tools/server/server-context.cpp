@@ -552,7 +552,14 @@ struct server_slot {
         if (task && task->params.sampling.temp > 0.0f) {
             static const int nmax_sampled = getenv("LLAMA_SPEC_NMAX_SAMPLED") ? atoi(getenv("LLAMA_SPEC_NMAX_SAMPLED")) : 2;
             if (nmax_sampled > 0) {
-                n_draft_max = std::min(n_draft_max, nmax_sampled);
+                // never below the draft's n_min: a shorter draft would be discarded entirely
+                const int cap = std::max(nmax_sampled, (int) task->params.speculative.draft.n_min);
+                static bool logged = false;
+                if (!logged && cap < n_draft_max) {
+                    logged = true;
+                    SLT_INF(*this, "sampled requests draft at most %d tokens (LLAMA_SPEC_NMAX_SAMPLED, 0 = no cap)\n", cap);
+                }
+                n_draft_max = std::min(n_draft_max, cap);
             }
         }
 
@@ -3208,6 +3215,8 @@ private:
                                 auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
                                 dp.temp     = temp;
                                 dp.result_q = &slot.spec_draft_q;
+                                dp.rs_seed  = common_sampler_get_seed(slot.smpl.get()) * 2654435761u + 0x6A09E667u;
+                                if (dp.rs_seed == 0) { dp.rs_seed = 1; }
                                 static const bool mirror = getenv("LLAMA_SPEC_RS_NOTRUNC") == nullptr;
                                 if (mirror) {
                                     dp.top_p = slot.task->params.sampling.top_p;
@@ -3904,9 +3913,10 @@ private:
         static const bool spec_trace_dec = getenv("LLAMA_SPEC_TRACE") != nullptr;
         const int64_t t_dec0 = spec_trace_dec && batch_view.n_tokens <= 16 ? ggml_time_us() : 0;
         // generation batch (every token an output, e.g. a verify): its decode time feeds the adaptive draft length
+        // (one sequence only: at -np > 1 the width of a multi-slot batch is not one slot's verify width)
         bool all_output = batch_view.n_tokens > 0 && batch_view.n_tokens <= 32;
         for (int i = off; all_output && i < off + batch_view.n_tokens; ++i) {
-            all_output &= batch.tokens[i].output;
+            all_output &= batch.tokens[i].output && batch_view.n_seq_id[i - off] == 1 && batch_view.seq_id[i - off][0] == batch_view.seq_id[0][0];
         }
         const int64_t t_dec_cost0 = spec && all_output ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
@@ -3923,6 +3933,8 @@ private:
         });
         if (t_dec_cost0 && ret == 0) {
             g_spec_dec_cost.add(batch_view.n_tokens, (ggml_time_us() - t_dec_cost0) / 1000.0f);
+        } else if (ret == 0) {
+            g_spec_dec_cost.w_prev = 0; // a prompt or multi-slot batch in between: the next verify is not steady state
         }
         if (t_dec0) {
             SRV_INF("spec-trace: tgt decode %.1f ms (n=%d)\n", (ggml_time_us() - t_dec0) / 1000.0, (int) batch_view.n_tokens);
