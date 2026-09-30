@@ -1185,13 +1185,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     };
 
     // halo-hybrid: at long context the [n_blocks x heads x tokens] scores and the per-cell expansion are each
-    // n_kv x n_tokens floats (2.5 GiB at 262K x 2560): build them in chunks of at most LLAMA_QSA_CHUNK_MB (default 512)
+    // n_kv x n_tokens floats (2.5 GiB at 262K x 2560): build them in chunks of at most LLAMA_QSA_CHUNK_MB (default 2048;
+    // chunking costs ~2.5% at 113K, so it only engages where a tensor would be larger - the 262K preset sets 256)
     // per such tensor at the full context (sized from n_ctx, not n_kv, so consecutive ubatches - the two prefill lanes -
     // build the same graph). Chunks only split along the query tokens, so every row is the same computation. One stream
     // only; LLAMA_QSA_CHUNK_MB=0 disables it.
     int64_t n_chunk = n_tps;
     if (n_stream == 1) {
-        static const int64_t budget = (getenv("LLAMA_QSA_CHUNK_MB") ? atoll(getenv("LLAMA_QSA_CHUNK_MB")) : 512) * 1024 * 1024;
+        static const int64_t budget = (getenv("LLAMA_QSA_CHUNK_MB") ? atoll(getenv("LLAMA_QSA_CHUNK_MB")) : 2048) * 1024 * 1024;
         if (budget > 0) {
             const int64_t n_kv_max  = std::max<int64_t>(n_kv, n_ctx);
             const int64_t per_token = std::max<int64_t>(n_kv_max, ((n_kv_max + r - 1)/r)*n_idx_h) * (int64_t) sizeof(float);

@@ -209,6 +209,18 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
         (const half *) mask->data, indices, int(mask->ne[0]), cap, group, int(mask->ne[1]), s31, s33);
+    // debug (with GGML_CUDA_DISABLE_GRAPHS=1): GGML_CUDA_FA_UNION_STATS=1 prints the mean / max list length per call
+    static const bool union_stats = getenv("GGML_CUDA_FA_UNION_STATS") != nullptr;
+    if (union_stats) {
+        const int64_t n_lists = int64_t(blocks_num.x) * blocks_num.y;
+        std::vector<int32_t> h(n_lists * (int64_t(cap) + 1));
+        CUDA_CHECK(cudaMemcpyAsync(h.data(), indices, h.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        double sum = 0; int mx = 0;
+        for (int64_t l = 0; l < n_lists; ++l) { const int c = h[l*(int64_t(cap) + 1)]; sum += c; mx = std::max(mx, c); }
+        GGML_LOG_WARN("fa-union: n_kv %lld rows %lld group %d cap %d: mean %.0f max %d\n", (long long) mask->ne[0],
+            (long long) mask->ne[1], group, cap, sum / n_lists, mx);
+    }
 #else
     GGML_ASSERT(group == 1);
     const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
