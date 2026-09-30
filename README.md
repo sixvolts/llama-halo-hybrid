@@ -1,19 +1,14 @@
-# llama.cpp for Strix Halo, with and without a GPU next to it
+#llama-halo-hybrid - Strix Halo + Radeon R9700 32GB
 
-I've had a Strix Halo board for about a year and been playing around with it for various projects when it's not
-just being a beefy linux machine. I also grabbed an R9700 Pro AI card late last year for another machine, thinking 
-it would be fun to compare the two. I ended up parting out the machine the R9700 was in for something else and 
-wondered what might be possible with the R9700 in the Strix Halo machine. On the Framework desktop board, there's 
-an x4 4.0 slot hanging out. I already had an x4 extension cable so I could mount a 25G card in it, but a GPU 
-would fit just fine too. I have my board in open air case instead of the framework shell (bought the bare 
-board), so I had plenty of room for the card and my power supply had the new 12V connector. Even with today's 
-pricing, a Framework Strix Halo 128GB board and an R9700 is about ~5k all in, so similar price to a DGX spark 
-but with a little more RAM (~160GB, obv with caveats), and it's a regular 16-core ryzen PC instead of the tacky gold box.
+This is a fork of llama.cpp that builds out support for Strix Halo with a GPU sidecar, initially targeting the R9700/Navi48. The idea is that you can take an R9700, or similar, and place dense parts of the model, KV, and some of the layers on the GPU and let the APU take the rest of the model. You can add the extra GPU through a PCIe extender (framework desktop), Occulink, or a thunderbolt dock depending on which machine you have. This is not some custom inference engine that requires a custom quant to run. This is llama.cpp modified to run whatever you want, albeit mostly tuned for Qwen and GLM families. 
+
+Upfront/Note - if you are just using Strix Halo by itself, this is probably not the right tool. Check out Gufo (https://github.com/gufo-org/gufo), which looks very promising.
+After continuing to tinker with it, it now performs better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant.
 
 ![The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU](docs/halo-hybrid/build.jpeg)
 
-So, the kicker is that it works. The model this tree is built around is **Qwen3.8-Flash-Next** (unsloth
-UD-Q4_K_XL, 111 GB, and the Swift 1.5 fine-tune of it): on the Strix Halo plus the R9700 it decodes at **63 tok/s**
+ The model this tree is built around is **Qwen3.8-Flash-Next** (unsloth
+UD-Q4_K_XL, 111 GB, and the Swift 1.5 fine-tune of it): on the Strix Halo plus the R9700 it decodes at **60+ tok/s**
 (real content, T=0.7) with the model's own MTP draft head and prefills at **~2,300 tok/s** at 16K, where stock
 llama.cpp on the same layout does 27-28 tok/s. On the Strix Halo alone it does ~40 tok/s and ~890 tok/s. The same
 tree also runs the 200 GB GLM-5.3-Flash across two of these boxes over a 100G link at 30 tok/s. (The setup was put
@@ -39,13 +34,6 @@ tree is about the setups they don't cover, without giving up the one they do:
   APU-only engine, not just this tree's own APU-only numbers. It does, by about 1.6x on prefill and 1.8x on decode.
 - **Several boxes.** Models bigger than one box's memory (GLM-5.3-Flash, 200 GB) split across hosts over RPC,
   with and without cards.
-- **One box, APU only, still first-class.** Every change is measured on the iGPU alone too, and the APU-only numbers
-  are meant to keep closing on the dedicated engines.
-- **General paths, not model hacks.** Ideas borrowed from other engines land as ggml backend paths (per-device
-  kernels, scheduler changes, new ops with CPU references), so other models and layouts get them as well.
-- **Quality gates.** A change has to keep greedy output bit-identical, or pass KLD against frozen baselines at the
-  width it affects, with a noise floor measured the same way. No IQ quants, and the verification output layer stays
-  at the model's own precision.
 
 ## Where it stands (2026-09-28)
 
