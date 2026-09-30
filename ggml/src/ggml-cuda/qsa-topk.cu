@@ -32,6 +32,56 @@ static __device__ int qsa_tk_scan(int v, int * sh, int * total) {
     return incl - v;
 }
 
+// one radix pass over the digit bits [shift, shift + BITS) of the keys that match the resolved prefix: the weighted
+// histogram, then a parallel search (descending bins) for the bin holding the need-th heaviest cell. Resolves BITS
+// more bits of the threshold key T into *prefix / *pmask and leaves in *need the cells still to take at or below it.
+template <int BITS>
+static __device__ void qsa_tk_pass(const float * __restrict__ srow, const int nbq, const int r, const int F, const int shift,
+        uint32_t * hist, int * sh, uint32_t * prefix, uint32_t * pmask, int * need) {
+    constexpr int NBINS = 1 << BITS;
+    constexpr int PER   = NBINS / QSA_TK_NT;   // bins per thread in the search
+    static_assert(NBINS % QSA_TK_NT == 0, "bins must split evenly over the threads");
+    const int tid = threadIdx.x;
+
+    for (int k = tid; k < NBINS; k += QSA_TK_NT) { hist[k] = 0; }
+    __syncthreads();
+    const uint32_t pf = *prefix, pm = *pmask;
+    for (int b = tid; b < nbq; b += QSA_TK_NT) {
+        const uint32_t key = qsa_tk_key(srow[b]);
+        if ((key & pm) == pf) {
+            atomicAdd(&hist[(key >> shift) & (NBINS - 1)], (uint32_t) min(r, F - b*r));
+        }
+    }
+    __syncthreads();
+
+    // thread t owns bins [NBINS - PER*(t+1), NBINS - PER*t), scanned from the top: the exclusive scan over threads
+    // gives the weight of every higher bin
+    const int top = NBINS - PER*tid - 1;
+    int own = 0;
+    for (int j = 0; j < PER; ++j) { own += (int) hist[top - j]; }
+    int tot;
+    const int above = qsa_tk_scan(own, sh, &tot);
+    const int nd = *need;
+    __syncthreads();
+    if (above < nd && above + own >= nd) {
+        int acc = above;
+        int bin = top - PER + 1;
+        for (int j = 0; j < PER; ++j) {
+            if (acc + (int) hist[top - j] >= nd) { bin = top - j; break; }
+            acc += (int) hist[top - j];
+        }
+        *prefix = pf | ((uint32_t) bin << shift);
+        *pmask  = pm | ((uint32_t) (NBINS - 1) << shift);
+        *need   = nd - acc;
+    }
+    __syncthreads();
+}
+
+// halo-hybrid: the threshold search in three passes of 12, 12 and 8 bits (was four of 8). The indexer scores are
+// ReLU'd sums, so the top 8 key bits (sign and exponent) put nearly every block in a handful of bins and all 256
+// threads' atomics serialized on them; 12-bit digits spread them over the mantissa as well, and one row read less.
+// Same T and tie count, so the same cells in the same order. GGML_CUDA_QSA_TK_V1=1 restores the old search.
+template <bool V2>
 static __global__ void k_qsa_top_k(const float * __restrict__ score, const int64_t s1, const int32_t * __restrict__ q_pos,
         const int32_t * __restrict__ n_bid, int32_t * __restrict__ dst, const int64_t d1,
         const int n_blocks, const int width, const int r) {
@@ -52,13 +102,18 @@ static __global__ void k_qsa_top_k(const float * __restrict__ score, const int64
     const float * srow = score + (int64_t) i * s1;
     const int nbq = (F + r - 1) / r;   // blocks with scored cells; block b weighs min(r, F - b*r)
 
-    __shared__ uint32_t hist[256];
+    __shared__ uint32_t hist[V2 ? 4096 : 256];
     __shared__ uint32_t prefix, pmask;
     __shared__ int      need;
     __shared__ int      sh[QSA_TK_NT];
     if (tid == 0) { prefix = 0; pmask = 0; need = width; }
     __syncthreads();
 
+    if constexpr (V2) {
+        qsa_tk_pass<12>(srow, nbq, r, F, 20, hist, sh, &prefix, &pmask, &need);
+        qsa_tk_pass<12>(srow, nbq, r, F,  8, hist, sh, &prefix, &pmask, &need);
+        qsa_tk_pass< 8>(srow, nbq, r, F,  0, hist, sh, &prefix, &pmask, &need);
+    } else
     for (int shift = 24; shift >= 0; shift -= 8) {
         for (int k = tid; k < 256; k += QSA_TK_NT) { hist[k] = 0; }
         __syncthreads();
@@ -140,8 +195,15 @@ void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int width = ggml_get_op_params_i32(dst, 0);
     const int r     = ggml_get_op_params_i32(dst, 1);
     const int64_t n_q = score->ne[1];
-    k_qsa_top_k<<<(int) n_q, QSA_TK_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
-            (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
-            (int) score->ne[0], width, r);
+    static const bool v1 = getenv("GGML_CUDA_QSA_TK_V1") != nullptr && atoi(getenv("GGML_CUDA_QSA_TK_V1")) != 0;
+    if (v1) {
+        k_qsa_top_k<false><<<(int) n_q, QSA_TK_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
+                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
+                (int) score->ne[0], width, r);
+    } else {
+        k_qsa_top_k<true><<<(int) n_q, QSA_TK_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
+                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
+                (int) score->ne[0], width, r);
+    }
     CUDA_CHECK(cudaGetLastError());
 }

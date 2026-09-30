@@ -12501,6 +12501,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_top_k(8192, 3, 8190, 2051, 4, 32760, ties));    // 32K decode verify
         test_cases.emplace_back(new test_qsa_top_k(700, 33, 690, 257, 4, 2600, ties));       // odd sizes
         test_cases.emplace_back(new test_qsa_top_k(300, 17, 290, 101, 3, 1000, ties));       // ratio 3
+        test_cases.emplace_back(new test_qsa_top_k(28672, 32, 28600, 2051, 4, 114000, ties)); // 113K prefill rows
+        test_cases.emplace_back(new test_qsa_top_k(65536, 8, 65530, 2051, 4, 262000, ties));  // 262K
     }
     // halo-hybrid (A3): whole MoE blocks (P6 takes n = 512: 4096 rows >= 40 per expert; n = 64 stays below it), partial
     // 192-row tiles, zero-row experts (64 experts, 8 used), and the other expert-GEMV/GEMM edges of the round
