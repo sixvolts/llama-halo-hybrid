@@ -95,30 +95,72 @@ rows a token needs are read, and once touched those pages stay in host RAM, so n
 state. Don't force a resident copy with `-ot per_layer_token_embd=CPU` / `-lzm off` - that adds a 26.8 GB anonymous
 allocation for no speed, and on the Strix Halo alone it is the difference between ~39 GB and ~12 GB of free memory.
 
+### Against a DGX Spark (2026-09-30)
+
+The target: one Strix Halo + one R9700 should beat one NVIDIA DGX Spark (GB10, 128 GB, 273 GB/s) on the same model.
+The reference is the best published single-Spark setup for Qwen3.8-Flash-Next
+([tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark),
+vLLM with NVIDIA's NVFP4 checkpoint, an MTP3 draft, 262K context). We ran **its own scripts**:
+`bench_categories.py` (40 prompts, 8 categories, T=0, thinking off) and `stress_prefill.py` (needle in a
+repeated filler, cold).
+
+Two changes to the scripts:
+- **Prefix caching off (`cache_prompt: false`).** It matches the Spark's no-prefix-cache runs.
+- **Thinking off in the prefill script.** Otherwise the model spends its 16-token answer budget thinking.
+
+Token counts are matched: llama.cpp tokenizes the filler to 0.88x of vLLM's counts, so we ran it longer to hit the
+Spark's 7,060 / 28,255 / 112,738 tokens.
+
+Model: Qwen3.8-Flash-Next UD-Q4_K_XL (~4.8 bits per weight, against NVFP4's ~4.5), with the q4_K-head MTP draft.
+Two numbers in a cell mean two runs. The concurrency-preset prefill was measured before the fused head-sum op.
+
+| | DGX Spark | Strix Halo + R9700, 128K (prefill preset) | Strix Halo + R9700, 128K (concurrency preset) | Strix Halo + R9700, 262K | Strix Halo alone, 128K |
+|---|---|---|---|---|---|
+| Decode median, 1 stream (tok/s) | 43.9 | 65.5 / 67.3 | 70.6 | 67.8 | 47.4 |
+| Prose (tok/s) | 29.0 | 55.0 / 55.0 | 59.8 | 57.1 | 40.7 |
+| Prefill 7K (tok/s) | 1,269 | 2,265 / 2,322 | 2,120 | 2,081 | 937 |
+| Prefill 28K | 1,757 | 2,195 / 2,190 | 2,133 | 2,108 | 841 |
+| Prefill 113K | 1,760 | 1,707 / 1,790 | 1,694 | 1,671 | 677 |
+| Per stream at 2 / 4 / 6 streams | 33.4 / 26.4 / 21.7 | 41.8 / 31.1 / 20.2 | 48.1 / 32.2 / 21.5 | - | 27.5 / 15.9 / 14.4 |
+| Quality auto-score | 0.88 | 0.85 | 0.82 | 0.82 | 0.88 |
+
+Presets:
+- **128K prefill preset:** all experts on the APU, `-ub 4096 -b 8192`.
+- **128K concurrency preset:** experts 5-47 on the APU, `-ub 2560 -b 5120`.
+- **262K:** experts 5-47 on the APU, `-ub 2560`, with `LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512` (next section).
+
+Swift 1.5 on the 128K prefill preset measured 2,382 / 2,178 / 1,752 prefill and 67.1 tok/s decode.
+
+What that means:
+- **Decode:** the card wins clearly, 1.5x the Spark single-stream and 2x on prose. Even the Strix Halo alone is ahead.
+- **Prefill:** 1.7-1.8x at 7K and ~1.25x at 28K. At 113K it's a tie, between 1,707 and 1,790 across runs.
+- **Several streams:** we win at 2 and 4 streams and tie at 6. Every extra token in a decode step touches ~1 GB of
+  new experts, which is a memory-bandwidth wall the Spark shares.
+- **Where the time goes at long context:** the card's sparse attention (a 16-query tile walks ~12K cells, 6x what
+  one query needs) and the indexer's top-k. Those are the levers left.
+- **Quality:** the auto-score misses are word-count limits in both setups. The quants differ, so compare the
+  quality columns as indicative only.
+
 ### Long context: 256K on the Strix Halo + R9700
 
-The model's full 256K window fits on the hybrid layout, but not with the settings above: the KV cache is small
-(~27 KiB per token, ~7 GB at 256K - only 12 of the 48 layers are attention), what grows is the prefill scratch on the
-card, which scales with context x ubatch. For 256K, move six more expert layers to the APU and use smaller ubatches
-(the card is then full, 32.6 GB used):
+The model's full 256K window fits on the hybrid layout. The KV cache is small (~27 KiB per token, ~7 GB at 256K:
+only 12 of the 48 layers are attention). What grows is the prefill scratch on the card, which scales with context x
+ubatch. Since 2026-09-30 the QSA indexer builds that scratch in chunks.
+
+At 256K, run the fast layout with a 256 MB chunk budget and a smaller draft ubatch:
 
 ```
-LLAMA_PREFILL_LANES=2 \
+LLAMA_PREFILL_LANES=2 LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 262144 -b 2048 -ub 1024 -np 1 \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 262144 -b 5120 -ub 2560 -np 1 \
   -ot 'blk\.([5-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
   --spec-type draft-mtp --spec-draft-n-max 2
 ```
 
-| Prompt | Prefill | Time to first token | Decode |
-|---|---|---|---|
-| 77K | 1386 tok/s | 56 s | 58.5 tok/s (47.7 ms/step) |
-| 155K | 1161 tok/s | 134 s | 46.6 tok/s (51.9 ms/step) |
-| 251K | 979 tok/s | 4.3 min | 43.8 tok/s (56.7 ms/step) |
-
-(One run per depth on a synthetic records prompt, T=0.7; acceptance varies with the content. At `-ub 2560` the
-scratch needs 8.9 GB per lane and does not fit, and one lane at the default layout does not fit either.)
+On the Spark needle prompts at 7K / 28K / 113K it measures 2,081 / 2,108 / 1,671 tok/s, with 67.8 tok/s decode. The
+earlier 256K recipe (`-ub 1024`) read 1,386 tok/s at 77K, 1,161 at 155K and 979 at 251K. Those numbers are from before
+the chunking and top-k changes, and they're kept here for the record.
 
 I kept going on tuning, and tried to reduce the number of kernel launches, which seemed to be holding back
 performance. I wasn't hitting anywhere near the right numbers per the theoretical bandwidth for each device. The
