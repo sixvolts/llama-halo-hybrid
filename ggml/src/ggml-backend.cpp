@@ -856,6 +856,12 @@ struct ggml_backend_sched {
     int copy_event_used[GGML_SCHED_MAX_BACKENDS]; // taken since the last sched synchronize (ring wrap guard)
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    // halo-hybrid: the backend's event was re-recorded behind the caller's output reads (record_output_events) and an eager
+    // copy into it from another stream has not waited on it yet in this graph
+    bool out_ev_pending[GGML_SCHED_MAX_BACKENDS];
+    // its own event per backend, recorded only there: waiting on the split event instead could bind (HIP binds a
+    // stream wait to the latest record at execution) to a record later in this graph that depends on the copy itself
+    ggml_backend_event_t out_ev[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2432,6 +2438,17 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                     continue;
                 }
                 ggml_backend_t dst_backend = sched->backends[cs->backend_id];
+                // an eager copy runs on this (source) stream and can land on memory the destination's pending output
+                // reads still use (a differently allocated next graph): wait on the destination's output-read event once.
+                // Integrated-GPU destinations only, as in the copy path above: a discrete destination's reads are
+                // ordered by its own stream ahead of this graph's first split there, which every eager source depends on
+                static const bool no_eager_fence = getenv("GGML_SCHED_NO_EAGER_FENCE") != nullptr;
+                if (!no_eager_fence && sched->out_ev_pending[cs->backend_id] && sched->out_ev[cs->backend_id] != NULL &&
+                        dst_backend->device != NULL && ggml_backend_dev_type(dst_backend->device) == GGML_BACKEND_DEVICE_TYPE_IGPU &&
+                        split_backend->iface.event_wait != NULL) {
+                    ggml_backend_event_wait(split_backend, sched->out_ev[cs->backend_id]);
+                    sched->out_ev_pending[cs->backend_id] = false;
+                }
                 st.eager_k.clear();
                 for (int k = 0; k < cs->n_inputs; k++) {
                     struct ggml_tensor * x = cs->inputs[k];
@@ -2797,6 +2814,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        if (sched->out_ev[b] != NULL) {
+            ggml_backend_event_free(sched->out_ev[b]);
+        }
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
@@ -2955,10 +2975,36 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_record_output_events(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    // GGML_SCHED_OUTPUT_EVENTS_ALL=1: every backend with events (the first version); default: only the backends that
+    // hold one of the graph's output tensors, the only ones the caller reads from
+    static const bool all = getenv("GGML_SCHED_OUTPUT_EVENTS_ALL") != nullptr;
+    bool has_out[GGML_SCHED_MAX_BACKENDS] = { false };
+    if (!all) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            const struct ggml_backend_sched_split * sp = &sched->splits[i];
+            if (has_out[sp->backend_id]) {
+                continue;
+            }
+            for (int j = 0; j < sp->graph.n_nodes; j++) {
+                if (sp->graph.nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                    has_out[sp->backend_id] = true;
+                    break;
+                }
+            }
+        }
+    }
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_event_t ev = sched->events[i][sched->cur_copy];
-        if (ev != NULL) {
+        if (ev != NULL && (all || has_out[i])) {
             ggml_backend_event_record(ev, sched->backends[i]);
+            // the eager-copy fence (compute_splits): only needed when another stream can write into this backend
+            if (sched->out_ev[i] == NULL && sched->backends[i]->device != NULL) {
+                sched->out_ev[i] = ggml_backend_event_new(sched->backends[i]->device);
+            }
+            if (sched->out_ev[i] != NULL) {
+                ggml_backend_event_record(sched->out_ev[i], sched->backends[i]);
+                sched->out_ev_pending[i] = true;
+            }
         }
     }
 }

@@ -165,7 +165,9 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
 ```
 
 On the Spark needle prompts at 7K / 28K / 113K it measures 2,081 / 2,108 / 1,671 tok/s, with 67.8 tok/s decode.
-This preset is for one slot (`-np 1`): the chunking only applies to a single sequence's cache. The
+The chunking applies to a single sequence's cache. Several slots don't need it: with `-np N` each slot's cache is
+n_ctx/N. For example, `-np 2 -c 262144` starts unchunked (4.4 GB compute buffer) and measured 2,140 / 1,745 tok/s at
+7K / 113K. The
 earlier 256K recipe (`-ub 1024`) read 1,386 tok/s at 77K, 1,161 at 155K and 979 at 251K. Those numbers are from before
 the chunking and top-k changes, and they're kept here for the record.
 
