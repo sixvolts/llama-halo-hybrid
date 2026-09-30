@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -3200,6 +3201,25 @@ ggml_cgraph * llama_context::graph_reserve(
     sched_build = nullptr;
 
     this->n_outputs = save_n_outputs;
+
+    // debug: LLAMA_RESERVE_DUMP=N prints the N largest nodes of each reserved graph
+    {
+        static const int n_dump = getenv("LLAMA_RESERVE_DUMP") ? atoi(getenv("LLAMA_RESERVE_DUMP")) : 0;
+        if (n_dump > 0 && gf && !split_only) {
+            std::vector<ggml_tensor *> nodes;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                nodes.push_back(ggml_graph_node(gf, i));
+            }
+            std::sort(nodes.begin(), nodes.end(), [](ggml_tensor * a, ggml_tensor * b) { return ggml_nbytes(a) > ggml_nbytes(b); });
+            LLAMA_LOG_WARN("%s: lane %d, %u tokens, %zu nodes; largest:\n", __func__, lane, n_tokens, nodes.size());
+            for (int i = 0; i < n_dump && i < (int) nodes.size(); ++i) {
+                ggml_tensor * t = nodes[i];
+                LLAMA_LOG_WARN("  %8.1f MiB %-8s %-14s %s [%lld %lld %lld %lld]%s\n", ggml_nbytes(t) / 1048576.0, ggml_type_name(t->type),
+                        ggml_op_desc(t), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        t->view_src ? " (view)" : "");
+            }
+        }
+    }
 
     // initialize scheduler with the specified graph
     if (split_only) {
