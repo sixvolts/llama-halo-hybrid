@@ -251,7 +251,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, ggml_backend_sched_t sch = nullptr);
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, ggml_backend_sched_t sch = nullptr);
 
     //
     // graph
@@ -340,6 +340,7 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

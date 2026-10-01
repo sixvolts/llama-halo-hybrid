@@ -236,7 +236,7 @@ class ModelBase:
 
         prefix = "model" if not self.is_mistral_format else "consolidated"
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
-        is_safetensors: bool = len(part_names) > 0
+        is_safetensors: bool = len(part_names) > 0 or (not self.is_mistral_format and (self.dir_model / "model.safetensors.index.json").is_file())
         if not is_safetensors:
             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
 
@@ -2571,6 +2571,11 @@ class TextModel(ModelBase):
         self.gguf_writer.add_eot_token_id(4)
 
         self.gguf_writer.add_add_space_prefix(False)
+
+        if (add_bos := tokenizer_config.get("add_bos_token")) is not None:
+            self.gguf_writer.add_add_bos_token(add_bos)
+        if (add_eos := tokenizer_config.get("add_eos_token")) is not None:
+            self.gguf_writer.add_add_eos_token(add_eos)
 
 
 class MmprojModel(ModelBase):

@@ -2418,9 +2418,6 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
-    // the target context, used to convert legacy llama_batch inputs
-    llama_context * ctx_tgt = nullptr;
-
     // list of implementations to use and their states
     std::vector<std::unique_ptr<common_speculative_impl>> impls;
 
@@ -2810,7 +2807,7 @@ common_speculative_init_result::common_speculative_init_result(
         // a draft head can leave out the embeddings and lm head and use the target's
         mparams.model_shared = model_tgt;
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
@@ -2979,7 +2976,6 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
     common_speculative_ptr result(new common_speculative {
         /* .dparams     = */ common_speculative_draft_params_vec(n_seq),
-        /* .ctx_tgt     = */ params.draft.ctx_tgt,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
@@ -3059,18 +3055,6 @@ void common_speculative_process_end(common_speculative * spec) {
         impl->process_end();
     }
 }
-
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
-    if (spec == nullptr) {
-        return true;
-    }
-
-    // ngram-only setups have no target context, they do not read the batch anyway
-    const common_batch tmp = spec->ctx_tgt ? common_batch_from_llama_batch(spec->ctx_tgt, batch) : common_batch();
-
-    return common_speculative_process(spec, tmp);
-}
-
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
     bool result = true;
 
