@@ -7,7 +7,7 @@ everywhere; only the device list changes.
 | # | Hardware | Status | Best numbers here | Recipe |
 |---|---|---|---|---|
 | 1 | One Strix Halo, nothing else | measured (2026-09-28) | Qwen3.8-Flash-Next: 40-41 tok/s with the MTP head (55-56 ms/step, real content, T=0.7); prefill 940 / 870 / 780 tok/s at 4K / 16K / 32K | [1](#1-one-strix-halo-by-itself) |
-| 2 | One Strix Halo + one R9700 | production (Qwen3.8-Flash-Next, 2026-09-28); GLM-5.3-Flash UD-Q2_K_XL measured (2026-10-01) | Qwen3.8: 63 tok/s decode (35.4 ms/step, real content, T=0.7); prefill 2,090 / 2,220 / 2,030 tok/s at 4K / 16K / 32K. GLM-5.3-Flash Q2: 44 tok/s decode, ~620 tok/s prefill, 128K context | [2](#2-one-strix-halo--one-r9700) |
+| 2 | One Strix Halo + one R9700 | production (Qwen3.8-Flash-Next, 2026-09-28); GLM-5.3-Flash UD-Q2_K_XL measured (2026-10-01); RX 9070 XT (16 GB) simulated (2026-10-01) | Qwen3.8: 63 tok/s decode (35.4 ms/step, real content, T=0.7); prefill 2,090 / 2,220 / 2,030 tok/s at 4K / 16K / 32K. GLM-5.3-Flash Q2: 44 tok/s decode, ~620 tok/s prefill, 128K context. With a 16 GB RX 9070 XT: Qwen3.8 68 tok/s decode, 1,560 / 1,640 / 1,380 tok/s prefill at 7K / 28K / 113K | [2](#2-one-strix-halo--one-r9700) |
 | 3 | Two Strix Halos over RDMA, no dGPU | derived, not measured | see 4 minus the R9700 | [3](#3-two-strix-halos-over-rdma) |
 | 4 | Two Strix Halos + one R9700 on the head node | superseded by 5 (GLM-5.3-Flash, 200 GB) | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K (09-08) | [4](#4-two-strix-halos--one-r9700-on-the-head-node) |
 | 5 | Two Strix Halos + one R9700 on each | production (GLM-5.3-Flash, 200 GB) | 896 tok/s prefill / 30 tok/s decode at 25.8K | [5](#5-two-strix-halos--one-r9700-on-each) |
@@ -220,6 +220,62 @@ prefill at matched token counts, MTP n-max 2, one run each. The first row is fro
 * **For comparison:** the two-box UD-Q4_K_XL production layout (recipe 5) runs 896 tok/s prefill at 25.8K and 30 tok/s
   decode, on a different harness.
 * **Quality:** the auto-score is the only quality check run on Q2. A KLD comparison against Q4_K_XL has not been done.
+
+### Radeon RX 9070 XT (16 GB) instead of the R9700 (simulated, 2026-10-01)
+
+The RX 9070 XT is the same gfx1201 die as the R9700, with the same 64 CUs and ~640 GB/s of memory bandwidth, but
+16 GB of VRAM instead of 32. Everything in this recipe runs the same kernels; the only question is what fits on the
+card. These numbers are **simulated** on the R9700: [`vram_ballast.cpp`](vram_ballast.cpp) holds 16 GiB of the card
+for the whole run, which leaves 15.65 GiB free. A headless 9070 XT should have ~15.8 GiB, so the simulation is about
+150 MB on the tight side. Not yet checked on a real 9070 XT.
+
+What has to fit, Qwen3.8-Flash-Next at 128K context:
+
+| On the card | Size |
+|---|---|
+| Trunk weights | 4.6 GB |
+| MTP draft head | 1.9 GB |
+| KV cache (128K, plus the draft's) | 3.7 GB |
+| Recurrent state | 0.3 GB |
+| Compute buffers | what is left (~5 GB) |
+
+The 32 GB preset spends 14 GB on compute (`-ub 4096`, two prefill lanes), so on 16 GB the ubatch has to come down.
+Launch (all routed experts on the iGPU; ROCm0 is the 9070 XT, ROCm1 the iGPU - check the device order in the
+startup log):
+
+```
+sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
+
+LLAMA_PREFILL_LANES=2 \
+llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 131072 -b 2048 -ub 1024 -np 1 \
+  -ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
+  -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
+  --spec-type draft-mtp --spec-draft-n-max 2 \
+  --host 0.0.0.0 --port 8080
+```
+
+Measured with the DGX Spark comparison's scripts (README, "Against a DGX Spark"): 40 prompts at T=0, needle-in-filler
+prefill at matched token counts, one run each, sync build (535b47640). "Spare" is the card's free memory after load;
+no layout logged an out-of-memory error during the 113K prefill.
+
+| Layout | Decode median | Prefill 7K / 28K / 113K | Spare |
+|---|---|---|---|
+| Two lanes, `-ub 1024 -b 2048` (the line above) | 67.7 tok/s | 1,563 / 1,643 / 1,378 | 0.6 GiB |
+| Two lanes, `-ub 1024`, `LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512` | 62.0 tok/s | 1,317 / 1,434 / 1,272 | 1.5 GiB |
+| One lane, `-ub 4096 -b 8192`, chunk 256, draft ubatch 512 | 64.2 tok/s | 1,281 / 1,307 / 1,163 | 0.2 GiB |
+| Two lanes, `-ub 2048 -b 4096`, chunk 256, draft ubatch 512 | 63.6 tok/s | 1,986 / 2,137 / 1,700 | 0.04 GiB |
+| For comparison: R9700 (32 GB), 128K prefill preset | 67.4 tok/s | 2,354 / 2,232 / 1,815 | - |
+
+* **Decode is unchanged:** 67.7 tok/s against 67.4 on the 32 GB card. Only prefill pays for the smaller card,
+  about 30% at 7K and 25% at 113K.
+* **The `-ub 2048` row** keeps nearly all of the R9700's prefill but leaves 40 MB spare. Do not use it on a card that
+  also drives a display; on a headless card try it, and fall back to the line above if it fails to load.
+* **Driving a display:** the desktop takes a few hundred MB. Use the second row (1.5 GiB spare).
+* **`LLAMA_QSA_CHUNK_MB=256`** splits the sparse-attention indexer's score buffer. It is what lets the bigger ubatches
+  fit at 128K; one lane at `-ub 2048` without it does not load.
+* **Not measured yet on 16 GB:** GLM-5.3-Flash Q2 (its fixed part is ~12 GB, so it needs the draft head on the iGPU or
+  less context), Swift 1.5, and multi-stream use.
 
 ### The original run: Qwen3.5-122B-A10B
 
