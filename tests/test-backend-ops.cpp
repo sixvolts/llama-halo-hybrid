@@ -8085,6 +8085,8 @@ struct test_qsa_top_k : public test_case {
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "n_bid") == 0) {
                 ggml_backend_tensor_set(t, &n_bid, 0, sizeof(int32_t));
+            } else if (t->view_src == nullptr && t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t); // the sentinels (see test_qsa_head_sum)
             }
         }
     }
@@ -8141,6 +8143,9 @@ struct test_qsa_head_sum : public test_case {
                 std::vector<float> v(ggml_nelements(t));
                 for (size_t i = 0; i < v.size(); ++i) { v[i] = i % 7 == 0 ? -INFINITY : (i % 11 == 0 ? 1e9f : 0.0f); }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (t->view_src == nullptr && t->type == GGML_TYPE_F32) {
+                // the sentinels: left alone they keep an earlier test's bytes (NaN failed the full run, never alone)
+                init_tensor_uniform(t);
             }
         }
     }
