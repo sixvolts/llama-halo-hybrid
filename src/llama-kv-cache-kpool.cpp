@@ -1,5 +1,7 @@
 #include "llama-kv-cache-kpool.h"
 
+#include "llama-impl.h"
+
 #include "llama-batch.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-hybrid.h"

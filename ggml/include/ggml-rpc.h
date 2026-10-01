@@ -16,7 +16,9 @@ extern "C" {
 // 7.5: GGML_OP_KQ_MASK_BUILD appended (masks built on the device; both hosts must carry the op)
 // 7.7: GGML_OP_QSA_TOP_K appended (qwen4exp block-level QSA top-k)
 // 7.8: GGML_OP_QSA_HEAD_SUM appended (qwen4exp QSA indexer head reduction)
-#define RPC_PROTO_MINOR_VERSION 8
+// 7.9: SET_TENSOR carries upstream's cache_flag byte (merged with upstream 2026-10: the client asks the server to
+//      save a hash-cache entry only for weights it has just failed to find)
+#define RPC_PROTO_MINOR_VERSION 9
 // 7.4.1: rpc_tensor.flags carries RPC_TENSOR_FLAG_WEIGHTS (client buffer usage WEIGHTS); the server marks the buffer so
 //        its scheduler places ops by their weights. Compatible both ways (an older peer ignores or never sets the bit).
 #define RPC_PROTO_PATCH_VERSION    0

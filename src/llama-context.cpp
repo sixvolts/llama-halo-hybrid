@@ -708,8 +708,11 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
@@ -1028,10 +1031,14 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
-        // reset the previous graph result to make sure that it won't be reused
-        // TODO: change the mctx->apply() to return information if a graph reserve is needed
-        //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        // reset the previous graph results to make sure that they won't be reused
+        // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
+        for (auto & res : gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
+        }
+        gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1562,7 +1569,15 @@ ggml_backend_sched_t llama_context::lane_sched(int lane) const {
 
 llm_graph_result_ptr & llama_context::lane_res(int lane) {
     switch (lane) {
-        case 0:  return gf_res_prev;
+        // lane 0: upstream's two arenas (#28549), batches with and without outputs, so the MTP draft's alternating
+        // ingest and draft graphs both keep their CUDA graphs
+        case 0: {
+            auto & res = gf_res_prev[n_outputs > 0];
+            if (!res) {
+                res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+            }
+            return res;
+        }
         case 1:  return gf_res_prev_lane;
         case 2:  return gf_res_prev_lane_x[0];
         default: return gf_res_prev_lane_x[1];
@@ -1596,7 +1611,8 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype, lane);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // (the active-arena check is lane 0's: the other lanes have one result each)
+    if (!graph_reuse_disable && (lane != 0 || gf_res_prev_active == res) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1609,6 +1625,9 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
         reused = true;
     } else {
+        if (lane == 0) {
+            gf_res_prev_active = nullptr;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sch);
@@ -1640,6 +1659,10 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
         tp3 = prep_debug ? ggml_time_us() : 0;
+
+        if (lane == 0) {
+            gf_res_prev_active = res;
+        }
     }
 
     // set the input data for the input tensors
@@ -3069,6 +3092,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // the n_tokens*40 budget below runs out by ubatch 3840: KDA costs 182 nodes + ~16/token
         // per layer, so 34 KDA layers alone need 6.2k + 31.9*n_tokens before DSA or the MoE
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_HRM_TEXT) {
+        // the 128-slot looped graph needs roughly one stack per token budget
+        res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
@@ -3116,6 +3142,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+}
+
+llm_graph_result * llama_context::get_gf_res_prev() {
+    auto & res = gf_res_prev[n_outputs > 0];
+    if (!res) {
+        res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+    }
+    return res.get();
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -3190,8 +3224,17 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ggml_backend_sched_reset(sch);
 
-    // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    lane_res(lane)->reset();
+    // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+    if (lane == 0) {
+        for (auto & res : gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
+        }
+        gf_res_prev_active = nullptr;
+    } else {
+        lane_res(lane)->reset();
+    }
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -4410,10 +4453,12 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = gf_res_prev.get();
+            auto * res = get_gf_res_prev();
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
+            // the optimizer graph is allocated outside sched, so the next decode must rebuild
+            gf_res_prev_active = nullptr;
             res->reset();
 
             auto * gf = model.build_graph(gparams);

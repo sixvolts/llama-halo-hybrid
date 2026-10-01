@@ -765,10 +765,31 @@ static void ggml_backend_rpc_buffer_memset_tensor(
     ctx->dispatcher->send(RPC_CMD_MEMSET_TENSOR, request, sizeof(*request));
 }
 
+// input serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes)
+static std::shared_ptr<uint8_t> serialize_set_tensor(const rpc_tensor & rpc_tensor, uint8_t cache_flag, uint64_t offset, const void * data, size_t size, size_t & input_size) {
+    input_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset) + size;
+    uint8_t * input = new uint8_t[input_size]();
+    uint8_t * p = input;
+    memcpy(p, &rpc_tensor, sizeof(rpc_tensor)); p += sizeof(rpc_tensor);
+    memcpy(p, &cache_flag, sizeof(cache_flag)); p += sizeof(cache_flag);
+    memcpy(p, &offset,     sizeof(offset));     p += sizeof(offset);
+    memcpy(p, data, size);
+    return std::shared_ptr<uint8_t>(input, std::default_delete<uint8_t[]>());
+}
+
+// the hash cache is meant for weights, so that a model reload can skip re-sending them.
+// compute-buffer inputs (the activations ggml_backend_sched copies between backends) must not
+// take this path, otherwise with `rpc-server -c` every ubatch above the threshold is written
+// to the cache directory and later served from there.
+static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
+    return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    uint8_t cache_flag = 0;
+    if (rpc_use_hash_cache(tensor, size)) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -779,15 +800,12 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             // the server has the same data, no need to send it
             return;
         }
+        // the server has no cache entry for this tensor - ask it to save one
+        cache_flag = 1;
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    uint8_t * input = new uint8_t[input_size]();
-    memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+    size_t input_size;
+    auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
+    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -998,9 +1016,11 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    // halo-hybrid: the hash round trip is a blocking wait for the whole queue; only weights can be de-duplicated
-    // (activations change every graph), and a compute-buffer upload must not stall behind an in-flight graph
-    if (size > HASH_THRESHOLD && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+    // halo-hybrid: the hash round trip is a blocking wait for the whole queue; only weights are de-duplicated
+    // (activations change every graph), so a compute-buffer upload never stalls behind an in-flight graph
+    // (upstream's rpc_use_hash_cache is the same rule)
+    uint8_t cache_flag = 0;
+    if (rpc_use_hash_cache(tensor, size)) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -1012,15 +1032,12 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
             // the server has the same data, no need to send it
             return;
         }
+        // the server has no cache entry for this tensor - ask it to save one
+        cache_flag = 1;
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    uint8_t * input = new uint8_t[input_size]();
-    memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+    size_t input_size;
+    auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
+    ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
 }
 
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -1487,6 +1504,11 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
+    // Discard all cached graphs to avoid use-after-free in graph_recompute,
+    // since their nodes may hold pointers to the buffer being freed.
+    for (auto & sg : stored_graphs) {
+        sg.graph = nullptr;
+    }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
@@ -1605,14 +1627,18 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 
 
 bool rpc_server::set_tensor(const uint8_t * input, size_t input_size) {
-    // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-    if (input_size < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+    // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
+    // (input is the receive buffer itself: halo-hybrid keeps a persistent, never-zeroed SET_TENSOR buffer)
+    uint8_t  cache_flag;
+    uint64_t offset;
+    const size_t header_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset);
+    if (input_size < header_size) {
         return false;
     }
     const rpc_tensor * in_tensor = (const rpc_tensor *)input;
-    uint64_t offset;
-    memcpy(&offset, input + sizeof(rpc_tensor), sizeof(offset));
-    const size_t size = input_size - sizeof(rpc_tensor) - sizeof(offset);
+    memcpy(&cache_flag, input + sizeof(rpc_tensor), sizeof(cache_flag));
+    memcpy(&offset,     input + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(offset));
+    const size_t size = input_size - header_size;
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1641,8 +1667,8 @@ bool rpc_server::set_tensor(const uint8_t * input, size_t input_size) {
         }
     }
 
-    const void * data = input + sizeof(rpc_tensor) + sizeof(offset);
-    if (cache_dir && size > HASH_THRESHOLD) {
+    const void * data = input + header_size;
+    if (cache_dir && cache_flag) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
@@ -2017,7 +2043,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
         int64_t id;
         memcpy(&id, &nodes[i], sizeof(id));
         graph->nodes[i] = create_node(id, ctx, tensor_ptrs, tensor_map);
-
         // Check if create_node failed for a *non-zero* ID.
         // If id was 0, create_node returning nullptr is expected.
         // If id was non-zero and create_node returned nullptr, it indicates a deserialization error.
