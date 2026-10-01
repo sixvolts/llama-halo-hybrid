@@ -2180,11 +2180,13 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                     }
                 }
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
-                }
+                // halo-hybrid: the host writes input_cpy directly, so everything QUEUED on this backend must be done, not
+                // only its last split: the peer copies that split's outputs take to later splits on other backends are
+                // issued on this stream after the split's event (and wait there for the destination's progress), and
+                // read memory the allocator may have given input_cpy (Qwen3.8 hybrid, upstream #28432's alloc deps moved
+                // the card's layout: the experts' input x overwritten by attn_inp_k_idxs before its copy to the APU,
+                // KLD 0.04 -> 0.24). A host synchronize of the stream covers them; the split event did not.
+                ggml_backend_synchronize(split_backend);
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
@@ -2323,11 +2325,8 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                             }
                         }
                         ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                        } else {
-                            ggml_backend_synchronize(split_backend);
-                        }
+                        // (all queued work, not the split event: see the user-input copy above)
+                        ggml_backend_synchronize(split_backend);
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }

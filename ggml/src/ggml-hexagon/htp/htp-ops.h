@@ -23,6 +23,7 @@ enum htp_data_type {
     HTP_TYPE_Q4_1   = 3,
     HTP_TYPE_Q8_0   = 8,
     HTP_TYPE_Q4_K   = 12,
+    HTP_TYPE_Q5_K   = 13,
     HTP_TYPE_Q6_K   = 14,
     HTP_TYPE_IQ4_NL = 20,
     HTP_TYPE_I32    = 26,
@@ -203,6 +204,14 @@ enum htp_trace_event_id {
     HTP_TRACE_EVT_HVX_FA_Q_PREP       = 28,
     HTP_TRACE_EVT_HVX_FA_K_PREP       = 29,
     HTP_TRACE_EVT_HVX_FA_V_PREP       = 30,
+
+    HTP_TRACE_EVT_HVX_GDN_PREP        = 31,
+    HTP_TRACE_EVT_HVX_GDN_SOLVE       = 32,
+    HTP_TRACE_EVT_HVX_GDN_V_PREP      = 33,
+    HTP_TRACE_EVT_HVX_GDN_D_PREP      = 34,
+    HTP_TRACE_EVT_HVX_GDN_OUT         = 35,
+    HTP_TRACE_EVT_HVX_GDN_STATE       = 36,
+    HTP_TRACE_EVT_HVX_GDN_REM         = 37,
 
     HTP_TRACE_EVT_HMX_COMP            = 40,
 };
