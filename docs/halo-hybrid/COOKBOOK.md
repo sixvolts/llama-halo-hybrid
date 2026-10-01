@@ -7,7 +7,7 @@ everywhere; only the device list changes.
 | # | Hardware | Status | Best numbers here | Recipe |
 |---|---|---|---|---|
 | 1 | One Strix Halo, nothing else | measured (2026-09-28) | Qwen3.8-Flash-Next: 40-41 tok/s with the MTP head (55-56 ms/step, real content, T=0.7); prefill 940 / 870 / 780 tok/s at 4K / 16K / 32K | [1](#1-one-strix-halo-by-itself) |
-| 2 | One Strix Halo + one R9700 | production (Qwen3.8-Flash-Next, 2026-09-28) | 63 tok/s decode (35.4 ms/step, real content, T=0.7); prefill 2,090 / 2,220 / 2,030 tok/s at 4K / 16K / 32K | [2](#2-one-strix-halo--one-r9700) |
+| 2 | One Strix Halo + one R9700 | production (Qwen3.8-Flash-Next, 2026-09-28); GLM-5.3-Flash UD-Q2_K_XL measured (2026-10-01) | Qwen3.8: 63 tok/s decode (35.4 ms/step, real content, T=0.7); prefill 2,090 / 2,220 / 2,030 tok/s at 4K / 16K / 32K. GLM-5.3-Flash Q2: 34 tok/s decode, ~590 tok/s prefill, 128K context | [2](#2-one-strix-halo--one-r9700) |
 | 3 | Two Strix Halos over RDMA, no dGPU | derived, not measured | see 4 minus the R9700 | [3](#3-two-strix-halos-over-rdma) |
 | 4 | Two Strix Halos + one R9700 on the head node | superseded by 5 (GLM-5.3-Flash, 200 GB) | 517 tok/s prefill / 20.5 tok/s decode at 13K, 503 / 20.7 at 26K (09-08) | [4](#4-two-strix-halos--one-r9700-on-the-head-node) |
 | 5 | Two Strix Halos + one R9700 on each | production (GLM-5.3-Flash, 200 GB) | 896 tok/s prefill / 30 tok/s decode at 25.8K | [5](#5-two-strix-halos--one-r9700-on-each) |
@@ -166,6 +166,56 @@ column's first request of a fresh server is cold, warm numbers are 10–20% high
 | 4 | hybrid-12 | 1262 | 67.6 agg, 18.0 each | does not fit with the head |
 | 4 | hybrid-10 | 585 (single lane) | 47.8 agg, 12.7 each | 51.5 agg, 14.0 each |
 | 1 at 68K context | hybrid-12 / hybrid-10 | 413 (`-ub 1024`) / 306 (`-ub 512`) | 25.7 | **43.6** |
+
+### GLM-5.3-Flash at UD-Q2_K_XL (one box, 2026-10-01)
+
+GLM-5.3-Flash at Unsloth's UD-Q2_K_XL quant (108.7 GB in four shards) fits on one Strix Halo + R9700. The production
+GLM layout is two boxes at UD-Q4_K_XL (recipe 5); this is the single-machine option.
+- **Card:** the dense trunk, attention, KV cache and output head, plus the MTP draft head.
+- **iGPU:** the routed experts.
+
+The draft head comes from the same download. Shard 4 carries the MTP block (`blk.45`), so export it into a draft-only
+file once (pure Python, about a second):
+
+```
+python3 docs/halo-hybrid/export_mtp.py <dir with the four UD-Q2_K_XL shards> GLM-5.3-Flash-mtp-UD-Q2_K_XL.gguf   # 2.8 GB
+```
+
+Launch at 128K context. ROCm0 is the R9700 and ROCm1 the iGPU; check the device order in the startup log:
+
+```
+sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
+
+LLAMA_PREFILL_LANES=2 \
+llama-server -m GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 131072 -b 4096 -ub 2048 -np 1 -t 16 \
+  -ot 'blk\.([3-9]|[1-3][0-9]|4[0-6])\.ffn_(gate|up|down)_exps=ROCm1,^token_embd\.weight$=CPU' \
+  -md GLM-5.3-Flash-mtp-UD-Q2_K_XL.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max 2 \
+  --jinja --host 0.0.0.0 --port 8080
+```
+
+Measured with the DGX Spark comparison's scripts (README, "Against a DGX Spark"): 40 prompts at T=0, needle-in-filler
+prefill at matched token counts, MTP n-max 2, one run each.
+
+| Layout | Decode median (prose) | Prefill 7K / 28K / 113K | Draft acceptance | Quality auto-score |
+|---|---|---|---|---|
+| `-c 131072`, all routed experts on the iGPU, `-ub 2048` (the line above) | 33.8-34.1 tok/s (25.3-25.8) | 569 / 594 / 483 tok/s | 0.73-0.74 | 0.88 |
+| `-c 65536`, experts of layers 3-9 on the card, `-ub 1024` | 36.4 tok/s (27.5) | 447 / 496 / - | 0.74 | 0.83 |
+| `-c 65536`, experts of layers 3-7 on the card, `-ub 2048` (prefill only) | - | 581 / 596 / - | - | - |
+
+* **Thinking:** GLM's chat template always opens a `<think>` block and has no `enable_thinking` switch. The numbers above
+  use `--reasoning-budget 0`, which is the equivalent of the Spark harness's "thinking off". With thinking on, answers
+  take longer but per-token speed is the same.
+* **Card memory:**
+  - At 128K context the attention buffers grow, so every routed expert has to live on the iGPU. That costs 2-3 tok/s
+    of decode against the 64K layout.
+  - At 64K, `-ub 2048` with experts of layers 3-9 on the card does not fit next to the draft; experts of 3-7 do.
+* **Prefill:** `-ub 2048` is the sweet spot, about 30% faster than 1024; 4096 is no better (571 / 593).
+* **Draft head:** the Q2 export and the Q4_K_XL export (recipe 5's draft) measure the same: 34.1 vs 33.8 tok/s,
+  acceptance 0.738 vs 0.734.
+* **For comparison:** the two-box UD-Q4_K_XL production layout (recipe 5) runs 896 tok/s prefill at 25.8K and 30 tok/s
+  decode, on a different harness.
+* **Quality:** the auto-score is the only quality check run on Q2. A KLD comparison against Q4_K_XL has not been done.
 
 ### The original run: Qwen3.5-122B-A10B
 
