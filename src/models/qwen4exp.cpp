@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <cinttypes>
 
+// [TAG_QWEN4_REIMPLEMENT]
+// TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -813,8 +816,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool scores, uint32_t top_k) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias), scores(scores), top_k(top_k) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool scores, uint32_t top_k, bool causal_attn) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), scores(scores), top_k(top_k), causal_attn(causal_attn) {}
 
     // halo-hybrid: the scores (and their inputs) are only needed when the KV window is wider than top-k returns
     static bool need_scores(int64_t n_kv, uint32_t ratio, uint32_t top_k) {
@@ -861,7 +864,7 @@ public:
             bp_shadow = *blk_pos; bp_shadow.data = blk_pos_host.data(); bp = &bp_shadow;
         }
         if (scores) {
-            mctx->set_input_qsa(cbk, bc, bp, bias, ubatch, ratio, blk_bias);
+            mctx->set_input_qsa(cbk, bc, bp, bias, ubatch, ratio, blk_bias, causal_attn);
         }
         if (blk_topk) {
             int32_t nb = 0;
@@ -977,6 +980,9 @@ public:
         n_bid = 0;
         return enabled && scores && blk_bias && n_stream == 1 && mctx && mctx->get_mem() && mctx->get_mem()->qsa_identity(ub, ratio, n_bid);
     }
+
+    // this is fixed for the graph's lifetime, as causal_attn is part of the reuse key (llm_graph_params::allow_reuse)
+    const bool causal_attn;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -1004,8 +1010,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // only the "which block is visible" half of the bias varies per block
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
-    // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
+    // alibi writes distances instead of a mask, so it opts out
     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
+    // halo-hybrid: non-causal graphs keep the per-cell bias - the block-key cache (C6) and the block-level top-k (C4)
+    // assume the causal rule; set_causal_attn therefore still re-reserves (llama-context)
     const bool blk_bias = kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
@@ -1018,7 +1026,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         inp = it->second;
     } else {
         const bool scores = llm_graph_input_qsa::need_scores(n_kv, (uint32_t) r, hparams.indexer_top_k);
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, scores, hparams.indexer_top_k);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, scores, hparams.indexer_top_k, cparams.causal_attn);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         if (scores) {

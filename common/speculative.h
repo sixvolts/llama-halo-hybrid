@@ -92,10 +92,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
 // halo-hybrid: call right before / right after the target's llama_decode of a batch that is then passed to
 // common_speculative_process (lets the MTP drafter ingest the batch per target ubatch, inside that decode)
-void common_speculative_process_begin(common_speculative * spec, const llama_batch & batch);
+void common_speculative_process_begin(common_speculative * spec, const common_batch & batch);
 void common_speculative_process_end(common_speculative * spec);
 
 // process the batch and update the internal state of the speculative context
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+
+// legacy llama_batch input, converted with common_batch_from_llama_batch()
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`

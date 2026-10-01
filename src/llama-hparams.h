@@ -292,6 +292,7 @@ struct llama_hparams {
     uint32_t indexer_top_k     = 0;
     // glm5next: the indexer scores pools of this many keys instead of single keys
     uint32_t indexer_kpool     = 0;
+    bool     indexer_kpool_select_tail = true; // glm5-next (upstream)
     // MSA
     uint32_t indexer_block_size  = 0;
     uint32_t indexer_local_blocks = 0;
@@ -360,6 +361,7 @@ struct llama_hparams {
     uint32_t    dec_n_layer        = 0;
 
     enum llama_pooling_type      pooling_type            = LLAMA_POOLING_TYPE_NONE;
+    enum llama_pooling_type      pooling_type_cls        = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling before the classifier head (RANK)
     enum llama_rope_type         rope_type               = LLAMA_ROPE_TYPE_NONE;
     enum llama_rope_scaling_type rope_scaling_type_train = LLAMA_ROPE_SCALING_TYPE_NONE;
 
