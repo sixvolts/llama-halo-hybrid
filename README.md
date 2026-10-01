@@ -179,7 +179,7 @@ the [cookbook](docs/halo-hybrid/COOKBOOK.md); the kernel and scheduler changes b
 | Hardware | Model it runs here | Status | Numbers |
 |---|---|---|---|
 | [One Strix Halo, nothing else](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~890 tok/s prefill at 16K |
-| [One Strix Halo + one R9700](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Swift 1.5, Qwen3.5-122B, GLM-5.3-Flash (UD-Q2_K_XL) | production | 63 tok/s, ~2,300 tok/s prefill at 16K (Qwen3.8); GLM-5.3-Flash Q2: 34 tok/s, ~590 tok/s prefill, 128K context ([recipe](docs/halo-hybrid/COOKBOOK.md#glm-53-flash-at-ud-q2_k_xl-one-box-2026-10-01)) |
+| [One Strix Halo + one R9700](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Swift 1.5, Qwen3.5-122B, GLM-5.3-Flash (UD-Q2_K_XL) | production | 63 tok/s, ~2,300 tok/s prefill at 16K (Qwen3.8); GLM-5.3-Flash Q2: 44 tok/s, ~620 tok/s prefill, 128K context ([recipe](docs/halo-hybrid/COOKBOOK.md#glm-53-flash-at-ud-q2_k_xl-one-box-2026-10-01)) |
 | [Two Strix Halos over the 100G link](docs/halo-hybrid/COOKBOOK.md#3-two-strix-halos-over-rdma) | GLM-5.3-Flash (200 GB) | derived, not measured | |
 | [Two Strix Halos + one R9700 on the head node](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node) | GLM-5.3-Flash | superseded by the next row | 517 tok/s prefill / 20.5 tok/s decode at 13K (09-08) |
 | [Two Strix Halos + one R9700 on each](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each) | GLM-5.3-Flash | production | 896 tok/s prefill / 30 tok/s decode at 25.8K |
