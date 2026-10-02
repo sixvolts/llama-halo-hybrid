@@ -454,10 +454,16 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                 for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
                     const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
 
-                    const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
-                    ggml_cuda_memcpy_1<cpy_nb>(
-                        tile_KV + i*(J/2 + J_padding) + j,
-                        !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
+                    // halo-hybrid: branch instead of selecting between a global pointer and a local zero array.
+                    // The select makes a flat pointer that may point into private memory; on gfx1030 (no
+                    // architected flat scratch) that load faulted at a near-null address for unaligned KV
+                    // lengths (Qwen3.8's 2051-cell gathered decode, test-backend-ops kv=113). Same values.
+                    if (!oob_check || i < i_sup) {
+                        ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, KV + i*stride_KV + j);
+                    } else {
+                        const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
+                        ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, zero);
+                    }
                 }
             }
         }
@@ -504,10 +510,15 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                 for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
                     const int j = j0*(cpy_ne/2) + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*(cpy_ne/2);
 
-                    const half2 zero[cpy_ne/2] = {{0.0f, 0.0f}};
                     __align__(16) half2 tmp_h2[cpy_ne/2];
-                    ggml_cuda_memcpy_1<sizeof(tmp_h2)>(
-                        tmp_h2, !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
+                    if (!oob_check || i < i_sup) { // (see the half2 variant above)
+                        ggml_cuda_memcpy_1<sizeof(tmp_h2)>(tmp_h2, KV + i*stride_KV + j);
+                    } else {
+#pragma unroll
+                        for (int l = 0; l < cpy_ne/2; ++l) {
+                            tmp_h2[l] = make_half2(0.0f, 0.0f);
+                        }
+                    }
 
                     __align__(16) float2 tmp_f2[cpy_ne/2];
 #pragma unroll
