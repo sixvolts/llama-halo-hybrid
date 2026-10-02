@@ -6343,10 +6343,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #define ggml_cuda_optimer_create  cudaEventCreate
 #endif
 struct ggml_cuda_optimer {
-    struct acc { uint64_t n = 0; double us = 0; };
+    struct acc { uint64_t n = 0; double us = 0; double bytes = 0; };
     std::map<std::string, acc> by_key;
     std::vector<cudaEvent_t> ev;      // pairs
     std::vector<std::string> keys;    // key per pair in this graph
+    std::vector<double> bytes;        // bytes moved per pair (external sources + output, an estimate)
     size_t used = 0;
     uint64_t graphs = 0;
     static bool enabled() { static const bool e = getenv("GGML_CUDA_TIME_OPS") != nullptr; return e; }
@@ -6355,7 +6356,21 @@ struct ggml_cuda_optimer {
         return ev[used++];
     }
     std::string tag;                  // "D " decode / "P " prefill, from the graph's widest MUL_MAT activation
-    void begin(cudaStream_t st, const std::string & key) { keys.push_back(tag + key); CUDA_CHECK(cudaEventRecord(next_event(), st)); }
+    void begin(cudaStream_t st, const std::string & key) { keys.push_back(tag + key); bytes.push_back(0); CUDA_CHECK(cudaEventRecord(next_event(), st)); }
+    // the nodes [i0, i0 + n] run as one launch: count the sources not produced inside the run, plus the last output
+    void set_bytes(const ggml_cgraph * cg, int i0, int n) {
+        double b = (double) ggml_nbytes(cg->nodes[i0 + n]);
+        for (int k = i0; k <= i0 + n; k++) {
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                const ggml_tensor * src = cg->nodes[k]->src[s];
+                if (!src) { continue; }
+                bool inside = false;
+                for (int q = i0; q < k && !inside; q++) { inside = src == cg->nodes[q] || src->view_src == cg->nodes[q]; }
+                if (!inside) { b += (double) ggml_nbytes(src); }
+            }
+        }
+        bytes.back() = b;
+    }
     void set_tag(const ggml_cgraph * cgraph) {
         int64_t n = 0;
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -6370,9 +6385,9 @@ struct ggml_cuda_optimer {
         CUDA_CHECK(cudaEventSynchronize(ev[used - 1]));
         for (size_t i = 0; i < keys.size(); i++) {
             float ms = 0; CUDA_CHECK(ggml_cuda_optimer_elapsed(&ms, ev[2*i], ev[2*i + 1]));
-            acc & a = by_key[keys[i]]; a.n++; a.us += ms * 1000.0;
+            acc & a = by_key[keys[i]]; a.n++; a.us += ms * 1000.0; a.bytes += bytes[i];
         }
-        used = 0; keys.clear(); graphs++;
+        used = 0; keys.clear(); bytes.clear(); graphs++;
         static const uint64_t every = getenv("GGML_CUDA_TIME_OPS_EVERY") ? (uint64_t) atoll(getenv("GGML_CUDA_TIME_OPS_EVERY")) : 200;
         if (graphs % every == 0) {
             std::vector<std::pair<std::string, acc>> v(by_key.begin(), by_key.end());
@@ -6382,8 +6397,9 @@ struct ggml_cuda_optimer {
                     device, (unsigned long long) graphs, (unsigned long long) n, tot / 1000.0, tot / 1000.0 / graphs);
             static const size_t top = getenv("GGML_CUDA_TIME_OPS_TOP") ? (size_t) atoi(getenv("GGML_CUDA_TIME_OPS_TOP")) : 40;
             for (size_t i = 0; i < v.size() && i < top; i++) {
-                fprintf(stderr, "OPTIMER dev %d %-64s n=%8llu  %9.2f ms  mean %8.2f us\n", device, v[i].first.c_str(),
-                        (unsigned long long) v[i].second.n, v[i].second.us / 1000.0, v[i].second.us / v[i].second.n);
+                fprintf(stderr, "OPTIMER dev %d %-64s n=%8llu  %9.2f ms  mean %8.2f us  %7.1f GB/s\n", device, v[i].first.c_str(),
+                        (unsigned long long) v[i].second.n, v[i].second.us / 1000.0, v[i].second.us / v[i].second.n,
+                        v[i].second.us > 0 ? v[i].second.bytes / (v[i].second.us * 1e3) : 0.0);
             }
             fflush(stderr);
         }
@@ -6567,11 +6583,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 const bool optimer_on = ggml_cuda_optimer::enabled() && !use_cuda_graph;
-                if (optimer_on) { ggml_cuda_optimer_for(cuda_ctx->device).begin(cuda_ctx->stream(), ggml_cuda_optimer_key(node, 0)); }
+                if (optimer_on) { auto & t = ggml_cuda_optimer_for(cuda_ctx->device); t.begin(cuda_ctx->stream(), ggml_cuda_optimer_key(node, 0)); t.set_bytes(cgraph, i, 0); }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
-                    if (optimer_on) { auto & t = ggml_cuda_optimer_for(cuda_ctx->device); t.keys.back() = t.tag + ggml_cuda_optimer_key(node, nodes_to_skip); t.end(cuda_ctx->stream()); }
+                    if (optimer_on) { auto & t = ggml_cuda_optimer_for(cuda_ctx->device); t.keys.back() = t.tag + ggml_cuda_optimer_key(node, nodes_to_skip); t.set_bytes(cgraph, i, nodes_to_skip); t.end(cuda_ctx->stream()); }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
