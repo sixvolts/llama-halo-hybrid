@@ -13225,6 +13225,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // halo-hybrid: Qwen3.8's q8_0 trunk GEMMs at a 2560-token prefill ubatch (m = rows, k = input width)
+    for (auto mk : std::vector<std::pair<int, int>>{{320, 10240}, {10240, 320}, {10240, 2560}, {2560, 6144}, {6144, 2560}, {640, 2560}, {12288, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk.first, 2560, mk.second, {1, 1}, {1, 1}));
+    }
+
     // halo-hybrid: Qwen3.8 QSA prefill attention (2560 queries, 2051 kept per query) - dense vs sparse tile walk
     for (int64_t kv : {8192, 28672}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2560, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051, true));

@@ -778,7 +778,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
     // sparse: the cache cell of each of this thread's KQ rows, read once (not once per Q column)
     [[maybe_unused]] int32_t i_mask_reg[use_sparse ? nbatch_fa/(np*warp_size) : 1];
-    if constexpr use_sparse {
+    if constexpr (use_sparse) {
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
             const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
