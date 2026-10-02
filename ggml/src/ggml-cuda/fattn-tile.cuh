@@ -1435,7 +1435,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
                     (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, /*use_sparse*/ true, warp_size,
                      /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             };
-            if constexpr (DKQ == 512) {
+            if constexpr (DKQ == 512 || ncols2 == 1) {
+                // D=512: 8 columns at most on RDNA2; D=256 with one head per K/V group (MHA, odd GQA): the 16/32-column
+                // <256, n, 1> tiles fail the occupancy query on RDNA2 (see rdna256_mha above)
                 launch_sparse(std::integral_constant<int, 8>{});
             } else {
                 // 32 columns (16 queries x 2 heads): the larger union costs less than half the K/V reuse (V620, 2560

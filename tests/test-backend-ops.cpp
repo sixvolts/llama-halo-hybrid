@@ -12875,6 +12875,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2052));
         }
     }
+    // the same walk for one head per K/V group (D=256 MHA / odd GQA), small-GQA D=512, and a quantized cache
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 1, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, false, 2051, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 3, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, false, 2051, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 4, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, false, 2052));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051, true));
 
 
     // sparse mask + quantized cache
