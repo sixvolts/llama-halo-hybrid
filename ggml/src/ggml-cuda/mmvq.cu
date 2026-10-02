@@ -102,7 +102,10 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    // halo-hybrid: real RDNA2 (gfx103x). gfx1151 also uses the RDNA2 table above by default (GGML_CUDA_MMVQ_RDNA35),
+    // so the Navi21 tuning (llama-navi21-furnace 0aa20a02b, b5f65d215, 05512bb1d) gets its own id
+    MMVQ_PARAMETERS_NAVI21
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -119,7 +122,7 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA2;
 #endif
 #elif defined(RDNA2)
-    return MMVQ_PARAMETERS_RDNA2;
+    return MMVQ_PARAMETERS_NAVI21;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
@@ -146,7 +149,7 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
 #endif
     }
     if (GGML_CUDA_CC_IS_RDNA2(cc)) {
-        return MMVQ_PARAMETERS_RDNA2;
+        return MMVQ_PARAMETERS_NAVI21;
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
@@ -663,6 +666,19 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
         return generic;
     }
+    // Navi21 (V620, from llama-navi21-furnace): upstream had no RDNA2 entry, so every dispatch ran as one wave32
+    // workgroup. ncols_dst == 1 wants 4 waves to keep enough loads in flight; the verify shapes carry ncols_dst
+    // accumulators per wave, so wider blocks stop paying (V620, Qwen3.8-27B: 2..4 at 2 waves +6.3%, 5..8 at 1 wave
+    // with 4 rows per block +7.6%)
+    if (table_id == MMVQ_PARAMETERS_NAVI21) {
+        if (ncols_dst == 1) {
+            return 4;
+        }
+        if (ncols_dst <= 4) {
+            return 2;
+        }
+        return 1;
+    }
     return 1;
 }
 
@@ -670,6 +686,24 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
         // halo-hybrid: small-K rows-per-block mode on RDNA4 (K=2560 rows took 2 loop trips + an 8-warp reduction)
         return (ncols_dst == 1 && small_k) ? nwarps : 1;
+    }
+    if (table_id == MMVQ_PARAMETERS_NAVI21) {
+        switch (ncols_dst) {
+            case 1:
+                return small_k ? nwarps : 1;
+            case 2:
+            case 3:
+            case 4:
+                return 2;
+            // 5..8 (block-drafter verify): 4 rows amortise the 8 y-columns each wave holds; 8 rows regress
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 4;
+            default:
+                return 1;
+        }
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
