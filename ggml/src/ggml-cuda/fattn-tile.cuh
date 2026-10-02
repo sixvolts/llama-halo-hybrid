@@ -424,9 +424,12 @@ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ,
 }
 
 // TODO: deduplicate with mma-f16
-template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+// halo-hybrid: sparse == true gathers row idx[i] of KV instead of row i (idx < 0 or i >= i_sup: zeros); KV then points
+// at the first row of the cache, not at the tile
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, bool sparse = false>
 static __device__ __forceinline__ void flash_attn_tile_load_tile(
-        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
+        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup,
+        const int32_t * const __restrict__ idx = nullptr) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -445,6 +448,21 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
             return;
         }
 
+        // sparse: the rows' indices are read once per row into registers ahead of the loads (a dependent global load
+        // in front of every 16-byte chunk otherwise)
+        constexpr int n_rows_max = (I + nwarps - 1) / nwarps;
+        int32_t row_reg[sparse ? n_rows_max : 1];
+        if constexpr (sparse) {
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += nwarps*stride_i) {
+                const int i = i0 + threadIdx.y*stride_i + (stride_j == warp_size ? 0 : threadIdx.x / stride_j);
+                // positions past the list's count load the walk's last listed cell (idx[i_sup - 1]: a real, selected
+                // cell, also when this sub-tile starts past the count) rather than zeros: the -inf mask removes them, as
+                // in the MMA path. One clamped load, no branch or select (both made gfx1030 spill registers)
+                row_reg[i0/(nwarps*stride_i)] = idx[min(i, i_sup - 1)];
+            }
+        }
+
 #pragma unroll
         for (int i0 = 0; i0 < I; i0 += nwarps*stride_i) {
             const int i = i0 + threadIdx.y*stride_i + (stride_j == warp_size ? 0 : threadIdx.x / stride_j);
@@ -458,8 +476,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     // The select makes a flat pointer that may point into private memory; on gfx1030 (no
                     // architected flat scratch) that load faulted at a near-null address for unaligned KV
                     // lengths (Qwen3.8's 2051-cell gathered decode, test-backend-ops kv=113). Same values.
-                    if (!oob_check || i < i_sup) {
-                        ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, KV + i*stride_KV + j);
+                    const int row = sparse ? row_reg[i0/(nwarps*stride_i)] : i; // (a cache of < 2^31 half2 per head)
+                    if (sparse || !oob_check || i < i_sup) {
+                        ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, KV + row*stride_KV + j);
                     } else {
                         const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
                         ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, zero);
@@ -480,9 +499,10 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
     ggml_cuda_unroll<7>{}(load);
 }
 
-template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, bool sparse = false>
 static __device__ __forceinline__ void flash_attn_tile_load_tile(
-        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
+        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup,
+        const int32_t * const __restrict__ idx = nullptr) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -501,6 +521,19 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
             return;
         }
 
+        constexpr int n_rows_max = (I + nwarps - 1) / nwarps;
+        int32_t row_reg[sparse ? n_rows_max : 1]; // (see the half2 variant)
+        if constexpr (sparse) {
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += nwarps*stride_i) {
+                const int i = i0 + threadIdx.y*stride_i + (stride_j == warp_size ? 0 : threadIdx.x / stride_j);
+                // positions past the list's count load the walk's last listed cell (idx[i_sup - 1]: a real, selected
+                // cell, also when this sub-tile starts past the count) rather than zeros: the -inf mask removes them, as
+                // in the MMA path. One clamped load, no branch or select (both made gfx1030 spill registers)
+                row_reg[i0/(nwarps*stride_i)] = idx[min(i, i_sup - 1)];
+            }
+        }
+
 #pragma unroll
         for (int i0 = 0; i0 < I; i0 += nwarps*stride_i) {
             const int i = i0 + threadIdx.y*stride_i + (stride_j == warp_size ? 0 : threadIdx.x / stride_j);
@@ -511,8 +544,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     const int j = j0*(cpy_ne/2) + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*(cpy_ne/2);
 
                     __align__(16) half2 tmp_h2[cpy_ne/2];
-                    if (!oob_check || i < i_sup) { // (see the half2 variant above)
-                        ggml_cuda_memcpy_1<sizeof(tmp_h2)>(tmp_h2, KV + i*stride_KV + j);
+                    const int row = sparse ? row_reg[i0/(nwarps*stride_i)] : i;
+                    if (sparse || !oob_check || i < i_sup) { // (see the half2 variant above)
+                        ggml_cuda_memcpy_1<sizeof(tmp_h2)>(tmp_h2, KV + row*stride_KV + j);
                     } else {
 #pragma unroll
                         for (int l = 0; l < cpy_ne/2; ++l) {
@@ -542,7 +576,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 
 // Function that performs a single iteration in for the KQ matrix multiplication:
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, typename T_vec_dot>
+    bool use_logit_softcap, bool oob_check, bool use_sparse, typename T_vec_dot>
 static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         const half2 * __restrict__ Qg_base, // Q as half2 in global memory (see launch_fattn), or nullptr
         const int   * __restrict__ q_row,   // per Q column of this warp: row index into Qg_base
@@ -553,7 +587,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         const int k_VKQ_0,
         const int k_VKQ_sup,
         const int k_KQ_0,
-        float * KQ_acc) {
+        float * KQ_acc,
+        const int32_t * __restrict__ indices) { // sparse: the tile's index list, else nullptr
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -561,8 +596,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
-    flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
-        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+    if constexpr (use_sparse) {
+        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check, true>
+            (K_h2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup, indices + k_VKQ_0);
+    } else {
+        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+            (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+    }
     __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
@@ -673,7 +713,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc>
+    bool use_logit_softcap, bool oob_check, bool use_sparse, typename T_vec_dot, typename T_KQ, typename T_acc>
 static __device__ __forceinline__ void flash_attn_tile_iter(
         const half2 * __restrict__ Qg_base,
         const int   * __restrict__ q_row,
@@ -694,7 +734,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         T_acc * const VKQ,
         const int k_VKQ_0,
         const int k_VKQ_max,
-        const int col_Q_0) {
+        const int col_Q_0,
+        const int32_t * __restrict__ indices) { // sparse: list positions [k_VKQ_0, k_VKQ_max) hold cache rows
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -726,13 +767,23 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int nbatch_K_last = DKQ % nbatch_K;
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>(
-            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, use_sparse>(
+            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, indices);
     }
     if (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check>(
-            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, use_sparse>(
+            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, indices);
+    }
+
+    // sparse: the cache cell of each of this thread's KQ rows, read once (not once per Q column)
+    [[maybe_unused]] int32_t i_mask_reg[use_sparse ? nbatch_fa/(np*warp_size) : 1];
+    if constexpr use_sparse {
+#pragma unroll
+        for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+            const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
+            i_mask_reg[i_KQ_0/(np*warp_size)] = i_KQ < k_VKQ_sup ? indices[k_VKQ_0 + i_KQ] : -1;
+        }
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -755,8 +806,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
+                // sparse: the list is the union over the tile's queries, the mask keeps each query to its own cells
+                const int i_mask = use_sparse ? i_mask_reg[i_KQ_0/(np*warp_size)] : k_VKQ_0 + i_KQ;
+                // sparse: positions past the list's count (-1) are -inf, which the softmax turns into 0
+                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += use_sparse && i_mask < 0 ? -INFINITY : (ncols2 > 1 || mask) ?
+                    slope*__half2float(mask[j*stride_mask + i_mask]) : 0.0f;
 
                 KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
             }
@@ -837,8 +891,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     static_assert(nbatch_V % np == 0, "bad nbatch_V");
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
-        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
-            (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+        if constexpr (use_sparse) {
+            flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check, true>
+                (V_h2, KV_tmp, stride_V2, k_VKQ_sup - k0, indices + k_VKQ_0 + k0);
+        } else {
+            flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+        }
         __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
@@ -907,7 +966,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
+// halo-hybrid: use_sparse == true walks the tile's index list (launch_fattn with use_sparse: the union of the tile's
+// ncols1 queries' selected cells, [count, cells...] per group, KV_max_ptr points at the lists) instead of the cache
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool use_sparse = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
@@ -1098,32 +1159,47 @@ static __global__ void flash_attn_tile(
     __syncthreads();
 
     // Main loop over KV cache:
+    if constexpr (use_sparse) {
+        // list of this tile's query group: ne11 is the list stride (capacity + 1), ne31 the mask rows (queries)
+        const int32_t * list = KV_max + (int64_t(sequence % ne33)*((ne31 + ncols1 - 1)/ncols1) + blockIdx.x)*ne11;
+        const int32_t * indices = list + 1;
+        const int k_VKQ_max = list[0];
+        // one loop body: the loads and the mask bound every position by the count themselves (the separate
+        // bounds-checked tail iteration doubled the code and spilled registers on gfx1030)
+        for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+            constexpr bool oob_check = false;
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, true>
+                (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, indices);
+        }
+    } else {
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, false>
                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, nullptr);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, false>
                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, nullptr);
         }
     } else {
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, false>
                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, nullptr);
         }
     }
+    } // use_sparse
 
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
@@ -1292,6 +1368,34 @@ static __global__ void flash_attn_tile(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
+// halo-hybrid: sparse attention on the tile kernel, for devices without the WMMA/MMA sparse path (RDNA2 here). The
+// graph marks top-k-selected attention by op param 4 (cells kept per query, e.g. 2051 for Qwen3.8's QSA and GLM's
+// DSA); the mask then is -inf outside each query's selection. Instead of walking the whole cache under that mask, the
+// kernel walks the union of its query group's selections. GGML_CUDA_FA_TILE_SPARSE=0 disables it,
+// GGML_CUDA_FA_TILE_SPARSE_MIN_RATIO (default 3) is the cache / selection ratio from which it is used.
+static bool ggml_cuda_fattn_tile_shall_use_sparse(const int cc, const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    static const bool enabled = getenv("GGML_CUDA_FA_TILE_SPARSE") == nullptr || atoi(getenv("GGML_CUDA_FA_TILE_SPARSE")) != 0;
+    static const int64_t min_ratio = getenv("GGML_CUDA_FA_TILE_SPARSE_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_TILE_SPARSE_MIN_RATIO")) : 3;
+    if (!enabled || !GGML_CUDA_CC_IS_RDNA2(cc)) {
+        return false;
+    }
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    return n_kv_max > 0 && mask != nullptr && dst->src[4] == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
+        mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+        Q->ne[1] >= 32 && K->ne[1] >= min_ratio*n_kv_max;
+#else
+    GGML_UNUSED_VARS(cc, dst);
+    return false;
+#endif // GGML_USE_HIP
+}
+
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -1316,6 +1420,38 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     const bool rdna_d128   = rdna2 && DKQ == 128;
     const bool rdna576     = rdna2 && DKQ == 576;
     const bool rdna256_mha = rdna2 && DKQ == 256 && ncols2 == 1;
+
+#ifdef GGML_USE_HIP
+    // sparse: a 16-column tile (8 for D=512 on RDNA2, see above) keeps the query group's union small
+    if constexpr ((DKQ == 256 || DKQ == 512) && DV == DKQ && ncols2 <= 8) {
+        if (ggml_cuda_fattn_tile_shall_use_sparse(cc, dst)) {
+            static const int sp_cols = getenv("GGML_CUDA_FA_TILE_SPARSE_COLS") ? atoi(getenv("GGML_CUDA_FA_TILE_SPARSE_COLS")) : 32;
+            auto launch_sparse = [&](auto cols_c) {
+                constexpr int cols_per_block = decltype(cols_c)::value;
+                const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+                const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+                fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true>;
+                launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                    (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, /*use_sparse*/ true, warp_size,
+                     /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
+            };
+            if constexpr (DKQ == 512) {
+                launch_sparse(std::integral_constant<int, 8>{});
+            } else {
+                // 32 columns (16 queries x 2 heads): the larger union costs less than half the K/V reuse (V620, 2560
+                // queries at 28K: 34 ms against 38 ms at 16 columns and 93 ms dense)
+                if (sp_cols == 32) {
+                    launch_sparse(std::integral_constant<int, 32>{});
+                } else if (sp_cols == 8) {
+                    launch_sparse(std::integral_constant<int, 8>{});
+                } else {
+                    launch_sparse(std::integral_constant<int, 16>{});
+                }
+            }
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
 
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
