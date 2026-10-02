@@ -312,6 +312,15 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     return 0;
 }
 
+// halo-hybrid: Q read from a global half2 buffer by the wide tile kernels (llama-navi21-furnace 5c913c0d2) is
+// measured on RDNA2 only; elsewhere (gfx1151 / gfx1201 decode and verify, NVIDIA) the kernels keep staging Q in
+// shared memory, so their results stay as they were.
+#if defined(GGML_USE_HIP) && defined(RDNA2)
+#define GGML_CUDA_FATTN_TILE_Q_GLOBAL 1
+#else
+#define GGML_CUDA_FATTN_TILE_Q_GLOBAL 0
+#endif // defined(GGML_USE_HIP) && defined(RDNA2)
+
 // RDNA2 (gfx1030) overrides. RDNA2 has no WMMA, so every flash-attention call lands on the
 // tile kernel. The occupancy-1 entries date from when HIP's occupancy query (which undercounts
 // the RDNA2 register file, see launch_fattn) made larger configs abort; launch_fattn now
@@ -551,7 +560,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     // through the LDS, which the K reads already saturate (RDNA2: removing them measured +30% on the
     // 512-column kernel). Narrow kernels keep the original loop over Q_tmp: they are bound by
     // streaming K/V and the extra cached reads cost them more than the LDS reads did.
-    constexpr bool q_global = DKQ <= 256 && ncols1*ncols2 >= 16;
+    constexpr bool q_global = GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols1*ncols2 >= 16;
     if constexpr (q_global) {
         static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
         constexpr int nsteps = (nbatch_K/2) / cpy_ne;
@@ -982,7 +991,7 @@ static __global__ void flash_attn_tile(
     // KQ == SRAM buffer to hold KQ fragments between KQ and VKQ matrix multiplications.
     // VKQ == Accumulators in registers for the final VKQ result.
 #ifdef FAST_FP16_AVAILABLE
-    __shared__ half2 Q_tmp[(DKQ <= 256 && ncols >= 16) ? 2 : ncols * DKQ/2]; // unused when Q comes from Q_h2
+    __shared__ half2 Q_tmp[(GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 16) ? 2 : ncols * DKQ/2]; // unused when Q comes from Q_h2
     __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
     __shared__ half  KQ[ncols * nbatch_fa];
     __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
@@ -1006,7 +1015,7 @@ static __global__ void flash_attn_tile(
     // Q comes pre-converted from Q_h2 (see launch_fattn) for the wide kernels, where the reads amortize
     // over many columns and the LDS traffic they replace is the limiter. The narrow decode kernels are
     // bound by streaming K/V and the extra cached reads cost them more than the LDS reads did.
-    constexpr bool q_global = DKQ <= 256 && ncols >= 16;
+    constexpr bool q_global = GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 16;
 #else
     constexpr bool q_global = false;
 #endif // FAST_FP16_AVAILABLE
@@ -1306,7 +1315,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
-                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
+                 /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1323,7 +1332,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
-                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
+                 /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1336,7 +1345,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
-                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
+                 /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1349,7 +1358,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
-                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
+                 /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1362,7 +1371,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
-                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
+                 /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
             return;
         }
     }
@@ -1374,7 +1383,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
         launch_fattn<DV, cols_per_block/ncols2, ncols2>
             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size,
-                 /*q_h2*/ fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
+                 /*q_h2*/ rdna2 && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
         return;
     }
 
