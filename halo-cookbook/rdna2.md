@@ -2,7 +2,7 @@
 
 Measured 2026-10-02 on gibson: one Strix Halo (Ryzen AI Max+ 395) plus a **Radeon Pro V620** (gfx1030, 32 GB GDDR6,
 ~512 GB/s, 250 W VBIOS cap) on a PCIe Gen4 x4 link. The RX 6800 / 6800 XT / 6900 XT are the same chip with 16 GB; for
-those use the 16 GB layouts of the [RX 9070 XT recipe](COOKBOOK.md#radeon-rx-9070-xt-16-gb-instead-of-the-r9700-simulated-2026-10-01)
+those use the 16 GB layouts of the [RX 9070 XT recipe](rdna4.md#radeon-rx-9070-xt-16-gb-simulated)
 (not measured on RDNA2).
 
 RDNA2 has no matrix (WMMA) units, so this card runs different kernels from the R9700: the tile flash-attention kernel
@@ -32,11 +32,7 @@ and dp4a integer matmuls. Three changes in this tree make it work well (all gate
 
 ## Build
 
-```
-cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS="gfx1151;gfx1030" -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON \
-      -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j --target llama-server
-```
+[Getting started](README.md#build) with `GPU_TARGETS="gfx1151;gfx1030"`.
 
 ## Qwen3.8-Flash-Next (UD-Q4_K_XL), 128K context
 
@@ -55,7 +51,7 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --host 0.0.0.0 --port 8080
 ```
 
-Measured with the DGX Spark comparison's scripts (README, "Against a DGX Spark"): 40 prompts at T=0, needle-in-filler
+Measured with the DGX Spark comparison's scripts ([README, "Against a DGX Spark"](../README.md#against-a-dgx-spark-2026-09-30)): 40 prompts at T=0, needle-in-filler
 prefill at matched token counts, one run each.
 
 | Layout | Decode median (prose) | Prefill 7K / 28K / 113K tok/s |
@@ -76,7 +72,7 @@ Several streams (`-np 6`, routed experts of layers 0-4 on the card, `-ub 2560`):
 
 ## GLM-5.3-Flash (UD-Q2_K_XL), 128K context
 
-The [one-box GLM recipe](COOKBOOK.md#glm-53-flash-at-ud-q2_k_xl-one-box-2026-10-01) unchanged (all routed experts on
+The [one-box GLM recipe](rdna4.md#glm-53-flash-at-ud-q2_k_xl) unchanged (all routed experts on
 the iGPU, `-ub 2048 -b 4096`, the Q2 MTP export, `--reasoning-budget 0` for the benchmark):
 
 | | Decode median (prose) | Prefill 7K / 28K / 113K | Draft acceptance |

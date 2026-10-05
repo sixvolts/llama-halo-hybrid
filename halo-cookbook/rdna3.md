@@ -1,8 +1,7 @@
 # Cookbook: Strix Halo + an RDNA3 card (Navi 32: RX 7800 XT / 7700 XT; Navi 31: RX 7900 XT / XTX)
 
 Measured 2026-10-04 on gibson: one Strix Halo (Ryzen AI Max+ 395) plus a **Radeon RX 7800 XT** (gfx1101, 16 GB GDDR6,
-~624 GB/s) in a **USB4 eGPU dock** (Thunderbolt 5 dock with an Intel JHL9480 hub, on the Strix Halo's 40 Gb/s USB4
-port). The RX 7900 XT / XTX (gfx1100, 20 / 24 GB) and RX 7700 XT (gfx1101, 12 GB) run the same kernels but were not
+~624 GB/s) in a **USB4 eGPU dock** ([usb4-thunderbolt.md](usb4-thunderbolt.md)). The RX 7900 XT / XTX (gfx1100, 20 / 24 GB) and RX 7700 XT (gfx1101, 12 GB) run the same kernels but were not
 measured; with 20 GB or more, start from these layouts and raise `-ub`.
 
 RDNA3 has the same f16 matrix (WMMA) instructions as the Strix Halo's own iGPU (RDNA3.5), so the card runs the same
@@ -13,40 +12,23 @@ stays dense, as on the other cards.
 
 ## Card setup
 
-* **`amdgpu.runpm=0`** in `GRUB_CMDLINE_LINUX`. The 7800 XT failed to wake from runtime power-down (BACO) after ~9
-  minutes idle, and a card stuck in D3hot took ROCm down for the iGPU as well. The cost is that the card never powers
-  down at idle.
-* **Over USB4 / Thunderbolt: add `thunderbolt.host_reset=false`** to the same line. The BIOS builds the PCIe tunnel to
-  the dock at power-on and gives the card its full 16 GB BAR; by default the Linux Thunderbolt driver resets the host
-  router, tears that tunnel down and re-creates it by hot-plug, which leaves the BAR at 256 MB (dmesg: "Not enough PCI
-  address space for a large BAR"). With the small BAR the iGPU cannot reach the card's memory (no peer access in that
-  direction) and HIP peer copies crash inside `libamdhip64` instead of returning an error. Check after boot:
-  `sudo lspci -vv -d 1002:747e | grep "Region 0"` should say `size=16G`, and `boltctl list` should show the dock
-  `authorized` with `authflags: boot`.
-* With the parameter, the dock is authorized at boot. Without it (security level "user"), authorize once with
-  `sudo boltctl authorize <uuid>` (`boltctl list` shows the uuid).
+* **`amdgpu.runpm=0`** in `GRUB_CMDLINE_LINUX` ([getting started](README.md#kernel-setup)). The 7800 XT failed to
+  wake from runtime power-down after ~9 minutes idle, and the stuck card took ROCm down for the iGPU as well.
+* **In a USB4 / Thunderbolt dock**, as measured here, follow [usb4-thunderbolt.md](usb4-thunderbolt.md) first
+  (`thunderbolt.host_reset=false`, or the card gets a 256 MB BAR and no peer access).
 * **Device order:** ROCm0 is the card and ROCm1 the iGPU (check the startup log).
-* **Link:** USB4 at 40 Gb/s carries peer copies at 3.8 GB/s in each direction (one at a time; 3.8 GB/s total when
-  both run at once) and 45 us for a 20 KB copy, against ~6.4 GB/s and 24 us on a Gen4 x4 slot. Hybrid decode matches
-  the V620 on a Gen4 x4 link, so the tunnel costs little here.
-* **If the card hangs or the box's NIC stalls under load, check the link's error counters** (`sudo lspci -vv | grep
-  CESta`: BadTLP, BadDLLP or Timeout set). This 7800 XT logged link errors even at idle on gibson's Gen4 x4 riser
-  cable, hung llama-server twice and dropped off the bus when its link speed was changed, while an R9700 and a V620
-  on the same cable were clean. In the dock it logged zero errors through every run on this page.
+* **This card on a riser cable:** it logged PCIe link errors even at idle on gibson's Gen4 x4 riser, hung
+  llama-server twice and dropped off the bus when its link speed was changed, while an R9700 and a V620 on the same
+  cable were clean. In the dock it logged none. If a card hangs, check the link's error counters first
+  ([usb4-thunderbolt.md](usb4-thunderbolt.md#troubleshooting)).
 
 ## Build
 
-```
-cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS="gfx1151;gfx1101" -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON \
-      -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j --target llama-server
-```
-
-Use `gfx1100` for the RX 7900 XT / XTX.
+[Getting started](README.md#build) with `GPU_TARGETS="gfx1151;gfx1101"` (`gfx1100` for the RX 7900 XT / XTX).
 
 ## Qwen3.8-Flash-Next (UD-Q4_K_XL), 128K context
 
-The 16 GB layout of the [RX 9070 XT recipe](COOKBOOK.md#radeon-rx-9070-xt-16-gb-instead-of-the-r9700-simulated-2026-10-01):
+The 16 GB layout of the [RX 9070 XT recipe](rdna4.md#radeon-rx-9070-xt-16-gb-simulated):
 dense trunk, KV cache and the MTP draft head on the card, every routed expert on the iGPU.
 
 ```
@@ -61,7 +43,7 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --host 0.0.0.0 --port 8080
 ```
 
-Measured with the DGX Spark comparison's scripts (README, "Against a DGX Spark"): 40 prompts at T=0, needle-in-filler
+Measured with the DGX Spark comparison's scripts ([README, "Against a DGX Spark"](../README.md#against-a-dgx-spark-2026-09-30)): 40 prompts at T=0, needle-in-filler
 prefill at matched token counts, one run each, build a7fca0639. "Spare" is the card's free memory after load; no
 layout logged an out-of-memory error during the 113K prefill.
 
@@ -84,7 +66,7 @@ layout logged an out-of-memory error during the 113K prefill.
 
 ## GLM-5.3-Flash (UD-Q2_K_XL), 128K context
 
-The [one-box GLM recipe](COOKBOOK.md#glm-53-flash-at-ud-q2_k_xl-one-box-2026-10-01) with all routed experts on the
+The [one-box GLM recipe](rdna4.md#glm-53-flash-at-ud-q2_k_xl) with all routed experts on the
 iGPU, but **one prefill lane at `-ub 1024`** and a smaller draft ubatch: with two lanes the card has 2.0 GB left after
 the trunk (6.3 GB), KV and compute buffers, and the Q2 MTP head needs 2.7 GB. The head cannot move to the iGPU
 because it shares the trunk's output weights (the server aborts with "pre-allocated tensor (output.weight) in a

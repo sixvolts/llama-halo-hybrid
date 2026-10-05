@@ -25,7 +25,7 @@ llama-server -m model.gguf -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 \
 Repeated `-ot` flags accumulate and patterns may be comma-joined in one flag (`common/arg.cpp`); the first pattern that matches a tensor wins (`src/llama-model-loader.cpp`). The launchers comma-join into a single flag.
 **Superseded (2026-09-28):** do not pin the PLE n-gram table to the CPU any more - it is read on demand from the page
 cache by default (lazy mode, a846a1e01), and the override below forces a resident 26.8 GB copy. Current launch lines:
-[COOKBOOK.md](halo-cookbook/COOKBOOK.md) recipes 1-2. The history: for Qwen3.8-Flash-Next (unsloth GGUF: three
+[the cookbook](halo-cookbook/README.md) (getting started and rdna4.md). The history: for Qwen3.8-Flash-Next (unsloth GGUF: three
 expert tensors per layer) the table was kept in host memory with `-ot 'blk\.(1[6-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1,per_layer_token_embd=CPU'`
 (hybrid-16: 4.6 GB dense + 16 expert layers on the R9700, 26.9 t/s before the fusions below; 37.4 t/s with everything in this document, hybrid-14 36.7).
 The table's 16-row gather then runs on the host inside `set_input` (no CPU split, see below).
@@ -84,7 +84,7 @@ parts of the old branch were dropped; so were the expert-parallel prototype and 
 diagnostics.
 
 (Superseded 2026-09-28: the draft now gets its own q4_K LM head and the line is `-c 40960 -b 5120 -ub 2560`,
-experts 11-47 on the iGPU, lanes 2, no PLE override - COOKBOOK.md recipe 2. The rest of this section is the 09-1x state.)
+experts 11-47 on the iGPU, lanes 2, no PLE override - the cookbook's rdna4.md. The rest of this section is the 09-1x state.)
 
 Draft head: `unsloth/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2.6 GB). The
 `shared-` file borrows `token_embd` and `output` from the target, so the draft must live on the device
@@ -228,7 +228,7 @@ GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB; 45 layers + 1 MTP block, 288 experts 
 layers, 11 DSA sparse-attention layers, mHC hyper-connections) does not fit one box, so it runs across gibson and a
 second Strix Halo (`mainframe`, 128 GB, no dGPU) over a direct 100G Intel E810 link with llama.cpp's RPC backend.
 This work is on `main`: upstream PR #27754's `glm5next` plus the fixes below. Launch line in the
-[cookbook](halo-cookbook/COOKBOOK.md); MTP export: `scripts/halo-hybrid/export_mtp.py`. Both hosts must run `ggml-rpc-server` and `llama-server`
+[multi-machine cookbook](halo-cookbook/multi-machine.md); MTP export: `scripts/halo-hybrid/export_mtp.py`. Both hosts must run `ggml-rpc-server` and `llama-server`
 from the same commit of this tree: the RPC wire format is fork-local (graph compute replies, protocol major 7); a mismatched
 pair is refused at the handshake ("RPC server version mismatch" on the client) instead of hanging with no error on either end. With a remote device `LLAMA_PREFILL_LANES=2` runs the rolling prefill pipeline below (`LLAMA_PREFILL_LANES_RPC=1` keeps the older pair schedule); launch with `-b 16384` so the pipeline is not drained at every logical batch, and with the experts of layer 5 on the APU (`APU_FROM=5` in the launcher): two lanes plus the draft head sit at 30.3 of the R9700's 32 GB otherwise and the draft's compute buffers fail to allocate on one launch in three. If gibson goes down, restart mainframe's
 `ggml-rpc-server` too (it spins on the dead connection and keeps the model resident). The R9700's runtime power
