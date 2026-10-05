@@ -2,6 +2,8 @@
 
 llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on an AMD Strix Halo (and soon Gorgon Halo) with an added Radeon card as an accelerator. In many cases, this can dramatically improve prefill and decode speeds, such as on models like Qwen-3.8-flash-next and GLM-5.3-flash. The idea is that you can take an R9700, or similar, and place dense parts of the model, KV, and some of the layers on the GPU and let the APU take the rest of the model. You can add the extra GPU through a PCIe extender (like on the framework desktop), Occulink, or a thunderbolt dock depending on which machine you have. This is not some custom inference engine that requires a custom quant to run. This is llama.cpp modified to run whatever you want, albeit mostly tuned for Qwen and GLM families. The tuning is done by adding tuned kernels and fixes for the model architectures. It retains all the original functionality of llama.cpp and remains completely open source. 
 
+
+
 Upfront/Note - if you are just using Strix Halo by itself, this is probably not the right tool. Check out Gufo (https://github.com/gufo-org/gufo), which looks very promising.
 Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant. Better performance at a lower cost: a Strix+GPU is $5k or less compared to the now $7k cost of 128GB DGX Spark.  
 
@@ -10,52 +12,22 @@ Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and 
 <img src="halo-cookbook/build-dual.jpeg" width="45%" alt="The dual setup: two Strix Halo boxes stacked in an open rack, each with an R9700, joined by a direct 100G cable">
 </p>
 
- The model this tree is built around is **Qwen3.8-Flash-Next** (unsloth
-UD-Q4_K_XL, 111 GB, and the Swift 1.5 fine-tune of it): on the Strix Halo plus the R9700 it decodes at **60+ tok/s**
-(real content, T=0.7) with the model's own MTP draft head and prefills at **~2,300 tok/s** at 16K, where stock
-llama.cpp on the same layout does 27-28 tok/s. On the Strix Halo alone it does ~40 tok/s and ~890 tok/s. The same
-tree also runs the 200 GB GLM-5.3-Flash across two of these boxes over a 100G link at 30 tok/s. (The setup was put
-together on Qwen3.5-122B, 24 → 49 tok/s; 3.8 came out the week it was working, and the numbers below are 3.8's.)
+## Which configuration?
 
-Here's how it works. We can't just slap part of the model on the R9700 and expect it to be good though. It's
-actually worse if you try to do that in most cases. First, we need to place the parts of the model that benefit
-from the different parts of the hardware. So, with a big MoE model like this, we have a bunch of data that only
-gets touched for some tokens and those routed experts need to get put on the Strix in the bigger unified memory
-pool. Most of the model is experts, but we might only read a couple of GB of it per token. The dense parts of the
-model get touched for every token, so we put them on the R9700 where we have more compute and memory bandwidth:
-KV cache, the dense trunk, and critically, the MTP drafter. We can stuff the remaining VRAM on the R9700 with as
-many whole expert layers as fit. This all works because only a few KB of data per token needs to cross that narrow
-x4 4.0 link, so as long as the latency isn't bad, it doesn't matter. Trying to do something like Tensor Parallelism
-across these two would not work well because of that bottleneck.
+You can run this fork on Strix Halo alone, with a Radeon card next to it (in a slot or a USB4 dock), or across two
+boxes. Start with the [cookbook's getting-started page](halo-cookbook/README.md) (build, kernel setup, placement
+rules, model prep); each row links to the launch lines, memory budget and numbers. The kernel and scheduler changes
+behind them are in [HALO-HYBRID.md](HALO-HYBRID.md).
 
-## What this fork is for
+| Hardware | Model it runs here | Status | Numbers |
+|---|---|---|---|
+| [One Strix Halo, nothing else](halo-cookbook/README.md#one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~890 tok/s prefill at 16K |
+| [+ R9700 or RX 9070 XT (RDNA4)](halo-cookbook/rdna4.md) | Qwen3.8-Flash-Next, Swift 1.5, Qwen3.5-122B, GLM-5.3-Flash (UD-Q2_K_XL) | production | 63 tok/s, ~2,300 tok/s prefill at 16K (Qwen3.8); GLM-5.3-Flash Q2 44 tok/s; 9070 XT (16 GB, simulated) 68 tok/s |
+| [+ RX 7800 XT (RDNA3, 16 GB)](halo-cookbook/rdna3.md) | Qwen3.8-Flash-Next, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 60 tok/s, 1,538 / 1,327 / 989 tok/s prefill at 7K / 28K / 113K |
+| [+ Radeon Pro V620 (RDNA2, 32 GB)](halo-cookbook/rdna2.md) | Qwen3.8-Flash-Next, Swift 1.5, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 58 tok/s, 1,517 / 1,324 / 1,023 tok/s prefill at 7K / 28K / 113K; needs `amdgpu.ras_enable=0` |
+| [Any card in a USB4 / Thunderbolt dock](halo-cookbook/usb4-thunderbolt.md) | as the card's page | measured (RX 7800 XT) | same decode as a PCIe x4 slot; needs `thunderbolt.host_reset=false` |
+| [Two Strix Halos over a 100G link](halo-cookbook/multi-machine.md) | GLM-5.3-Flash (200 GB) | production (an R9700 on each) | 896 tok/s prefill / 30 tok/s decode at 25.8K |
 
-There are good engines for a single Strix Halo already (gufo, halogen), and they are fast at what they do. This
-tree is about the setups they don't cover, without giving up the one they do:
-
-- **One box, APU + a discrete GPU.** The card has to earn its slot: with the R9700 the box must beat the best
-  APU-only engine, not just this tree's own APU-only numbers. It does, by about 1.6x on prefill and 1.8x on decode.
-- **Several boxes.** Models bigger than one box's memory (GLM-5.3-Flash, 200 GB) split across hosts over RPC,
-  with and without cards.
-
-## Where it stands (2026-09-28)
-
-The 2026-09-30 numbers on the Spark's benchmark are in [Against a DGX Spark](#against-a-dgx-spark-2026-09-30) below.
-
-Measured on this box (Framework Strix Halo 128 GB + R9700 on PCIe 4.0 x4). Prefill is cold, fresh server, record
-prompts; decode is real-content chat at T=0.7 with the MTP draft (6 prompts x 2 seeds short, 3 prompts x 2 seeds at
-~20K context).
-
-| Config | Model | Prefill 4K / 16K / 32K (tok/s) | Decode, short | Decode, ~20K context |
-|---|---|---|---|---|
-| Strix Halo + R9700 | Qwen3.8-Flash-Next UD-Q4_K_XL | 2078 / 2300 / 2141 | 63 tok/s (35.4 ms/step) | 62 tok/s (40.0 ms/step) |
-| Strix Halo + R9700 | Swift 1.5 (q8_0 trunk) | 2052 / 2285 / 2129 | 62 tok/s (35.9 ms/step) | 60 tok/s (40.4 ms/step) |
-| Strix Halo only | Qwen3.8-Flash-Next UD-Q4_K_XL | 954 / 892 / 821 | 40 tok/s (56 ms/step) | 39 tok/s (62.8 ms/step) |
-| Strix Halo only | Swift 1.5 (q8_0 trunk) | 964 / 893 / 823 | 39 tok/s (56.7 ms/step) | 39 tok/s (63.7 ms/step) |
-| 2x (Strix Halo + R9700) | GLM-5.3-Flash UD-Q4_K_XL | 783 at 12.7K, 896 at 25.8K | - | 30 tok/s at 25.8K (92 ms/step) |
-
-For reference, on the same box: gufo (APU-only) 1359 / 1431 / 1410 prefill and 34.8 tok/s MTP decode; halogen
-(APU-only, its own 4-bit format) 1246 at 8K / 1424 at 32K prefill and 44.8 tok/s MTP decode on prose.
 
 What that means:
 
@@ -171,32 +143,7 @@ I kept going on tuning, and tried to reduce the number of kernel launches, which
 performance. I wasn't hitting anywhere near the right numbers per the theoretical bandwidth for each device. The
 kernel and scheduler changes that came out of that are listed in [HALO-HYBRID.md](HALO-HYBRID.md).
 
-## Which configuration?
 
-The same tree runs on a Strix Halo alone, with a Radeon card next to it (in a slot or a USB4 dock), or across two
-boxes. Start with the [cookbook's getting-started page](halo-cookbook/README.md) (build, kernel setup, placement
-rules, model prep); each row links to the launch lines, memory budget and numbers. The kernel and scheduler changes
-behind them are in [HALO-HYBRID.md](HALO-HYBRID.md).
-
-| Hardware | Model it runs here | Status | Numbers |
-|---|---|---|---|
-| [One Strix Halo, nothing else](halo-cookbook/README.md#one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~890 tok/s prefill at 16K |
-| [+ R9700 or RX 9070 XT (RDNA4)](halo-cookbook/rdna4.md) | Qwen3.8-Flash-Next, Swift 1.5, Qwen3.5-122B, GLM-5.3-Flash (UD-Q2_K_XL) | production | 63 tok/s, ~2,300 tok/s prefill at 16K (Qwen3.8); GLM-5.3-Flash Q2 44 tok/s; 9070 XT (16 GB, simulated) 68 tok/s |
-| [+ RX 7800 XT (RDNA3, 16 GB)](halo-cookbook/rdna3.md) | Qwen3.8-Flash-Next, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 60 tok/s, 1,538 / 1,327 / 989 tok/s prefill at 7K / 28K / 113K |
-| [+ Radeon Pro V620 (RDNA2, 32 GB)](halo-cookbook/rdna2.md) | Qwen3.8-Flash-Next, Swift 1.5, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 58 tok/s, 1,517 / 1,324 / 1,023 tok/s prefill at 7K / 28K / 113K; needs `amdgpu.ras_enable=0` |
-| [Any card in a USB4 / Thunderbolt dock](halo-cookbook/usb4-thunderbolt.md) | as the card's page | measured (RX 7800 XT) | same decode as a PCIe x4 slot; needs `thunderbolt.host_reset=false` |
-| [Two Strix Halos over a 100G link](halo-cookbook/multi-machine.md) | GLM-5.3-Flash (200 GB) | production (an R9700 on each) | 896 tok/s prefill / 30 tok/s decode at 25.8K |
-
-## GLM-5.3-Flash across two Strix Halo boxes
-
-The 200 GB GLM-5.3-Flash (unsloth UD-Q4_K_XL) runs split between two 128 GB Strix Halo boxes over a direct 100G
-link (Intel E810) with llama.cpp's RPC backend, with an R9700 on each box: on the head node KV, the dense trunk of
-the first 26 layers and the MTP draft head on the card, their experts on the iGPU; the second box schedules its own
-half across its card and iGPU. Single stream, 128K context: 30 tok/s decode and 896 tok/s prefill at a 25.8K prompt,
-with the model's own MTP head. The link currently runs over TCP (RDMA is off after
-E810 resets under load). Launch lines, the rpc-server unit and the operating rules:
-[multi-machine cookbook](halo-cookbook/multi-machine.md); the draft-head
-export and the fixes: [HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
 
 ---
 
@@ -298,18 +245,6 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [server](tools/server/README.md)
 - [GBNF grammars](grammars/README.md)
 
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
 
 ## Contributing
 
