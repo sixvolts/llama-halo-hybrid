@@ -14,14 +14,13 @@ Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and 
 
 ## Which configuration?
 
-You can run this fork on Strix Halo alone, with a Radeon card next to it (in a slot or a USB4 dock), or across two
+You can run this fork on Strix Halo alone (but again, look at gufo), with a Radeon card next to it (in a slot or a USB4 dock), or across two
 boxes. Start with the [cookbook's getting-started page](halo-cookbook/README.md) (build, kernel setup, placement
 rules, model prep); each row links to the launch lines, memory budget and numbers. The kernel and scheduler changes
 behind them are in [HALO-HYBRID.md](HALO-HYBRID.md).
 
 | Hardware | Model it runs here | Status | Numbers |
 |---|---|---|---|
-| [One Strix Halo, nothing else](halo-cookbook/README.md#one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~890 tok/s prefill at 16K |
 | [+ R9700 or RX 9070 XT (RDNA4)](halo-cookbook/rdna4.md) | Qwen3.8-Flash-Next, Swift 1.5, Qwen3.5-122B, GLM-5.3-Flash (UD-Q2_K_XL) | production | 63 tok/s, ~2,300 tok/s prefill at 16K (Qwen3.8); GLM-5.3-Flash Q2 44 tok/s; 9070 XT (16 GB, simulated) 68 tok/s |
 | [+ RX 7800 XT (RDNA3, 16 GB)](halo-cookbook/rdna3.md) | Qwen3.8-Flash-Next, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 60 tok/s, 1,538 / 1,327 / 989 tok/s prefill at 7K / 28K / 113K |
 | [+ Radeon Pro V620 (RDNA2, 32 GB)](halo-cookbook/rdna2.md) | Qwen3.8-Flash-Next, Swift 1.5, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 58 tok/s, 1,517 / 1,324 / 1,023 tok/s prefill at 7K / 28K / 113K; needs `amdgpu.ras_enable=0` |
