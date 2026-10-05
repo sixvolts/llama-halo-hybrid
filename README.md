@@ -5,7 +5,7 @@ This is a fork of llama.cpp that builds out support for Strix Halo with a GPU si
 Upfront/Note - if you are just using Strix Halo by itself, this is probably not the right tool. Check out Gufo (https://github.com/gufo-org/gufo), which looks very promising.
 After continuing to tinker with it, it now performs better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant.
 
-![The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU](docs/halo-hybrid/build.jpeg)
+![The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU](halo-cookbook/build.jpeg)
 
  The model this tree is built around is **Qwen3.8-Flash-Next** (unsloth
 UD-Q4_K_XL, 111 GB, and the Swift 1.5 fine-tune of it): on the Strix Halo plus the R9700 it decodes at **60+ tok/s**
@@ -166,26 +166,24 @@ the chunking and top-k changes, and they're kept here for the record.
 
 I kept going on tuning, and tried to reduce the number of kernel launches, which seemed to be holding back
 performance. I wasn't hitting anywhere near the right numbers per the theoretical bandwidth for each device. The
-kernel and scheduler changes that came out of that are listed in [HALO-HYBRID.md](HALO-HYBRID.md), and the running
-log of the latest rounds, with every number and what didn't work, is in
-[APU-DECODE-BUDGET.md](docs/halo-hybrid/APU-DECODE-BUDGET.md).
+kernel and scheduler changes that came out of that are listed in [HALO-HYBRID.md](HALO-HYBRID.md).
 
 ## Which configuration?
 
 The same tree runs five hardware shapes. Each row links to the launch line, the memory budget and the numbers in
-the [cookbook](docs/halo-hybrid/COOKBOOK.md); the kernel and scheduler changes behind them are in
+the [cookbook](halo-cookbook/COOKBOOK.md); the kernel and scheduler changes behind them are in
 [HALO-HYBRID.md](HALO-HYBRID.md).
 
 | Hardware | Model it runs here | Status | Numbers |
 |---|---|---|---|
-| [One Strix Halo, nothing else](docs/halo-hybrid/COOKBOOK.md#1-one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~890 tok/s prefill at 16K |
-| [One Strix Halo + one R9700](docs/halo-hybrid/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Swift 1.5, Qwen3.5-122B, GLM-5.3-Flash (UD-Q2_K_XL) | production | 63 tok/s, ~2,300 tok/s prefill at 16K (Qwen3.8); GLM-5.3-Flash Q2: 44 tok/s, ~620 tok/s prefill, 128K context ([recipe](docs/halo-hybrid/COOKBOOK.md#glm-53-flash-at-ud-q2_k_xl-one-box-2026-10-01)) |
-| [One Strix Halo + one RX 9070 XT (16 GB)](docs/halo-hybrid/COOKBOOK.md#radeon-rx-9070-xt-16-gb-instead-of-the-r9700-simulated-2026-10-01) | Qwen3.8-Flash-Next | simulated on the R9700 | 68 tok/s, 1,560 / 1,640 / 1,380 tok/s prefill at 7K / 28K / 113K, 128K context |
-| [One Strix Halo + one Radeon Pro V620 (RDNA2, 32 GB)](docs/halo-hybrid/cookbook-rdna2.md) | Qwen3.8-Flash-Next, Swift 1.5, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 58 tok/s, 1,517 / 1,324 / 1,023 tok/s prefill at 7K / 28K / 113K, 128K context; needs `amdgpu.ras_enable=0` |
-| [One Strix Halo + one RX 7800 XT (RDNA3, 16 GB, USB4 dock)](docs/halo-hybrid/cookbook-rdna3.md) | Qwen3.8-Flash-Next, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 60 tok/s, 1,538 / 1,327 / 989 tok/s prefill at 7K / 28K / 113K, 128K context; over USB4 needs `thunderbolt.host_reset=false` |
-| [Two Strix Halos over the 100G link](docs/halo-hybrid/COOKBOOK.md#3-two-strix-halos-over-rdma) | GLM-5.3-Flash (200 GB) | derived, not measured | |
-| [Two Strix Halos + one R9700 on the head node](docs/halo-hybrid/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node) | GLM-5.3-Flash | superseded by the next row | 517 tok/s prefill / 20.5 tok/s decode at 13K (09-08) |
-| [Two Strix Halos + one R9700 on each](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each) | GLM-5.3-Flash | production | 896 tok/s prefill / 30 tok/s decode at 25.8K |
+| [One Strix Halo, nothing else](halo-cookbook/COOKBOOK.md#1-one-strix-halo-by-itself) | anything up to ~115 GB | runs | Qwen3.8-Flash-Next 40 tok/s, ~890 tok/s prefill at 16K |
+| [One Strix Halo + one R9700](halo-cookbook/COOKBOOK.md#2-one-strix-halo--one-r9700) | Qwen3.8-Flash-Next, Swift 1.5, Qwen3.5-122B, GLM-5.3-Flash (UD-Q2_K_XL) | production | 63 tok/s, ~2,300 tok/s prefill at 16K (Qwen3.8); GLM-5.3-Flash Q2: 44 tok/s, ~620 tok/s prefill, 128K context ([recipe](halo-cookbook/COOKBOOK.md#glm-53-flash-at-ud-q2_k_xl-one-box-2026-10-01)) |
+| [One Strix Halo + one RX 9070 XT (16 GB)](halo-cookbook/COOKBOOK.md#radeon-rx-9070-xt-16-gb-instead-of-the-r9700-simulated-2026-10-01) | Qwen3.8-Flash-Next | simulated on the R9700 | 68 tok/s, 1,560 / 1,640 / 1,380 tok/s prefill at 7K / 28K / 113K, 128K context |
+| [One Strix Halo + one Radeon Pro V620 (RDNA2, 32 GB)](halo-cookbook/cookbook-rdna2.md) | Qwen3.8-Flash-Next, Swift 1.5, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 58 tok/s, 1,517 / 1,324 / 1,023 tok/s prefill at 7K / 28K / 113K, 128K context; needs `amdgpu.ras_enable=0` |
+| [One Strix Halo + one RX 7800 XT (RDNA3, 16 GB, USB4 dock)](halo-cookbook/cookbook-rdna3.md) | Qwen3.8-Flash-Next, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 60 tok/s, 1,538 / 1,327 / 989 tok/s prefill at 7K / 28K / 113K, 128K context; over USB4 needs `thunderbolt.host_reset=false` |
+| [Two Strix Halos over the 100G link](halo-cookbook/COOKBOOK.md#3-two-strix-halos-over-rdma) | GLM-5.3-Flash (200 GB) | derived, not measured | |
+| [Two Strix Halos + one R9700 on the head node](halo-cookbook/COOKBOOK.md#4-two-strix-halos--one-r9700-on-the-head-node) | GLM-5.3-Flash | superseded by the next row | 517 tok/s prefill / 20.5 tok/s decode at 13K (09-08) |
+| [Two Strix Halos + one R9700 on each](halo-cookbook/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each) | GLM-5.3-Flash | production | 896 tok/s prefill / 30 tok/s decode at 25.8K |
 
 ## GLM-5.3-Flash across two Strix Halo boxes
 
@@ -195,7 +193,7 @@ the first 26 layers and the MTP draft head on the card, their experts on the iGP
 half across its card and iGPU. Single stream, 128K context: 30 tok/s decode and 896 tok/s prefill at a 25.8K prompt,
 with the model's own MTP head. The link currently runs over TCP (RDMA is off after
 E810 resets under load). Launch lines, the rpc-server unit and the operating rules:
-[cookbook, recipe 5](docs/halo-hybrid/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each); the draft-head
+[cookbook, recipe 5](halo-cookbook/COOKBOOK.md#5-two-strix-halos--one-r9700-on-each); the draft-head
 export and the fixes: [HALO-HYBRID.md](HALO-HYBRID.md) ("GLM-5.3-Flash across two hosts").
 
 ---

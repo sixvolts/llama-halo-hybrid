@@ -84,7 +84,7 @@ fresh server, 4K/16K/32K record prompts; decode = six real-content prompts, T=0.
 
 gufo (APU-only engine) on the same box: prefill 1,359 / 1,431 / 1,410, MTP decode 34.8 tok/s on its own harness
 (temperature 0, not like for like). The prefill gap is hyper-connection traffic and the sparse-attention pipeline;
-experts, dense GEMMs and the GDN scan are at parity (see APU-DECODE-BUDGET.md).
+experts, dense GEMMs and the GDN scan are at parity.
 
 Older comparison (2026-09-16, before the 09-24..09-28 rounds):
 
@@ -101,8 +101,7 @@ prefill), this tree on the iGPU against halogen-flash-server 0.11.1 on its own 4
 Halogen's engine is gfx1151-only and runs ~500 kernels per token against our ~1,400; its GEMVs read bf16 activations
 directly (no quantize pass), its sampler and MTP acceptance run on the GPU, and the n-gram table is on the device.
 Its GGUF mode does not accept K-quants, so this is engine-plus-format against engine-plus-format, not the same weights.
-Upstream's multi-stream graph optimisation (`GGML_CUDA_GRAPH_OPT=1`) measured no difference here. The launch-count
-analysis and the persistent-kernel plan that follows from it: [PERSISTENT-DECODE.md](PERSISTENT-DECODE.md).
+Upstream's multi-stream graph optimisation (`GGML_CUDA_GRAPH_OPT=1`) measured no difference here.
 
 The 111 GB model plus the 2.6 GB head leaves room for 8-16K of context on a 128 GB box; Qwen3.5-122B (71 GB) fits
 with room to spare; GLM-5.3-Flash (200 GB) does not, which is what recipes 3-5 are for.
@@ -117,7 +116,7 @@ expert layers on the card as VRAM allows. The launch line is in the README; the 
 Dense trunk, KV cache and the draft head on the R9700, the routed experts of layers 11-47 on the Strix, the n-gram
 table read on demand from the page cache. This repo's `main` is upstream master plus the MTP work from
 unslothai/llama.cpp#144 and ggml-org#28118, plus the kernel and scheduler changes in
-[HALO-HYBRID.md](../../HALO-HYBRID.md) and [APU-DECODE-BUDGET.md](APU-DECODE-BUDGET.md).
+[HALO-HYBRID.md](../HALO-HYBRID.md).
 
 Launch (single user, 40K context; ROCm0 is the R9700, ROCm1 the iGPU - check the device order in the startup log):
 

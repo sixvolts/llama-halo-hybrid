@@ -153,3 +153,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# halo-hybrid: internal write-ups, kept local
+/docs/halo-hybrid/
