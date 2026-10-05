@@ -1,9 +1,6 @@
 # Halo cookbook: getting started
 
-This fork runs big mixture-of-experts models on an AMD Strix Halo (Ryzen AI Max+ 395, 128 GB unified memory), alone
-or with a Radeon card next to it. The routed experts stay in unified memory on the iGPU; the dense parts (trunk,
-attention, KV cache, the MTP draft head) go where the compute is. The placement rules are the same everywhere; only
-the device list changes.
+llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on an AMD Strix Halo (Ryzen AI Max+ 395, 128 GB unified memory) with an added Radeon card as an accelerator. In many cases, this can dramatically improve prefill and decode speeds, such as on models like Qwen-3.8-flash-next and GLM-5.3-flash. The routed experts stay in unified memory on the iGPU/APU and the dense parts (trunk, attention, KV cache, the MTP draft head) go on the added dGPU. Various AMD GPUs have been tested. Vulkan or NVidia devices are outside the scope of this project to keep the complexity manageable.  
 
 This page covers what every setup shares (build, kernel setup, placement rules, model preparation) and the Strix
 Halo on its own. Each other page is one hardware shape:
@@ -17,8 +14,6 @@ Halo on its own. Each other page is one hardware shape:
 | [usb4-thunderbolt.md](usb4-thunderbolt.md) | Any of the cards above in a USB4 / Thunderbolt eGPU dock | measured with the RX 7800 XT (2026-10-04) | same decode as a PCIe x4 slot; 3.8 GB/s card <-> iGPU |
 | [multi-machine.md](multi-machine.md) | Two Strix Halos over a 100G link, with or without cards | production (GLM-5.3-Flash, 200 GB) | 896 tok/s prefill / 30 tok/s decode at 25.8K |
 
-All numbers come from one test box (gibson: Framework Strix Halo board, 128 GB, ROCm 7.2, Linux 7.0) unless a page
-says otherwise. The kernel and scheduler changes behind them are listed in [HALO-HYBRID.md](../HALO-HYBRID.md).
 
 ## Build
 
