@@ -5,7 +5,7 @@ llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on
 Upfront/Note - if you are just using Strix Halo by itself, this is probably not the right tool. Check out Gufo (https://github.com/gufo-org/gufo), which looks very promising.
 Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant. Better performance at a lower cost: a Strix+GPU is $5k or less compared to the now $7k cost of 128GB DGX Spark.  
 
-![The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU](halo-cookbook/build.jpeg)
+<img src="halo-cookbook/build.jpeg" width="60%" alt="The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU">
 
  The model this tree is built around is **Qwen3.8-Flash-Next** (unsloth
 UD-Q4_K_XL, 111 GB, and the Swift 1.5 fine-tune of it): on the Strix Halo plus the R9700 it decodes at **60+ tok/s**
