@@ -227,7 +227,7 @@ prefill at matched token counts, MTP n-max 2, one run each. The first row is fro
 
 The RX 9070 XT is the same gfx1201 die as the R9700, with the same 64 CUs and ~640 GB/s of memory bandwidth, but
 16 GB of VRAM instead of 32. Everything in this recipe runs the same kernels; the only question is what fits on the
-card. These numbers are **simulated** on the R9700: [`vram_ballast.cpp`](../../scripts/halo-hybrid/vram_ballast.cpp) holds 16 GiB of the card
+card. These numbers are **simulated** on the R9700: a ballast allocation holds 16 GiB of the card
 for the whole run, which leaves 15.65 GiB free. A headless 9070 XT should have ~15.8 GiB, so the simulation is about
 150 MB on the tight side. Not yet checked on a real 9070 XT.
 
@@ -334,8 +334,7 @@ second box's iGPU, output head pulled back to the R9700. The link is crossed twi
 hidden state back), so the 100G E810 pair runs RoCE RDMA (negotiated automatically once both builds have
 `GGML_RPC_RDMA`; `GGML_RPC_NO_RDMA=1` forces TCP, which costs ~20% prefill and ~30% decode).
 
-The launcher is [`run_glm_two_host.sh`](../../scripts/halo-hybrid/run_glm_two_host.sh) (`LLAMA_PREFILL_LANES=2 APU_FROM=5 DRAFT=1
-run_glm_two_host.sh <tag> 25 131072 -b 32768`); the line it runs is:
+The launch line:
 
 ```
 LLAMA_PREFILL_LANES=2 LLAMA_ASYNC_INPUTS=1 \

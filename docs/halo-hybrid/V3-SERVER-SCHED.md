@@ -197,7 +197,7 @@ of per-call cost; the remaining gap to v2c on prefill is the card's dense prefil
 software gap (Phase 0: 1.17 vs floor 0.28 ms/layer) is untouched - both Phase 3. Two server-side lessons from the build:
 a fresh graph needs an explicit sched reset+alloc, a RECOMPUTE must reuse the plan (the sched mutates sources when it
 splits), and every non-node deserialised tensor must be a leaf whatever its op (GLM reaches KV/state through views).
-A small-model smoke test (scripts/halo-hybrid/smoke_v3s.sh) proved the mechanics but not the GLM-size leaf case.
+A small-model smoke test proved the mechanics but not the GLM-size leaf case.
 Per-step budget of the gate (mainframe uprobes, 700 calls): MODEL graph 46.4 ms (p25-p75 45.3-47.6) + TINY KDA-state
 graph 0.1 ms + gaps 2.8 ms + gibson 80.9 ms = 130 ms at ~2.9 tokens/step (MTP n-max 2, acceptance 0.77) = 22 t/s;
 server busy 36%. RECOMPUTE fired 0 of 700 times: the composite receives TWO splits per token (MODEL + TINY) that

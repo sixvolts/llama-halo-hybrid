@@ -28,7 +28,7 @@ The gap is hardware dispatch between dependent kernels inside a replayed graph: 
 
 ## What a boundary costs, measured
 
-`scratchpad/persist/sync.hip`, cooperative launch, 2 blocks per CU, 2,000 iterations:
+A standalone test, cooperative launch, 2 blocks per CU, 2,000 iterations:
 
 | boundary kind | gfx1151 (iGPU) | gfx1201 (R9700) |
 |---|---|---|
@@ -129,8 +129,6 @@ microbenchmark says; nothing after it should start until that test passes at siz
 
 ## Stage 1 result (2026-09-16): the primitives work, at one workgroup per WGP
 
-`scripts/halo-hybrid/persist/pk_test.hip` (build: `hipcc --offload-arch=gfx1151 --offload-arch=gfx1201 -O2 -DPK_SLEEP=8`;
-run: `pk_test <floats per row> <rows per task> <layers> <blocks per CU, or -N blocks> <mode 1|2|3> <groups> <block size>`).
 A synthetic decode-shaped DAG (per layer: norm, four independent GEMV-like tasks, a fan-in sum; 6 tasks per layer),
 every task reading and writing activation-sized rows, checked against a CPU reference, run as one cooperative
 kernel and as one kernel per task in a replayed hipGraph. Results, best of 20, `tick` = per task:
@@ -219,7 +217,7 @@ configuration and the grid. Bisection ran on Qwen3.5-4B Q4_K_M on the iGPU (3 s 
 reduction (slower: same total wave-iterations, more syncs), a cooperative "touch" prefetch of the weight group into L0
 (73 spills, no gain), non-inlined bodies. Before the address-space fix none of them moved the number, because the
 loop was issuing 1-3 flat loads per wait regardless of how many were independent. The standalone bandwidth test
-(`scripts/halo-hybrid/persist/bw.hip`) shows a resident 20x1024 grid streams 241 GB/s with a single 16-byte load per lane, the same as a
+shows a resident 20x1024 grid streams 241 GB/s with a single 16-byte load per lane, the same as a
 1280x256 launch, so the resident shape itself is not a bandwidth limit; MMVQ's 16 waves/SIMD is not needed once the
 loads are global.
 
@@ -271,7 +269,7 @@ UD-Q4_K_XL, iGPU only, serial greedy decode, 32 tokens (`llama-completion -dev R
 less loses less. This is not a missing-body problem, and adding DeltaNet/attention/rope bodies would not change it.
 
 **Why, measured:** the same q4_K GEMV (9216 rows x 2560, one column) runs at 62.4 us as a standalone kernel and
-72.6 us as a task inside `pk_run` (`scripts/halo-hybrid/persist/gemv_bench.hip` vs `gemv_bench2.hip`, which compiles the
+72.6 us as a task inside `pk_run` (two standalone benchmarks; the second compiles the
 REAL device half of persist.cu around a hand-built region). Same grid (20 blocks x 1024 threads), same math, same
 q8_1 input, same 8 waves per SIMD. The difference is the kernel itself: a resident kernel that contains every body
 allocates registers for the worst path (190 VGPRs, and any extra GEMV instantiation pushed it to 192 with spills),
