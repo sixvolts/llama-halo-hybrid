@@ -1,9 +1,9 @@
 # llama-halo-hybrid - Strix Halo + Radeon R9700
 
-This is a fork of llama.cpp that builds out support for Strix Halo with a GPU sidecar, initially targeting the R9700/Navi48. The idea is that you can take an R9700, or similar, and place dense parts of the model, KV, and some of the layers on the GPU and let the APU take the rest of the model. You can add the extra GPU through a PCIe extender (framework desktop), Occulink, or a thunderbolt dock depending on which machine you have. This is not some custom inference engine that requires a custom quant to run. This is llama.cpp modified to run whatever you want, albeit mostly tuned for Qwen and GLM families. 
+llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on an AMD Strix Halo (and soon Gorgon Halo) with an added Radeon card as an accelerator. In many cases, this can dramatically improve prefill and decode speeds, such as on models like Qwen-3.8-flash-next and GLM-5.3-flash. The idea is that you can take an R9700, or similar, and place dense parts of the model, KV, and some of the layers on the GPU and let the APU take the rest of the model. You can add the extra GPU through a PCIe extender (like on the framework desktop), Occulink, or a thunderbolt dock depending on which machine you have. This is not some custom inference engine that requires a custom quant to run. This is llama.cpp modified to run whatever you want, albeit mostly tuned for Qwen and GLM families. The tuning is done by adding tuned kernels and fixes for the model architectures. It retains all the original functionality of llama.cpp and remains completely open source. 
 
 Upfront/Note - if you are just using Strix Halo by itself, this is probably not the right tool. Check out Gufo (https://github.com/gufo-org/gufo), which looks very promising.
-After continuing to tinker with it, it now performs better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant.
+Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant. Better performance at a lower cost: a Strix+GPU is $5k or less compared to the now $7k cost of 128GB DGX Spark.  
 
 ![The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU](halo-cookbook/build.jpeg)
 
