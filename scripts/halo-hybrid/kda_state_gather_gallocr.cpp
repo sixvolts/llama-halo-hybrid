@@ -2,7 +2,7 @@
 // order (glm5next build_kda_layer + build_conv_state + build_rs + build_recurrent_attn), n_seqs = 1, rollback K slots.
 // Runs the same step sequence on a GPU backend and on CPU, compares output + both recurrent caches after each step.
 // usage: sg <backend> <T> [neg]   (neg: a cpy into the ssm cache between the gather and the gdn -> gate must decline)
-// build: g++ -O2 -std=c++17 -I ggml/include docs/halo-hybrid/kda_state_gather_gallocr.cpp -o sg \
+// build: g++ -O2 -std=c++17 -I ggml/include scripts/halo-hybrid/kda_state_gather_gallocr.cpp -o sg \
 //            -L build-hip/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,$PWD/build-hip/bin
 //         SG_SCHED=1 allocates through ggml_backend_sched (graph_optimize alloc deps) like llama.cpp
 // proof:  rocprofv3 --kernel-trace --output-format csv -d p -o run -- env SG_NO_REF=1 ./sg ROCm0 3

@@ -17,7 +17,7 @@ Parsed from the GGUF tensor table (`scratchpad` helper, 1,224 tensors, 103.7 GiB
 The DRAM ceiling on this part is **223 GB/s**, measured on the only matrix too large to cache: the 675 MB LM head
 (`test-backend-ops perf`, `TBO_Q38=1`, 3,030 us/run). Everything smaller is served by the 32 MB Infinity Cache and
 reports 300-775 GB/s in isolation, which is why op benchmarks flatter decode kernels; do not size decode work from
-them. A streaming test with no math (`persist/bw.hip`) reaches 241 GB/s.
+them. A streaming test with no math (`scripts/halo-hybrid/persist/bw.hip`) reaches 241 GB/s.
 
 So the floor is 6.33 GB / 223 GB/s = **28.4 ms**, and we run at 165 GB/s = **74% of DRAM**. Halogen's 35.6 tok/s on
 the same model is 225 GB/s, i.e. saturation: their whole advantage over this tree is the missing 26%.

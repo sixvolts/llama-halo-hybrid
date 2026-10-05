@@ -183,7 +183,7 @@ What was needed (all in `ggml/src/ggml-backend.cpp`, `ggml-cuda.cu`, `src/llama-
    (the selector on ubatches without outputs) are skipped instead of waited for.
 3. **A pool of copy events** (`ggml_backend_cuda_context::next_copy_event`, 512 per device). On ROCm a queued
    `hipStreamWaitEvent` resolves against the event's newest record when the queue reaches it, not the record at
-   call time as on CUDA (`docs/halo-hybrid/lane_pattern.hip`: the two-lane pattern takes 599 ms with distinct
+   call time as on CUDA (`scripts/halo-hybrid/lane_pattern.hip`: the two-lane pattern takes 599 ms with distinct
    events, 873 ms with one re-recorded event per device, 780 ms if fully serialized). `cpy_tensor_async`
    re-recorded one `copy_event` per device on every cross-device copy, so every earlier wait became a wait for a
    later copy. This alone also serializes upstream's pipeline parallelism on ROCm.
@@ -228,7 +228,7 @@ GLM-5.3-Flash (unsloth UD-Q4_K_XL, 200 GB; 45 layers + 1 MTP block, 288 experts 
 layers, 11 DSA sparse-attention layers, mHC hyper-connections) does not fit one box, so it runs across gibson and a
 second Strix Halo (`mainframe`, 128 GB, no dGPU) over a direct 100G Intel E810 link with llama.cpp's RPC backend.
 This work is on `main`: upstream PR #27754's `glm5next` plus the fixes below. Launcher and MTP export:
-`docs/halo-hybrid/run_glm_two_host.sh`, `docs/halo-hybrid/export_mtp.py`. Both hosts must run `ggml-rpc-server` and `llama-server`
+`scripts/halo-hybrid/run_glm_two_host.sh`, `scripts/halo-hybrid/export_mtp.py`. Both hosts must run `ggml-rpc-server` and `llama-server`
 from the same commit of this tree: the RPC wire format is fork-local (graph compute replies, protocol major 7); a mismatched
 pair is refused at the handshake ("RPC server version mismatch" on the client) instead of hanging with no error on either end. With a remote device `LLAMA_PREFILL_LANES=2` runs the rolling prefill pipeline below (`LLAMA_PREFILL_LANES_RPC=1` keeps the older pair schedule); launch with `-b 16384` so the pipeline is not drained at every logical batch, and with the experts of layer 5 on the APU (`APU_FROM=5` in the launcher): two lanes plus the draft head sit at 30.3 of the R9700's 32 GB otherwise and the draft's compute buffers fail to allocate on one launch in three. If gibson goes down, restart mainframe's
 `ggml-rpc-server` too (it spins on the dead connection and keeps the model resident). The R9700's runtime power
@@ -400,7 +400,7 @@ state), so the limit is the dense-attention scratch, not the cache. Mainframe pe
    snapshots the record at call time). `ggml_backend_cuda_cpy_tensor_async` re-records one `copy_event` per
    device on every cross-device copy, so every earlier queued wait becomes a wait for a later copy and any
    cross-device overlap (pipeline parallelism included) collapses to a total order. Repro:
-   `docs/halo-hybrid/lane_pattern.hip` (599 ms with distinct events, 873 ms with one re-recorded event, 780 ms if
+   `scripts/halo-hybrid/lane_pattern.hip` (599 ms with distinct events, 873 ms with one re-recorded event, 780 ms if
    fully serialized). Fix in this branch: a per-context pool of copy events.
 6. **The scheduler's cross-backend copies are issued too late to overlap.** A split input is copied on the
    producer's stream only when the consumer split is submitted, so anything queued on the producer's stream in
