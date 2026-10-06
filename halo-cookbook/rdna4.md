@@ -77,6 +77,36 @@ On that benchmark (40 prompts at T=0, needle-in-filler prefill): 65.5-67.3 tok/s
 
 ### Several streams
 
+Each slot (`-np N`) gets its own share of `-c` and its own KV stream. Two 128K slots, one for the WebUI and one for
+an agent, is the line this fork runs in production:
+
+```
+LLAMA_PREFILL_LANES=2 \
+llama-server -m Swift-1.5-Qwen3.8-Flash-Next-Q8trunk-00001-of-00003.gguf \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 262144 -b 8192 -ub 4096 -np 2 \
+  -ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
+  -md mtp-Swift1.5-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
+  --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+What fits on the R9700 (32 GB; Swift 1.5 Q8T with the draft head, every routed expert on the iGPU). The card holds
+4.5 GB of weights plus 1.9 GB of draft head, 3.6 GB of KV and indexer cache per 128K of total context, 0.33 GB of
+recurrent state per slot, and two prefill compute buffers that grow with the context per slot (6.9 GB each at 128K
+and `-ub 4096`, 3.5 GB at `-ub 2048`, ~6.6 GB at 256K for either ubatch):
+
+| slots x context | `-ub` | card |
+|---|---|---|
+| 1 x 128K | 4096 | 27.1 GB |
+| 2 x 128K | 4096 | 31.3 GB |
+| 4 x 128K | 2048 | 31.8 GB |
+| 1 x 256K | 4096, with `LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512` | 28.6 GB |
+| 2 x 256K, 4 x 128K at `-ub 4096`, 3 or 4 x 256K | | does not fit |
+
+Long context on several streams (2026-10-06; no draft, `-ub 2048`, each slot at 59K): 36.4 tok/s on one stream,
+26.4 each on two (51.4 agg), 18.0 each on four (62.9 agg). Busy slots should be neighbours, since one ubatch only
+joins consecutive slots; the server now hands new requests the idle slot that keeps them so
+(`LLAMA_SERVER_SLOT_CONTIG=0` restores the old choice).
+
 Older measurements (2026-09-2x, `-b 4096 -ub 1024`, experts of layers 12-47 on the iGPU, draft sharing the q8_0
 output layer; not re-measured since; 4K prompts, 256-token completions; "agg" is the sum over streams):
 

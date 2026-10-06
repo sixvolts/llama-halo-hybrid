@@ -49,7 +49,9 @@ is a split either way and measured ~0.7 t/s slower than the host gather.
 | *(superseded)* `src/models/qwen4exp.cpp` | **graph reuse** for the QSA/PLE inputs (`can_reuse`): implemented here first (cold decode 33.0 → 29.3 ms/token, +10% on the server); upstream master now carries its own, so the branch uses upstream's. Kept in the table because the numbers above include it | `LLAMA_GRAPH_REUSE_DISABLE=1` |
 | `ggml/src/ggml-cuda/mmvq.cu` | **small-K matvec mode on RDNA4**: upstream disables `mul_mat_vec_q`'s rows-per-block ("small_k") mode on every RDNA part, so a short-K row (Qwen3.8's 96 hyper-connection up-projections/token are Q8_0 [10240 × 320]) ran as one 256-thread block per row doing a single loop trip: 23 µs, 150 GB/s. Enabled for RDNA4: 7 µs, 490 GB/s; K=640 shared-expert down 6.3 → 3.5 µs; large-K shapes unchanged within 1%. Bit-identical; cold decode 29.1 → 27.3 ms/token (−6%) | `GGML_CUDA_MMVQ_NO_SMALLK=1` |
 | `ggml/src/ggml-cuda/mmvf.cu` | **load pipelining in the f32/f16/bf16 matvec**: the per-row loop issued one dependent load per trip, which is fine for wide launches but latency-bound for the few-row shapes here (48 f32 routers [512 × 2560] at 25 µs / 210 GB/s, the 4-row hyper-connection inject at 6 µs, ssm alpha/beta). Four loads in flight per thread with the same per-thread accumulation order (bit-identical); cold decode 27.3 → 26.8 ms/token (−2%). Batched `test-backend-ops` cannot see this shape effect (it hides launch latency), only the real run does | none (unfused path only) |
-| `src/llama-graph.cpp`, `src/models/qwen4exp.cpp` | **QSA gather at depth** (ported from ucicelos/flashnext-hybrid, their fix 4): above `LLAMA_QSA_GATHER` cells (default 65536) a decode step gathers the ~2k selected K/V rows out of the cache and runs flash attention over exactly those instead of masking the whole cache. Below the threshold the graph is unchanged by construction. Measured here at 68.5K tokens (hybrid-12, no draft): needles at positions 200 and 1400 of 2300 records retrieved with it on and off, identical answer text, decode 23.9 → 25.7 t/s (+7%); prefill unchanged. The padded variant of the original was not ported (it lost needles for them) | `LLAMA_QSA_GATHER=0` (off) or `=<n_kv>` |
+| `src/llama-graph.cpp`, `src/models/qwen4exp.cpp` | **QSA gather at depth** (ported from ucicelos/flashnext-hybrid, their fix 4): above `LLAMA_QSA_GATHER` cells a decode step gathers the ~2k selected K/V rows out of the cache and runs flash attention over exactly those instead of masking the whole cache. Below the threshold the graph is unchanged by construction. Measured here at 68.5K tokens (hybrid-12, no draft): needles at positions 200 and 1400 of 2300 records retrieved with it on and off, identical answer text, decode 23.9 → 25.7 t/s (+7%); prefill unchanged. The padded variant of the original was not ported (it lost needles for them). Default 16384 cells, 24576 when the layer's attention runs on an iGPU (was 65536 until 2026-10-06, the crossover while the indexer still re-pooled every block; with the block-key cache and block top-k it pays from ~16K on the R9700 and ~23K on the APU: Swift 1.5 with the MTP head, 1 stream: −3% at 4–8K, even at 16K, +3% at 31K, +9% at 59K without the head) | `LLAMA_QSA_GATHER=0` (off) or `=<n_kv>` |
+| `src/llama-memory-hybrid-idx.cpp`, `src/models/qwen4exp.cpp`, `ggml/src/ggml-cuda/qsa-topk.cu` | **QSA block-key cache and block top-k per stream** (2026-10-06): both were single-stream only, so with `-np N` (one KV stream per slot) every decode step re-pooled every indexer block of every slot and ran the per-cell top-k (~21 ms per step at 2 × 59K: two streams decoded at 15.9 t/s each, below one stream alone). The cache is now `[idx_dim, cells/ratio + 1, n_stream]` with per-stream validity, `ggml_qsa_top_k` takes one block count per stream, and `set_input_qsa` fills the decode layout (one sequence, cell j = position j) with plain writes instead of the grouping scan. Greedy text of each stream is identical to the same prompt decoded alone; the cache is bit-exact against a full re-pool | `LLAMA_QSA_BLK_CACHE=0`, `LLAMA_QSA_BLOCK_TOPK=0`, `LLAMA_QSA_INPUT_FAST=0` |
+| `tools/server/server-context.cpp` | **contiguous slots** (2026-10-06): one ubatch only joins consecutive KV streams (`split_equal`, sequential), so busy slots 0 and 2 decode in two passes over the weights (−34% aggregate decode at two streams). New tasks only consider the idle slots that keep the busy ones in the fewest runs of consecutive ids, then the usual similarity / LRU choice; the RAM prompt cache (idle slots are saved to it on every new task) makes moving a conversation cheap. A pinned `id_slot` is taken as asked | `LLAMA_SERVER_SLOT_CONTIG=0` |
 | `tools/server/server-context.cpp` | speculative recurrent-state checkpoints are saved and restored with `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` (the `spec_ckpt` update/load pairs); on both shipped archs the `n_rs_seq` rollback path makes them unreachable, they are the fallback for recurrent targets outside `llm_arch_supports_rs_rollback` | none |
 | `src/llama-context.cpp`, `src/models/glm5next.cpp` | fused lightning-indexer scoring for the DSA layers (the fused kernel sums heads in a different order, so a near-tied top-k can differ from the unfused path) | `LLAMA_FUSED_LID_DISABLE=1` |
 | `src/models/dflash.cpp`, `src/llama-hparams.h`, `src/llama-graph.cpp` | DFlash drafts run their sliding-window layers **causally**, as the z-lab reference does (`is_causal = layer_type == "sliding_attention"`); upstream ran every draft layer bidirectionally. Verified token-for-token against the reference PyTorch draft | `LLAMA_DFLASH_SWA_BIDIR=1` |
@@ -121,6 +123,22 @@ Full table on the merged base (model-card sampler, 4K prompts, 256-token complet
 Four-stream decode moves by up to 30% between sessions (a hybrid-1 run gave 61.6 agg plain / 49.3 MTP), so the
 multi-stream rows say "the head is about break-even at four streams", nothing finer. The flashnext-hybrid fix 5
 (uniform draft lengths across streams) is not ported; it is what makes the head pay at four streams there.
+
+Long-context streams (2026-10-06, Swift 1.5 Q8T, routed experts of all 48 layers on the iGPU, `-ub 2048`, no draft,
+`~/bench/longmulti/lm_bench.py`: each stream's prompt prefilled alone, then all decoded together), per-stream tok/s
+before → after the per-stream QSA cache / top-k and the 16K gather threshold:
+
+| streams | ~1K context | 59K context | 59K aggregate |
+|---|---|---|---|
+| 1 | 41.5 → 41.5 | 32.8 → 36.4 | |
+| 2 | 29.8 → 29.8 | 15.9 → 26.4 | 31.3 → 51.4 |
+| 4 | 20.5 → 20.6 | 8.6 → 18.0 | 34.0 → 62.9 |
+
+Busy slots that are not neighbours (before the contiguous-slot change): two streams at 1K read 57.7 tok/s aggregate
+in slots 0 + 1 and 38.3 in slots 0 + 2; with a long generation in one slot and an agent's back-to-back turns in
+another, 18.5 / 18 tok/s became 27.0 / 28 at 2K and 17.4 / 17 became 25.8 / 27 at 20K. What long context still
+costs per stream at 59K is ~3.4 ms per step (the gathered attention, the indexer scoring over ~15K blocks, the
+block top-k), against ~17 ms before.
 
 `--spec-draft-n-max 3` is equal within noise, 4 collapses (acceptance 0.32), and `--spec-draft-p-min`
 0.5–0.7 raises acceptance but not throughput. The hyper-connection fusions and q8 side copies still
@@ -359,8 +377,9 @@ the KDA gate (add, mul, scale, sigmoid, scale) and the hc mean into one launch e
 activation once per graph at decode/verify widths (ne1 <= 8) and registers it in the q8 side arena, so the six KDA
 projections (q/k/v/f_a/g_a/beta) and the five DSA projections that read the same normed input stop re-running
 quantize_q8_1 each. Also on this pass: the RPC server never sees GRAPH_RECOMPUTE at decode because two distinct
-graphs (58 ms and 89 us) alternate on the one last_graph_uid slot per device (a per-uid store would save 1-2 ms;
-not done). Gibson-only A/B (mainframe still on dedecad89): step 127.6 -> 126.2 ms, 3K 372 / 18.5 -> 378 / 19.6, 13K
+graphs (58 ms and 89 us) alternate on the one last_graph_uid slot per device (fixed later by b9ce8d3ce, proto 7.6:
+a second slot per device, `last_graph_uid_small`, so the pair stops evicting each other; a full per-uid store is
+still open). Gibson-only A/B (mainframe still on dedecad89): step 127.6 -> 126.2 ms, 3K 372 / 18.5 -> 378 / 19.6, 13K
 517 / 20.5 -> 518 / 20.6, greedy text and acceptance identical.
 Both hosts on 45be1a617 (prod22): 3K 375 / 19.6, 13K 517 / 20.4, 26K 503 / 20.7, 300-token decode 22.1 tok/s, step
 126.7 ms: about 1 ms per step, at the noise floor end-to-end; the dense-GEMM kernel does not show at 13K/26K either
