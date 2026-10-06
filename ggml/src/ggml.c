@@ -6669,11 +6669,11 @@ struct ggml_tensor * ggml_qsa_top_k(
         int32_t               width,
         int32_t               ratio) {
     GGML_ASSERT(score->type == GGML_TYPE_F32 && q_pos->type == GGML_TYPE_I32 && n_bid->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(score) && score->ne[2] == 1 && score->ne[3] == 1);
-    GGML_ASSERT(ggml_nelements(q_pos) >= score->ne[1] && ggml_nelements(n_bid) == 1);
+    GGML_ASSERT(ggml_is_contiguous(score) && score->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(q_pos) >= score->ne[1]*score->ne[2] && ggml_nelements(n_bid) == score->ne[2]);
     GGML_ASSERT(width > 0 && ratio > 0);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, score->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, score->ne[1]*score->ne[2]);
 
     ggml_set_op_params_i32(result, 0, width);
     ggml_set_op_params_i32(result, 1, ratio);

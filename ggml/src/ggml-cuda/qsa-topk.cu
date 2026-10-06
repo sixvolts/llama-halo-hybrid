@@ -84,11 +84,11 @@ static __device__ void qsa_tk_pass(const float * __restrict__ srow, const int nb
 template <bool V2>
 static __global__ void k_qsa_top_k(const float * __restrict__ score, const int64_t s1, const int32_t * __restrict__ q_pos,
         const int32_t * __restrict__ n_bid, int32_t * __restrict__ dst, const int64_t d1,
-        const int n_blocks, const int width, const int r) {
+        const int n_blocks, const int n_tps, const int width, const int r) {
     const int i   = blockIdx.x;
     const int tid = threadIdx.x;
     const int q   = q_pos[i];
-    const int nb  = min(n_bid[0], n_blocks);
+    const int nb  = min(n_bid[i / n_tps], n_blocks);   // row i belongs to stream i / n_tps
     const int F   = max(0, min(nb * r, q + 1));
     int32_t * out = dst + (int64_t) i * d1;
 
@@ -194,16 +194,16 @@ void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(ggml_is_contiguous(q_pos) && ggml_is_contiguous(dst));
     const int width = ggml_get_op_params_i32(dst, 0);
     const int r     = ggml_get_op_params_i32(dst, 1);
-    const int64_t n_q = score->ne[1];
+    const int64_t n_q = score->ne[1]*score->ne[2];   // rows of every stream (contiguous: row i at i*nb[1])
     static const bool v1 = getenv("GGML_CUDA_QSA_TK_V1") != nullptr && atoi(getenv("GGML_CUDA_QSA_TK_V1")) != 0;
     if (v1) {
         k_qsa_top_k<false><<<(int) n_q, QSA_TK_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
                 (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
-                (int) score->ne[0], width, r);
+                (int) score->ne[0], (int) score->ne[1], width, r);
     } else {
         k_qsa_top_k<true><<<(int) n_q, QSA_TK_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
                 (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
-                (int) score->ne[0], width, r);
+                (int) score->ne[0], (int) score->ne[1], width, r);
     }
     CUDA_CHECK(cudaGetLastError());
 }

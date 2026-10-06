@@ -2756,7 +2756,9 @@ extern "C" {
     // score[j/ratio, i]; every other cell is -inf. The result [width, n_q] (I32) is the set of the width largest cell
     // values with ties taken in ascending cell index (-inf cells last, also in ascending index) - exactly what
     // ggml_top_k returns over the expanded per-cell scores - listed in ascending cell index.
-    //   score: F32 [n_blocks, n_q]   q_pos: I32 [n_q]   n_bid: I32 [1] (complete blocks)
+    //   score: F32 [n_blocks, n_q, n_stream]   q_pos: I32 [n_q*n_stream]   n_bid: I32 [n_stream] (complete blocks)
+    // Several streams (one sequence each, every one laid out as above): row i belongs to stream i / n_q and uses
+    // n_bid[stream]; the result is [width, n_q*n_stream], each row indexing its own stream's cells.
     GGML_API struct ggml_tensor * ggml_qsa_top_k(
             struct ggml_context * ctx,
             struct ggml_tensor  * score,

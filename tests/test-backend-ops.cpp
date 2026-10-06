@@ -8045,22 +8045,27 @@ struct test_qsa_top_k : public test_case {
     const int32_t ratio;
     const int32_t pos0;   // first query position
     const bool    ties;
+    const int64_t n_stream;   // streams, each with fewer complete blocks and earlier queries than the one before
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_TOP_K"; }
 
     std::string vars() override {
-        return VARS_TO_STR7(n_blocks, n_q, n_bid, width, ratio, pos0, ties);
+        return VARS_TO_STR8(n_blocks, n_q, n_bid, width, ratio, pos0, ties, n_stream);
     }
+
+    int32_t n_bid_of(int64_t s) const { return std::max<int32_t>(0, n_bid - (int32_t) (s*37)); }
+    int32_t pos0_of (int64_t s) const { return std::max<int32_t>(0, pos0 - (int32_t) (s*37*ratio)); }
 
     double max_err() override { return 0.0; }
 
-    test_qsa_top_k(int64_t n_blocks, int64_t n_q, int32_t n_bid, int32_t width, int32_t ratio, int32_t pos0, bool ties)
-        : n_blocks(n_blocks), n_q(n_q), n_bid(n_bid), width(width), ratio(ratio), pos0(pos0), ties(ties) {}
+    test_qsa_top_k(int64_t n_blocks, int64_t n_q, int32_t n_bid, int32_t width, int32_t ratio, int32_t pos0, bool ties,
+            int64_t n_stream = 1)
+        : n_blocks(n_blocks), n_q(n_q), n_bid(n_bid), width(width), ratio(ratio), pos0(pos0), ties(ties), n_stream(n_stream) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_blocks, n_q);
-        ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);
-        ggml_tensor * nbid  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_q, n_stream);
+        ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q*n_stream);
+        ggml_tensor * nbid  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_stream);
         ggml_set_name(score, "score");
         ggml_set_name(q_pos, "q_pos");
         ggml_set_name(nbid,  "n_bid");
@@ -8077,14 +8082,18 @@ struct test_qsa_top_k : public test_case {
                 std::uniform_real_distribution<float> d(0.0f, 8.0f);
                 for (auto & x : v) { x = ties ? std::floor(d(rng)) : d(rng); }
                 // the tail bias of the real graph: some blocks far above the rest
-                for (int64_t i = 0; i < n_q; ++i) { v[i*n_blocks + (i % n_blocks)] += 1e9f; }
+                for (int64_t i = 0; i < n_q*n_stream; ++i) { v[i*n_blocks + (i % n_blocks)] += 1e9f; }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "q_pos") == 0) {
-                std::vector<int32_t> v(n_q);
-                for (int64_t i = 0; i < n_q; ++i) { v[i] = pos0 + (int32_t) i; }
+                std::vector<int32_t> v(n_q*n_stream);
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t i = 0; i < n_q; ++i) { v[s*n_q + i] = pos0_of(s) + (int32_t) i; }
+                }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "n_bid") == 0) {
-                ggml_backend_tensor_set(t, &n_bid, 0, sizeof(int32_t));
+                std::vector<int32_t> v(n_stream);
+                for (int64_t s = 0; s < n_stream; ++s) { v[s] = n_bid_of(s); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (t->view_src == nullptr && t->type == GGML_TYPE_F32) {
                 init_tensor_uniform(t); // the sentinels (see test_qsa_head_sum)
             }
@@ -13029,6 +13038,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_top_k(300, 17, 290, 101, 3, 1000, ties));       // ratio 3
         test_cases.emplace_back(new test_qsa_top_k(28672, 32, 28600, 2051, 4, 114000, ties)); // 113K prefill rows
         test_cases.emplace_back(new test_qsa_top_k(65536, 8, 65530, 2051, 4, 262000, ties));  // 262K
+        test_cases.emplace_back(new test_qsa_top_k(16384, 1, 16300, 2051, 4, 65210, ties, 2)); // 2-stream decode
+        test_cases.emplace_back(new test_qsa_top_k(16384, 3, 16300, 2051, 4, 65200, ties, 4)); // 4-stream verify
+        test_cases.emplace_back(new test_qsa_top_k(700, 5, 600, 257, 4, 2400, ties, 3));        // odd sizes, 3 streams
+        test_cases.emplace_back(new test_qsa_top_k(600, 2, 520, 2051, 4, 2090, ties, 2));        // F <= width in one stream
     }
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_qsa_head_sum(2560, 4, 64, b));

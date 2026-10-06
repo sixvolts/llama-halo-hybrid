@@ -12611,16 +12611,17 @@ void ggml_compute_forward_qsa_top_k(const struct ggml_compute_params * params, s
     const int32_t width = ggml_get_op_params_i32(dst, 0);
     const int32_t r     = ggml_get_op_params_i32(dst, 1);
     const int64_t n_blocks = score->ne[0];
-    const int64_t n_q      = score->ne[1];
-    const int64_t nb       = std::min<int64_t>(((const int32_t *) n_bid->data)[0], n_blocks);
+    const int64_t n_tps    = score->ne[1];             // query rows per stream
+    const int64_t n_q      = n_tps*score->ne[2];
 
     std::vector<int32_t> order;
     std::vector<float>   val;
     for (int64_t i = params->ith; i < n_q; i += params->nth) {
-        const int64_t q = ((const int32_t *) q_pos->data)[i];
+        const int64_t nb = std::min<int64_t>(((const int32_t *) n_bid->data)[i / n_tps], n_blocks);
+        const int64_t q  = ((const int32_t *) q_pos->data)[i];
         const int64_t F = std::max<int64_t>(0, std::min<int64_t>(nb*r, q + 1));   // cells [0, F) are scored
         const int64_t n_cells = std::max<int64_t>(F, width);
-        const float * srow = (const float *) ((const char *) score->data + i*score->nb[1]);
+        const float * srow = (const float *) ((const char *) score->data + (i % n_tps)*score->nb[1] + (i / n_tps)*score->nb[2]);
         val.resize(n_cells);
         order.resize(n_cells);
         for (int64_t j = 0; j < n_cells; ++j) {

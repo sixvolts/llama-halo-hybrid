@@ -71,13 +71,17 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
-    // halo-hybrid (C6): the block-key cache, one sequence only (a unified cache with several sequences pools per
+    qsa_valid_pos.assign(mem_idx ? mem_idx->get_n_stream() : 1, 0);
+
+    // halo-hybrid (C6): the block-key cache, one sequence per stream (a unified cache with several sequences pools per
     // sequence set, which this indexing by position cannot follow; qsa_blk_plan then declines)
     static const bool enabled = getenv("LLAMA_QSA_BLK_CACHE") == nullptr || atoi(getenv("LLAMA_QSA_BLK_CACHE")) != 0;
-    if (!enabled || !mem_idx || mem_idx->get_n_stream() != 1 || model.hparams.no_alloc) {
+    if (!enabled || !mem_idx || model.hparams.no_alloc) {
         return;
     }
-    const int64_t idx_dim = model.hparams.indexer_head_size;
+    const int64_t idx_dim  = model.hparams.indexer_head_size;
+    const int64_t n_strm   = mem_idx->get_n_stream();
+    const int64_t strm_sz  = mem_idx->get_size();   // cells per stream
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
     for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
         const uint32_t r = model.hparams.dsv4_compress_ratios[il];
@@ -90,7 +94,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             ggml_init_params params = { /*.mem_size =*/ 64*ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
             it = ctx_map.emplace(buft, ggml_context_ptr(ggml_init(params))).first;
         }
-        ggml_tensor * t = ggml_new_tensor_2d(it->second.get(), GGML_TYPE_F32, idx_dim, (int64_t) kv_size/r + 1);
+        ggml_tensor * t = ggml_new_tensor_3d(it->second.get(), GGML_TYPE_F32, idx_dim, strm_sz/r + 1, n_strm);
         ggml_format_name(t, "qsa_blk_k_l%u", il);
         qsa_blk_k[(int32_t) il] = t;
     }
@@ -108,19 +112,21 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }
 }
 
-bool llama_memory_hybrid_idx::qsa_identity(const llama_ubatch & ubatch, uint32_t ratio, int32_t & n_bid) const {
-    int32_t first = 0;
-    bool usable = false;
+bool llama_memory_hybrid_idx::qsa_identity(const llama_ubatch & ubatch, uint32_t ratio, std::vector<int32_t> & n_bid) const {
     // (the plan also answers for layers without a block-key cache; n_re only matters for its own verdict)
-    qsa_blk_plan_cells(ubatch, ratio, 1, n_bid, first, usable);
-    if (!usable) {
+    const qsa_plan p = qsa_blk_plan_cells(ubatch, ratio, 1);
+    n_bid = p.n_bid;
+    if (!p.usable) {
         return false;
     }
-    const auto & cells = mem_idx->get_cells(ubatch.seq_id[0][0]);
-    const uint32_t used = cells.get_used();
-    for (uint32_t j = 0; j < used; ++j) {
-        if (cells.is_empty(j) || cells.pos_get(j) != (llama_pos) j) {
-            return false;
+    const uint32_t n_tps = ubatch.n_tokens / (uint32_t) p.n_bid.size();
+    for (size_t g = 0; g < p.n_bid.size(); ++g) {
+        const auto & cells = mem_idx->get_cells(ubatch.seq_id[g*n_tps][0]);
+        const uint32_t used = cells.get_used();
+        for (uint32_t j = 0; j < used; ++j) {
+            if (cells.is_empty(j) || cells.pos_get(j) != (llama_pos) j) {
+                return false;
+            }
         }
     }
     return true;
@@ -131,62 +137,80 @@ ggml_tensor * llama_memory_hybrid_idx::get_qsa_blk_k(int32_t il) const {
     return it == qsa_blk_k.end() ? nullptr : it->second;
 }
 
-bool llama_memory_hybrid_idx::qsa_blk_plan(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re,
-        int32_t & n_bid, int32_t & first, bool & usable) const {
+llama_memory_hybrid_idx::qsa_plan llama_memory_hybrid_idx::qsa_blk_plan(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re) const {
     if (qsa_blk_k.empty()) {
-        n_bid = 0; first = 0; usable = false;
-        return false;
+        return {};
     }
-    return qsa_blk_plan_cells(ubatch, ratio, n_re, n_bid, first, usable);
+    return qsa_blk_plan_cells(ubatch, ratio, n_re);
 }
 
-bool llama_memory_hybrid_idx::qsa_blk_plan_cells(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re,
-        int32_t & n_bid, int32_t & first, bool & usable) const {
-    n_bid = 0; first = 0; usable = false;
+llama_memory_hybrid_idx::qsa_plan llama_memory_hybrid_idx::qsa_blk_plan_cells(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re) const {
+    qsa_plan p;
     {
         static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 6 : 0;
         if (n_dbg > 0) {
             n_dbg--;
-            LLAMA_LOG_WARN("qsa-blk plan entry: have_cache %d mem_idx %d ratio %u n_tokens %u pos_2d %d\n", (int) !qsa_blk_k.empty(),
-                (int) (mem_idx != nullptr), ratio, ubatch.n_tokens, (int) ubatch.is_pos_2d());
+            LLAMA_LOG_WARN("qsa-blk plan entry: have_cache %d mem_idx %d ratio %u n_tokens %u n_seqs_unq %u\n", (int) !qsa_blk_k.empty(),
+                (int) (mem_idx != nullptr), ratio, ubatch.n_tokens, ubatch.n_seqs_unq);
         }
     }
     // (qwen4exp's text positions are 4-section mrope rows, so is_pos_2d() holds for every batch; what matters is that no
     // position repeats - set_input_qsa ranks cells only then - and the hole-free check below already guarantees it)
     if (!mem_idx || ratio == 0 || ubatch.n_tokens == 0) {
-        return false;
+        return p;
     }
-    // exactly one sequence in the cells and in the ubatch
-    const llama_seq_id seq = ubatch.seq_id[0][0];
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq) {
-            return false;
+    // the graph's streams: one per sequence of the ubatch when the cache keeps a stream per sequence
+    const uint32_t n_ns = mem_idx->get_n_stream() == 1 ? 1 : ubatch.n_seqs_unq;
+    if (n_ns == 0 || ubatch.n_tokens % n_ns != 0) {
+        return p;
+    }
+    const uint32_t n_tps = ubatch.n_tokens / n_ns;
+    p.n_bid.assign(n_ns, 0);
+    p.first.assign(n_ns, 0);
+    bool incr = true;
+    for (uint32_t g = 0; g < n_ns; ++g) {
+        // exactly one sequence in the group's tokens and in its stream's cells
+        const llama_seq_id seq = ubatch.seq_id[g*n_tps][0];
+        for (uint32_t i = g*n_tps; i < (g + 1)*n_tps; ++i) {
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq) {
+                return p;
+            }
         }
-    }
-    const auto & cells = mem_idx->get_cells(seq);
-    for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
-        if (sq != seq && cells.seq_pos_min(sq) >= 0) {
-            return false;
+        const uint32_t strm = mem_idx->get_stream(seq);
+        if (g == 0) {
+            p.s0 = strm;
+        } else if (strm != p.s0 + g) {
+            return p;
         }
-    }
-    const llama_pos pmin = cells.seq_pos_min(seq);
-    const llama_pos pmax = cells.seq_pos_max(seq);
-    {
-        static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 12 : 0;
-        if (n_dbg > 0) {
-            n_dbg--;
-            LLAMA_LOG_WARN("qsa-blk plan: seq %d pmin %d pmax %d used %u size %u\n", seq, pmin, pmax, cells.get_used(), cells.size());
+        const auto & cells = mem_idx->get_cells(seq);
+        for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+            if (sq != seq && cells.seq_pos_min(sq) >= 0) {
+                return p;
+            }
         }
+        const llama_pos pmin = cells.seq_pos_min(seq);
+        const llama_pos pmax = cells.seq_pos_max(seq);
+        {
+            static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 12 : 0;
+            if (n_dbg > 0) {
+                n_dbg--;
+                LLAMA_LOG_WARN("qsa-blk plan: group %u seq %d stream %u pmin %d pmax %d used %u size %u\n", g, seq, strm, pmin, pmax,
+                    cells.get_used(), cells.size());
+            }
+        }
+        // hole-free from position 0: then the complete blocks are exactly 0 .. (pmax+1)/r - 1, and block id = position / r
+        if (pmin != 0 || pmax < 0 || (int64_t) cells.get_used() != (int64_t) pmax + 1) {
+            return p;
+        }
+        p.n_bid[g] = (pmax + 1) / (llama_pos) ratio;
+        p.first[g] = p.n_bid[g] - n_re;
+        // the incremental graph recomputes [first, n_bid): everything before must already be current
+        incr = incr && p.first[g] >= 0 && strm < qsa_valid_pos.size() &&
+            (llama_pos) p.first[g] * (llama_pos) ratio <= qsa_valid_pos[strm];
     }
-    // hole-free from position 0: then the complete blocks are exactly 0 .. (pmax+1)/r - 1, and block id = position / r
-    if (pmin != 0 || pmax < 0 || (int64_t) cells.get_used() != (int64_t) pmax + 1) {
-        return false;
-    }
-    usable = true;
-    n_bid  = (pmax + 1) / (llama_pos) ratio;
-    first  = n_bid - n_re;
-    // the incremental graph recomputes [first, n_bid): everything before must already be current
-    return first >= 0 && (llama_pos) first * (llama_pos) ratio <= qsa_valid_pos;
+    p.usable = true;
+    p.incr   = incr;
+    return p;
 }
 
 
@@ -265,7 +289,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
-    qsa_valid_pos = 0;
+    qsa_valid_reset();
 
     if (mem_idx) {
         mem_idx->clear(data);
@@ -317,14 +341,19 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
             mem_idx_stale_set(-1, 0);
         }
     }
-    qsa_valid_pos = p0 < 0 ? 0 : std::min(qsa_valid_pos, p0);
+    // only the edited sequence's stream loses blocks (each stream holds one sequence where the cache is used)
+    for (uint32_t strm = 0; strm < qsa_valid_pos.size(); ++strm) {
+        if (seq_id < 0 || !mem_idx || mem_idx->get_n_stream() == 1 || mem_idx->get_stream(seq_id) == strm) {
+            qsa_valid_pos[strm] = p0 < 0 ? 0 : std::min(qsa_valid_pos[strm], p0);
+        }
+    }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
-    qsa_valid_pos = 0;
+    qsa_valid_reset();
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -336,7 +365,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     llama_memory_hybrid::seq_keep(seq_id);
-    qsa_valid_pos = 0;
+    qsa_valid_reset();
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
@@ -347,7 +376,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
-    qsa_valid_pos = 0;
+    qsa_valid_reset();
 
     if (mem_idx) {
         // a negative shift moves the cells below p0, so they regroup as well
@@ -359,7 +388,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
-    qsa_valid_pos = 0;
+    qsa_valid_reset();
 
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
@@ -401,7 +430,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
-    qsa_valid_pos = 0;
+    qsa_valid_reset();
 
     try {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
@@ -433,7 +462,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
-    qsa_valid_pos = 0;
+    qsa_valid_reset();
 
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
@@ -534,6 +563,54 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
 
         const bool one_seq = n_seq_present <= 1;
+
+        // halo-hybrid: the decode layout - one sequence whose cell j holds position j, no holes - in O(n_kv) plain
+        // writes instead of the grouping scan below (~1.5 ms per stream per step at 59K). Same values as the general
+        // path for that layout: full block b = cells [b*r, b*r + r), the incomplete tail and the empty cells point at the
+        // spare block. Block-level bias only (the decode graphs); LLAMA_QSA_INPUT_FAST=0 always takes the scan.
+        static const bool fast_inputs = getenv("LLAMA_QSA_INPUT_FAST") == nullptr || atoi(getenv("LLAMA_QSA_INPUT_FAST")) != 0;
+        if (fast_inputs && blk_bias && one_seq && cells.seq_pos_min(seq_of_stream) == 0 &&
+                (int64_t) cells.seq_pos_max(seq_of_stream) + 1 == (int64_t) cells.get_used() && (int64_t) cells.get_used() <= n_kv) {
+            const int64_t used = cells.get_used();
+            bool identity = true;
+            for (int64_t j = 0; j < used && identity; ++j) {
+                identity = !cells.is_empty(j) && cells.pos_get(j) == (llama_pos) j;
+            }
+            bool own = true;   // every token of this stream belongs to the one sequence
+            for (int64_t ii = 0; ii < n_tps && own; ++ii) {
+                own = ubatch->seq_id[s*n_tps + ii][0] == seq_of_stream;
+            }
+            if (identity && own && used/r <= n_blocks) {
+                const int64_t n_bid     = used/r;
+                const bool    have_dead = n_bid < n_blocks;
+                const int32_t dead_bid  = have_dead ? (int32_t) n_bid : (int32_t) (n_blocks - 1);
+
+                for (int64_t j = 0; j < n_bid*r; ++j) {
+                    cur_blk_cells[j] = (int32_t) j;
+                    cur_cell_blk[j]  = (int32_t) (j/r);
+                }
+                for (int64_t j = n_bid*r; j < n_kv; ++j) {
+                    cur_cell_blk[j] = dead_bid;
+                }
+                for (int64_t b = 0; b < n_bid; ++b) {
+                    for (int64_t sec = 0; sec < 4; ++sec) {
+                        dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = (int32_t) (b*r);
+                    }
+                }
+                for (int64_t ii = 0; ii < n_tps; ++ii) {
+                    const int64_t i          = s*n_tps + ii;
+                    const int64_t tail_start = ((int64_t) ubatch->pos[i] + 1)/r*r;
+                    float * cur_blk_bias = dst_bias + i*n_blocks;
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        cur_blk_bias[b] = b >= n_bid ? -INFINITY : ((causal_attn && b*r >= tail_start) ? 1e9f : 0.0f);
+                    }
+                    if (have_dead) {
+                        cur_blk_bias[dead_bid] = 1e9f;
+                    }
+                }
+                continue;
+            }
+        }
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false

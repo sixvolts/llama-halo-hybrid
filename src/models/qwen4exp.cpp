@@ -828,16 +828,19 @@ public:
 
     // halo-hybrid (C6): 0 = no block-key cache, 1 = full re-pool that refreshes the cache, 2 = recompute only the
     // n_re trailing blocks [first, n_bid) and score against the cache
+    // several streams: every stream of the graph (n_stream) must hold one planned sequence
     static int blk_mode_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
-            int32_t n_re, int32_t & n_bid, int32_t & first) {
-        n_bid = 0; first = 0;
+            int32_t n_re, int64_t n_stream, llama_memory_hybrid_idx::qsa_plan & plan) {
+        plan = {};
         const llama_memory_hybrid_idx * mem = mctx ? mctx->get_mem() : nullptr;
         if (!scores || mem == nullptr) {
             return 0;
         }
-        bool usable = false;
-        const bool incr = mem->qsa_blk_plan(ub, ratio, n_re, n_bid, first, usable);
-        return !usable ? 0 : (incr ? 2 : 1);
+        plan = mem->qsa_blk_plan(ub, ratio, n_re);
+        if (!plan.usable || (int64_t) plan.n_bid.size() != n_stream) {
+            return 0;
+        }
+        return plan.incr ? 2 : 1;
     }
     static int32_t n_re_for(uint32_t n_tokens, uint32_t ratio) {
         return (int32_t) ((n_tokens + ratio - 1)/ratio) + 1;
@@ -867,38 +870,45 @@ public:
             mctx->set_input_qsa(cbk, bc, bp, bias, ubatch, ratio, blk_bias, causal_attn);
         }
         if (blk_topk) {
-            int32_t nb = 0;
-            GGML_ASSERT(blk_topk_for(mctx, *ubatch, ratio, scores, blk_bias, 1, nb) && "qsa block top-k: the layout changed between graph build and set_input");
+            std::vector<int32_t> nb;
+            GGML_ASSERT(blk_topk_for(mctx, *ubatch, ratio, scores, blk_bias, ggml_nelements(n_bid_t), nb) && "qsa block top-k: the layout changed between graph build and set_input");
             GGML_ASSERT(ggml_backend_buffer_is_host(n_bid_t->buffer));
-            ((int32_t *) n_bid_t->data)[0] = nb;
+            std::copy(nb.begin(), nb.end(), (int32_t *) n_bid_t->data);
         }
         if (blk_mode == 0) {
             return;
         }
-        int32_t n_bid = 0, first = 0;
-        const int mode = blk_mode_for(mctx, *ubatch, ratio, scores, n_re, n_bid, first);
-        GGML_ASSERT(mode == blk_mode && "qsa block-key cache: the plan changed between graph build and set_input");
+        const int64_t ns = cell_blk->ne[1];
+        llama_memory_hybrid_idx::qsa_plan plan;
+        const int mode = blk_mode_for(mctx, *ubatch, ratio, scores, n_re, ns, plan);
+        GGML_ASSERT(mode == blk_mode && plan.s0 == blk_s0 && "qsa block-key cache: the plan changed between graph build and set_input");
         if (blk_mode == 2) {
-            // hole-free single sequence: block id == position / ratio == the bid set_input_qsa numbered, so the cells of
-            // block b are row b of blk_cells
+            // hole-free single sequence per stream: block id == position / ratio == the bid set_input_qsa numbered, so the
+            // cells of block b of stream s are row b of stream s's blk_cells
             GGML_ASSERT(ggml_backend_buffer_is_host(re_cells->buffer) && bc->data != nullptr);
+            const int64_t n_blocks = bc->ne[0] / ratio;
             const int32_t * bcd = (const int32_t *) bc->data;
             int32_t * rc = (int32_t *) re_cells->data;
             int64_t * ri = (int64_t *) re_ids->data;
             int32_t * rp = (int32_t *) re_pos->data;
-            for (int32_t k = 0; k < n_re; ++k) {
-                const int32_t b = first + k;
-                for (uint32_t m = 0; m < ratio; ++m) {
-                    rc[k*ratio + m] = bcd[(int64_t) b*ratio + m];
-                }
-                ri[k] = b;
-                for (int sec = 0; sec < 4; ++sec) {
-                    rp[sec*n_re + k] = b*(int32_t) ratio;
+            for (int64_t st = 0; st < ns; ++st) {
+                for (int32_t k = 0; k < n_re; ++k) {
+                    const int32_t b = plan.first[st] + k;
+                    for (uint32_t m = 0; m < ratio; ++m) {
+                        rc[(st*n_re + k)*ratio + m] = bcd[(st*n_blocks + b)*ratio + m];
+                    }
+                    ri[st*n_re + k] = b;
+                    for (int sec = 0; sec < 4; ++sec) {
+                        rp[sec*n_re*ns + st*n_re + k] = b*(int32_t) ratio;
+                    }
                 }
             }
         }
-        // after this graph the cache holds every complete block
-        const_cast<llama_memory_hybrid_idx *>(mctx->get_mem())->qsa_valid_pos = (llama_pos) n_bid * (llama_pos) ratio;
+        // after this graph the cache holds every complete block of each stream
+        const auto * mem = mctx->get_mem();
+        for (int64_t st = 0; st < ns; ++st) {
+            mem->qsa_valid_pos[plan.s0 + st] = (llama_pos) plan.n_bid[st] * (llama_pos) ratio;
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -929,19 +939,21 @@ public:
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
 
-        int32_t nb = 0, fi = 0;
-        const int mode_now = blk_mode_for(mctx, params.ubatch, ratio, scores, n_re_for(params.ubatch.n_tokens, ratio), nb, fi);
+        llama_memory_hybrid_idx::qsa_plan plan;
+        const int mode_now = blk_mode_for(mctx, params.ubatch, ratio, scores, n_re_for(params.ubatch.n_tokens / n_stream, ratio), n_stream, plan);
         {
             static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 40 : 0;
             if (n_dbg > 0 && (mode_now != blk_mode || !res)) {
                 n_dbg--;
-                LLAMA_LOG_WARN("qsa-blk can_reuse: n_tokens %u mode built %d now %d, other checks %d, n_bid %d first %d valid_pos %d\n",
-                    params.ubatch.n_tokens, blk_mode, mode_now, (int) res, nb, fi, (int) mctx->get_mem()->qsa_valid_pos);
+                LLAMA_LOG_WARN("qsa-blk can_reuse: n_tokens %u mode built %d now %d, other checks %d, n_bid %d first %d\n",
+                    params.ubatch.n_tokens, blk_mode, mode_now, (int) res, plan.n_bid.empty() ? 0 : plan.n_bid[0],
+                    plan.first.empty() ? 0 : plan.first[0]);
             }
         }
         res &= mode_now == blk_mode;
-        res &= n_re == n_re_for(params.ubatch.n_tokens, ratio);
-        int32_t nbt = 0;
+        res &= mode_now == 0 || plan.s0 == blk_s0;
+        res &= n_re == n_re_for(params.ubatch.n_tokens / n_stream, ratio);
+        std::vector<int32_t> nbt;
         res &= blk_topk_for(mctx, params.ubatch, ratio, scores, blk_bias, n_stream, nbt) == blk_topk;
 
         return res;
@@ -963,22 +975,24 @@ public:
     const uint32_t top_k;
 
     // halo-hybrid (C6): block-key cache mode and, for mode 2, the blocks to recompute
-    int     blk_mode = 0;
-    int32_t n_re     = 0;
-    ggml_tensor * re_cells = nullptr;   // I32 [ratio*n_re]  cells of each recomputed block
-    ggml_tensor * re_ids   = nullptr;   // I64 [n_re]        their block ids (rows of the cache)
-    ggml_tensor * re_pos   = nullptr;   // I32 [4*n_re]      mrope position rows of their first token
+    int      blk_mode = 0;
+    int32_t  n_re     = 0;              // recomputed blocks per stream
+    uint32_t blk_s0   = 0;              // physical stream of the graph's first stream (the cache rows it views)
+    ggml_tensor * re_cells = nullptr;   // I32 [ratio*n_re, n_stream]  cells of each recomputed block
+    ggml_tensor * re_ids   = nullptr;   // I64 [n_re, n_stream]        their block ids (rows of the stream's cache)
+    ggml_tensor * re_pos   = nullptr;   // I32 [4*n_re*n_stream]       mrope position rows of their first token
 
     std::vector<int32_t> blk_cells_host, blk_pos_host, cell_blk_host;   // shadows when the graph does not allocate them
 
     // halo-hybrid (C4): block-level top-k (ggml_qsa_top_k) instead of expanding the scores to every cell
     bool          blk_topk  = false;
-    ggml_tensor * n_bid_t   = nullptr;   // I32 [1]
+    ggml_tensor * n_bid_t   = nullptr;   // I32 [n_stream]
     static bool blk_topk_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
-            bool blk_bias, int64_t n_stream, int32_t & n_bid) {
+            bool blk_bias, int64_t n_stream, std::vector<int32_t> & n_bid) {
         static const bool enabled = getenv("LLAMA_QSA_BLOCK_TOPK") == nullptr || atoi(getenv("LLAMA_QSA_BLOCK_TOPK")) != 0;
-        n_bid = 0;
-        return enabled && scores && blk_bias && n_stream == 1 && mctx && mctx->get_mem() && mctx->get_mem()->qsa_identity(ub, ratio, n_bid);
+        n_bid.clear();
+        return enabled && scores && blk_bias && mctx && mctx->get_mem() && mctx->get_mem()->qsa_identity(ub, ratio, n_bid) &&
+            (int64_t) n_bid.size() == n_stream;
     }
 
     // this is fixed for the graph's lifetime, as causal_attn is part of the reuse key (llm_graph_params::allow_reuse)
@@ -1040,15 +1054,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->blk_pos);
             ggml_set_input(qsa->bias);
 
-            int32_t n_bid = 0, first = 0;
-            qsa->n_re     = llm_graph_input_qsa::n_re_for(n_tokens, (uint32_t) r);
-            qsa->blk_mode = n_stream == 1 && mctx_hyb->get_mem()->get_qsa_blk_k(il) != nullptr
-                ? llm_graph_input_qsa::blk_mode_for(mctx_hyb, ubatch, (uint32_t) r, scores, qsa->n_re, n_bid, first) : 0;
+            llama_memory_hybrid_idx::qsa_plan plan;
+            qsa->n_re     = llm_graph_input_qsa::n_re_for(n_tps, (uint32_t) r);
+            qsa->blk_mode = mctx_hyb->get_mem()->get_qsa_blk_k(il) != nullptr
+                ? llm_graph_input_qsa::blk_mode_for(mctx_hyb, ubatch, (uint32_t) r, scores, qsa->n_re, n_stream, plan) : 0;
+            qsa->blk_s0   = plan.s0;
             {
-                int32_t nbt = 0;
+                std::vector<int32_t> nbt;
                 qsa->blk_topk = llm_graph_input_qsa::blk_topk_for(mctx_hyb, ubatch, (uint32_t) r, scores, blk_bias, n_stream, nbt);
                 if (qsa->blk_topk) {
-                    qsa->n_bid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+                    qsa->n_bid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_stream);
                     ggml_set_input(qsa->n_bid_t);
                 }
             }
@@ -1056,14 +1071,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 40 : 0;
                 if (n_dbg > 0) {
                     n_dbg--;
-                    LLAMA_LOG_WARN("qsa-blk build: n_tokens %u n_kv %lld mode %d n_bid %d first %d valid_pos %d\n", ubatch.n_tokens,
-                        (long long) n_kv, qsa->blk_mode, n_bid, first, (int) mctx_hyb->get_mem()->qsa_valid_pos);
+                    LLAMA_LOG_WARN("qsa-blk build: n_tokens %u n_stream %lld n_kv %lld mode %d topk %d s0 %u n_bid[0] %d first[0] %d\n",
+                        ubatch.n_tokens, (long long) n_stream, (long long) n_kv, qsa->blk_mode, (int) qsa->blk_topk, plan.s0,
+                        plan.n_bid.empty() ? 0 : plan.n_bid[0], plan.first.empty() ? 0 : plan.first[0]);
                 }
             }
             if (qsa->blk_mode == 2) {
-                qsa->re_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*qsa->n_re);
-                qsa->re_ids   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, qsa->n_re);
-                qsa->re_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*qsa->n_re);
+                qsa->re_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*qsa->n_re, n_stream);
+                qsa->re_ids   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I64, qsa->n_re, n_stream);
+                qsa->re_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*qsa->n_re*n_stream);
                 ggml_set_input(qsa->re_cells);
                 ggml_set_input(qsa->re_ids);
                 ggml_set_input(qsa->re_pos);
@@ -1127,16 +1143,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // decode step recomputes only the trailing blocks its tokens touch. Every step is per block row (pool, norm, rope),
     // so the cached rows equal the ones a full re-pool computes and the scores are bit-identical.
     ggml_tensor * blk_k = inp->blk_mode != 0 ? mctx_hyb->get_mem()->get_qsa_blk_k(il) : nullptr;
+    if (blk_k != nullptr) {
+        // the graph's streams are the consecutive physical streams from blk_s0 (qsa_blk_plan checked it)
+        blk_k = ggml_view_3d(ctx0, blk_k, idx_dim, blk_k->ne[1], n_stream, blk_k->nb[1], blk_k->nb[2], inp->blk_s0*blk_k->nb[2]);
+    }
     if (blk_k != nullptr && inp->blk_mode == 2) {
-        ggml_tensor * fresh = pool_blocks(inp->re_cells, inp->re_pos, inp->n_re, 1);
-        ggml_tensor * upd = ggml_set_rows(ctx0, blk_k, ggml_reshape_2d(ctx0, fresh, idx_dim, inp->n_re), inp->re_ids);
-        pooled = ggml_view_3d(ctx0, upd, idx_dim, n_blocks, 1, upd->nb[1], upd->nb[1]*n_blocks, 0);
+        ggml_tensor * fresh = pool_blocks(inp->re_cells, inp->re_pos, inp->n_re, n_stream);
+        ggml_tensor * upd = ggml_set_rows(ctx0, blk_k, fresh, inp->re_ids);
+        pooled = ggml_view_3d(ctx0, upd, idx_dim, n_blocks, n_stream, upd->nb[1], upd->nb[2], 0);
     } else {
         pooled = pool_blocks(inp->blk_cells, inp->blk_pos, n_blocks, n_stream);
         if (blk_k != nullptr) {
             // refresh the cache for the steps that follow (rows past the complete blocks are never read as valid)
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, pooled, idx_dim, n_blocks),
-                    ggml_view_2d(ctx0, blk_k, idx_dim, n_blocks, blk_k->nb[1], 0)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, pooled,
+                    ggml_view_3d(ctx0, blk_k, idx_dim, n_blocks, n_stream, blk_k->nb[1], blk_k->nb[2], 0)));
         }
     }
     cb(pooled, "indexer_k", il);
@@ -1252,8 +1272,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             // halo-hybrid (C4): one sequence laid out cell j = position j: the cell-level top-k follows from the block
             // scores (ggml_qsa_top_k, exact), without the [n_kv, n_tokens] expansion, its permutes, the mask add and a
             // radix top-k over every cell. LLAMA_QSA_BLOCK_TOPK=0 restores the expansion.
+            // several streams: row i of the result belongs to stream i / n_tps, as the ubatch lays its tokens out
             ggml_tensor * qp = ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
-            top_k = ggml_qsa_top_k(ctx0, ggml_reshape_2d(ctx0, score, n_blocks, n_tps), qp, inp->n_bid_t, (int32_t) width, (int32_t) r);
+            top_k = ggml_qsa_top_k(ctx0, ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream), qp, inp->n_bid_t, (int32_t) width, (int32_t) r);
         } else {
             top_k = expand_top_k(score, 0, n_tps);
         }
