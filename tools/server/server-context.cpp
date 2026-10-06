@@ -1703,10 +1703,52 @@ private:
         return nullptr;
     }
 
+    // halo-hybrid: with a KV stream per slot (no unified KV) one ubatch can only hold consecutive streams
+    // (llama_batch_allocr::split_equal, sequential), so busy slots 0 and 2 decode in two passes over the weights:
+    // -34% aggregate decode for two streams on Swift 1.5 (57.7 -> 38.3 t/s at 1K, 50.8 -> 34.2 at 30K). New tasks
+    // therefore only consider the idle slots that leave the busy slots in the fewest runs of consecutive ids; the
+    // prompt cache (idle slots are saved to it on every new task) makes moving a conversation to another slot cheap.
+    // LLAMA_SERVER_SLOT_CONTIG=0 restores the plain similarity / LRU choice.
+    std::vector<bool> contiguous_candidates() const {
+        std::vector<bool> ok(slots.size(), true);
+        static const bool enabled = getenv("LLAMA_SERVER_SLOT_CONTIG") == nullptr || atoi(getenv("LLAMA_SERVER_SLOT_CONTIG")) != 0;
+        if (!enabled || params_base.kv_unified || slots.size() < 2) {
+            return ok;
+        }
+        std::vector<bool> busy(slots.size());
+        for (size_t i = 0; i < slots.size(); ++i) {
+            busy[i] = slots[i].is_processing();
+        }
+        auto runs = [&](size_t extra) {
+            int n = 0;
+            for (size_t i = 0; i < slots.size(); ++i) {
+                const bool b  = busy[i] || i == extra;
+                const bool bp = i > 0 && (busy[i - 1] || i - 1 == extra);
+                n += b && !bp;
+            }
+            return n;
+        };
+        int best = INT32_MAX;
+        std::vector<int> r(slots.size(), INT32_MAX);
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (!busy[i]) {
+                r[i] = runs(i);
+                best = std::min(best, r[i]);
+            }
+        }
+        for (size_t i = 0; i < slots.size(); ++i) {
+            ok[i] = !busy[i] && r[i] == best;
+        }
+        return ok;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+
+        // a pinned slot (task.id_slot) is taken as asked
+        const std::vector<bool> contig = contiguous_candidates();
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1732,6 +1774,11 @@ private:
                 }
 
                 const auto & tokens = slot.prompt.tokens;
+
+                if (task.id_slot == -1 && !contig[slot.id]) {
+                    SLT_TRC(slot, "%s", " - skipping, would split the busy slots\n");
+                    continue;
+                }
 
                 // skip the slot if it does not contains cached tokens
                 if (tokens.empty()) {
@@ -1775,6 +1822,10 @@ private:
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+
+                if (!contig[slot.id]) {
                     continue;
                 }
 
