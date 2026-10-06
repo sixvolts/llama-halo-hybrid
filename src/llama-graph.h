@@ -1196,7 +1196,8 @@ struct llm_graph_context {
     // top-k (QSA) attention decode fast path: the selection width the gather attends over when
     // the gather applies to this ubatch, otherwise 0. Ported from ucicelos/flashnext-hybrid
     // (their fix 4, "sparse attention at sparse prices"); the padded variant was dropped.
-    int64_t attn_top_k_gather_n_sel(int64_t n_kv, int64_t width) const;
+    // igpu: the layer's attention runs on an integrated GPU (a later crossover, see the definition)
+    int64_t attn_top_k_gather_n_sel(int64_t n_kv, int64_t width, bool igpu = false) const;
 
     // gather the selected K/V rows and attend over exactly those instead of masking all n_kv cells
     ggml_tensor * build_attn_top_k_gather(

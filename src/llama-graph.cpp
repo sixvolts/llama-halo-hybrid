@@ -2635,20 +2635,23 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
 // Decides whether the top-k attention may gather the selected rows instead of masking all
 // n_kv cells. Returns 0 to keep the dense path. Ported from ucicelos/flashnext-hybrid.
 //
-// LLAMA_QSA_GATHER=0 disables; an integer sets the minimum n_kv it activates at. The default
-// (65536) is where they measured the crossover on a Strix Halo + eGPU: the gather removes the
-// O(n_kv) attention but not the O(n_kv) indexer scan that produces the top-k, so it only pays
-// once the cache is much larger than the ~2k-cell selection (-5.8% at 16K, a wash at 64K,
-// +8.7% at 128K on their machine).
-int64_t llm_graph_context::attn_top_k_gather_n_sel(int64_t n_kv, int64_t width) const {
-    static const int64_t min_kv = [] {
+// LLAMA_QSA_GATHER=0 disables; an integer sets the minimum n_kv it activates at. They measured the
+// crossover at 64K on a Strix Halo + eGPU (-5.8% at 16K, a wash at 64K, +8.7% at 128K), where the
+// indexer still re-pooled and expanded every cell per step. halo-hybrid: with the block-key cache
+// and the block-level top-k the indexer no longer scales that way, and on Swift 1.5 (R9700, MTP
+// verify of 3 tokens, 1 and 2 streams) the crossover is ~16K: -3% at 4-8K, even at 16K, +3% at 31K,
+// +9% at 59K (1 stream) and +10% at 31K (2 streams): default 16384. On the Strix Halo iGPU alone the
+// dense walk is relatively cheaper (-3.5% at 15.5K, +3% at 31K, crossover ~23K): default 24576 there.
+int64_t llm_graph_context::attn_top_k_gather_n_sel(int64_t n_kv, int64_t width, bool igpu) const {
+    static const int64_t min_kv_env = [] {
         const char * env = getenv("LLAMA_QSA_GATHER");
         if (env == nullptr) {
-            return (int64_t) 65536;
+            return (int64_t) -1;
         }
         const int64_t v = atoll(env);
         return v <= 0 ? INT64_MAX : v;
     }();
+    const int64_t min_kv = min_kv_env >= 0 ? min_kv_env : (igpu ? 24576 : 16384);
 
     // the gather relies on flash attention: a non-transposed V cache and an f16 mask.
     // alibi encodes distances in the mask, and only the dense path is exercised with it.
