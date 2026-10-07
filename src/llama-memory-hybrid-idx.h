@@ -243,6 +243,8 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool needs_reserve() const override;
+
     //
     // llama_memory_hybrid_idx_context specific API
     //

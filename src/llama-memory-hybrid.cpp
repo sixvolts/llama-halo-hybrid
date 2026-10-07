@@ -372,6 +372,13 @@ bool llama_memory_hybrid_context::next() {
     return true;
 }
 
+bool llama_memory_hybrid_context::needs_reserve() const {
+    const auto nr = [](const llama_memory_context_ptr & c) {
+        return c && c->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && c->needs_reserve();
+    };
+    return nr(ctx_attn) || nr(ctx_recr) || nr(ctx_idx);
+}
+
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 

@@ -128,6 +128,9 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // any part that has an update and needs it
+    bool needs_reserve() const override;
+
     //
     // llama_memory_hybrid_context
     //

@@ -362,6 +362,19 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             break;
         }
 
+        // a sequence that would run into another one: move cells first (llama_kv_cache::plan_moves), in the update the
+        // decode loop runs on this failure. The indexer cache mirrors the attention cells, so it takes the same moves;
+        // the block-key cache is indexed by position and stays valid. Not with the pool layout, which follows cells
+        if (get_kpool() == 0) {
+            if (auto mv = get_mem_attn()->plan_moves(ubatches); !mv.empty()) {
+                if (mem_idx) {
+                    mem_idx->set_moves(mv);
+                }
+                get_mem_attn()->set_moves(std::move(mv));
+                return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            }
+        }
+
         // prepare the recurrent batches first
         if (!get_mem_recr()->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
@@ -1281,6 +1294,11 @@ bool llama_memory_hybrid_idx_context::next() {
     ++i_cur;
 
     return llama_memory_hybrid_context::next();
+}
+
+bool llama_memory_hybrid_idx_context::needs_reserve() const {
+    return llama_memory_hybrid_context::needs_reserve() ||
+        (ctx_idx && ctx_idx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && ctx_idx->needs_reserve());
 }
 
 bool llama_memory_hybrid_idx_context::apply() {

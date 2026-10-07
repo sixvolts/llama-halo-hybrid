@@ -725,6 +725,13 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             break;
         }
 
+        // a sequence that would run into another one: move cells in the update the decode loop runs on this failure,
+        // then place the retried batch
+        if (auto mv = plan_moves(ubatches); !mv.empty()) {
+            set_moves(std::move(mv));
+            break;
+        }
+
         auto sinfos = prepare(ubatches);
         if (sinfos.empty()) {
             break;
@@ -746,7 +753,10 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
     bool do_shift = get_has_shift();
 
-    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
+    std::vector<cell_move> mv = std::move(moves_pending);
+    moves_pending.clear();
+
+    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info), std::move(mv));
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
@@ -815,7 +825,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
-bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info, const std::vector<cell_move> & moves) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -824,6 +834,21 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     bool updated = false;
 
     auto * sched = lctx->get_sched();
+
+    if (!moves.empty()) {
+        // the rows may still be written or read by the previous graph
+        llama_synchronize(lctx);
+
+        for (const auto & m : moves) {
+            const int64_t t0 = ggml_time_us();
+            move_rows(m);
+            v_cells[0].mv(m.src, m.dst, m.n);
+            LLAMA_LOG_WARN("%s: moved cells [%u, %u) to %u in %.1f ms\n", __func__, m.src, m.src + m.n, m.dst, (ggml_time_us() - t0)/1000.0);
+        }
+
+        moves_done = true;
+        updated    = true;
+    }
 
     if (!sc_info.empty()) {
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
@@ -1193,6 +1218,161 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot_window(const llama_ubatch & 
     }
 
     return res;
+}
+
+std::vector<llama_kv_cache::cell_move> llama_kv_cache::plan_moves(const std::vector<llama_ubatch> & ubatches) {
+    static const bool disabled = getenv("LLAMA_KV_NO_MOVE") != nullptr && atoi(getenv("LLAMA_KV_NO_MOVE")) != 0;
+
+    if (moves_done) {
+        // the retry after a move
+        moves_done = false;
+        return {};
+    }
+
+    if (disabled || !window || n_stream != 1 || v_trans || other != nullptr || v_cells[0].get_has_shift()) {
+        return {};
+    }
+
+    const auto & cells = v_cells[0];
+
+    const uint32_t size = cells.size();
+    const uint32_t C    = llama_kv_cells::SEQ_CHUNK;
+
+    // the moved cells keep half of a free run for the sequence they leave room for, but at least this many cells
+    // when the run allows it, so a sequence that keeps growing does not move every few chunks
+    const uint32_t min_gain = 16*C;
+
+    // the cells each sequence adds
+    std::map<llama_seq_id, uint32_t> need;
+    for (const auto & ub : ubatches) {
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            if (ub.n_seq_id[i] != 1) {
+                return {};
+            }
+            need[ub.seq_id[i][0]]++;
+        }
+    }
+
+    // every used cell of [c0, c1) holds seq_id alone
+    const auto alone = [&](llama_seq_id seq_id, uint32_t c0, uint32_t c1) {
+        for (uint32_t i = c0; i < c1; ++i) {
+            if (!cells.is_empty(i) && (cells.seq_count(i) != 1 || !cells.seq_has(i, seq_id))) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // the move distance: half of a free run of len cells (or all of it), at least min_gain and the deficit,
+    // whole chunks, at most the run. 0 if that leaves less than the deficit
+    const auto dist = [&](uint32_t len, bool all, uint32_t deficit) -> uint32_t {
+        const uint32_t cap  = len/C*C;
+        const uint32_t want = std::max({ all ? cap : len/2/C*C, min_gain, (deficit + C - 1)/C*C });
+        const uint32_t d    = std::min(want, cap);
+        return d >= deficit ? d : 0;
+    };
+
+    for (const auto & [seq_x, n] : need) {
+        const int64_t last = cells.seq_cell_last(seq_x);
+        if (last < 0) {
+            continue; // a new sequence: find_slot_window places it
+        }
+
+        uint32_t room = 0;
+        for (uint32_t i = last + 1; i < size && room < n && cells.is_empty(i); ++i) {
+            room++;
+        }
+        if (room >= n) {
+            continue;
+        }
+
+        const uint32_t deficit = n - room;
+        const uint32_t nb      = last + 1 + room; // the first cell after the room: another sequence's, or the end
+
+        cell_move best = { 0, 0, 0 };
+        uint32_t  gain = 0;
+
+        // the next sequence up, if its cells start right there
+        if (nb < size && cells.seq_count(nb) == 1) {
+            const llama_seq_id seq_b = cells.seq_get(nb);
+            const int64_t b_last = cells.seq_cell_last(seq_b);
+            if (seq_b != seq_x && cells.seq_cell_first(seq_b) == (int64_t) nb) {
+                uint32_t len = 0;
+                for (uint32_t i = b_last + 1; i < size && cells.is_empty(i); ++i) {
+                    len++;
+                }
+                const uint32_t d = dist(len, false, deficit);
+                if (d > 0 && alone(seq_b, nb, b_last + 1)) {
+                    best = { nb, nb + d, (uint32_t) (b_last + 1 - nb) };
+                    gain = d;
+                }
+            }
+        }
+
+        // the sequence itself down
+        {
+            const int64_t first = cells.seq_cell_first(seq_x);
+            uint32_t len = 0;
+            for (int64_t i = first - 1; i >= 0 && cells.is_empty(i); --i) {
+                len++;
+            }
+            const uint32_t d = dist(len, len == first, deficit);
+            if (d > gain && alone(seq_x, first, last + 1)) {
+                best = { (uint32_t) first, (uint32_t) (first - d), (uint32_t) (last + 1 - first) };
+                gain = d;
+            }
+        }
+
+        if (gain > 0) {
+            return { best };
+        }
+    }
+
+    return {};
+}
+
+void llama_kv_cache::set_moves(std::vector<cell_move> moves) {
+    moves_pending = std::move(moves);
+}
+
+void llama_kv_cache::move_rows(const cell_move & m) {
+    if (m.n == 0 || m.src == m.dst) {
+        return;
+    }
+
+    // pieces no longer than the distance never overlap their own destination; moving up goes from the far end
+    const uint32_t d    = m.dst > m.src ? m.dst - m.src : m.src - m.dst;
+    const uint32_t step = std::min(d, m.n);
+
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k, layer.v }) {
+            if (t == nullptr) {
+                continue;
+            }
+
+            const size_t rb = t->nb[1];
+            GGML_ASSERT(rb == ggml_row_size(t->type, t->ne[0]));
+
+            for (uint32_t k = 0; k < m.n; k += step) {
+                const uint32_t c = std::min(step, m.n - k);
+                const uint32_t o = m.dst > m.src ? m.n - k - c : k;
+
+                ggml_init_params params = {
+                    /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context_ptr ctx { ggml_init(params) };
+
+                ggml_tensor * vs = ggml_view_1d(ctx.get(), t, c*t->ne[0], (size_t) (m.src + o)*rb);
+                ggml_tensor * vd = ggml_view_1d(ctx.get(), t, c*t->ne[0], (size_t) (m.dst + o)*rb);
+                GGML_ASSERT(ggml_backend_view_init(vs) == GGML_STATUS_SUCCESS);
+                GGML_ASSERT(ggml_backend_view_init(vd) == GGML_STATUS_SUCCESS);
+
+                ggml_backend_tensor_copy(vs, vd);
+            }
+        }
+    }
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
@@ -3103,8 +3283,10 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_context * lctx,
         bool do_shift,
-        stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
-    if (!do_shift && this->sc_info.empty()) {
+        stream_copy_info sc_info,
+        std::vector<llama_kv_cache::cell_move> moves) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift),
+            sc_info(std::move(sc_info)), moves(std::move(moves)) {
+    if (!do_shift && this->sc_info.empty() && this->moves.empty()) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 }
@@ -3116,6 +3298,11 @@ llama_kv_cache_context::llama_kv_cache_context(
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
+
+bool llama_kv_cache_context::needs_reserve() const {
+    // cell moves copy rows outside the scheduler
+    return do_shift || !sc_info.empty() || moves.empty();
+}
 
 bool llama_kv_cache_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
@@ -3132,7 +3319,7 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
+        kv->update(lctx, do_shift, sc_info, moves);
 
         return true;
     }

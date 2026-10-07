@@ -479,6 +479,40 @@ public:
         n     = sp.size();
     }
 
+    // halo-hybrid: move the cells [src, src + n) to [dst, dst + n) with their positions, sequences and ext. The
+    // cells of the destination outside the source range must be empty; the data is moved by the caller
+    void mv(uint32_t src, uint32_t dst, uint32_t n) {
+        assert(src + n <= pos.size());
+        assert(dst + n <= pos.size());
+
+        if (src == dst || n == 0) {
+            return;
+        }
+
+        for (uint32_t k = 0; k < n; ++k) {
+            // from the far end when moving up, so a cell is vacated before it is written
+            const uint32_t j = dst > src ? n - 1 - k : k;
+            const uint32_t i = src + j;
+            if (pos[i] == -1) {
+                continue;
+            }
+
+            assert(shift[i] == 0);
+
+            const llama_pos         p = pos[i];
+            const llama_kv_cell_ext e = ext[i];
+            const seq_set_t         s = seq[i];
+
+            rm(i);
+
+            const uint32_t d = dst + j;
+            pos_set(d, p);
+            ext[d] = e;
+            seq[d] = s;
+            seq_pos_add(d);
+        }
+    }
+
     // the longest run of empty cells: [start, start + len)
     void free_run_max(uint32_t & start, uint32_t & len) const {
         start = 0;

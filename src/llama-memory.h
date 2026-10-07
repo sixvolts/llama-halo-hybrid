@@ -64,6 +64,10 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // halo-hybrid: for an update context, whether apply() computes a graph on the scheduler, so the worst-case graph
+    // must be reserved again afterwards (a K-shift does; plain buffer copies do not)
+    virtual bool needs_reserve() const { return true; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

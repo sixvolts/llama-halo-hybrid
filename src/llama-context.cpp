@@ -1061,6 +1061,8 @@ bool llama_context::memory_update(bool optimize) {
         return false;
     }
 
+    bool reserve = true;
+
     {
         const auto mctx = memory->init_update(this, optimize);
         switch (mctx->get_status()) {
@@ -1090,13 +1092,15 @@ bool llama_context::memory_update(bool optimize) {
         }
         gf_res_prev_active = nullptr;
 
+        reserve = mctx->needs_reserve();
+
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
         }
     }
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
-    {
+    if (reserve) {
         const auto mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");

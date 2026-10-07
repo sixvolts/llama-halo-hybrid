@@ -235,11 +235,16 @@ public:
     // preparation API
     //
 
+    // a move of cells within a stream (see plan_moves)
+    struct cell_move {
+        uint32_t src, dst, n;   // cells [src, src + n) -> [dst, dst + n)
+    };
+
     // find places for the provided ubatches in the cache, returns the slot infos
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info, const std::vector<cell_move> & moves = {});
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -248,6 +253,17 @@ public:
 
     // find_slot for a cache with the KV window: keep the cells of each sequence together, so its window stays tight
     slot_info find_slot_window(const llama_ubatch & ubatch) const;
+
+    // halo-hybrid: a sequence of the KV window that has no room to grow in place (the cells after its last one belong to
+    // another sequence) would scatter, and the window of both then spans the two (dense attention over both, no
+    // per-sequence QSA groups). plan_moves picks one move of a whole sequence's cells that gives it the room, keeping
+    // every position at the same distance from its sequence's first cell:
+    //   - the next sequence up into the free run after it, keeping half of that run for its own growth, or
+    //   - the sequence itself down into the free run before it (all of it at the start of the cache, else half)
+    // whichever gives more room. Empty when nothing needs or allows a move. set_moves queues the moves for the next
+    // update(), which copies the rows of every layer and moves the cells. LLAMA_KV_NO_MOVE=1 disables
+    std::vector<cell_move> plan_moves(const std::vector<llama_ubatch> & ubatches);
+    void set_moves(std::vector<cell_move> moves);
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
@@ -358,6 +374,14 @@ private:
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
 
+    // pending cell moves for the next update (see plan_moves); moves_done: the last update moved cells, so the retried
+    // batch is placed as it comes instead of planning again
+    std::vector<cell_move> moves_pending;
+    bool moves_done = false;
+
+    // copy the rows of cells [src, src + n) to [dst, dst + n) in every layer
+    void move_rows(const cell_move & m);
+
     std::vector<kv_layer> layers;
 
     // model layer id -> KV cache layer id
@@ -417,7 +441,8 @@ public:
             llama_kv_cache * kv,
             llama_context * lctx,
             bool do_shift,
-            stream_copy_info sc_info);
+            stream_copy_info sc_info,
+            std::vector<llama_kv_cache::cell_move> moves = {});
 
     // used to create a batch processing context from a batch
     llama_kv_cache_context(
@@ -435,6 +460,7 @@ public:
     bool apply() override;
 
     llama_memory_status  get_status() const override;
+    bool needs_reserve() const override;
     const llama_ubatch & get_ubatch() const override;
 
     //
@@ -513,6 +539,8 @@ private:
     bool do_shift = false;
 
     stream_copy_info sc_info;
+
+    std::vector<llama_kv_cache::cell_move> moves;
 
     //
     // batch processing context
