@@ -43,6 +43,10 @@ static ggml_tensor * build_attn_inp_kq_mask(
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
+    // the K/V views of this graph start at the first cell of the KV window (see llama_kv_cache::get_kv_window)
+    // an input has no op, so its op params are free to carry the offset for can_reuse_kq_mask
+    res->op_params[0] = (int32_t) mctx->get_kv_lo();
+
     return res;
 }
 
@@ -61,6 +65,7 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
+    res &= (kq_mask->op_params[0] == (int32_t) mctx->get_kv_lo());
 
     return res;
 }

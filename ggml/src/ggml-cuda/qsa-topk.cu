@@ -84,18 +84,19 @@ static __device__ void qsa_tk_pass(const float * __restrict__ srow, const int nb
 // Same T and tie count, so the same cells in the same order. GGML_CUDA_QSA_TK_V1=1 restores the old search.
 template <bool V2>
 static __global__ void k_qsa_top_k(const float * __restrict__ score, const int64_t s1, const int32_t * __restrict__ q_pos,
-        const int32_t * __restrict__ n_bid, int32_t * __restrict__ dst, const int64_t d1,
+        const int32_t * __restrict__ n_bid, const int32_t * __restrict__ cbase, int32_t * __restrict__ dst, const int64_t d1,
         const int n_blocks, const int n_tps, const int width, const int r) {
     const int i   = blockIdx.x;
     const int tid = threadIdx.x;
     const int q   = q_pos[i];
     const int nb  = min(n_bid[i / n_tps], n_blocks);   // row i belongs to stream i / n_tps
     const int F   = max(0, min(nb * r, q + 1));
+    const int c0  = cbase ? cbase[i / n_tps] : 0;      // the stream's first cell (see ggml_qsa_top_k)
     int32_t * out = dst + (int64_t) i * d1;
 
     if (F <= width) {   // every scored cell, then the -inf cells F.. in index order: 0 .. width-1
         for (int k = tid; k < width; k += QSA_TK_NT) {
-            out[k] = k;
+            out[k] = c0 + k;
         }
         return;
     }
@@ -182,7 +183,7 @@ static __global__ void k_qsa_top_k(const float * __restrict__ score, const int64
             eb += w;
         }
         for (int m = 0; m < take; ++m) {
-            out[o++] = b*r + m;
+            out[o++] = c0 + b*r + m;
         }
     }
 }
@@ -260,18 +261,19 @@ static __device__ void qsa_tk3_pass(const uint32_t (&key)[KPT], const int n_own,
 
 template <int KPT>
 static __global__ void __launch_bounds__(QSA_TK3_NT) k_qsa_top_k_reg(const float * __restrict__ score, const int64_t s1,
-        const int32_t * __restrict__ q_pos, const int32_t * __restrict__ n_bid, int32_t * __restrict__ dst, const int64_t d1,
-        const int n_blocks, const int n_tps, const int width, const int r) {
+        const int32_t * __restrict__ q_pos, const int32_t * __restrict__ n_bid, const int32_t * __restrict__ cbase,
+        int32_t * __restrict__ dst, const int64_t d1, const int n_blocks, const int n_tps, const int width, const int r) {
     const int i   = blockIdx.x;
     const int tid = threadIdx.x;
     const int q   = q_pos[i];
     const int nb  = min(n_bid[i / n_tps], n_blocks);
     const int F   = max(0, min(nb * r, q + 1));
+    const int c0  = cbase ? cbase[i / n_tps] : 0;
     int32_t * out = dst + (int64_t) i * d1;
 
     if (F <= width) {
         for (int k = tid; k < width; k += QSA_TK3_NT) {
-            out[k] = k;
+            out[k] = c0 + k;
         }
         return;
     }
@@ -355,7 +357,7 @@ static __global__ void __launch_bounds__(QSA_TK3_NT) k_qsa_top_k_reg(const float
             eb += w;
         }
         for (int j = 0; j < take; ++j) {
-            out[o++] = b*r + j;
+            out[o++] = c0 + b*r + j;
         }
     }
 }
@@ -369,6 +371,8 @@ void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int width = ggml_get_op_params_i32(dst, 0);
     const int r     = ggml_get_op_params_i32(dst, 1);
     const int64_t n_q = score->ne[1]*score->ne[2];   // rows of every stream (contiguous: row i at i*nb[1])
+    // n_bid may carry each stream's first cell after the block counts
+    const int32_t * cbase = ggml_nelements(n_bid) == 2*score->ne[2] ? (const int32_t *) n_bid->data + score->ne[2] : nullptr;
     static const bool v1 = getenv("GGML_CUDA_QSA_TK_V1") != nullptr && atoi(getenv("GGML_CUDA_QSA_TK_V1")) != 0;
     // the register variant up to 64K blocks (262K context). It wins at every row count, prefill batches included
     // (1024 rows at 113K: 4.4 -> 0.27 ms on the R9700, 10.6 -> 0.83 ms on the 8060S). GGML_CUDA_QSA_TK_REG=0 restores
@@ -378,7 +382,7 @@ void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     if (!v1 && reg && nblk <= 64*QSA_TK3_NT) {
         auto launch = [&](auto kern) {
             kern<<<(int) n_q, QSA_TK3_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
-                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
+                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, cbase, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
                 (int) score->ne[0], (int) score->ne[1], width, r);
         };
         if (nblk <= 16*QSA_TK3_NT) {
@@ -390,11 +394,11 @@ void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         }
     } else if (v1) {
         k_qsa_top_k<false><<<(int) n_q, QSA_TK_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
-                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
+                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, cbase, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
                 (int) score->ne[0], (int) score->ne[1], width, r);
     } else {
         k_qsa_top_k<true><<<(int) n_q, QSA_TK_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
-                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
+                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, cbase, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
                 (int) score->ne[0], (int) score->ne[1], width, r);
     }
     CUDA_CHECK(cudaGetLastError());

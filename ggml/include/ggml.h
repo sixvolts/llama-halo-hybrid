@@ -2759,6 +2759,8 @@ extern "C" {
     //   score: F32 [n_blocks, n_q, n_stream]   q_pos: I32 [n_q*n_stream]   n_bid: I32 [n_stream] (complete blocks)
     // Several streams (one sequence each, every one laid out as above): row i belongs to stream i / n_q and uses
     // n_bid[stream]; the result is [width, n_q*n_stream], each row indexing its own stream's cells.
+    // n_bid may also be I32 [2*n_stream]: then n_bid[n_stream + s] is added to every cell index of stream s (streams
+    // that are sequences laid out from that cell on in one shared cache).
     GGML_API struct ggml_tensor * ggml_qsa_top_k(
             struct ggml_context * ctx,
             struct ggml_tensor  * score,

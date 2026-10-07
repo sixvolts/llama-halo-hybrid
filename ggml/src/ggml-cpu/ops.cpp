@@ -12631,9 +12631,11 @@ void ggml_compute_forward_qsa_top_k(const struct ggml_compute_params * params, s
         std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return val[a] > val[b]; });
         order.resize(width);
         std::sort(order.begin(), order.end());
+        // n_bid may carry each stream's first cell after the block counts
+        const int32_t c0 = ggml_nelements(n_bid) == 2*score->ne[2] ? ((const int32_t *) n_bid->data)[score->ne[2] + i / n_tps] : 0;
         int32_t * out = (int32_t *) ((char *) dst->data + i*dst->nb[1]);
         for (int32_t k = 0; k < width; ++k) {
-            out[k] = order[k];
+            out[k] = c0 + order[k];
         }
     }
 }

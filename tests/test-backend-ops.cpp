@@ -8046,11 +8046,12 @@ struct test_qsa_top_k : public test_case {
     const int32_t pos0;   // first query position
     const bool    ties;
     const int64_t n_stream;   // streams, each with fewer complete blocks and earlier queries than the one before
+    const bool    base;       // n_bid also carries each stream's first cell (streams sharing one cache)
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_TOP_K"; }
 
     std::string vars() override {
-        return VARS_TO_STR8(n_blocks, n_q, n_bid, width, ratio, pos0, ties, n_stream);
+        return VARS_TO_STR9(n_blocks, n_q, n_bid, width, ratio, pos0, ties, n_stream, base);
     }
 
     int32_t n_bid_of(int64_t s) const { return std::max<int32_t>(0, n_bid - (int32_t) (s*37)); }
@@ -8059,13 +8060,14 @@ struct test_qsa_top_k : public test_case {
     double max_err() override { return 0.0; }
 
     test_qsa_top_k(int64_t n_blocks, int64_t n_q, int32_t n_bid, int32_t width, int32_t ratio, int32_t pos0, bool ties,
-            int64_t n_stream = 1)
-        : n_blocks(n_blocks), n_q(n_q), n_bid(n_bid), width(width), ratio(ratio), pos0(pos0), ties(ties), n_stream(n_stream) {}
+            int64_t n_stream = 1, bool base = false)
+        : n_blocks(n_blocks), n_q(n_q), n_bid(n_bid), width(width), ratio(ratio), pos0(pos0), ties(ties), n_stream(n_stream),
+          base(base) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_q, n_stream);
         ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q*n_stream);
-        ggml_tensor * nbid  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_stream);
+        ggml_tensor * nbid  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, base ? 2*n_stream : n_stream);
         ggml_set_name(score, "score");
         ggml_set_name(q_pos, "q_pos");
         ggml_set_name(nbid,  "n_bid");
@@ -8091,8 +8093,9 @@ struct test_qsa_top_k : public test_case {
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "n_bid") == 0) {
-                std::vector<int32_t> v(n_stream);
+                std::vector<int32_t> v(ggml_nelements(t));
                 for (int64_t s = 0; s < n_stream; ++s) { v[s] = n_bid_of(s); }
+                for (int64_t s = 0; base && s < n_stream; ++s) { v[n_stream + s] = (int32_t) (s*131072 + 768); }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (t->view_src == nullptr && t->type == GGML_TYPE_F32) {
                 init_tensor_uniform(t); // the sentinels (see test_qsa_head_sum)
@@ -13097,6 +13100,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_top_k(16384, 3, 16300, 2051, 4, 65200, ties, 4)); // 4-stream verify
         test_cases.emplace_back(new test_qsa_top_k(700, 5, 600, 257, 4, 2400, ties, 3));        // odd sizes, 3 streams
         test_cases.emplace_back(new test_qsa_top_k(600, 2, 520, 2051, 4, 2090, ties, 2));        // F <= width in one stream
+        test_cases.emplace_back(new test_qsa_top_k(16384, 3, 16300, 2051, 4, 65200, ties, 2, true)); // streams sharing a cache
+        test_cases.emplace_back(new test_qsa_top_k(600, 2, 520, 2051, 4, 2090, ties, 2, true));
     }
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_qsa_head_sum(2560, 4, 64, b));

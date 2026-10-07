@@ -2906,7 +2906,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
+                        auto * kv = new llama_kv_cache(
                                 *this,
                                 hparams,
                                 params.type_k,
@@ -2923,6 +2923,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter,
                                 nullptr,
                                 nullptr);
+
+                        // the qwen4exp MTP head is plain attention over its own cells, so it can take the
+                        // per-sequence KV window like the target's hybrid memory
+                        if (mtp_on_hybrid_qwen && arch == LLM_ARCH_QWEN4EXP) {
+                            kv->set_window(true);
+                        }
+
+                        res = kv;
                     }
                 }
             }

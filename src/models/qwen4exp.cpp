@@ -443,6 +443,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
     if (mctx_idx) {
         GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
+                mctx_idx->get_kv_lo() == inp->mctx->get_attn()->get_kv_lo() &&
                 "the indexer cache must track the attention cache cell for cell");
     }
 
@@ -830,17 +831,34 @@ public:
     // n_re trailing blocks [first, n_bid) and score against the cache
     // several streams: every stream of the graph (n_stream) must hold one planned sequence
     static int blk_mode_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
-            int32_t n_re, int64_t n_stream, llama_memory_hybrid_idx::qsa_plan & plan) {
+            int32_t n_re, int64_t n_stream, bool shared, llama_memory_hybrid_idx::qsa_plan & plan) {
         plan = {};
         const llama_memory_hybrid_idx * mem = mctx ? mctx->get_mem() : nullptr;
         if (!scores || mem == nullptr) {
             return 0;
         }
-        plan = mem->qsa_blk_plan(ub, ratio, n_re);
-        if (!plan.usable || (int64_t) plan.n_bid.size() != n_stream) {
+        plan = mem->qsa_blk_plan(ub, ratio, n_re, mctx->get_idx()->get_kv_lo(), mctx->get_idx()->get_n_kv());
+        if (!plan.usable || plan.shared != shared || (int64_t) plan.n_bid.size() != n_stream) {
             return 0;
         }
         return plan.incr ? 2 : 1;
+    }
+
+    // halo-hybrid: a shared pool (one unified cache holding several sequences, attended through the KV window) whose
+    // layout plan holds: the graph's QSA groups are the ubatch's sequences, each scored against its own slab of the
+    // block-key cache and its cells found from its base (ggml_qsa_top_k with cell bases). Needs the block-level top-k.
+    // LLAMA_QSA_SHARED=0: one group over the whole window, as without the plan
+    static bool shared_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
+            bool causal_attn, llama_memory_hybrid_idx::qsa_plan & plan) {
+        static const bool enabled = getenv("LLAMA_QSA_SHARED") == nullptr || atoi(getenv("LLAMA_QSA_SHARED")) != 0;
+        static const bool topk    = getenv("LLAMA_QSA_BLOCK_TOPK") == nullptr || atoi(getenv("LLAMA_QSA_BLOCK_TOPK")) != 0;
+        plan = {};
+        const llama_memory_hybrid_idx * mem = mctx ? mctx->get_mem() : nullptr;
+        if (!enabled || !topk || !scores || !causal_attn || mem == nullptr || !mem->qsa_shared_pool()) {
+            return false;
+        }
+        plan = mem->qsa_identity(ub, ratio, mctx->get_idx()->get_kv_lo(), mctx->get_idx()->get_n_kv());
+        return plan.usable && plan.shared;
     }
     static int32_t n_re_for(uint32_t n_tokens, uint32_t ratio) {
         return (int32_t) ((n_tokens + ratio - 1)/ratio) + 1;
@@ -870,17 +888,22 @@ public:
             mctx->set_input_qsa(cbk, bc, bp, bias, ubatch, ratio, blk_bias, causal_attn);
         }
         if (blk_topk) {
-            std::vector<int32_t> nb;
-            GGML_ASSERT(blk_topk_for(mctx, *ubatch, ratio, scores, blk_bias, ggml_nelements(n_bid_t), nb) && "qsa block top-k: the layout changed between graph build and set_input");
+            llama_memory_hybrid_idx::qsa_plan tp;
+            const int64_t ng = shared ? ggml_nelements(n_bid_t)/2 : ggml_nelements(n_bid_t);
+            GGML_ASSERT(blk_topk_for(mctx, *ubatch, ratio, scores, blk_bias, ng, shared, tp) &&
+                    "qsa block top-k: the layout changed between graph build and set_input");
             GGML_ASSERT(ggml_backend_buffer_is_host(n_bid_t->buffer));
-            std::copy(nb.begin(), nb.end(), (int32_t *) n_bid_t->data);
+            std::copy(tp.n_bid.begin(), tp.n_bid.end(), (int32_t *) n_bid_t->data);
+            if (shared) {
+                std::copy(tp.base.begin(), tp.base.end(), (int32_t *) n_bid_t->data + ng);
+            }
         }
         if (blk_mode == 0) {
             return;
         }
         const int64_t ns = cell_blk->ne[1];
         llama_memory_hybrid_idx::qsa_plan plan;
-        const int mode = blk_mode_for(mctx, *ubatch, ratio, scores, n_re, ns, plan);
+        const int mode = blk_mode_for(mctx, *ubatch, ratio, scores, n_re, ns, shared, plan);
         GGML_ASSERT(mode == blk_mode && plan.s0 == blk_s0 && "qsa block-key cache: the plan changed between graph build and set_input");
         if (blk_mode == 2) {
             // hole-free single sequence per stream: block id == position / ratio == the bid set_input_qsa numbered, so the
@@ -920,18 +943,27 @@ public:
         }
 
         const int64_t n_kv     = idx->get_n_kv();
-        const int64_t n_stream = mctx->get_n_stream();
-        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+        const int64_t n_kvs    = mctx->get_n_stream();
 
         bool res = true;
 
-        res &= params.ubatch.n_tokens % n_stream == 0;
+        res &= params.ubatch.n_tokens % n_kvs == 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
         res &= need_scores(n_kv, ratio, top_k) == scores;
         if (!scores) {
             return res;
         }
+
+        llama_memory_hybrid_idx::qsa_plan sp;
+        const bool shared_now = shared_for(mctx, params.ubatch, ratio, scores, causal_attn, sp);
+        res &= shared_now == shared;
+        if (!res) {
+            return false;
+        }
+        const int64_t n_stream = shared ? (int64_t) sp.n_bid.size() : n_kvs;   // the QSA groups
+        const int64_t n_blocks = shared ? sp.n_blocks : (n_kv + ratio - 1)/ratio;
+        res &= params.ubatch.n_tokens % n_stream == 0;
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
@@ -940,7 +972,7 @@ public:
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
 
         llama_memory_hybrid_idx::qsa_plan plan;
-        const int mode_now = blk_mode_for(mctx, params.ubatch, ratio, scores, n_re_for(params.ubatch.n_tokens / n_stream, ratio), n_stream, plan);
+        const int mode_now = blk_mode_for(mctx, params.ubatch, ratio, scores, n_re_for(params.ubatch.n_tokens / n_stream, ratio), n_stream, shared, plan);
         {
             static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 40 : 0;
             if (n_dbg > 0 && (mode_now != blk_mode || !res)) {
@@ -953,8 +985,8 @@ public:
         res &= mode_now == blk_mode;
         res &= mode_now == 0 || plan.s0 == blk_s0;
         res &= n_re == n_re_for(params.ubatch.n_tokens / n_stream, ratio);
-        std::vector<int32_t> nbt;
-        res &= blk_topk_for(mctx, params.ubatch, ratio, scores, blk_bias, n_stream, nbt) == blk_topk;
+        llama_memory_hybrid_idx::qsa_plan tp;
+        res &= blk_topk_for(mctx, params.ubatch, ratio, scores, blk_bias, n_stream, shared, tp) == blk_topk;
 
         return res;
     }
@@ -986,14 +1018,20 @@ public:
 
     // halo-hybrid (C4): block-level top-k (ggml_qsa_top_k) instead of expanding the scores to every cell
     bool          blk_topk  = false;
-    ggml_tensor * n_bid_t   = nullptr;   // I32 [n_stream]
+    ggml_tensor * n_bid_t   = nullptr;   // I32 [n_stream], [2*n_stream] with the groups' base cells when shared
     static bool blk_topk_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
-            bool blk_bias, int64_t n_stream, std::vector<int32_t> & n_bid) {
+            bool blk_bias, int64_t n_stream, bool shared, llama_memory_hybrid_idx::qsa_plan & plan) {
         static const bool enabled = getenv("LLAMA_QSA_BLOCK_TOPK") == nullptr || atoi(getenv("LLAMA_QSA_BLOCK_TOPK")) != 0;
-        n_bid.clear();
-        return enabled && scores && blk_bias && mctx && mctx->get_mem() && mctx->get_mem()->qsa_identity(ub, ratio, n_bid) &&
-            (int64_t) n_bid.size() == n_stream;
+        plan = {};
+        if (!enabled || !scores || !blk_bias || !mctx || !mctx->get_mem()) {
+            return false;
+        }
+        plan = mctx->get_mem()->qsa_identity(ub, ratio, mctx->get_idx()->get_kv_lo(), mctx->get_idx()->get_n_kv());
+        return plan.usable && plan.shared == shared && (int64_t) plan.n_bid.size() == n_stream;
     }
+
+    // halo-hybrid: the graph's QSA groups are the sequences of a shared pool (shared_for)
+    bool shared = false;
 
     // this is fixed for the graph's lifetime, as causal_attn is part of the reuse key (llm_graph_params::allow_reuse)
     const bool causal_attn;
@@ -1015,10 +1053,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     GGML_ASSERT(r > 0);
 
-    const int64_t n_blocks = (n_kv + r - 1)/r;
-
     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
-    const int64_t n_stream = mctx_hyb->get_n_stream();
+    const int64_t n_kvs = mctx_hyb->get_n_stream();   // streams of the K/V views and the KQ mask
+    GGML_ASSERT(n_tokens % n_kvs == 0);
+
+    // halo-hybrid: the indexer's groups - the KV streams, or the sequences of a shared pool (shared_for); "stream" below
+    // means such a group
+    llama_memory_hybrid_idx::qsa_plan sp;
+    const bool shared = llm_graph_input_qsa::shared_for(mctx_hyb, ubatch, (uint32_t) r,
+            llm_graph_input_qsa::need_scores(n_kv, (uint32_t) r, hparams.indexer_top_k), cparams.causal_attn, sp);
+    const int64_t n_stream = shared ? (int64_t) sp.n_bid.size() : n_kvs;
+    const int64_t n_blocks = shared ? sp.n_blocks : (n_kv + r - 1)/r;
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
@@ -1029,7 +1074,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // halo-hybrid: non-causal graphs keep the per-cell bias - the block-key cache (C6) and the block-level top-k (C4)
     // assume the causal rule; set_causal_attn therefore still re-reserves (llama-context)
     const bool blk_bias = kq_mask != nullptr &&
-        kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
+        kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tokens/n_kvs && kq_mask->ne[3] == n_kvs &&
         cparams.causal_attn && !hparams.use_alibi;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
@@ -1041,6 +1086,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     } else {
         const bool scores = llm_graph_input_qsa::need_scores(n_kv, (uint32_t) r, hparams.indexer_top_k);
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, scores, hparams.indexer_top_k, cparams.causal_attn);
+        qsa->shared = shared;
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         if (scores) {
@@ -1057,13 +1103,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             llama_memory_hybrid_idx::qsa_plan plan;
             qsa->n_re     = llm_graph_input_qsa::n_re_for(n_tps, (uint32_t) r);
             qsa->blk_mode = mctx_hyb->get_mem()->get_qsa_blk_k(il) != nullptr
-                ? llm_graph_input_qsa::blk_mode_for(mctx_hyb, ubatch, (uint32_t) r, scores, qsa->n_re, n_stream, plan) : 0;
+                ? llm_graph_input_qsa::blk_mode_for(mctx_hyb, ubatch, (uint32_t) r, scores, qsa->n_re, n_stream, shared, plan) : 0;
             qsa->blk_s0   = plan.s0;
             {
-                std::vector<int32_t> nbt;
-                qsa->blk_topk = llm_graph_input_qsa::blk_topk_for(mctx_hyb, ubatch, (uint32_t) r, scores, blk_bias, n_stream, nbt);
+                llama_memory_hybrid_idx::qsa_plan tp;
+                qsa->blk_topk = llm_graph_input_qsa::blk_topk_for(mctx_hyb, ubatch, (uint32_t) r, scores, blk_bias, n_stream, shared, tp);
+                // a shared pool's groups only exist for the block-level top-k (cells from each group's base)
+                GGML_ASSERT(!shared || qsa->blk_topk);
                 if (qsa->blk_topk) {
-                    qsa->n_bid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_stream);
+                    qsa->n_bid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, shared ? 2*n_stream : n_stream);
                     ggml_set_input(qsa->n_bid_t);
                 }
             }
@@ -1105,14 +1153,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         return nullptr;
     }
 
-    // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
+    // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_kvs].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
-    k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
+    k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_kvs, k_all->nb[2], k_all->nb[3], 0);
 
     // pool (mean of the r member keys), norm and rotate nb blocks whose member cells are `cells` [r*nb, ns]
     auto pool_blocks = [&](ggml_tensor * cells, ggml_tensor * pos, int64_t nb, int64_t ns) {
-        // gathers per stream: blk_cells row s indexes stream s's own cells
-        ggml_tensor * members = ggml_get_rows(ctx0, k_all, cells);
+        // gathers per stream: blk_cells row s indexes stream s's own cells; the groups of a shared pool index the one
+        // window, so their rows are one list
+        ggml_tensor * members = ggml_get_rows(ctx0, k_all, k_all->ne[2] == ns ? cells : ggml_reshape_1d(ctx0, cells, ggml_nelements(cells)));
         members = ggml_reshape_4d(ctx0, members, idx_dim, r, nb, ns);
 
         // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
@@ -1290,8 +1339,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         }
     }
 
-    // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
-    top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
+    // build_attn_qsa reads [n_top_k, n_batch, 1, n_kvs], matching the KQ mask (the groups of a shared pool are one
+    // KV stream: their rows already index the window)
+    top_k = ggml_reshape_4d(ctx0, top_k, width, n_tokens/n_kvs, 1, n_kvs);
     cb(top_k, "indexer_top_k", il);
 
     return top_k;

@@ -97,15 +97,29 @@ public:
         uint32_t s0     = 0;        // physical stream of group 0
         std::vector<int32_t> n_bid; // complete blocks after this ubatch, per group
         std::vector<int32_t> first; // first block the incremental graph recomputes (n_bid - n_re), per group
+
+        // a unified cache holding several sequences (the KV window, llama_kv_cache::get_kv_window): the groups are
+        // the ubatch's sequences, each laid out position p -> window cell base[g] + p with no other sequence in its
+        // span; s0 is then the first sequence's slab of the block-key cache (one slab per sequence) and the graph
+        // scores n_blocks blocks per group instead of every block of the window
+        bool                 shared   = false;
+        std::vector<int32_t> base;
+        int64_t              n_blocks = 0;
     };
-    // usable = false without the cache
-    qsa_plan qsa_blk_plan(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re) const;
+    // usable = false without the cache. lo, n_kv: the ubatch's KV window
+    qsa_plan qsa_blk_plan(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re, uint32_t lo, uint32_t n_kv) const;
 
-    // halo-hybrid (C4): usable (see above) and every used cell j of each stream holds position j - the layout
-    // ggml_qsa_top_k assumes; n_bid per group
-    bool qsa_identity(const llama_ubatch & ubatch, uint32_t ratio, std::vector<int32_t> & n_bid) const;
+    // halo-hybrid (C4): usable (see above) and every used cell of each group holds its position (from base[g]) - the
+    // layout ggml_qsa_top_k assumes; works without the block-key cache
+    qsa_plan qsa_identity(const llama_ubatch & ubatch, uint32_t ratio, uint32_t lo, uint32_t n_kv) const;
 
-    // per physical stream: blocks whose first qsa_valid_pos[s] positions hold cells that the cache reflects; raised after
+    // the cache layout of shared_pool(): several sequences in one unified cache, attended through the KV window
+    bool qsa_shared_pool() const;
+
+    // block-key cache slab (and qsa_valid_pos entry) of a sequence: its stream, or the sequence in a shared pool
+    uint32_t qsa_slab(llama_seq_id seq_id) const;
+
+    // per slab: blocks whose first qsa_valid_pos[s] positions hold cells that the cache reflects; raised after
     // a graph computes them, lowered by seq_rm, zeroed by any other edit of the cells or their positions
     mutable std::vector<llama_pos> qsa_valid_pos;
     void qsa_valid_reset() const { std::fill(qsa_valid_pos.begin(), qsa_valid_pos.end(), 0); }
@@ -119,9 +133,10 @@ public:
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
+    // cell j of all of these is cell lo + j of the cache, the start of the KV window (llama_kv_cache::get_kv_window)
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
+                       bool blk_bias, bool causal_attn, uint32_t lo) const;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -160,7 +175,8 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
-    qsa_plan qsa_blk_plan_cells(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re) const;
+    qsa_plan qsa_blk_plan_cells(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re, uint32_t lo, uint32_t n_kv) const;
+    qsa_plan qsa_blk_plan_shared(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re, uint32_t lo, uint32_t n_kv) const;
 
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_ctxs_bufs;
     std::unordered_map<int32_t, ggml_tensor *> qsa_blk_k;
