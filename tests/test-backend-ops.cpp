@@ -9509,10 +9509,12 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const bool qsa_mask; // halo-hybrid: a causal Qwen3.8 QSA selection mask (init_tensor_kq_mask_qsa)
+    const int64_t mask_off; // halo-hybrid: the mask is a view of a wider, taller one, from column mask_off and row 3
+                            // (a shared KV pool's per-sequence span: strided rows)
 
     std::string vars() override {
         return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max)
-            + (qsa_mask ? ",qsa_mask=1" : "");
+            + (qsa_mask ? ",qsa_mask=1" : "") + (mask_off ? ",mask_off=" + std::to_string(mask_off) : "");
     }
 
     double max_nmse_err() override {
@@ -9529,9 +9531,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool qsa_mask = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool qsa_mask = false, int64_t mask_off = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), qsa_mask(qsa_mask) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), qsa_mask(qsa_mask), mask_off(mask_off) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -9579,8 +9581,15 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
-            ggml_set_name(m, "m");
+            if (mask_off > 0) {
+                ggml_tensor * mb = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv + 2*mask_off, nb + 3, 1, nr23[1]);
+                ggml_set_name(mb, "m");
+                m = ggml_view_4d(ctx, mb, kv, nb, 1, nr23[1], mb->nb[1], mb->nb[2], mb->nb[3], mask_off*mb->nb[0] + 3*mb->nb[1]);
+                ggml_set_name(m, "m_view");
+            } else {
+                m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+                ggml_set_name(m, "m");
+            }
         }
 
         ggml_tensor * s = nullptr;
@@ -9603,6 +9612,8 @@ struct test_flash_attn_ext : public test_case {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "m_view") == 0) {
+                // a view of "m", initialised with it
             } else if (strcmp(t->name, "m") == 0) {
                 if (qsa_mask) {
                     init_tensor_kq_mask_qsa(t, n_kv_max);
@@ -12874,6 +12885,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // halo-hybrid: a mask with strided rows (a per-sequence span of a shared KV pool's window mask); 1029 queries
+    // over 4096 cells also take the mask pre-pass (flash_attn_mask_to_KV_max) with a partial last tile
+    for (int64_t kv : {512, 4096}) {
+        for (int64_t nb : {1, 3, 64, 1029}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, 256));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, 256));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

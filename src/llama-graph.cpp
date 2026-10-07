@@ -3108,8 +3108,10 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_tensor * q_r = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nt, q->nb[1], q->nb[2], r.t0*q->nb[2]);
             ggml_tensor * k_r = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], nk, 1, k->nb[1], k->nb[2], k->nb[3], r.a*k->nb[2]);
             ggml_tensor * v_r = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], nk, 1, v->nb[1], v->nb[2], v->nb[3], r.a*v->nb[2]);
-            ggml_tensor * m_r = ggml_cont(ctx0, ggml_view_2d(ctx0, kq_mask, nk, nt, kq_mask->nb[1],
-                    r.a*kq_mask->nb[0] + r.t0*kq_mask->nb[1]));
+            // a strided view, not a copy: the copies came on top of the worst-case reserve, which has no spans, and
+            // grew with the window (an MTP draft ubatch at a 134K window ran out of memory on a full card)
+            ggml_tensor * m_r = ggml_view_2d(ctx0, kq_mask, nk, nt, kq_mask->nb[1],
+                    r.a*kq_mask->nb[0] + r.t0*kq_mask->nb[1]);
             ggml_tensor * o_r = build_attn_mha(q_r, k_r, v_r, nullptr, m_r, sinks, v_mla, 0, kq_scale, il);
             cur = cur ? ggml_concat(ctx0, cur, o_r, 1) : o_r;
         }

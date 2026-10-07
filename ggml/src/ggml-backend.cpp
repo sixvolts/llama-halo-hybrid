@@ -633,6 +633,14 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    // a flash attention mask with strided rows is read through its strides by the CPU and CUDA/ROCm/MUSA kernels only
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[3] && !ggml_is_contiguous(op->src[3])) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        const char * name = reg ? ggml_backend_reg_name(reg) : "";
+        if (strcmp(name, "CPU") != 0 && strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0) {
+            return false;
+        }
+    }
     return device->iface.supports_op(device, op);
 }
 

@@ -5530,7 +5530,9 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
-        GGML_ASSERT(ggml_is_contiguous(mask));
+        // rows may be strided (a view of the columns of a wider mask); backends that need a contiguous mask say so
+        // through supports_op (see ggml_backend_dev_supports_op)
+        GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
