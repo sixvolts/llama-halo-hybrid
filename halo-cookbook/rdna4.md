@@ -107,6 +107,10 @@ Long context on several streams (2026-10-06; no draft, `-ub 2048`, each slot at 
 joins consecutive slots; the server now hands new requests the idle slot that keeps them so
 (`LLAMA_SERVER_SLOT_CONTIG=0` restores the old choice).
 
+2026-10-07 kernels (register block top-k, fused block scoring): 37.6 tok/s on one stream at 60K, 36.4 at 120K,
+51.7 agg on two at 60K; with the draft head 56.5 on one stream and 63.6 agg on two. `GGML_CUDA_QSA_TK_REG=0` and
+`GGML_CUDA_NO_QSA_SCORE=1` switch them off.
+
 Older measurements (2026-09-2x, `-b 4096 -ub 1024`, experts of layers 12-47 on the iGPU, draft sharing the q8_0
 output layer; not re-measured since; 4K prompts, 256-token completions; "agg" is the sum over streams):
 
