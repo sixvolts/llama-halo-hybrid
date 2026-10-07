@@ -111,6 +111,17 @@ joins consecutive slots; the server now hands new requests the idle slot that ke
 51.7 agg on two at 60K; with the draft head 56.5 on one stream and 63.6 agg on two. `GGML_CUDA_QSA_TK_REG=0` and
 `GGML_CUDA_NO_QSA_SCORE=1` switch them off.
 
+One shared pool instead of fixed slots (2026-10-07): with `-kvu` both slots draw on the whole 256K, so one
+conversation can run past 128K while the other is short. Same speed as 2 × 128K slots (56.3 tok/s on one stream at
+60K, 64.8 agg on two with the draft head), 30.7 GB on the card:
+
+```
+LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=2048 llama-server ... -c 262144 -b 8192 -ub 4096 -np 2 -kvu --no-cache-idle-slots ...
+```
+
+`--no-cache-idle-slots` is required: without it every idle conversation is saved and cleared on each new request
+and re-prefilled on its next turn.
+
 Older measurements (2026-09-2x, `-b 4096 -ub 1024`, experts of layers 12-47 on the iGPU, draft sharing the q8_0
 output layer; not re-measured since; 4K prompts, 256-token completions; "agg" is the sum over streams):
 
