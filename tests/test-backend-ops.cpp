@@ -8160,6 +8160,61 @@ struct test_qsa_head_sum : public test_case {
     }
 };
 
+// halo-hybrid: qwen4exp's decode block scoring, MUL_MAT(block keys, queries) -> RESHAPE -> QSA_HEAD_SUM (the CUDA
+// backend runs it as one kernel). The keys are a row view of a larger per-stream cache, as in the graph.
+struct test_qsa_score : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_tok;   // queries per stream
+    const int64_t n_stream;
+    const bool    with_bias;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_SCORE"; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_blocks, n_tok, n_stream, with_bias);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_qsa_score(int64_t n_blocks, int64_t n_tok, int64_t n_stream, bool with_bias)
+        : n_blocks(n_blocks), n_tok(n_tok), n_stream(n_stream), with_bias(with_bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 128, nh = 4;
+        ggml_tensor * cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_blocks + 9, n_stream);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * k = ggml_view_3d(ctx, cache, D, n_blocks, n_stream, cache->nb[1], cache->nb[2], 0);
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, nh, n_tok*n_stream);
+        ggml_set_name(q, "q");
+        ggml_tensor * score = ggml_mul_mat(ctx, k, ggml_reshape_3d(ctx, q, D, nh*n_tok, n_stream));
+        score = ggml_reshape_4d(ctx, score, n_blocks, nh, n_tok, n_stream);
+        ggml_tensor * bias = nullptr;
+        if (with_bias) {
+            bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tok, n_stream);
+            ggml_set_name(bias, "bias");
+        }
+        ggml_tensor * out = ggml_qsa_head_sum(ctx, score, bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(777 + n_blocks + n_tok);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "bias") == 0) {
+                std::vector<float> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) { v[i] = i % 7 == 0 ? -INFINITY : (i % 11 == 0 ? 1e9f : 0.0f); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (t->view_src == nullptr && t->type == GGML_TYPE_F32) {
+                std::vector<float> v(ggml_nelements(t));
+                std::normal_distribution<float> d(0.0f, 1.0f);
+                for (auto & e : v) { e = d(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 struct test_top_k : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -13049,6 +13104,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_head_sum(701, 3, 33, b));
     }
     test_cases.emplace_back(new test_qsa_head_sum(2560, 4, 64, true, true));
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_qsa_score(14912, 1, 1, b));   // decode (fused: mul_mat_vec_f block 64)
+        test_cases.emplace_back(new test_qsa_score(14848, 2, 1, b));   // 2-token verify
+        test_cases.emplace_back(new test_qsa_score(16384, 1, 2, b));   // 2 streams
+        test_cases.emplace_back(new test_qsa_score(2048, 1, 1, b));    // gfx1201 cliff: block 32
+        test_cases.emplace_back(new test_qsa_score(701, 1, 3, b));     // odd rows, 3 streams
+        test_cases.emplace_back(new test_qsa_score(700, 3, 1, b));     // 12 columns: not fused
+    }
     test_cases.emplace_back(new test_qsa_head_sum(701, 3, 33, true, true));
     // halo-hybrid (A3): whole MoE blocks (P6 takes n = 512: 4096 rows >= 40 per expert; n = 64 stays below it), partial
     // 192-row tiles, zero-row experts (64 experts, 8 used), and the other expert-GEMV/GEMM edges of the round
@@ -13251,6 +13314,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // halo-hybrid: Qwen3.8 QSA prefill attention (2560 queries, 2051 kept per query) - dense vs sparse tile walk
     for (int64_t kv : {8192, 28672}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2560, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051, true));
+    }
+
+    // halo-hybrid: Qwen3.8 QSA decode indexer at 59K / 128K / 256K: block top-k (one row, a verify batch of 3, two
+    // streams) and the block scoring (128-wide block keys x 4 index heads)
+    for (int64_t nb : {14848, 32768, 65536}) {
+        test_cases.emplace_back(new test_qsa_top_k(nb, 1, (int32_t) nb - 2, 2051, 4, (int32_t) (4*nb - 6), false));
+        test_cases.emplace_back(new test_qsa_top_k(nb, 3, (int32_t) nb - 2, 2051, 4, (int32_t) (4*nb - 8), false));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, nb, 4, 128, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_qsa_top_k(14848, 1, 14846, 2051, 4, 59380, false, 2));
+    for (int64_t nb : {14912, 32768}) {
+        test_cases.emplace_back(new test_qsa_score(nb, 1, 1, true));
+    }
+    test_cases.emplace_back(new test_qsa_score(14912, 1, 2, true));
+    // prefill rows at 16K and 113K
+    for (int64_t nq : {64, 1024}) {
+        test_cases.emplace_back(new test_qsa_top_k(4096, nq, 4000, 2051, 4, 16000, false));
+        test_cases.emplace_back(new test_qsa_top_k(28672, nq, 28600, 2051, 4, 114000, false));
     }
 
     // halo-hybrid: Qwen3.8 GDN prefill ubatch (16 k-heads, 48 v-heads, 128)

@@ -1,4 +1,5 @@
 #include "qsa-topk.cuh"
+#include "mmvf.cuh"
 
 // halo-hybrid: the top-`width` cells of qwen4exp's QSA indexer from its BLOCK scores (GGML_OP_QSA_TOP_K, ggml.h).
 // Cells [0, F) of query row i are scored with their block's value (F = min(n_bid*ratio, q+1)), all later cells are
@@ -186,6 +187,179 @@ static __global__ void k_qsa_top_k(const float * __restrict__ score, const int64
     }
 }
 
+// halo-hybrid: the kernel above runs a decode step as one 256-thread workgroup per layer, and its six walks over the
+// row (three radix passes, two scans, the placement) were latency-bound: 120 us at 59K, 260 us at 262K. This variant
+// has 1024 threads read the row once into registers (a contiguous run of at most KPT blocks each, the placement's
+// order) and does the passes and scans from there, with shuffle scans: ~10 us at 59K and 128K. Prefill rows gain as
+// much (see the launch). Same T, same tie rule and the same placement, so the same cells in the same order.
+#define QSA_TK3_NT 1024
+
+// exclusive scan of v over the 1024-thread workgroup (integers, so the order of the adds does not matter)
+static __device__ int qsa_tk3_scan(int v, int * sh_w, int * total) {
+    constexpr int ws = ggml_cuda_get_physical_warp_size();
+    constexpr int nw = QSA_TK3_NT / ws;
+    const int tid = threadIdx.x;
+    const int incl = warp_prefix_inclusive_sum<int, ws>(v);
+    if (tid % ws == ws - 1) { sh_w[tid / ws] = incl; }
+    __syncthreads();
+    if (tid < ws) {
+        const int x = tid < nw ? sh_w[tid] : 0;
+        const int xi = warp_prefix_inclusive_sum<int, ws>(x);
+        if (tid < nw) { sh_w[tid] = xi - x; }   // exclusive per-wave offsets
+        if (tid == ws - 1) { sh_w[nw] = xi; }   // grand total
+    }
+    __syncthreads();
+    const int r = sh_w[tid / ws] + incl - v;
+    *total = sh_w[nw];
+    __syncthreads();
+    return r;
+}
+
+template <int BITS, int KPT>
+static __device__ void qsa_tk3_pass(const uint32_t (&key)[KPT], const int n_own, const int b0, const int r, const int F,
+        const int shift, uint32_t * hist, int * sh_w, uint32_t * prefix, uint32_t * pmask, int * need) {
+    constexpr int NBINS = 1 << BITS;
+    constexpr int PER   = NBINS >= QSA_TK3_NT ? NBINS / QSA_TK3_NT : 1;   // bins per thread in the search
+    constexpr int NOWN  = NBINS / PER;                                    // threads owning bins
+    const int tid = threadIdx.x;
+
+    for (int k = tid; k < NBINS; k += QSA_TK3_NT) { hist[k] = 0; }
+    __syncthreads();
+    const uint32_t pf = *prefix, pm = *pmask;
+#pragma unroll
+    for (int k = 0; k < KPT; ++k) {
+        if (k < n_own && (key[k] & pm) == pf) {
+            atomicAdd(&hist[(key[k] >> shift) & (NBINS - 1)], (uint32_t) min(r, F - (b0 + k)*r));
+        }
+    }
+    __syncthreads();
+
+    // thread t < NOWN owns bins [NBINS - PER*(t+1), NBINS - PER*t), scanned from the top
+    const int top = NBINS - PER*tid - 1;
+    int own = 0;
+    if (tid < NOWN) {
+        for (int j = 0; j < PER; ++j) { own += (int) hist[top - j]; }
+    }
+    int tot;
+    const int above = qsa_tk3_scan(own, sh_w, &tot);
+    const int nd = *need;
+    __syncthreads();
+    if (tid < NOWN && above < nd && above + own >= nd) {
+        int acc = above;
+        int bin = top - PER + 1;
+        for (int j = 0; j < PER; ++j) {
+            if (acc + (int) hist[top - j] >= nd) { bin = top - j; break; }
+            acc += (int) hist[top - j];
+        }
+        *prefix = pf | ((uint32_t) bin << shift);
+        *pmask  = pm | ((uint32_t) (NBINS - 1) << shift);
+        *need   = nd - acc;
+    }
+    __syncthreads();
+}
+
+template <int KPT>
+static __global__ void __launch_bounds__(QSA_TK3_NT) k_qsa_top_k_reg(const float * __restrict__ score, const int64_t s1,
+        const int32_t * __restrict__ q_pos, const int32_t * __restrict__ n_bid, int32_t * __restrict__ dst, const int64_t d1,
+        const int n_blocks, const int n_tps, const int width, const int r) {
+    const int i   = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int q   = q_pos[i];
+    const int nb  = min(n_bid[i / n_tps], n_blocks);
+    const int F   = max(0, min(nb * r, q + 1));
+    int32_t * out = dst + (int64_t) i * d1;
+
+    if (F <= width) {
+        for (int k = tid; k < width; k += QSA_TK3_NT) {
+            out[k] = k;
+        }
+        return;
+    }
+
+    const float * srow = score + (int64_t) i * s1;
+    const int nbq   = (F + r - 1) / r;
+    const int chunk = (nbq + QSA_TK3_NT - 1) / QSA_TK3_NT;   // <= KPT (the launch checked n_blocks)
+    const int b0    = min(nbq, tid * chunk);
+    const int n_own = min(nbq, b0 + chunk) - b0;
+
+    // unconditional loads (clamped index, the value dropped after): a load under `k < n_own` was a branch and a wait
+    // per block, every load of the run serialized (4-5x slower at 128K/262K)
+    uint32_t key[KPT];
+#pragma unroll
+    for (int k = 0; k < KPT; ++k) {
+        key[k] = qsa_tk_key(srow[min(b0 + k, nbq - 1)]);
+    }
+#pragma unroll
+    for (int k = 0; k < KPT; ++k) {
+        key[k] = k < n_own ? key[k] : 0u;
+    }
+
+    __shared__ uint32_t hist[4096];
+    __shared__ uint32_t prefix, pmask;
+    __shared__ int      need;
+    __shared__ int      sh_w[QSA_TK3_NT/32 + 1];
+    if (tid == 0) { prefix = 0; pmask = 0; need = width; }
+    __syncthreads();
+
+    qsa_tk3_pass<12>(key, n_own, b0, r, F, 20, hist, sh_w, &prefix, &pmask, &need);
+    qsa_tk3_pass<12>(key, n_own, b0, r, F,  8, hist, sh_w, &prefix, &pmask, &need);
+    qsa_tk3_pass< 8>(key, n_own, b0, r, F,  0, hist, sh_w, &prefix, &pmask, &need);
+    const uint32_t T     = prefix;
+    const int      limit = need;
+
+    // the run's blocks above / at T as bit masks (bit k = block b0 + k); the rest walks their set bits in rolled
+    // loops. Unrolling the placement per block too made the kernel larger than the instruction cache: 6x slower once
+    // a row filled every thread's run (128K).
+    static_assert(KPT <= 64, "one 64-bit mask per run");
+    uint64_t gt = 0, eq = 0;
+#pragma unroll
+    for (int k = 0; k < KPT; ++k) {
+        if (k < n_own) {
+            gt |= (uint64_t) (key[k] >  T) << k;
+            eq |= (uint64_t) (key[k] == T) << k;
+        }
+    }
+    auto weight = [&](const int k) { return min(r, F - (b0 + k)*r); };
+
+    int eq_w = 0;
+    for (uint64_t m = eq; m != 0; m &= m - 1) {
+        eq_w += weight(__ffsll((unsigned long long) m) - 1);
+    }
+    int tot;
+    const int eq_before = qsa_tk3_scan(eq_w, sh_w, &tot);
+
+    int sel_w = 0;
+    {
+        int eb = eq_before;
+        for (uint64_t m = gt | eq; m != 0; m &= m - 1) {
+            const int k = __ffsll((unsigned long long) m) - 1;
+            const int w = weight(k);
+            if ((gt >> k) & 1) {
+                sel_w += w;
+            } else {
+                sel_w += max(0, min(w, limit - eb));
+                eb += w;
+            }
+        }
+    }
+    int o = qsa_tk3_scan(sel_w, sh_w, &tot);
+
+    int eb = eq_before;
+    for (uint64_t m = gt | eq; m != 0; m &= m - 1) {
+        const int k = __ffsll((unsigned long long) m) - 1;
+        const int b = b0 + k;
+        const int w = weight(k);
+        int take = w;
+        if (!((gt >> k) & 1)) {
+            take = max(0, min(w, limit - eb));
+            eb += w;
+        }
+        for (int j = 0; j < take; ++j) {
+            out[o++] = b*r + j;
+        }
+    }
+}
+
 void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * score = dst->src[0];
     const ggml_tensor * q_pos = dst->src[1];
@@ -196,7 +370,25 @@ void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int r     = ggml_get_op_params_i32(dst, 1);
     const int64_t n_q = score->ne[1]*score->ne[2];   // rows of every stream (contiguous: row i at i*nb[1])
     static const bool v1 = getenv("GGML_CUDA_QSA_TK_V1") != nullptr && atoi(getenv("GGML_CUDA_QSA_TK_V1")) != 0;
-    if (v1) {
+    // the register variant up to 64K blocks (262K context). It wins at every row count, prefill batches included
+    // (1024 rows at 113K: 4.4 -> 0.27 ms on the R9700, 10.6 -> 0.83 ms on the 8060S). GGML_CUDA_QSA_TK_REG=0 restores
+    // the per-row kernel above.
+    static const bool reg = getenv("GGML_CUDA_QSA_TK_REG") == nullptr || atoi(getenv("GGML_CUDA_QSA_TK_REG")) != 0;
+    const int64_t nblk = score->ne[0];
+    if (!v1 && reg && nblk <= 64*QSA_TK3_NT) {
+        auto launch = [&](auto kern) {
+            kern<<<(int) n_q, QSA_TK3_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
+                (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
+                (int) score->ne[0], (int) score->ne[1], width, r);
+        };
+        if (nblk <= 16*QSA_TK3_NT) {
+            launch(k_qsa_top_k_reg<16>);
+        } else if (nblk <= 32*QSA_TK3_NT) {
+            launch(k_qsa_top_k_reg<32>);
+        } else {
+            launch(k_qsa_top_k_reg<64>);
+        }
+    } else if (v1) {
         k_qsa_top_k<false><<<(int) n_q, QSA_TK_NT, 0, ctx.stream()>>>((const float *) score->data, score->nb[1] / sizeof(float),
                 (const int32_t *) q_pos->data, (const int32_t *) n_bid->data, (int32_t *) dst->data, dst->nb[1] / sizeof(int32_t),
                 (int) score->ne[0], (int) score->ne[1], width, r);
@@ -255,4 +447,136 @@ void ggml_cuda_op_qsa_head_sum(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             sx1, sx2, sx3, sb1, sb2, sd1, sd2);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// halo-hybrid: qwen4exp's decode block scoring, MUL_MAT(block keys, queries) -> RESHAPE -> QSA_HEAD_SUM, in one pass
+// (after the score fusion of the gfx906 fork's c2a356097, which matches the unfused relu / head-add / expand / mask
+// form; here the head sum is already one op and top-k reads block scores). The unfused MUL_MAT is mul_mat_vec_f with
+// one 512-byte row per 64-thread block - one load per wave, latency-bound (34 us for 15K blocks, 220 GB/s) - and
+// writes NC scores per block that QSA_HEAD_SUM reads back. Here a wave takes RPW rows with every load in flight,
+// keeps the queries in registers and writes one score per block and token.
+// Bit-identical to the pair: the dot products replay mul_mat_vec_f's order for its block size BS (the one
+// ggml_cuda_mmvf_block_size picks; 128-wide rows give 64, or 32 next to the gfx1201 dispatch cliff):
+//   BS 64: lane l of wave w accumulates float2 l + 32w; each wave's butterfly; the cross-wave butterfly over
+//          [S0, S1, 0, ...] gives (S0 + 0) + (S1 + 0) (the +0 only turns -0 into +0, as the zero lanes do there)
+//   BS 32: lane l accumulates float2 l then l + 32; one butterfly
+// then QSA_HEAD_SUM's relu, head sum in order and bias add. GGML_CUDA_NO_QSA_SCORE=1 disables it.
+#define QSA_SC_RPW 8   // rows per wave
+#define QSA_SC_WPB 4   // waves per block
+
+template <int NC, int NH, int BS>
+static __global__ void __launch_bounds__(QSA_SC_WPB*32) k_qsa_score_blocks(
+        const float * __restrict__ K, const float * __restrict__ Q, const float * __restrict__ bias, float * __restrict__ dst,
+        const int n_blocks,
+        const int64_t sk1, const int64_t sk2, const int64_t sq1, const int64_t sq2,
+        const int64_t sb1, const int64_t sb2, const int64_t sd1, const int64_t sd2) {
+    static_assert(BS == 32 || BS == 64, "128-wide rows take a 32- or 64-thread block");
+    const int lane = threadIdx.x % 32;
+    const int s    = blockIdx.y;
+    const int row0 = (blockIdx.x*QSA_SC_WPB + threadIdx.x/32) * QSA_SC_RPW;
+    if (row0 >= n_blocks) {
+        return;
+    }
+
+    const float2 * q2 = (const float2 *) (Q + s*sq2);
+    float2 qa[NC], qb[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        qa[c] = q2[c*(sq1/2) + lane];
+        qb[c] = q2[c*(sq1/2) + lane + 32];
+    }
+    float2 xa[QSA_SC_RPW], xb[QSA_SC_RPW];
+#pragma unroll
+    for (int r = 0; r < QSA_SC_RPW; ++r) {
+        const float2 * x2 = (const float2 *) (K + s*sk2 + (int64_t) min(row0 + r, n_blocks - 1)*sk1);
+        xa[r] = x2[lane];
+        xb[r] = x2[lane + 32];
+    }
+
+#pragma unroll
+    for (int r = 0; r < QSA_SC_RPW; ++r) {
+        const int row = row0 + r;
+        if (row >= n_blocks) {
+            break;
+        }
+        float v[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if constexpr (BS == 64) {
+                float a = 0.0f;
+                float b = 0.0f;
+                ggml_cuda_mad(a, xa[r].x, qa[c].x); ggml_cuda_mad(a, xa[r].y, qa[c].y);
+                ggml_cuda_mad(b, xb[r].x, qb[c].x); ggml_cuda_mad(b, xb[r].y, qb[c].y);
+                a = warp_reduce_sum<32>(a);
+                b = warp_reduce_sum<32>(b);
+                v[c] = (a + 0.0f) + (b + 0.0f);
+            } else {
+                float a = 0.0f;
+                ggml_cuda_mad(a, xa[r].x, qa[c].x); ggml_cuda_mad(a, xa[r].y, qa[c].y);
+                ggml_cuda_mad(a, xb[r].x, qb[c].x); ggml_cuda_mad(a, xb[r].y, qb[c].y);
+                v[c] = warp_reduce_sum<32>(a);
+            }
+        }
+        // QSA_HEAD_SUM (k_qsa_head_sum's order) for token t, written by lane t; every lane holds every v
+#pragma unroll
+        for (int t = 0; t < NC/NH; ++t) {
+            float acc = fmaxf(v[t*NH], 0.0f);
+#pragma unroll
+            for (int h = 1; h < NH; ++h) {
+                acc = acc + fmaxf(v[t*NH + h], 0.0f);
+            }
+            if (bias) {
+                acc = acc + bias[t*sb1 + s*sb2 + row];
+            }
+            if (lane == t) {
+                dst[t*sd1 + s*sd2 + row] = acc;
+            }
+        }
+    }
+}
+
+bool ggml_cuda_qsa_score_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * hs) {
+    const ggml_tensor * k    = mm->src[0];
+    const ggml_tensor * q    = mm->src[1];
+    const ggml_tensor * x    = hs->src[0];   // the reshaped scores [n_blocks, nh, n_tok, ns]
+    const ggml_tensor * bias = hs->src[1];
+    const int device = ctx.device;
+    if (ggml_cuda_info().devices[device].warp_size != 32) {
+        return false;
+    }
+    const int64_t NC = q->ne[1];
+    const int     nh = (int) x->ne[1];
+    if (k->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || hs->type != GGML_TYPE_F32 ||
+            k->ne[0] != 128 || q->ne[0] != 128 || k->nb[0] != sizeof(float) || q->nb[0] != sizeof(float) ||
+            k->nb[1] % 8 != 0 || k->nb[2] % 8 != 0 || q->nb[1] % 8 != 0 || q->nb[2] % 8 != 0 ||
+            k->ne[3] != 1 || q->ne[3] != 1 || k->ne[2] != q->ne[2] || (NC != 4 && NC != 8) ||
+            nh != 4 || x->ne[2]*nh != NC || x->ne[0] != k->ne[1] || x->ne[3] != k->ne[2] ||
+            hs->ne[0] != k->ne[1] || hs->ne[1] != NC/nh || hs->ne[2] != k->ne[2] || hs->nb[0] != sizeof(float) ||
+            (bias && (bias->type != GGML_TYPE_F32 || bias->nb[0] != sizeof(float)))) {
+        return false;
+    }
+    // mul_mat_vec_f launches a block per dst row, channel and sample
+    const int bs = ggml_cuda_mmvf_block_size(device, 128, mm->ne[0] * mm->ne[2] * mm->ne[3]);
+    if (bs != 32 && bs != 64) {
+        return false;
+    }
+    const int n_blocks = (int) k->ne[1];
+    const int64_t ns   = k->ne[2];
+    const dim3 grid((unsigned) ((n_blocks + QSA_SC_RPW*QSA_SC_WPB - 1) / (QSA_SC_RPW*QSA_SC_WPB)), (unsigned) ns, 1);
+    const int64_t sk1 = k->nb[1]/sizeof(float), sk2 = k->nb[2]/sizeof(float);
+    const int64_t sq1 = q->nb[1]/sizeof(float), sq2 = q->nb[2]/sizeof(float);
+    const int64_t sb1 = bias ? bias->nb[1]/sizeof(float) : 0, sb2 = bias ? bias->nb[2]/sizeof(float) : 0;
+    const int64_t sd1 = hs->nb[1]/sizeof(float), sd2 = hs->nb[2]/sizeof(float);
+    const float * bp = bias ? (const float *) bias->data : nullptr;
+    auto launch = [&](auto kern) {
+        kern<<<grid, QSA_SC_WPB*32, 0, ctx.stream()>>>((const float *) k->data, (const float *) q->data, bp, (float *) hs->data,
+            n_blocks, sk1, sk2, sq1, sq2, sb1, sb2, sd1, sd2);
+    };
+    if (NC == 4) {
+        bs == 64 ? launch(k_qsa_score_blocks<4, 4, 64>) : launch(k_qsa_score_blocks<4, 4, 32>);
+    } else {
+        bs == 64 ? launch(k_qsa_score_blocks<8, 4, 64>) : launch(k_qsa_score_blocks<8, 4, 32>);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
