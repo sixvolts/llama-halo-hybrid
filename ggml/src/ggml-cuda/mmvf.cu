@@ -477,25 +477,9 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
-template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
-void launch_mul_mat_vec_f_cuda(
-        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-        const int64_t ncols, const int64_t nrows,
-        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
-        const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
-        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
-        const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
-        const int64_t nsamples_or_ntokens, const int64_t ids_stride, cudaStream_t stream) {
-    GGML_ASSERT(ncols        % 2 == 0);
-    GGML_ASSERT(stride_row   % 2 == 0);
-    GGML_ASSERT(stride_col_y % 2 == 0);
-    GGML_ASSERT(ids || nchannels_dst % nchannels_x == 0);
-    GGML_ASSERT(       nsamples_dst  % nsamples_x  == 0);
-    const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
-    const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0) : init_fastdiv_values(nchannels_dst / nchannels_x);
-    const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
-
-    const int device = ggml_cuda_get_device();
+// the block size mul_mat_vec_f launches for rows of ncols elements and `launches` row blocks (rows x channels x
+// samples); exported for kernels that must reproduce its reduction order (qsa-topk.cu, the fused block scoring)
+int ggml_cuda_mmvf_block_size(const int device, const int64_t ncols, const int64_t launches) {
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
     int64_t block_size_best = warp_size;
@@ -518,7 +502,6 @@ void launch_mul_mat_vec_f_cuda(
     static const bool no_cliff_guard = getenv("GGML_CUDA_MMVF_NO_CLIFF") != nullptr;
     if (!no_cliff_guard && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
         const int64_t slots    = (int64_t) ggml_cuda_info().devices[device].nsm * 64;
-        const int64_t launches = nrows * nchannels_dst * nsamples_or_ntokens;
         const auto on_cliff = [&](int64_t bs) {
             const int64_t waves = launches * (bs / warp_size);
             const int64_t r     = waves % slots;
@@ -528,6 +511,30 @@ void launch_mul_mat_vec_f_cuda(
             block_size_best -= warp_size;
         }
     }
+    return (int) block_size_best;
+}
+
+template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
+void launch_mul_mat_vec_f_cuda(
+        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const int64_t ncols, const int64_t nrows,
+        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
+        const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
+        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
+        const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int64_t nsamples_or_ntokens, const int64_t ids_stride, cudaStream_t stream) {
+    GGML_ASSERT(ncols        % 2 == 0);
+    GGML_ASSERT(stride_row   % 2 == 0);
+    GGML_ASSERT(stride_col_y % 2 == 0);
+    GGML_ASSERT(ids || nchannels_dst % nchannels_x == 0);
+    GGML_ASSERT(       nsamples_dst  % nsamples_x  == 0);
+    const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
+    const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0) : init_fastdiv_values(nchannels_dst / nchannels_x);
+    const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
+
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int64_t block_size_best = ggml_cuda_mmvf_block_size(device, ncols, nrows * nchannels_dst * nsamples_or_ntokens);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 

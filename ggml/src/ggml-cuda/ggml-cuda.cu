@@ -5349,6 +5349,56 @@ static int ggml_cuda_try_fuse_moe_tail(ggml_backend_cuda_context * cuda_ctx, ggm
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// halo-hybrid: qwen4exp's decode block scoring MUL_MAT(block keys, queries) -> RESHAPE -> QSA_HEAD_SUM as one kernel
+// (qsa-topk.cu ggml_cuda_qsa_score_fused), only where the unfused MUL_MAT runs mul_mat_vec_f, whose arithmetic it
+// replays: the result is bit-identical. GGML_CUDA_NO_QSA_SCORE=1 disables it.
+static int ggml_cuda_try_fuse_qsa_score(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_QSA_SCORE") != nullptr && atoi(getenv("GGML_CUDA_NO_QSA_SCORE")) != 0;
+    ggml_tensor * mm = cgraph->nodes[i];
+    const ggml_tensor * k = mm->src[0];
+    const ggml_tensor * q = mm->src[1];
+    if (disabled || mm->op != GGML_OP_MUL_MAT || k->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || k->ne[0] != 128 || !hc_uses1(cgraph, i) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    // ggml_cuda_mul_mat's route to mul_mat_vec_f
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(k->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(k) != ggml_backend_buffer_get_alloc_size(k->buffer, k) && k->view_src;
+    if (bad_padding_clear || ggml_cuda_op_mul_mat_use_fwht(mm) ||
+            !ggml_cuda_should_use_mmvf(k->type, cc, k->ne, k->nb, q->ne[1])) {
+        return 0;
+    }
+    const int j = hc_next(cgraph, i + 1);
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * hs = cgraph->nodes[j];
+    const ggml_tensor * x = hs->src[0];
+    if (hs->op != GGML_OP_QSA_HEAD_SUM || x->op != GGML_OP_RESHAPE || x->src[0] != mm) {
+        return 0;
+    }
+    // the reshape is the only reader of the MUL_MAT and only the head sum reads it
+    for (int u = i + 1; u < j; ++u) {
+        const ggml_tensor * v = cgraph->nodes[u];
+        if (v != x && hc_root(v) == mm) {
+            return 0;
+        }
+        if (v == x && !hc_uses1(cgraph, u)) {
+            return 0;
+        }
+    }
+    // the fused kernel writes the head sum while it reads the keys, queries and bias: the allocator may have put the
+    // head sum's output over a buffer the unfused graph had finished with (the queries)
+    if (!hc_disjoint(hs, k) || !hc_disjoint(hs, q) || (hs->src[1] && !hc_disjoint(hs, hs->src[1]))) {
+        return 0;
+    }
+    if (!ggml_cuda_qsa_score_fused(*cuda_ctx, mm, hs)) {
+        return 0;
+    }
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5423,7 +5473,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_MUL_MAT) {
-        int skip = ggml_cuda_try_fuse_kda_gate(cuda_ctx, cgraph, i);
+        int skip = ggml_cuda_try_fuse_qsa_score(cuda_ctx, cgraph, i);
+        if (skip == 0) {
+            skip = ggml_cuda_try_fuse_kda_gate(cuda_ctx, cgraph, i);
+        }
         if (skip == 0) {
             skip = ggml_cuda_try_fuse_mla_v_permute(cuda_ctx, cgraph, i);
         }
