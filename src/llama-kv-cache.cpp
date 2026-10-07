@@ -1437,6 +1437,70 @@ void llama_kv_cache::get_kv_window(const slot_info & sinfo, const llama_ubatch &
     n_kv = w1 - w0;
 }
 
+std::vector<llama_kv_cache::seq_span> llama_kv_cache::get_seq_spans(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t lo, uint32_t n_kv) const {
+    static const bool disabled = getenv("LLAMA_KV_NO_SPANS") != nullptr;
+
+    std::vector<seq_span> res;
+    if (disabled || !window || sinfo.n_stream() != 1 || ubatch.n_tokens == 0) {
+        return res;
+    }
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+
+    llama_seq_id cur = -1;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1) {
+            return {};
+        }
+        const llama_seq_id s = ubatch.seq_id[i][0];
+        if (s != cur) {
+            for (const auto & r : res) {
+                if (ubatch.seq_id[r.t0][0] == s) {
+                    return {};   // a sequence in two runs
+                }
+            }
+            if (res.size() == MAX_SPANS) {
+                return {};
+            }
+            res.push_back({ i, i, 0, 0 });
+            cur = s;
+        }
+        res.back().t1 = i + 1;
+    }
+    if (res.size() < 2) {
+        return {};
+    }
+
+    uint64_t sum = 0;
+    for (auto & r : res) {
+        uint32_t c0 = UINT32_MAX;
+        uint32_t c1 = 0;
+        if (!cells.seq_chunk_range(ubatch.seq_id[r.t0][0], c0, c1)) {
+            return {};
+        }
+        const int64_t a = (int64_t) c0*llama_kv_cells::SEQ_CHUNK - lo;
+        const int64_t b = std::min<int64_t>((int64_t) (c1 + 1)*llama_kv_cells::SEQ_CHUNK - lo, n_kv);
+        if (a < 0 || b <= a) {
+            return {};
+        }
+        r.a = (uint32_t) a;
+        r.b = (uint32_t) b;
+        sum += r.b - r.a;
+    }
+    for (size_t x = 0; x < res.size(); ++x) {
+        for (size_t y = x + 1; y < res.size(); ++y) {
+            if (res[x].a < res[y].b && res[y].a < res[x].b) {
+                return {};
+            }
+        }
+    }
+    if (sum >= n_kv) {
+        return {};
+    }
+
+    return res;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t lo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1835,7 +1899,27 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
             }
 
-            for (uint32_t jj = 0; jj < n_kv; ++jj) {
+            // halo-hybrid: a fresh row only visits the chunks that hold the sequence (llama_kv_cells::seq_chunk_range); the
+            // rest of the row cannot carry it and is dropped in bulk. A shared pool's window spans every sequence of the
+            // ubatch and the gaps between them, so a row was 3-4x the sequence's own cells
+            uint32_t jj0 = 0;
+            uint32_t jj1 = n_kv;
+            if (!prev) {
+                uint32_t c0 = UINT32_MAX;
+                uint32_t c1 = 0;
+                if (cells.seq_chunk_range(seq_id, c0, c1)) {
+                    const int64_t a = (int64_t) c0*llama_kv_cells::SEQ_CHUNK - lo;
+                    const int64_t b = (int64_t) (c1 + 1)*llama_kv_cells::SEQ_CHUNK - lo;
+                    jj0 = (uint32_t) std::clamp<int64_t>(a, 0, n_kv);
+                    jj1 = (uint32_t) std::clamp<int64_t>(b, 0, n_kv);
+                } else {
+                    jj0 = jj1 = 0;
+                }
+                std::fill(data + idst,       data + idst + jj0,  mask_drop);
+                std::fill(data + idst + jj1, data + idst + n_kv, mask_drop);
+            }
+
+            for (uint32_t jj = jj0; jj < jj1; ++jj) {
                 uint32_t j = jj;
 
                 // we have an exiting mask for this sequence -> update just seq_idxs
@@ -3059,6 +3143,8 @@ bool llama_kv_cache_context::apply() {
     kv->get_kv_window(sinfos[i_cur], ubatches[i_cur], kv_lo, n_kv_cur);
     n_kv = n_kv_cur;
 
+    seq_spans = kv->get_seq_spans(sinfos[i_cur], ubatches[i_cur], kv_lo, n_kv);
+
     return true;
 }
 
@@ -3078,6 +3164,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 
 uint32_t llama_kv_cache_context::get_kv_lo() const {
     return kv_lo;
+}
+
+const std::vector<llama_kv_cache::seq_span> & llama_kv_cache_context::get_seq_spans() const {
+    return seq_spans;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

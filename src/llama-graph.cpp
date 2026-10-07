@@ -47,6 +47,16 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // an input has no op, so its op params are free to carry the offset for can_reuse_kq_mask
     res->op_params[0] = (int32_t) mctx->get_kv_lo();
 
+    // and the per-sequence spans build_attn splits the attention by (llama_kv_cache::get_seq_spans), which the graph's
+    // K/V views depend on as well
+    const auto & spans = mctx->get_seq_spans();
+    res->op_params[1] = (int32_t) spans.size();
+    for (size_t i = 0; i < spans.size(); ++i) {
+        res->op_params[2 + 3*i + 0] = (int32_t) spans[i].t1;
+        res->op_params[2 + 3*i + 1] = (int32_t) spans[i].a;
+        res->op_params[2 + 3*i + 2] = (int32_t) spans[i].b;
+    }
+
     return res;
 }
 
@@ -66,6 +76,14 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
     res &= (kq_mask->op_params[0] == (int32_t) mctx->get_kv_lo());
+
+    const auto & spans = mctx->get_seq_spans();
+    res &= (kq_mask->op_params[1] == (int32_t) spans.size());
+    for (size_t i = 0; res && i < spans.size(); ++i) {
+        res &= kq_mask->op_params[2 + 3*i + 0] == (int32_t) spans[i].t1 &&
+               kq_mask->op_params[2 + 3*i + 1] == (int32_t) spans[i].a &&
+               kq_mask->op_params[2 + 3*i + 2] == (int32_t) spans[i].b;
+    }
 
     return res;
 }
@@ -3075,7 +3093,29 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = nullptr;
+
+    // halo-hybrid: a KV window over several sequences (a shared pool, -kvu) spans all of them and the gaps between them;
+    // with their spans known (llama_kv_cache::get_seq_spans), each run of tokens attends over its own sequence's cells
+    // only: one flash attention per run on views of K/V and of its rows and columns of the mask, the outputs joined
+    // in token order. The cells it drops are the ones its mask row holds at -inf
+    const auto & spans = cparams.training ? std::vector<llama_kv_cache::seq_span>() : mctx_cur->get_seq_spans();
+    if (!spans.empty() && kq_b == nullptr && cparams.flash_attn && v->nb[1] <= v->nb[2] && k->ne[3] == 1 &&
+            kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 && ggml_is_contiguous(q)) {
+        for (const auto & r : spans) {
+            const int64_t nt = r.t1 - r.t0;
+            const int64_t nk = r.b - r.a;
+            ggml_tensor * q_r = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nt, q->nb[1], q->nb[2], r.t0*q->nb[2]);
+            ggml_tensor * k_r = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], nk, 1, k->nb[1], k->nb[2], k->nb[3], r.a*k->nb[2]);
+            ggml_tensor * v_r = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], nk, 1, v->nb[1], v->nb[2], v->nb[3], r.a*v->nb[2]);
+            ggml_tensor * m_r = ggml_cont(ctx0, ggml_view_2d(ctx0, kq_mask, nk, nt, kq_mask->nb[1],
+                    r.a*kq_mask->nb[0] + r.t0*kq_mask->nb[1]));
+            ggml_tensor * o_r = build_attn_mha(q_r, k_r, v_r, nullptr, m_r, sinks, v_mla, 0, kq_scale, il);
+            cur = cur ? ggml_concat(ctx0, cur, o_r, 1) : o_r;
+        }
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

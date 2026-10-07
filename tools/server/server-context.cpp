@@ -1881,21 +1881,29 @@ private:
             return res;
         }
 
+        // halo-hybrid: the least recently used idle slot goes first, and its prompt is kept in the RAM prompt cache (when
+        // there is one) so that conversation can come back without a full re-prefill. With --no-cache-idle-slots a shared
+        // pool keeps idle conversations resident, and this is the only place they leave it
+        server_slot * victim = nullptr;
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
-
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
+                victim = &slot;
             }
+        }
+
+        if (victim != nullptr) {
+            SRV_WRN("purging slot %d with %zu tokens\n", victim->id, victim->prompt.tokens.size());
+
+            if (prompt_cache && victim->prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+
+            victim->prompt_clear();
+
+            res = true;
         }
 
         return res;

@@ -206,6 +206,18 @@ public:
 
     void get_kv_window(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & lo, uint32_t & n_kv) const;
 
+    // halo-hybrid: the ubatch's tokens as runs of one sequence each, with the cells [a, b) of the window [lo, lo + n_kv)
+    // that hold the run's sequence (whole SEQ_CHUNKs, window-relative). Dense attention can then run per run over its
+    // own span instead of over the whole window, which also covers the other sequences and the gaps between them.
+    // Empty unless the window is on, the ubatch has 2..MAX_SPANS runs of distinct sequences and their spans are disjoint
+    // and together narrower than the window
+    struct seq_span {
+        uint32_t t0, t1;   // tokens [t0, t1) of the ubatch
+        uint32_t a,  b;    // cells [a, b) of the window
+    };
+    static constexpr uint32_t MAX_SPANS = 4;   // 3 op params each in the KQ mask input (see build_attn_inp_kq_mask)
+    std::vector<seq_span> get_seq_spans(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t lo, uint32_t n_kv) const;
+
     // get views of the current state of the cache, cells [lo, lo + n_kv)
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t lo = 0) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t lo = 0) const;
@@ -443,6 +455,9 @@ public:
     // first cell of the window the graph attends: get_k/get_v and the KQ mask start there
     uint32_t get_kv_lo() const;
 
+    // see llama_kv_cache::get_seq_spans
+    const std::vector<llama_kv_cache::seq_span> & get_seq_spans() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -520,4 +535,7 @@ private:
 
     // see llama_kv_cache::get_kv_window()
     uint32_t kv_lo = 0;
+
+    // see llama_kv_cache::get_seq_spans()
+    std::vector<llama_kv_cache::seq_span> seq_spans;
 };
