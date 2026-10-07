@@ -121,6 +121,8 @@ LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=2048 llama-server ... -c 262144 -b 81
 
 `--no-cache-idle-slots` is required: without it every idle conversation is saved and cleared on each new request
 and re-prefilled on its next turn.
+When one conversation grows into the other's cells, the cache moves one of them (a stall of ~0.2 s for a 63K
+conversation) and both keep their speed; `LLAMA_KV_NO_MOVE=1` turns that off.
 
 Older measurements (2026-09-2x, `-b 4096 -ub 1024`, experts of layers 12-47 on the iGPU, draft sharing the q8_0
 output layer; not re-measured since; 4K prompts, 256-token completions; "agg" is the sum over streams):
