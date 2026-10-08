@@ -864,9 +864,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
     };
     const bool lds_ok = chunk_lds(S_v) <= ggml_cuda_info().devices[ctx.device].smpbo;
 #if defined(GGML_USE_HIP)
-    // bf16 WMMA chunked prefill (rdna-boosts port): reads a plain state (a deferred gather is copied out first), the
-    // K > 1 tail goes through the token loop
-    static const bool gdn_bf16 = getenv("GGML_CUDA_GDN_BF16") && atoi(getenv("GGML_CUDA_GDN_BF16")) != 0;
+    // bf16 WMMA chunked prefill (rdna-boosts port), default on RDNA3/RDNA4 (GGML_CUDA_GDN_BF16=0: the fp32 chunked path).
+    // bf16 operands, fp32 accumulation and state: NMSE ~1.5e-5, KLD no worse than fp32 chunked; prefill +1-2.5%. Reads a
+    // plain state (a deferred gather is copied out first), the K > 1 tail goes through the token loop
+    static const bool gdn_bf16 = !getenv("GGML_CUDA_GDN_BF16") || atoi(getenv("GGML_CUDA_GDN_BF16")) != 0;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (gdn_bf16 && !kda && S_v == 128 && (state_idx == nullptr || n_seqs == 1) && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc)) &&
             !gdn_chunked_disabled() && n_tokens >= gdn_chunked_min_tokens() && n_tokens - n_tail >= GDN_CH_C) {

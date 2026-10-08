@@ -5554,6 +5554,12 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
+// halo-hybrid: the cases the HIP bf16 chunked GDN prefill runs (scalar gate, head size 128, at least a chunk-path width)
+static bool gdn_bf16_case(int64_t head_size, bool kda, int64_t n_seq_tokens) {
+    const char * e = getenv("GGML_CUDA_GDN_BF16");
+    return head_size == 128 && !kda && n_seq_tokens >= 64 && (e == nullptr || atoi(e) != 0);
+}
+
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
 
@@ -5575,7 +5581,13 @@ struct test_gated_delta_net : public test_case {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
-    double max_nmse_err() override { return getenv("TBO_GDN_NMSE") ? atof(getenv("TBO_GDN_NMSE")) : 1e-7; }
+    double max_nmse_err() override {
+        if (getenv("TBO_GDN_NMSE")) {
+            return atof(getenv("TBO_GDN_NMSE"));
+        }
+        // the HIP bf16 chunked prefill (default, GGML_CUDA_GDN_BF16=0 off) takes these: NMSE ~1e-5 (a cross-sequence scratch overlap showed up as 1e-4..1e-3)
+        return gdn_bf16_case(head_size, kda, n_seq_tokens) ? 3e-5 : 1e-7;
+    }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
@@ -5651,6 +5663,9 @@ struct test_kda_state_gather : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR9(head_count, head_size, n_seq_tokens, K, mem_size, head, plane, kda, reps);
+    }
+    double max_nmse_err() override {
+        return gdn_bf16_case(head_size, kda, n_seq_tokens) ? 3e-5 : test_case::max_nmse_err();
     }
 
     test_kda_state_gather(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 1, int64_t K = 3,
