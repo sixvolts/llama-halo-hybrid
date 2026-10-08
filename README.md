@@ -16,7 +16,7 @@ Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and 
 
 You can run this fork on Strix Halo alone (but again, look at gufo), with a Radeon card next to it (in a slot or a USB4 dock), or across two
 boxes. Start with the [cookbook's getting-started page](halo-cookbook/README.md) (build, kernel setup, placement
-rules, model prep); each row links to the launch lines, memory budget and numbers. The kernel and scheduler changes
+rules, model prep); cli launch commands for common cards are in the table. The kernel and scheduler changes
 behind them are in [HALO-HYBRID.md](HALO-HYBRID.md).
 
 <p>
