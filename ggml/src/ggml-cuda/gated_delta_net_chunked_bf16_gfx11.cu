@@ -984,7 +984,7 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
         case 4:  if (!launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
         case 6:  if (!launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
         case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
-        default: GGML_ABORT("gated_delta_net_chunked_bf16_gfx11: unsupported GQA ratio");
+        default: return false; // halo-hybrid: other GQA ratios keep the fp32 path (was an abort)
     }
     static const bool dbg_a = getenv("GDN_DBG_A") != nullptr;
     if (dbg_a) {

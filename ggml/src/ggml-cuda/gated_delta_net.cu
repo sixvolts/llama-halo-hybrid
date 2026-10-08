@@ -866,17 +866,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
 #if defined(GGML_USE_HIP)
     // bf16 WMMA chunked prefill (rdna-boosts port), default on RDNA3/RDNA4 (GGML_CUDA_GDN_BF16=0: the fp32 chunked path).
     // bf16 operands, fp32 accumulation and state: NMSE ~1.5e-5, KLD no worse than fp32 chunked; prefill +1-2.5%. Reads a
-    // plain state (a deferred gather is copied out first), the K > 1 tail goes through the token loop
+    // plain state (a deferred gather is copied out first), the K > 1 tail goes through the token loop. The kernels step
+    // sequences by the token count they scan, so a split-off tail is only right for one sequence
     static const bool gdn_bf16 = !getenv("GGML_CUDA_GDN_BF16") || atoi(getenv("GGML_CUDA_GDN_BF16")) != 0;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (gdn_bf16 && !kda && S_v == 128 && (state_idx == nullptr || n_seqs == 1) && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc)) &&
+    if (gdn_bf16 && !kda && S_v == 128 && aligned && (n_tail == 0 || n_seqs == 1) && (state_idx == nullptr || n_seqs == 1) &&
+            (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc)) &&
             !gdn_chunked_disabled() && n_tokens >= gdn_chunked_min_tokens() && n_tokens - n_tail >= GDN_CH_C) {
         const int64_t n_main = n_tokens - n_tail;
         ggml_cuda_pool_alloc<float> state_src(ctx.pool());
         const float * s_plain = nullptr;
         if (state_idx != nullptr) {
             const int64_t n4 = S_v * S_v * H / 4;
-            GGML_ASSERT(state_row_stride % 4 == 0 && ((uintptr_t) s_d) % 16 == 0);
             s_plain = state_src.alloc((size_t) S_v * S_v * H);
             gdn_gather_state_row<<<(int) std::min<int64_t>((n4 + 255) / 256, 1024), 256, 0, stream>>>(
                 (const float4 *) s_d, state_idx, state_row_stride / 4, (float4 *) s_plain, n4);
