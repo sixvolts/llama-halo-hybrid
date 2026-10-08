@@ -668,7 +668,41 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
-    if (mtp_qsa) {
+    // halo-hybrid: an ingest batch (no outputs: the draft catching its cache up on prompt tokens) needs only this
+    // block's K/V in the cache; the attention of its queries is dropped by the out_ids rows below anyway (dense over
+    // the whole context: most of a 4096-token ingest at 16-30K). Store K/V and skip the query side.
+    // LLAMA_MTP_INGEST_FULL=1 runs the full block as before
+    static const bool ingest_full = getenv("LLAMA_MTP_INGEST_FULL") != nullptr && atoi(getenv("LLAMA_MTP_INGEST_FULL")) != 0;
+    const bool kv_only = !ingest_full && !mtp_qsa && n_outputs == 0 && inp_out_ids != nullptr && !cparams.training &&
+        inp_attn->self_k_rot == nullptr && inp_attn->self_v_rot == nullptr;   // (a rotated cache keeps the full path)
+
+    if (kv_only) {
+        const int64_t n_embd_head = hparams.n_embd_head_v();
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "mtp_Kcur_normed", il);
+
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, "mtp_Vcur", il);
+
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Kcur, "mtp_Kcur", il);
+
+        // as build_attn stores them
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+
+        // the attention output of no token
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cb(cur, "mtp_attn_out", il);
+    } else if (mtp_qsa) {
         // the trunk's full-attention layer as-is (QSA top-k from this block's indexer, then sparse attention)
         cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
         cb(cur, "mtp_attn_out", il);
@@ -728,7 +762,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
 
     if (inp_out_ids) {
-        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+        if (!kv_only) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
         inject = ggml_get_rows(ctx0, inject, inp_out_ids);
 
         res_hc = ggml_reshape_2d(ctx0, res_hc, hc_dim, res_hc->ne[2]);
