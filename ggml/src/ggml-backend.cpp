@@ -2698,6 +2698,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
     // and of b cover the same layers on the same backend, so a's writes to the KV / recurrent state of a layer are
     // queued before b's reads). Different structures (e.g. a different ubatch width changing placement) fall back to
     // running a completely, then b - still correct, just without overlap.
+    bool by_hazard = false; // admitted by the hazard check, which models the alternating order only
     {
         // same layers per split = same backend and the same first and last node (by name); node COUNTS may differ
         // legitimately (e.g. Qwen3.8's QSA indexer scoring only exists once a lane's ubatch sees > 2051 KV cells)
@@ -2730,7 +2731,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
                 }
             }
             if (!same && pair_hazard && n_bad == 0) {
-                same = true;
+                same      = true;
+                by_hazard = true;
             }
         }
         if (!same) {
@@ -2783,7 +2785,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
     // each other on the remote host, and the local devices idle meanwhile. Instead run lane a through its
     // remote split (submitted asynchronously), then lane b's local splits while the remote host computes a,
     // then the tails. Cross-lane ordering still holds: every split of a precedes the same split of b on
-    // every backend. GGML_SCHED_PAIR_LOCKSTEP=1 restores the alternating order.
+    // every backend. GGML_SCHED_PAIR_LOCKSTEP=1 restores the alternating order. A pair admitted by the hazard check
+    // keeps that guarantee only with the remote split at the same index in both lanes (else b's splits between them
+    // would run before a's): otherwise it alternates, the order the check validated.
     static const bool lockstep = getenv("GGML_SCHED_PAIR_LOCKSTEP") != nullptr;
     auto first_remote_split = [](ggml_backend_sched_t sched) -> int {
         for (int i = 0; i < sched->n_splits; i++) {
@@ -2798,7 +2802,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
     };
     const int ra = first_remote_split(sched_a);
     const int rb = first_remote_split(sched_b);
-    if (!lockstep && ra >= 0 && rb >= 0) {
+    if (!lockstep && ra >= 0 && rb >= 0 && !(by_hazard && ra != rb)) {
         struct phase { ggml_backend_sched_t sched; int from; int to; ggml_backend_sched_compute_state * st; };
         const phase phases[4] = {
             { sched_a, 0,      ra + 1,             &st_a },
