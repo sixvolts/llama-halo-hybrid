@@ -7,7 +7,8 @@ llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on
 Upfront/Note - if you are just using Strix Halo by itself, this is probably not the right tool. Check out Gufo (https://github.com/gufo-org/gufo), which looks very promising.
 Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant. Better performance at a lower cost: a Strix+GPU is $5k or less compared to the now $7k cost of 128GB DGX Spark.  
 <p>
-    <img src="halo-cookbook/8oct2026-perf-swift1.5-Q4_K_XL.png" alt="Decode and Prefill Performance with Qwen-3.8-flash-next (Swift 1.5 fine tune) at Q4_K_XL">
+    <img src="halo-cookbook/8oct2026-perf-swift1.5-Q4_K_XL.png" alt="Decode and Prefill Performance with Qwen-3.8-flash-next (Swift 1.5 fine tune) at Q4_K_XL"><br/>
+    Decode and Prefill Performance with Qwen-3.8-flash-next (Swift 1.5 fine tune) at Q4_K_XL
 </p>
 
 ## Which configuration?
