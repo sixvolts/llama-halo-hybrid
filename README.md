@@ -5,7 +5,7 @@ llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on
 
 Upfront/Note - if you are just using Strix Halo by itself, this is probably not the right tool. Check out Gufo (https://github.com/gufo-org/gufo), which looks very promising.
 <p>
-    Decode and Prefill Performance with Qwen-3.8-flash-next (Swift 1.5 fine tune) at Q4_K_XL:
+    Decode and Prefill Performance with Qwen-3.8-flash-next (Swift 1.5 fine tune) at Q4_K_XL with an R9700:
     <img src="halo-cookbook/8oct2026-perf-swift1.5-Q4_K_XL.png" alt="Decode and Prefill Performance with Qwen-3.8-flash-next (Swift 1.5 fine tune) at Q4_K_XL">
     <br/>
 </p>
