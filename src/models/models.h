@@ -2451,11 +2451,15 @@ struct llama_model_qwen35 : public llama_model_base {
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    ~llama_model_qwen4exp() override;
 
     class llm_graph_input_qsa;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // the PLE host gather of a prefill ubatch, started early (see llama_model::prefetch_inputs)
+    void prefetch_inputs(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, bool pending) const override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

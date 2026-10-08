@@ -1,6 +1,10 @@
 #include "models.h"
 
 #include <algorithm>
+#include <deque>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <thread>
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -1809,43 +1813,34 @@ public:
     std::vector<llama_token> prev;
 };
 
-void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-    const auto & hp = pmodel.hparams;
-
-    // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
+// the n-gram rows of every token (ple_n_heads per token); prev holds n_gram - 1 predecessors per token, oldest-first,
+// LLAMA_TOKEN_NULL where there is none
+static void ple_rows(const llama_hparams & hp, const llama_ubatch & ubatch, const std::vector<llama_token> & prev,
+                     std::vector<int32_t> & idx) {
+    // an image arrives as an embd batch, so ubatch.token is null, but every position still needs a row for ggml_get_rows
     // stand in the image token id that the reference hashes, or EOS if the file has no such key
     // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
     const llama_token img_tok = hp.ple_image_token_id != 0
         ? (llama_token) hp.ple_image_token_id
         : (llama_token) hp.ple_eos_token_id;
     auto tok_of = [&](int64_t k) -> llama_token {
-        return ubatch->token ? ubatch->token[k] : img_tok;
+        return ubatch.token ? ubatch.token[k] : img_tok;
     };
 
-    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_tokens = ubatch.n_tokens;
     const int64_t n_gram   = hp.ple_ngram_size;
     const int64_t n_heads  = hp.ple_n_heads;
     const int64_t per_gram = hp.ple_heads_per_ngram;
     const int64_t eos      = hp.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
-    std::vector<int32_t> idx(n_heads * n_tokens);
+    idx.resize(n_heads * n_tokens);
 
-    GGML_ASSERT(mctx != nullptr);
-
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        // the preceding tokens would be ambiguous, see get_prev_tokens()
-        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
-    }
-
-    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
-    mctx->get_prev_tokens(*ubatch, n_prev, prev);
-
+    std::vector<int64_t> ctx(n_gram);
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
         ctx[0] = tok_of(i);
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
@@ -1868,55 +1863,212 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+}
+
+// gather + dequant the rows from the host (mmapped) table: F32 [head_dim * n_heads, n_tokens]
+static void ple_gather(const ggml_tensor * w, int64_t hd, const std::vector<int32_t> & idx, std::vector<float> & out) {
+    const auto * tt = ggml_get_type_traits(w->type);   // same dequant the CPU get_rows uses
+    out.resize(idx.size() * hd);
+    const char * base = (const char *) w->data;
+    const size_t row_bytes = ggml_row_size(w->type, hd);
+#if defined(__linux__)
+    // the table is mmapped and mostly cold: ask for every page this ubatch reads up front, so the kernel reads
+    // them in parallel instead of one fault at a time inside the dequant loop (adjacent pages merged per call)
+    static const bool willneed = !getenv("LLAMA_PLE_WILLNEED") || atoi(getenv("LLAMA_PLE_WILLNEED")) > 0;
+    if (willneed) {
+        static const long pg = sysconf(_SC_PAGESIZE);
+        std::vector<uintptr_t> pages;
+        pages.reserve(idx.size() * 2);
+        for (size_t r = 0; r < idx.size(); ++r) {
+            const uintptr_t a = (uintptr_t) (base + (size_t) idx[r] * w->nb[1]);
+            for (uintptr_t p0 = a & ~(uintptr_t) (pg - 1); p0 < a + row_bytes; p0 += pg) {
+                pages.push_back(p0);
+            }
+        }
+        std::sort(pages.begin(), pages.end());
+        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+        for (size_t i = 0; i < pages.size(); ) {
+            size_t j = i + 1;
+            while (j < pages.size() && pages[j] == pages[j - 1] + pg) { ++j; }
+            madvise((void *) pages[i], (j - i) * pg, MADV_WILLNEED);
+            i = j;
+        }
+    }
+#endif
+    // dequant on a few threads: page faults that the read-ahead has not satisfied yet then overlap
+    static const int n_thr_env = getenv("LLAMA_PLE_THREADS") ? atoi(getenv("LLAMA_PLE_THREADS")) : 8;
+    const int n_thr = (int) std::max<int64_t>(1, std::min<int64_t>(n_thr_env, (int64_t) idx.size() / 256));
+    auto work = [&](int t) {
+        const size_t r0 = idx.size() * t / n_thr, r1 = idx.size() * (t + 1) / n_thr;
+        for (size_t r = r0; r < r1; ++r) {
+            tt->to_float(base + (size_t) idx[r] * w->nb[1], out.data() + r*hd, hd);
+        }
+    };
+    if (n_thr == 1) {
+        work(0);
+    } else {
+        std::vector<std::thread> thr;
+        for (int t = 1; t < n_thr; ++t) { thr.emplace_back(work, t); }
+        work(0);
+        for (auto & th : thr) { th.join(); }
+    }
+}
+
+// halo-hybrid: prefetched PLE gathers. A prefill ubatch's ~65K scattered rows come mostly from disk (~170 ms per 4096
+// tokens); llama_context starts them for both lanes of a pair while the previous pair still runs on the GPUs
+// (prefetch_inputs), and set_input takes one only when its rows are exactly the ones it computes.
+// LLAMA_PLE_PREFETCH=0 turns it off
+namespace {
+struct ple_prefetch {
+    const llama_model *                 model = nullptr;
+    std::vector<int32_t>                idx;
+    std::shared_ptr<std::vector<float>> out;
+    std::shared_future<void>            done;
+};
+std::mutex               ple_pf_mu;
+std::deque<ple_prefetch> ple_pf;   // the two lanes of a pair, plus stale guesses until they age out
+constexpr size_t         ple_pf_max = 4;
+
+// the matching prefetch's rows (waits for its gather), or nullptr; *n_stale: this model's entries that did not match
+std::shared_ptr<std::vector<float>> ple_prefetch_take(const llama_model * model, const std::vector<int32_t> & idx, int * n_stale) {
+    ple_prefetch hit;
+    {
+        std::lock_guard<std::mutex> lock(ple_pf_mu);
+        *n_stale = 0;
+        for (auto it = ple_pf.begin(); it != ple_pf.end(); ++it) {
+            if (it->model != model) {
+                continue;
+            }
+            if (it->idx == idx) {
+                hit = std::move(*it);
+                ple_pf.erase(it);
+                break;
+            }
+            ++*n_stale;
+        }
+    }
+    if (!hit.out) {
+        return nullptr;
+    }
+    hit.done.wait();
+    return hit.out;
+}
+
+// drops this model's prefetches (all of them with model == nullptr), waiting for gathers still reading its table
+void ple_prefetch_drop(const llama_model * model) {
+    std::vector<ple_prefetch> dropped;
+    {
+        std::lock_guard<std::mutex> lock(ple_pf_mu);
+        for (auto it = ple_pf.begin(); it != ple_pf.end(); ) {
+            if (model == nullptr || it->model == model) {
+                dropped.push_back(std::move(*it));
+                it = ple_pf.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto & e : dropped) {
+        e.done.wait();
+    }
+}
+} // namespace
+
+static bool ple_host_gather(const llama_model & model) {
+    return model.per_layer_tok_embd != nullptr && model.per_layer_tok_embd->buffer != nullptr &&
+        ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer) && getenv("LLAMA_PLE_GET_ROWS") == nullptr;
+}
+
+llama_model_qwen4exp::~llama_model_qwen4exp() {
+    ple_prefetch_drop(this);
+}
+
+void llama_model_qwen4exp::prefetch_inputs(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, bool pending) const {
+    static const bool enabled = !getenv("LLAMA_PLE_PREFETCH") || atoi(getenv("LLAMA_PLE_PREFETCH")) != 0;
+    if (!enabled || mctx == nullptr || hparams.ple_n_heads == 0 || ubatch.n_tokens < 64 || !ubatch.token ||
+            !ple_host_gather(*this)) {
+        return;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1) {
+            return;   // set_input rejects these
+        }
+    }
+
+    const auto * kv = static_cast<const llama_memory_hybrid_idx_context *>(mctx)->get_attn();
+    const uint32_t n_prev = hparams.ple_ngram_size - 1;
+    std::vector<llama_token> prev;
+    if (pending) {
+        if (!kv->get_prev_tokens_pending(ubatch, n_prev, prev)) {
+            return;
+        }
+    } else {
+        kv->get_prev_tokens(ubatch, n_prev, prev);
+    }
+
+    ple_prefetch e;
+    e.model = this;
+    ple_rows(hparams, ubatch, prev, e.idx);
+    {
+        // lane 1's ubatch is prefetched twice, by lane 0 (pending) and by its own prepare: keep the first
+        std::lock_guard<std::mutex> lock(ple_pf_mu);
+        for (const auto & q : ple_pf) {
+            if (q.model == this && q.idx == e.idx) {
+                return;
+            }
+        }
+    }
+    e.out = std::make_shared<std::vector<float>>();
+    e.done = std::async(std::launch::async,
+        [w = per_layer_tok_embd, hd = (int64_t) hparams.ple_head_dim, idx = e.idx, out = e.out] {
+            ple_gather(w, hd, idx, *out);
+        }).share();
+
+    ple_prefetch old;
+    {
+        std::lock_guard<std::mutex> lock(ple_pf_mu);
+        if (ple_pf.size() >= ple_pf_max) {
+            old = std::move(ple_pf.front());
+            ple_pf.pop_front();
+        }
+        ple_pf.push_back(std::move(e));
+    }
+    if (old.out) {
+        old.done.wait();
+    }
+}
+
+void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+    const auto & hp = pmodel.hparams;
+
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(mctx != nullptr);
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        // the preceding tokens would be ambiguous, see get_prev_tokens()
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
+    }
+
+    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+    mctx->get_prev_tokens(*ubatch, hp.ple_ngram_size - 1, prev);
+
+    std::vector<int32_t> idx;
+    ple_rows(hp, *ubatch, prev, idx);
 
     if (emb) {
-        const ggml_tensor * w  = pmodel.per_layer_tok_embd;
-        const auto *        tt = ggml_get_type_traits(w->type);   // same dequant the CPU get_rows uses
-        const int64_t       hd = hp.ple_head_dim;
-        std::vector<float> out(idx.size() * hd);
-        const char * base = (const char *) w->data;
-        const size_t row_bytes = ggml_row_size(w->type, hd);
-#if defined(__linux__)
-        // the table is mmapped and mostly cold: ask for every page this ubatch reads up front, so the kernel reads
-        // them in parallel instead of one fault at a time inside the dequant loop (adjacent pages merged per call)
-        static const bool willneed = !getenv("LLAMA_PLE_WILLNEED") || atoi(getenv("LLAMA_PLE_WILLNEED")) > 0;
-        if (willneed) {
-            static const long pg = sysconf(_SC_PAGESIZE);
-            std::vector<uintptr_t> pages;
-            pages.reserve(idx.size() * 2);
-            for (size_t r = 0; r < idx.size(); ++r) {
-                const uintptr_t a = (uintptr_t) (base + (size_t) idx[r] * w->nb[1]);
-                for (uintptr_t p0 = a & ~(uintptr_t) (pg - 1); p0 < a + row_bytes; p0 += pg) {
-                    pages.push_back(p0);
-                }
-            }
-            std::sort(pages.begin(), pages.end());
-            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-            for (size_t i = 0; i < pages.size(); ) {
-                size_t j = i + 1;
-                while (j < pages.size() && pages[j] == pages[j - 1] + pg) { ++j; }
-                madvise((void *) pages[i], (j - i) * pg, MADV_WILLNEED);
-                i = j;
-            }
+        int n_stale = 0;
+        std::shared_ptr<std::vector<float>> pf = ple_prefetch_take(&pmodel, idx, &n_stale);
+        static const int lanes_debug = getenv("LLAMA_LANES_DEBUG") ? atoi(getenv("LLAMA_LANES_DEBUG")) : 0;
+        if (lanes_debug >= 3 && n_tokens >= 64) {
+            LLAMA_LOG_INFO("ple prefetch: %" PRId64 " tokens %s, %d unmatched\n", n_tokens, pf ? "hit" : "miss", n_stale);
         }
-#endif
-        // dequant on a few threads: page faults that the read-ahead has not satisfied yet then overlap
-        static const int n_thr_env = getenv("LLAMA_PLE_THREADS") ? atoi(getenv("LLAMA_PLE_THREADS")) : 8;
-        const int n_thr = (int) std::max<int64_t>(1, std::min<int64_t>(n_thr_env, (int64_t) idx.size() / 256));
-        auto work = [&](int t) {
-            const size_t r0 = idx.size() * t / n_thr, r1 = idx.size() * (t + 1) / n_thr;
-            for (size_t r = r0; r < r1; ++r) {
-                tt->to_float(base + (size_t) idx[r] * w->nb[1], out.data() + r*hd, hd);
-            }
-        };
-        if (n_thr == 1) {
-            work(0);
-        } else {
-            std::vector<std::thread> thr;
-            for (int t = 1; t < n_thr; ++t) { thr.emplace_back(work, t); }
-            work(0);
-            for (auto & th : thr) { th.join(); }
+        if (pf) {
+            ggml_backend_tensor_set(emb, pf->data(), 0, pf->size()*sizeof(float));
+            return;
         }
+        std::vector<float> out;
+        ple_gather(pmodel.per_layer_tok_embd, hp.ple_head_dim, idx, out);
         ggml_backend_tensor_set(emb, out.data(), 0, out.size()*sizeof(float));
         return;
     }
@@ -1991,9 +2143,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     ggml_tensor * emb = nullptr;
     // halo-hybrid: with the 28 GB table in host memory the 16-row gather + dequant runs on the host
     // in set_input and arrives as an F32 input, so the scheduler needs no CPU split for it
-    const bool host_gather = model.per_layer_tok_embd->buffer != nullptr &&
-        ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer) &&
-        getenv("LLAMA_PLE_GET_ROWS") == nullptr;
+    const bool host_gather = ple_host_gather(model);
     if (host_gather) {
         ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
         ggml_set_input(ple_inp->emb);

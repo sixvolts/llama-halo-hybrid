@@ -803,6 +803,13 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // halo-hybrid: start host-side input work for a ubatch (e.g. a table gather from the mmapped model) while the GPUs
+    // still run the previous graph; set_input() takes the result only if it matches what it computes itself.
+    // `pending`: the ubatch is not applied to mctx yet (see llama_kv_cache::get_prev_tokens_pending). Default: none
+    virtual void prefetch_inputs(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, bool pending) const {
+        GGML_UNUSED(ubatch); GGML_UNUSED(mctx); GGML_UNUSED(pending);
+    }
+
 protected:
     llama_model_params params;
 

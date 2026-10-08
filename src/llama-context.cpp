@@ -1658,6 +1658,18 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    // halo-hybrid: start the host-side input work (qwen4exp: the PLE table gather, ~170 ms per 4096 tokens) of this
+    // ubatch and, on lane 0 of a pair, of lane 1's, before the wait for the previous graph below: it then runs while
+    // the GPUs finish that graph instead of after it. set_inputs() uses a result only if it computes the same rows
+    if (mctx && ubatch.n_tokens >= 64) {
+        model.prefetch_inputs(ubatch, mctx, false);
+        if (lane == 0 && cparams.prefill_lanes >= 2) {
+            if (const llama_ubatch * next = mctx->peek_ubatch(1); next && next->n_tokens >= 64) {
+                model.prefetch_inputs(*next, mctx, true);
+            }
+        }
+    }
     const int64_t tp1 = prep_debug ? ggml_time_us() : 0;
     int64_t tp2 = tp1, tp3 = tp1, tp4 = tp1;
     bool reused = false;
@@ -2771,7 +2783,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     return handle_failure({&ubatch, &ubatch_b}, status);
                 }
 
-                static const bool lanes_debug = getenv("LLAMA_LANES_DEBUG") != nullptr;
+                // LLAMA_LANES_DEBUG=4: the per-lane prep timings without this pair-end wait, which hides cross-call overlap
+                static const bool lanes_debug = getenv("LLAMA_LANES_DEBUG") != nullptr && atoi(getenv("LLAMA_LANES_DEBUG")) < 4;
                 const int64_t t_pair_us = lanes_debug ? ggml_time_us() : 0;
 
                 status = graph_compute_pair(true);

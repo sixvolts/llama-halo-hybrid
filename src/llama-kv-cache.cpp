@@ -2377,6 +2377,43 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     }
 }
 
+bool llama_kv_cache::get_prev_tokens_pending(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    const uint32_t n_tokens = ubatch.n_tokens;
+
+    res.clear();
+    res.resize(n_tokens*n, LLAMA_TOKEN_NULL);
+
+    if (!ubatch.token) {
+        return false;
+    }
+    if (n == 0) {
+        return true;
+    }
+
+    // the ubatch's own (seq, pos) -> token
+    std::unordered_map<uint64_t, llama_token> own;
+    own.reserve(n_tokens);
+    auto key = [](llama_seq_id s, llama_pos p) { return ((uint64_t) (uint32_t) s << 32) | (uint32_t) p; };
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        own[key(ubatch.seq_id[i][0], ubatch.pos[i])] = ubatch.token[i];
+    }
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+        for (uint32_t j = 0; j < n; ++j) {
+            const llama_pos p = ubatch.pos[i] - (llama_pos) (n - j);
+            if (p < 0) {
+                continue;
+            }
+            const auto it = own.find(key(seq_id, p));
+            res[i*n + j] = it != own.end() ? it->second : v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
+        }
+    }
+
+    return true;
+}
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
@@ -3452,4 +3489,8 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+bool llama_kv_cache_context::get_prev_tokens_pending(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    return kv->get_prev_tokens_pending(ubatch, n, res);
 }

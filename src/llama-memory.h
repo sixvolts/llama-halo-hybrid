@@ -68,6 +68,10 @@ struct llama_memory_context_i {
     // halo-hybrid: for an update context, whether apply() computes a graph on the scheduler, so the worst-case graph
     // must be reserved again afterwards (a K-shift does; plain buffer copies do not)
     virtual bool needs_reserve() const { return true; }
+
+    // halo-hybrid: the ubatch `ahead` places after the current one, before it is applied (nullptr if there is none or
+    // the context does not keep its ubatches), so host-side input work for it can start early
+    virtual const llama_ubatch * peek_ubatch(uint32_t ahead) const { GGML_UNUSED(ahead); return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

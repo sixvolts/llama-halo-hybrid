@@ -303,6 +303,11 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // halo-hybrid: the same for a ubatch that has NOT been applied yet - a predecessor inside the ubatch comes from its
+    // own tokens (exact positions), the rest from the cells. A guess for early input work: the caller compares it with
+    // get_prev_tokens() once the ubatch is applied. Token ubatches only (false for embd)
+    bool get_prev_tokens_pending(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -525,6 +530,7 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+    bool get_prev_tokens_pending(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     llama_memory_status status;
