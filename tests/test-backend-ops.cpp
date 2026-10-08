@@ -13265,6 +13265,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 3, false, false, 1, -8.0f, -2.0f));
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 100, 2, 3));                 // n_seqs > 1, partial chunk
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 100, 1, 3));                 // partial chunk, one sequence
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 2, 3));                 // n_seqs > 1, whole chunks
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 97, 2, 2, true));            // permuted q/k/v
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 130, 1, 1, false, false, 3)); // K > 1: chunked + token tail
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3, false, false, 4, -0.05f, -1e-4f));
