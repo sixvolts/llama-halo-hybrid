@@ -2711,10 +2711,11 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
             same = xa.backend_id == xb.backend_id && strcmp(node_name(xa, false), node_name(xb, false)) == 0 &&
                    strcmp(node_name(xa, true), node_name(xb, true)) == 0;
         }
-        // GGML_SCHED_PAIR_DEBUG=1: count the cache hazards of every pair (accepted or not);
-        // GGML_SCHED_PAIR_HAZARD=1: a pair whose split names differ still interleaves when it has none
+        // a pair whose split names differ still interleaves when it has no cache hazards (a batch that starts a sequence:
+        // 2 x 4096 tokens 4.8 -> 3.1 s; GGML_SCHED_PAIR_HAZARD=0 keeps the name guard alone);
+        // GGML_SCHED_PAIR_DEBUG=1 counts the cache hazards of every pair (accepted or not)
         static const bool pair_debug  = getenv("GGML_SCHED_PAIR_DEBUG")  != nullptr && atoi(getenv("GGML_SCHED_PAIR_DEBUG"))  != 0;
-        static const bool pair_hazard = getenv("GGML_SCHED_PAIR_HAZARD") != nullptr && atoi(getenv("GGML_SCHED_PAIR_HAZARD")) != 0;
+        static const bool pair_hazard = getenv("GGML_SCHED_PAIR_HAZARD") == nullptr || atoi(getenv("GGML_SCHED_PAIR_HAZARD")) != 0;
         if (pair_debug || (!same && pair_hazard)) {
             static int n_hz_logged = 0;
             int n_shared = 0;
