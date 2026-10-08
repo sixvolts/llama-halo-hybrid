@@ -279,7 +279,7 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    sum += slope*__half2float(maskh[j*(nb31/sizeof(half)) + i_KQ]); // rows by stride: a span mask is a view
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);

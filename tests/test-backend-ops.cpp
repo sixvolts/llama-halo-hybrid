@@ -12894,6 +12894,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
                 GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, 256));
         }
+        // the vec kernel (quantized KV or no GQA at 1-2 queries) walks the mask rows itself
+        for (int64_t nb : {1, 2}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, false, 256));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, 256));
+        }
     }
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
