@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include <typeinfo>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1393,9 +1395,26 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
-    for (auto & input : inputs) {
-        input->set_input(ubatch);
+    // LLAMA_LANES_DEBUG >= 3: time every input of a prefill ubatch and log the slowest
+    static const bool timed = getenv("LLAMA_LANES_DEBUG") && atoi(getenv("LLAMA_LANES_DEBUG")) >= 3;
+    if (!timed || ubatch->n_tokens < 32) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
     }
+    std::vector<std::pair<int64_t, const char *>> t;
+    for (auto & input : inputs) {
+        const int64_t t0 = ggml_time_us();
+        input->set_input(ubatch);
+        t.emplace_back(ggml_time_us() - t0, typeid(*input).name());
+    }
+    std::sort(t.begin(), t.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+    std::string top;
+    for (size_t i = 0; i < t.size() && i < 6; i++) {
+        top += " " + std::to_string(t[i].first / 1000) + "ms:" + t[i].second;
+    }
+    LLAMA_LOG_INFO("set_inputs %u tokens, %zu inputs, slowest:%s\n", ubatch->n_tokens, t.size(), top.c_str());
 }
 
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
