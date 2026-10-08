@@ -5770,17 +5770,26 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t K; // snapshot slot count (>1)
+    const float   g_min; // log-gate range, as in test_gated_delta_net
 
     ggml_tensor * cpy_node = nullptr;
 
     std::string vars() override {
+        if (g_min != -20.0f) {
+            return VARS_TO_STR7(type, head_count, head_size, n_seq_tokens, n_seqs, K, g_min);
+        }
         return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+    }
+
+    double max_nmse_err() override {
+        return gdn_bf16_case(head_size, false, n_seq_tokens) ? 3e-5 : 1e-7;
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2)
-        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+            int64_t K = 2, float g_min = -20.0f)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
+          g_min(g_min) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -5863,7 +5872,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                init_tensor_uniform(t, g_min, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
@@ -13287,6 +13296,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 130, 1, 3, false, false, 4)); // K > 1 tail, the prod shape
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 130, 2, 3, false, false, 4)); // K > 1 tail, n_seqs > 1
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 130, 2, 3, true,  false, 4)); // ... permuted q/k/v
+    // n_seqs > 1 with gates that keep the state alive: the default -20.. range forgets within a token for most heads,
+    // so a sequence reading another's chunk scratch or state can still pass (rdna-boosts #113 hid there)
+    for (int64_t T : { 100, 256 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 2, 3, false, false, 1, -0.5f, -1e-4f));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 130, 2, 3, false, false, 4, -0.5f, -1e-4f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 130, 1, 3, false, false, 4, -0.5f, -1e-4f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  97, 2, 2, true,  false, 1, -0.5f, -1e-4f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 130, 2, 1, false, false, 1, -0.5f, -1e-4f));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3, false, false, 4, -0.05f, -1e-4f));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 96, 2, 1, false, false, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 200, 1, 2));
@@ -13323,6 +13341,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    // chunked prefill into the fused cache at the Qwen3.8 head size, gates that keep the state alive (with the
+    // default -20.. most heads forget within a token, which hides one sequence reading another's state)
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 1, 1, -0.5f));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 2, 1, -0.5f));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 1, 4, -0.5f));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 130, 2, 4, -0.5f));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
