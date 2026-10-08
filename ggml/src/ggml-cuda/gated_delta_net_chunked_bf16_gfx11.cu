@@ -938,6 +938,8 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
 
     const int64_t S_v      = nev0;
     const int64_t H        = nev1;
+    // halo-hybrid: the kernels step sequences (g/beta reads, output rows) by n_tokens, not nev2, so a limit below nev2
+    // is only right for one sequence (the caller gates it); pass nev2 as the sequence stride before relaxing that
     const int64_t n_tokens = (n_tokens_limit > 0 && n_tokens_limit < nev2) ? n_tokens_limit : nev2;
     const int64_t n_seqs   = nev3;
 
