@@ -2606,6 +2606,83 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+// halo-hybrid: data hazards on the persistent state two lanes share (KV / recurrent caches: buffers that are neither
+// weights nor compute). The alternating submission a0 b0 a1 b1 ... orders a's split j before b's split i only when both
+// run on the same backend stream and j <= i, so every write of a to a cache tensor must reach b's reads and writes of
+// it that way, and every read of a must precede b's writes the same way. Per whole cache tensor (conservative). Returns
+// the number of violations, logging the first n_log.
+static int ggml_backend_sched_pair_hazards(ggml_backend_sched_t sa, ggml_backend_sched_t sb, int n_log, int * n_shared = nullptr, int a_shift = 0) {
+    struct acc { int split; int backend; bool write; };
+    std::unordered_map<const ggml_tensor *, std::vector<acc>> use[2];
+    auto root = [](const ggml_tensor * t) {
+        while (t->view_src) {
+            t = t->view_src;
+        }
+        return t;
+    };
+    auto cache = [](const ggml_tensor * r) {
+        return r->buffer != nullptr && ggml_backend_buffer_get_usage(r->buffer) == GGML_BACKEND_BUFFER_USAGE_ANY;
+    };
+    ggml_backend_sched_t lanes[2] = { sa, sb };
+    for (int l = 0; l < 2; l++) {
+        ggml_backend_sched_t s = lanes[l];
+        for (int i = 0; i < s->n_splits; i++) {
+            const ggml_backend_sched_split & sp = s->splits[i];
+            for (int k = 0; k < sp.n_inputs; k++) {   // an input copied in from another backend: read at this split
+                const ggml_tensor * r = root(sp.inputs[k]);
+                if (cache(r)) {
+                    use[l][r].push_back({ i + (l == 0 ? a_shift : 0), sp.backend_id, false });
+                }
+            }
+            for (int n = 0; n < sp.graph.n_nodes; n++) {
+                const ggml_tensor * t = sp.graph.nodes[n];
+                if (ggml_op_is_empty(t->op) || ggml_is_empty(t)) {
+                    continue;
+                }
+                const ggml_tensor * r = root(t);
+                const int si = i + (l == 0 ? a_shift : 0);   // a_shift: self-test, delays a so hazards must show
+                if (cache(r)) {
+                    use[l][r].push_back({ si, sp.backend_id, true });
+                }
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    if (t->src[j] && cache(root(t->src[j]))) {
+                        use[l][root(t->src[j])].push_back({ si, sp.backend_id, false });
+                    }
+                }
+            }
+        }
+    }
+    int n_bad = 0;
+    if (n_shared) {
+        *n_shared = 0;
+    }
+    for (const auto & [r, ua] : use[0]) {
+        const auto it = use[1].find(r);
+        if (it == use[1].end()) {
+            continue;
+        }
+        if (n_shared) {
+            (*n_shared)++;
+        }
+        for (const acc & x : ua) {
+            for (const acc & y : it->second) {
+                if (!x.write && !y.write) {
+                    continue;
+                }
+                if (x.split <= y.split && x.backend == y.backend) {
+                    continue;
+                }
+                if (n_bad++ < n_log) {
+                    GGML_LOG_WARN("  pair hazard on %s: a %s at split %d (%s) | b %s at split %d (%s)\n", r->name,
+                        x.write ? "writes" : "reads", x.split, ggml_backend_name(sa->backends[x.backend]),
+                        y.write ? "writes" : "reads", y.split, ggml_backend_name(sb->backends[y.backend]));
+                }
+            }
+        }
+    }
+    return n_bad;
+}
+
 enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_t sched_a, ggml_backend_sched_t sched_b) {
     GGML_ASSERT(sched_a && sched_b && sched_a != sched_b);
     GGML_ASSERT(sched_a->is_alloc && sched_b->is_alloc);
@@ -2633,6 +2710,27 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
             const ggml_backend_sched_split & xb = sched_b->splits[i];
             same = xa.backend_id == xb.backend_id && strcmp(node_name(xa, false), node_name(xb, false)) == 0 &&
                    strcmp(node_name(xa, true), node_name(xb, true)) == 0;
+        }
+        // GGML_SCHED_PAIR_DEBUG=1: count the cache hazards of every pair (accepted or not);
+        // GGML_SCHED_PAIR_HAZARD=1: a pair whose split names differ still interleaves when it has none
+        static const bool pair_debug  = getenv("GGML_SCHED_PAIR_DEBUG")  != nullptr && atoi(getenv("GGML_SCHED_PAIR_DEBUG"))  != 0;
+        static const bool pair_hazard = getenv("GGML_SCHED_PAIR_HAZARD") != nullptr && atoi(getenv("GGML_SCHED_PAIR_HAZARD")) != 0;
+        if (pair_debug || (!same && pair_hazard)) {
+            static int n_hz_logged = 0;
+            int n_shared = 0;
+            const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, n_hz_logged < 8 ? 8 : 0, &n_shared);
+            if (n_hz_logged < 8) {
+                n_hz_logged++;
+                GGML_LOG_WARN("%s: names %s, %d vs %d splits, %d cache tensors shared, %d cache hazards\n", __func__,
+                    same ? "match" : "differ", sched_a->n_splits, sched_b->n_splits, n_shared, n_bad);
+                if (getenv("GGML_SCHED_PAIR_DEBUG") && atoi(getenv("GGML_SCHED_PAIR_DEBUG")) >= 2) {
+                    GGML_LOG_WARN("%s: self-test, a delayed one split: %d cache hazards\n", __func__,
+                        ggml_backend_sched_pair_hazards(sched_a, sched_b, 2, nullptr, 1));
+                }
+            }
+            if (!same && pair_hazard && n_bad == 0) {
+                same = true;
+            }
         }
         if (!same) {
             static int n_logged = 0;
