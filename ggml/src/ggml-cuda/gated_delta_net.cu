@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_chunked.cuh"
 #include "ggml-cuda/common.cuh"
 
 #include <algorithm>
@@ -710,6 +711,15 @@ static int64_t gdn_chunked_min_tokens() {
     return n;
 }
 
+// the deferred state gather for kernels that read a plain state: copy row idx[0] of the cache
+static __global__ void gdn_gather_state_row(const float4 * __restrict__ src, const int32_t * __restrict__ idx,
+                                            int64_t row_stride4, float4 * __restrict__ dst, int64_t n4) {
+    const float4 * row = src + idx[0] * row_stride4;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        dst[i] = row[i];
+    }
+}
+
 template <int S_v>
 static void launch_gdn_chunked(ggml_backend_cuda_context & ctx,
         const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d, const float * s_d,
@@ -853,6 +863,40 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
     };
     const bool lds_ok = chunk_lds(S_v) <= ggml_cuda_info().devices[ctx.device].smpbo;
+#if defined(GGML_USE_HIP)
+    // bf16 WMMA chunked prefill (rdna-boosts port): reads a plain state (a deferred gather is copied out first), the
+    // K > 1 tail goes through the token loop
+    static const bool gdn_bf16 = getenv("GGML_CUDA_GDN_BF16") && atoi(getenv("GGML_CUDA_GDN_BF16")) != 0;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (gdn_bf16 && !kda && S_v == 128 && (state_idx == nullptr || n_seqs == 1) && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc)) &&
+            !gdn_chunked_disabled() && n_tokens >= gdn_chunked_min_tokens() && n_tokens - n_tail >= GDN_CH_C) {
+        const int64_t n_main = n_tokens - n_tail;
+        ggml_cuda_pool_alloc<float> state_src(ctx.pool());
+        const float * s_plain = nullptr;
+        if (state_idx != nullptr) {
+            const int64_t n4 = S_v * S_v * H / 4;
+            GGML_ASSERT(state_row_stride % 4 == 0 && ((uintptr_t) s_d) % 16 == 0);
+            s_plain = state_src.alloc((size_t) S_v * S_v * H);
+            gdn_gather_state_row<<<(int) std::min<int64_t>((n4 + 255) / 256, 1024), 256, 0, stream>>>(
+                (const float4 *) s_d, state_idx, state_row_stride / 4, (float4 *) s_plain, n4);
+        }
+        ggml_cuda_pool_alloc<float> state_mid(ctx.pool());
+        float * state_main = n_tail > 0 ? state_mid.alloc((size_t) S_v * S_v * H * n_seqs) : state_d;
+        const bool ok = GGML_CUDA_CC_IS_RDNA4(cc) ? ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_main, n_main, s_plain)
+                                                  : ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, state_main, n_main, s_plain);
+        if (ok) {
+            if (n_tail == 0) {
+                return;
+            }
+            const int64_t t0 = n_main;
+            launch_gated_delta_net<false, true>(q_d + t0 * sq2, k_d + t0 * sq2, v_d + t0 * sv2, g_d + t0 * sb2, b_d + t0 * sb2,
+                state_main, dst_d + t0 * S_v * H, state_d,
+                S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, nullptr, 0, attn_seq_stride, stream);
+            return;
+        }
+    }
+#endif
     if (!kda && aligned && lds_ok && !gdn_chunked_disabled() && n_tokens >= gdn_chunked_min_tokens() && n_tokens - n_tail >= GDN_CH_C &&
             (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
         const int64_t n_main = n_tokens - n_tail;

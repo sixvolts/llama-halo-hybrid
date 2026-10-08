@@ -13295,6 +13295,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_kda_state_gather(64, 128, 3, 3, 1, 0, 1, true));
     test_cases.emplace_back(new test_kda_state_gather(64, 128, 1, 3, 1, 0, 0, true));
+    // scalar-gate prefill at head size 128 through a gathered state (the chunked paths, incl. GGML_CUDA_GDN_BF16=1)
+    test_cases.emplace_back(new test_kda_state_gather(16, 128, 128, 1, 3, 2, 0, false));
+    test_cases.emplace_back(new test_kda_state_gather(16, 128, 300, 3, 2, 1, 1, false));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
