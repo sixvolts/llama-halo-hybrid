@@ -1,0 +1,35 @@
+# gpu-<gen>: one card generation + the APU (ROCm0 = card, ROCm1 = APU). Sourced by run.sh; $GEN is rdna2|rdna3|rdna4.
+# Uses the build from the base suite ($BUILD); run base first on a new commit.
+#   pre-flight (stops the run with HOST-STATE): host state, GEMV probe, peer copies, against machines/<host>.json
+#   card: op cases + model shapes, random-weight architectures vs CPU
+#   two devices: batched peer copies, scheduler exactness over card + APU (lanes, hazard model)
+
+MACHINE_JSON="$HALO_DIR/machines/$HOST.json"
+
+build_p2p() {   # the peer-copy probe (host code only, so one binary for every card)
+    local exe="$BUILD/bin/halo-p2p"
+    if [ ! -x "$exe" ] || [ "$HALO_DIR/gpu/p2p.cpp" -nt "$exe" ]; then
+        hipcc -O2 -o "$exe" "$HALO_DIR/gpu/p2p.cpp" || return 1
+    fi
+}
+
+suite_gpu() {
+    [ -x "$BUILD/bin/test-backend-ops" ] || { echo "no build in $BUILD: run the base suite first"; return 1; }
+    local bless=; [ "$BLESS" = 1 ] && bless=--bless
+    prod_stop
+    export ROCR_VISIBLE_DEVICES=$(python3 "$HALO_DIR/lib/devices.py" visible "$GEN") || { halo_finish; return 1; }
+    step_gate devices      SETUP      python3 "$HALO_DIR/lib/devices.py" check "$GEN"
+    step_gate p2p-build    SETUP      build_p2p
+    step_gate host-state   HOST-STATE python3 "$HALO_DIR/lib/preflight.py" host "$GEN" "$MACHINE_JSON"
+    step_gate gemv-probe   HOST-STATE python3 "$HALO_DIR/lib/preflight.py" gemv "$GEN" "$MACHINE_JSON" "$BUILD/bin" $bless
+    step_gate peer-copy    HOST-STATE python3 "$HALO_DIR/lib/preflight.py" p2p "$GEN" "$MACHINE_JSON" "$BUILD/bin/halo-p2p" $bless
+
+    step ops-card     run_ops ROCm0 "$HALO_DIR/ops.txt" TBO_Q38_EVAL=1 TBO_GLM_EVAL=1
+    step shapes-card  run_shapes ROCm0
+    step archs-card   archs_dev ROCm0
+    step peer-batch   "$BUILD/bin/test-peer-copy-batch"
+    [ -d "$RUN_DIR/models" ] || step models gen_models
+    step sched-card   python3 "$HALO_DIR/lib/sched_check.py" card --bin "$BUILD/bin" --models "$RUN_DIR/models" \
+        --out "$RUN_DIR/sched-card" --known "$HALO_DIR/known-failures.txt"
+    halo_finish
+}

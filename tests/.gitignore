@@ -6,3 +6,6 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+!halo/
+!halo/*/
+__pycache__/
