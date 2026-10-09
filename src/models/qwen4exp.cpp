@@ -1937,7 +1937,12 @@ static void ple_gather(const ggml_tensor * w, int64_t hd, const std::vector<int3
     auto work = [&](int t) {
         const size_t r0 = idx.size() * t / n_thr, r1 = idx.size() * (t + 1) / n_thr;
         for (size_t r = r0; r < r1; ++r) {
-            tt->to_float(base + (size_t) idx[r] * w->nb[1], out.data() + r*hd, hd);
+            const char * row = base + (size_t) idx[r] * w->nb[1];
+            if (w->type == GGML_TYPE_F32) {   // f32 has no to_float trait
+                memcpy(out.data() + r*hd, row, hd * sizeof(float));
+            } else {
+                tt->to_float(row, out.data() + r*hd, hd);
+            }
         }
     };
     if (n_thr == 1) {
