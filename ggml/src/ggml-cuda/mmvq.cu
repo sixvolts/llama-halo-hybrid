@@ -598,6 +598,19 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
+        // halo-hybrid: ncols_dst 2..4 get RDNA4's tall (small_k tag, 32 warps) and wide (halve_iters tag, 8 warps)
+        // blocks when the host asks for them (see the ncols_dst 2..4 launch); upstream ran one wave per row there.
+        if (ncols_dst != 1 && ncols_dst <= 4 && (small_k || halve_iters)) {
+            switch (type) {
+                case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_NL:
+                    return small_k ? 32 : 8;
+                case GGML_TYPE_Q2_K: case GGML_TYPE_IQ4_XS:
+                    return small_k ? 1 : 8;
+                default:
+                    return 1;
+            }
+        }
         // RDNA3 (W7900): stricter whitelist than RDNA4.
         // Q2_K / Q5_K / IQ4_XS regress in full quant sweeps.
         if (ncols_dst == 1) {
@@ -729,9 +742,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 // (150 GB/s, one 256-thread block per row doing one loop trip) to 7 us (490 GB/s), and the
 // large-K shapes are unchanged within 1%. Measured -6% per decoded token on Qwen3.8-Flash-Next.
 // GGML_CUDA_MMVQ_NO_SMALLK=1 restores the upstream behaviour.
-// halo-hybrid: 8-warp blocks for ncols_dst 2..4 on RDNA4 (see calc_nwarps). GGML_CUDA_MMVQ_NO_WIDE=1 restores
-// the upstream one-wave-per-row launch for A/B.
-static bool ggml_cuda_mmvq_rdna4_wide() {
+// halo-hybrid: 8-warp blocks for ncols_dst 2..4 on RDNA4 and RDNA3 (see calc_nwarps). GGML_CUDA_MMVQ_NO_WIDE=1
+// restores the upstream one-wave-per-row launch for A/B.
+static bool ggml_cuda_mmvq_wide() {
     static const bool enabled = []() {
         const char * env = getenv("GGML_CUDA_MMVQ_NO_WIDE");
         return env == nullptr || atoi(env) == 0;
@@ -1685,14 +1698,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 2:
         case 3:
         case 4: {
-            // halo-hybrid: RDNA4 gets the 8-warp block here too (split-K over the block, or rows-per-block for
-            // short K); every other table keeps upstream's launch. Tag types keep the flags compile-time.
-            const bool rdna4_wide = table_id == MMVQ_PARAMETERS_RDNA4 && ggml_cuda_mmvq_rdna4_wide();
+            // halo-hybrid: RDNA4 and RDNA3 get the 8-warp block here too (split-K over the block); every other table
+            // keeps upstream's launch. Tag types keep the flags compile-time.
+            const bool wide_table = (table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0) &&
+                ggml_cuda_mmvq_wide();
             const auto launch_n = [&](auto ncols_tag) {
                 static constexpr int c_ncols_dst = decltype(ncols_tag)::value;
                 const auto launch = [&](auto small_k_tag, auto wide_tag) {
-                    // Types the RDNA4 table does not promote would compile a second, identical kernel.
-                    constexpr bool c_promoted = calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, true) > 1;
+                    // Types neither table promotes would compile a second, identical kernel.
+                    constexpr bool c_promoted = calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, true) > 1 ||
+                                                calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA3_0, false, true) > 1;
                     constexpr bool c_small_k  = decltype(small_k_tag)::value && c_promoted;   // = tall on RDNA4
                     constexpr bool c_wide     = decltype(wide_tag)::value && c_promoted;
                     const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
@@ -1703,7 +1718,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                         stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                         stream);
                 };
-                if (rdna4_wide && calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, true) > 1) {
+                if (wide_table && calc_nwarps(type, c_ncols_dst, table_id, false, true) > 1) {
                     // wide (8 warps, 1 row/block) when the 8-way K split still gives every warp a full trip and
                     // the matrix is under 2^25 weights; otherwise upstream (1 wave, 1 row). In situ on the R9700
                     // (v3s decode, n=3, op timer): 24x16384 30.8 -> 14.8 us, 2048x4096 39.1 -> 28.6,
@@ -1726,17 +1741,26 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const int64_t w_wide = (int64_t) nrows_x * 8 * launches;
                     const int64_t w_up   = (int64_t) nrows_x * launches;
                     bool wide = long_k && !big;
+                    // RDNA3 (RX 7800 XT, 1920 wave slots, n=3): wide pays only while one wave per row leaves the card
+                    // short of waves for the K loop: 128 / 256 x 4096 1.12-1.42x, 512 x 16384 1.26-1.58x, but
+                    // 1024 x 4096 0.90x, 2048 x 4096 0.89x and 4096 x 2048 0.63x (q8_0; q4_K / q6_K alike). Rows
+                    // over slots <= K / 16384 separates every measured shape; the cliff flip below still applies
+                    // (1920 x 4096 one-wave-per-row 23.8 us, wide 14.2).
+                    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && w_up * 16384 > slots * (int64_t) ncols_x) {
+                        wide = false;
+                    }
                     if (wide ? on_cliff(w_wide) : on_cliff(w_up)) {
                         wide = !wide;
                     }
                     // tall: <= 64 rows over K >= 8192 (q8_0), 32 warps split the K loop 4x deeper than wide
                     static const bool no_tall = getenv("GGML_CUDA_MMVQ_NO_TALL") != nullptr;
                     const bool tall = !no_tall && wide && nrows_x <= 64 && blocks_per_row_x >= 32 * blocks_per_iter_1warp &&
-                        calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, true, false) > 1 && !on_cliff((int64_t) nrows_x * 32 * launches);
+                        calc_nwarps(type, c_ncols_dst, table_id, true, false) > 1 && !on_cliff((int64_t) nrows_x * 32 * launches);
                     static const bool dbg = getenv("GGML_CUDA_MMVQ_DEBUG") != nullptr;
                     if (dbg) {
-                        fprintf(stderr, "mmvq rdna4: rows=%d K=%d n=%d ch*s=%lld long_k=%d big=%d -> %s\n",
-                            nrows_x, ncols_x, c_ncols_dst, (long long) launches, long_k, big, tall ? "tall" : wide ? "wide" : "upstream");
+                        fprintf(stderr, "mmvq %s: rows=%d K=%d n=%d ch*s=%lld slots=%lld long_k=%d big=%d -> %s\n",
+                            table_id == MMVQ_PARAMETERS_RDNA4 ? "rdna4" : "rdna3", nrows_x, ncols_x, c_ncols_dst,
+                            (long long) launches, (long long) slots, long_k, big, tall ? "tall" : wide ? "wide" : "upstream");
                     }
                     if (tall) {
                         launch(std::true_type{},  std::false_type{});
