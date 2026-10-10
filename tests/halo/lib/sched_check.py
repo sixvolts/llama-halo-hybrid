@@ -132,6 +132,23 @@ def mode_base(a):
 
 
 HZ = re.compile(r'names (match|differ), (\d+) vs (\d+) splits, (\d+) cache tensors shared, (\d+) cache hazards')
+REFUSED = 'running them one after the other'
+
+
+def admitted_hazards(err):
+    """(pairs checked, admitted pairs with cache hazards): a pair with hazards is fine when the scheduler ran its lanes one
+    after the other, which it logs right after the pair's hazard line"""
+    lines = [l for l in err.splitlines() if HZ.search(l) or REFUSED in l]
+    n, bad = 0, 0
+    for i, l in enumerate(lines):
+        m = HZ.search(l)
+        if not m:
+            continue
+        n += 1
+        refused = i + 1 < len(lines) and REFUSED in lines[i + 1]
+        if int(m.group(5)) != 0 and not refused:
+            bad += 1
+    return n, bad
 SELF = re.compile(r'self-test, a delayed one split: (\d+) cache hazards')
 
 
@@ -159,19 +176,21 @@ def mode_card(a):
             if 'LLAMA_PREFILL_LANES ignored' in err:
                 problems.append('%s/%s: lanes not enabled' % (model, tag))
                 continue
-            hz = HZ.findall(err)
-            bad = [h for h in hz if int(h[4]) != 0]
+            n_hz, bad = admitted_hazards(err)
             st = [int(x) for x in SELF.findall(err)]
-            n_pairs += len(hz)
+            n_pairs += n_hz
             n_self += sum(1 for x in st if x > 0)
+            n_refused = err.count(REFUSED)
+            if n_refused:
+                print('%s/%s: %d pairs run one after the other (CPU split with cache hazards)' % (model, tag, n_refused))
             if bad:
                 reason = known(MODE, model, 'hazards')
                 if reason:
-                    print('KNOWN %s/%s: %d pairs with cache hazards: %s' % (model, tag, len(bad), reason))
+                    print('KNOWN %s/%s: %d admitted pairs with cache hazards: %s' % (model, tag, bad, reason))
                     KNOWN_HITS.append('%s/%s hazards' % (model, tag))
                 else:
-                    problems.append('%s/%s: %d pairs with cache hazards' % (model, tag, len(bad)))
-            if hz and not any(x > 0 for x in st):
+                    problems.append('%s/%s: %d admitted pairs with cache hazards' % (model, tag, bad))
+            if n_hz and not any(x > 0 for x in st):
                 problems.append('%s/%s: hazard self-test found nothing' % (model, tag))
         res_c = {'card': run(a, 'card', model, ['-dev', 'ROCm0'])}
         check_group(model + '/card', res_c, problems)

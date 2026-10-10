@@ -1,4 +1,3 @@
 # Failures the suites report as KNOWN instead of FAIL. Every line needs a date and a reason, and comes out when it is
 # fixed. Anything not listed here fails its step.
 # <test> <model regex> <subtest | abort | *> <date: reason>
-sched-card ^glm5next-moe$ hazards 2026-10-10: the random-weight model runs DSV4_HC_MIX and the MLA flash attention on the CPU (shapes the HIP kernels do not take), so a CPU split reads cache_k_l0 that a GPU split writes and the hazard model flags the cross-backend order in pairs the name guard admits; outputs identical (the cells involved are the later lane's positions, masked). The real GLM-5.3-Flash UD-Q2_K_XL single-box layout has no CPU split and 0 hazards in its admitted pairs (2026-10-10). Open: the name guard assumes one backend per cache tensor

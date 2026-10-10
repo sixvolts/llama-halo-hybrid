@@ -2717,11 +2717,28 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
         // GGML_SCHED_PAIR_DEBUG=1 counts the cache hazards of every pair (accepted or not)
         static const bool pair_debug  = getenv("GGML_SCHED_PAIR_DEBUG")  != nullptr && atoi(getenv("GGML_SCHED_PAIR_DEBUG"))  != 0;
         static const bool pair_hazard = getenv("GGML_SCHED_PAIR_HAZARD") == nullptr || atoi(getenv("GGML_SCHED_PAIR_HAZARD")) != 0;
-        if (pair_debug || (!same && pair_hazard)) {
+        // the name guard's argument (a's accesses to a layer's cache are queued on the same stream ahead of b's) needs
+        // every cache tensor to stay on one backend. A CPU split breaks it: an op the GPU kernels do not take at that
+        // shape reads a cache the GPU writes (the random-weight glm5next: MLA flash attention and DSV4_HC_MIX on the
+        // CPU, 2026-10-10). Such a pair is admitted only without cache hazards (~0.2 ms per pair on GLM-5.3's graph).
+        bool cpu_split = false;
+        if (same && pair_hazard) {
+            for (int l = 0; l < 2 && !cpu_split; l++) {
+                ggml_backend_sched_t s = l == 0 ? sched_a : sched_b;
+                for (int i = 0; i < s->n_splits && !cpu_split; i++) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(s->backends[s->splits[i].backend_id]);
+                    cpu_split = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                }
+            }
+        }
+        bool refused = false; // names match, but a CPU split leaves cache hazards
+        if (pair_debug || (!same && pair_hazard) || cpu_split) {
             static int n_hz_logged = 0;
+            // (a pair checked only for its CPU split stays quiet unless it is refused)
+            const bool log_hz = (pair_debug || !same) && n_hz_logged < 8;
             int n_shared = 0;
-            const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, n_hz_logged < 8 ? 8 : 0, &n_shared);
-            if (n_hz_logged < 8) {
+            const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, log_hz ? 8 : 0, &n_shared);
+            if (log_hz) {
                 n_hz_logged++;
                 GGML_LOG_WARN("%s: names %s, %d vs %d splits, %d cache tensors shared, %d cache hazards\n", __func__,
                     same ? "match" : "differ", sched_a->n_splits, sched_b->n_splits, n_shared, n_bad);
@@ -2733,11 +2750,19 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
             if (!same && pair_hazard && n_bad == 0) {
                 same      = true;
                 by_hazard = true;
+            } else if (cpu_split && n_bad > 0) {
+                same    = false;
+                refused = true;
+                static int n_refused_logged = 0;
+                if (n_refused_logged++ < 4) {
+                    GGML_LOG_WARN("%s: the lanes match but a CPU split leaves %d cache hazards: running them one after the other\n",
+                        __func__, n_bad);
+                }
             }
         }
         if (!same) {
             static int n_logged = 0;
-            if (n_logged++ < 4) {
+            if (!refused && n_logged++ < 4) {
                 GGML_LOG_WARN("%s: the two lanes have different split structures (%d vs %d splits): running them one after the other\n",
                     __func__, sched_a->n_splits, sched_b->n_splits);
                 const int n = std::max(sched_a->n_splits, sched_b->n_splits);
