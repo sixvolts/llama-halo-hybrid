@@ -2877,32 +2877,43 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     }
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
 
-    uint64_t key[16 + 3*GGML_MAX_DIMS + GGML_MAX_OP_PARAMS/sizeof(uint64_t) + GGML_MAX_SRC*(2 + 2*GGML_MAX_DIMS)];
-    size_t n = 0;
-    key[n++] = (uint64_t) (uintptr_t) dev;
-    key[n++] = ((uint64_t) op->op << 32) | (uint32_t) op->type;
-    for (int i = 0; i < GGML_MAX_DIMS; i++) { key[n++] = (uint64_t) op->ne[i]; key[n++] = (uint64_t) op->nb[i]; }
-    memcpy(key + n, op->op_params, GGML_MAX_OP_PARAMS);
-    n += GGML_MAX_OP_PARAMS/sizeof(uint64_t);
-    for (int s = 0; s < GGML_MAX_SRC && op->src[s]; s++) {
+    // every source slot is keyed (a zero word for a null one): FLASH_ATTN_EXT and SOFT_MAX have a live source after a
+    // null mask
+    std::vector<uint64_t> key;
+    key.reserve(2 + 2*GGML_MAX_DIMS + GGML_MAX_OP_PARAMS/sizeof(uint64_t) + GGML_MAX_SRC*(2 + 2*GGML_MAX_DIMS));
+    key.push_back((uint64_t) (uintptr_t) dev);
+    key.push_back(((uint64_t) op->op << 32) | (uint32_t) op->type);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) { key.push_back((uint64_t) op->ne[i]); key.push_back((uint64_t) op->nb[i]); }
+    for (size_t i = 0; i < GGML_MAX_OP_PARAMS/sizeof(uint64_t); i++) {
+        uint64_t w;
+        memcpy(&w, (const char *) op->op_params + i*sizeof(uint64_t), sizeof(w));
+        key.push_back(w);
+    }
+    for (int s = 0; s < GGML_MAX_SRC; s++) {
         const ggml_tensor * src = op->src[s];
-        key[n++] = ((uint64_t) s << 32) | (uint32_t) src->type;
-        key[n++] = (uint64_t) (uintptr_t) src->buffer;
-        for (int i = 0; i < GGML_MAX_DIMS; i++) { key[n++] = (uint64_t) src->ne[i]; key[n++] = (uint64_t) src->nb[i]; }
+        if (!src) {
+            key.push_back(0);
+            continue;
+        }
+        key.push_back(((uint64_t) (s + 1) << 32) | (uint32_t) src->type);
+        key.push_back((uint64_t) (uintptr_t) src->buffer);
+        for (int i = 0; i < GGML_MAX_DIMS; i++) { key.push_back((uint64_t) src->ne[i]); key.push_back((uint64_t) src->nb[i]); }
     }
     uint64_t h = 0x9e3779b97f4a7c15ULL;
-    for (size_t i = 0; i < n; i++) {
-        h = (h ^ key[i]) * 0xff51afd7ed558ccdULL;
+    for (const uint64_t w : key) {
+        h = (h ^ w) * 0xff51afd7ed558ccdULL;
         h ^= h >> 32;
     }
 
+    // the full key is kept and compared: a hash collision must not answer for another op (a false "supported" would
+    // bring back the server abort, a false "unsupported" moves the op)
     static std::mutex cache_mutex;
-    static std::unordered_map<uint64_t, bool> cache;
+    static std::unordered_map<uint64_t, std::pair<std::vector<uint64_t>, bool>> cache;
     {
         std::lock_guard<std::mutex> lock(cache_mutex);
         auto it = cache.find(h);
-        if (it != cache.end()) {
-            return it->second;
+        if (it != cache.end() && it->second.first == key) {
+            return it->second.second;
         }
     }
 
@@ -2910,9 +2921,10 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     auto dispatcher = get_dispatcher(ctx->endpoint);
     if (dispatcher->server_minor >= 10) {
         auto request = std::make_shared<rpc_msg_supports_op_req>();
-        request->tensor = serialize_tensor(op);
+        // with the dispatcher, a tensor in another endpoint's buffer goes over as buffer 0 (as in GRAPH_COMPUTE)
+        request->tensor = serialize_tensor(op, dispatcher);
         for (int i = 0; i < GGML_MAX_SRC; i++) {
-            request->srcs[i] = serialize_tensor(op->src[i]);
+            request->srcs[i] = serialize_tensor(op->src[i], dispatcher);
         }
         // a composite device runs the op on whichever server device its scheduler picks
         const uint32_t d0 = ctx->composite ? 0 : ctx->device;
@@ -2930,7 +2942,7 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
         if (cache.size() >= (1u << 16)) {
             cache.clear();   // shapes vary with n_tokens; bound the table
         }
-        cache[h] = supported;
+        cache[h] = { std::move(key), supported };
     }
     return supported;
 }
