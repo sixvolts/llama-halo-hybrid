@@ -18,7 +18,9 @@ extern "C" {
 // 7.8: GGML_OP_QSA_HEAD_SUM appended (qwen4exp QSA indexer head reduction)
 // 7.9: SET_TENSOR carries upstream's cache_flag byte (merged with upstream 2026-10: the client asks the server to
 //      save a hash-cache entry only for weights it has just failed to find)
-#define RPC_PROTO_MINOR_VERSION 9
+// 7.10: RPC_CMD_SUPPORTS_OP: the client asks the server's backend instead of assuming every op is supported (a
+//       shape-restricted kernel aborted the server, 2026-10-09); an older server is never asked
+#define RPC_PROTO_MINOR_VERSION 10
 // 7.4.1: rpc_tensor.flags carries RPC_TENSOR_FLAG_WEIGHTS (client buffer usage WEIGHTS); the server marks the buffer so
 //        its scheduler places ops by their weights. Compatible both ways (an older peer ignores or never sets the bit).
 #define RPC_PROTO_PATCH_VERSION    0

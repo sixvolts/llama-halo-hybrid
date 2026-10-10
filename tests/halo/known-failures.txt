@@ -2,4 +2,3 @@
 # fixed. Anything not listed here fails its step.
 # <test> <model regex> <subtest | abort | *> <date: reason>
 test-save-load-state ^glm5next- rf 2026-10-09: fragmented-ring restore of a sequence is not byte-identical (fork arch glm5next) - open
-sched-rpc ^glm5next-moe$ * 2026-10-09: rpc-server aborts in DSV4_HC_MIX (dsv4-hc.cu:927 asserts hc_dim == the fused kernel width); the random-weight model has a smaller hc_dim, local runs decline the op, RPC cannot. GLM-5.3-Flash itself matches - open

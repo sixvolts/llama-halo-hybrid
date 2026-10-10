@@ -94,6 +94,7 @@ enum rpc_cmd {
     RPC_CMD_MEMSET_TENSOR,
     RPC_CMD_COPY_TENSOR_ASYNC, // halo-hybrid: same-server cross-device copy, enqueued async on the server, empty reply
     RPC_CMD_GRAPH_COMPUTE_SCHED, // halo-hybrid (proto 7.2): graph spanning the server's devices, scheduled by the server's own ggml_backend_sched
+    RPC_CMD_SUPPORTS_OP, // halo-hybrid (proto 7.10): ask the server's backend whether it supports an op
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -127,6 +128,17 @@ struct rpc_msg_get_alloc_size_req {
 
 struct rpc_msg_get_alloc_size_rsp {
     uint64_t alloc_size;
+};
+
+// halo-hybrid (proto 7.10): same layout as the alloc-size request (the op and its sources)
+struct rpc_msg_supports_op_req {
+    uint32_t   device;
+    rpc_tensor tensor;
+    rpc_tensor srcs[GGML_MAX_SRC];
+};
+
+struct rpc_msg_supports_op_rsp {
+    uint8_t supported;
 };
 
 struct rpc_msg_init_tensor_req {
@@ -1339,6 +1351,7 @@ public:
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+    bool supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
 
     // halo-hybrid V3: a boundary output the client will read at ITS address (buffer/data as serialised); the
@@ -1427,6 +1440,37 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
 
     response.alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
 
+    return true;
+}
+
+bool rpc_server::supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response) {
+    if (request.device >= backends.size()) {
+        return false;
+    }
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead()*(1 + GGML_MAX_SRC),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr || tensor->op >= GGML_OP_COUNT) {
+        response.supported = 0;
+        return true;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (request.srcs[i].id != 0) {
+            tensor->src[i] = deserialize_tensor(ctx, &request.srcs[i]);
+            if (tensor->src[i] == nullptr) {
+                response.supported = 0;
+                return true;
+            }
+        }
+    }
+    response.supported = ggml_backend_supports_op(backends[request.device], tensor) ? 1 : 0;
     return true;
 }
 
@@ -2419,6 +2463,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SUPPORTS_OP: {
+                rpc_msg_supports_op_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_supports_op_rsp response;
+                if (!server.supports_op(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_ALIGNMENT: {
                 rpc_msg_get_alignment_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2808,11 +2866,73 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
     GGML_UNUSED(dev);
 }
 
+// halo-hybrid (proto 7.10): the server's backend answers, so an op its kernels cannot run at this shape (DSV4_HC_MIX
+// at a width other than 4 x 4096, 2026-10-09) is placed elsewhere instead of aborting the server. Answers are cached by
+// the op's shape and its sources' shapes and buffers; an older server is not asked (every op supported, as before).
+// GGML_RPC_NO_SUPPORTS_OP=1 restores that for A/B.
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    static const bool disabled = getenv("GGML_RPC_NO_SUPPORTS_OP") != nullptr;
+    if (disabled) {
+        return true;
+    }
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+
+    uint64_t key[16 + 3*GGML_MAX_DIMS + GGML_MAX_OP_PARAMS/sizeof(uint64_t) + GGML_MAX_SRC*(2 + 2*GGML_MAX_DIMS)];
+    size_t n = 0;
+    key[n++] = (uint64_t) (uintptr_t) dev;
+    key[n++] = ((uint64_t) op->op << 32) | (uint32_t) op->type;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) { key[n++] = (uint64_t) op->ne[i]; key[n++] = (uint64_t) op->nb[i]; }
+    memcpy(key + n, op->op_params, GGML_MAX_OP_PARAMS);
+    n += GGML_MAX_OP_PARAMS/sizeof(uint64_t);
+    for (int s = 0; s < GGML_MAX_SRC && op->src[s]; s++) {
+        const ggml_tensor * src = op->src[s];
+        key[n++] = ((uint64_t) s << 32) | (uint32_t) src->type;
+        key[n++] = (uint64_t) (uintptr_t) src->buffer;
+        for (int i = 0; i < GGML_MAX_DIMS; i++) { key[n++] = (uint64_t) src->ne[i]; key[n++] = (uint64_t) src->nb[i]; }
+    }
+    uint64_t h = 0x9e3779b97f4a7c15ULL;
+    for (size_t i = 0; i < n; i++) {
+        h = (h ^ key[i]) * 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+    }
+
+    static std::mutex cache_mutex;
+    static std::unordered_map<uint64_t, bool> cache;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(h);
+        if (it != cache.end()) {
+            return it->second;
+        }
+    }
+
+    bool supported = true;
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+    if (dispatcher->server_minor >= 10) {
+        auto request = std::make_shared<rpc_msg_supports_op_req>();
+        request->tensor = serialize_tensor(op);
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            request->srcs[i] = serialize_tensor(op->src[i]);
+        }
+        // a composite device runs the op on whichever server device its scheduler picks
+        const uint32_t d0 = ctx->composite ? 0 : ctx->device;
+        const uint32_t d1 = ctx->composite ? ctx->n_server_devices : ctx->device + 1;
+        supported = false;
+        for (uint32_t d = d0; d < d1 && !supported; d++) {
+            request->device = d;
+            rpc_msg_supports_op_rsp response = {};
+            dispatcher->send(RPC_CMD_SUPPORTS_OP, request, sizeof(*request), &response, sizeof(response));
+            supported = response.supported != 0;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (cache.size() >= (1u << 16)) {
+            cache.clear();   // shapes vary with n_tokens; bound the table
+        }
+        cache[h] = supported;
+    }
+    return supported;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
