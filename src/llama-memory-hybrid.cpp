@@ -295,29 +295,31 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
 
-    // a part that fails cleans up after itself; the parts restored before it are undone here (state_clear frees
-    // the cells and zeroes their data: without flash attention a free cell's garbage still reaches the softmax).
-    // The indexer cache was left out of this when it was added, so a rejected blob left the sequence's restored
-    // indexer cells in place, full of whatever the blob held (NaN logits on the other sequences, 2026-10-10)
-    if (read_attn) {
-        mem_attn->state_read(io, seq_id, flags);
-        if (mem_idx) {
-            try {
+    // on a failed restore the sequence is dropped from every part, which is the one state they agree on: undoing only
+    // the parts restored before the failing one left the failing part's own pre-restore cells when it threw before
+    // its cleanup (n_stream mismatch), and the indexer cache was missing from the undo altogether - its restored
+    // cells stayed occupied with the blob's bytes (NaN logits on the other sequences, 2026-10-10). state_clear frees
+    // and zeroes the cells: without flash attention a free cell's data still reaches the softmax. A partial-only
+    // restore touches the recurrent state alone, which cleans up after itself.
+    try {
+        if (read_attn) {
+            mem_attn->state_read(io, seq_id, flags);
+            if (mem_idx) {
                 mem_idx->state_read(io, seq_id, flags);
-            } catch (...) {
-                mem_attn->state_clear(seq_id);
-                throw;
             }
         }
-    }
 
-    try {
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
         if (read_attn) {
-            mem_attn->state_clear(seq_id);
-            if (mem_idx) {
-                mem_idx->state_clear(seq_id);
+            if (seq_id < 0) {
+                clear(true);
+            } else {
+                mem_attn->state_clear(seq_id);
+                if (mem_idx) {
+                    mem_idx->state_clear(seq_id);
+                }
+                mem_recr->seq_rm(seq_id, -1, -1);
             }
         }
 

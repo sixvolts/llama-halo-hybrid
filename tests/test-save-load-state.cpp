@@ -670,6 +670,18 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 
             return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
         }},
+        { "over", [&]() {
+            // restored over the live sequence (a server slot keeps its cached prompt): every part of the memory must
+            // drop the sequence, including the one that rejected the blob
+            std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) == state.size());
+
+            if (!corrupt_state(state)) {
+                return false;
+            }
+
+            return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
+        }},
         { "file", [&]() {
             GGML_ASSERT(llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens_save.data(), tokens_save.size()) > 0);
             llama_memory_seq_rm(mem, 0, -1, -1);
@@ -713,6 +725,14 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 
         if (llama_memory_seq_pos_max(mem, 0) != -1) {
             LOG_ERR("%s: %s: sequence not empty after failed restore\n", __func__, name);
+            return false;
+        }
+
+        // seq_pos_max of a hybrid memory is the min over its parts, so it misses a part that still holds the sequence;
+        // the serialized state does not: it must be that of a sequence never used (seq 3)
+        if (llama_state_seq_get_size(ctx.get(), 0) != llama_state_seq_get_size(ctx.get(), 3)) {
+            LOG_ERR("%s: %s: a part of the memory still holds the sequence after the failed restore (%zu vs %zu bytes)\n",
+                    __func__, name, llama_state_seq_get_size(ctx.get(), 0), llama_state_seq_get_size(ctx.get(), 3));
             return false;
         }
 
