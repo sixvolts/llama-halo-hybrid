@@ -295,17 +295,30 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
 
+    // a part that fails cleans up after itself; the parts restored before it are undone here (state_clear frees
+    // the cells and zeroes their data: without flash attention a free cell's garbage still reaches the softmax).
+    // The indexer cache was left out of this when it was added, so a rejected blob left the sequence's restored
+    // indexer cells in place, full of whatever the blob held (NaN logits on the other sequences, 2026-10-10)
     if (read_attn) {
         mem_attn->state_read(io, seq_id, flags);
-        if (mem_idx) mem_idx->state_read(io, seq_id, flags);
+        if (mem_idx) {
+            try {
+                mem_idx->state_read(io, seq_id, flags);
+            } catch (...) {
+                mem_attn->state_clear(seq_id);
+                throw;
+            }
+        }
     }
 
     try {
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
-        // the attention part is already restored - undo it
         if (read_attn) {
             mem_attn->state_clear(seq_id);
+            if (mem_idx) {
+                mem_idx->state_clear(seq_id);
+            }
         }
 
         throw;

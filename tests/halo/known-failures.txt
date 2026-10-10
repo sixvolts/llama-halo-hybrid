@@ -1,4 +1,3 @@
 # Failures the suites report as KNOWN instead of FAIL. Every line needs a date and a reason, and comes out when it is
 # fixed. Anything not listed here fails its step.
 # <test> <model regex> <subtest | abort | *> <date: reason>
-test-save-load-state ^glm5next- rf 2026-10-09: fragmented-ring restore of a sequence is not byte-identical (fork arch glm5next) - open
