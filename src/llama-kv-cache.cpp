@@ -3188,6 +3188,11 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 }
 
 void llama_kv_cache::state_clear(llama_seq_id seq_id) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS] - a cache that shares another's cells owns none of them (as state_read)
+    if (other) {
+        return;
+    }
+
     if (seq_id == -1) {
         clear(true);
         return;

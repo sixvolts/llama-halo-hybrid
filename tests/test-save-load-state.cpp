@@ -698,6 +698,25 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 
             return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
         }},
+        { "over-truncated", [&]() {
+            // cut short: the last part of the memory always fails to read (no payload ambiguity)
+            std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) == state.size());
+
+            return llama_state_seq_set_data(ctx.get(), state.data(), state.size() - 8, 0) == 0;
+        }},
+        { "partial-truncated", [&]() {
+            // a partial-only restore (checkpoints: the recurrent / SWA part alone) cut short, over the live sequence
+            const auto fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx.get(), 0, fl));
+            if (state.size() < 64) {
+                llama_memory_seq_rm(mem, 0, -1, -1); // nothing partial to restore: not applicable
+                return true;
+            }
+            GGML_ASSERT(llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), 0, fl) == state.size());
+
+            return llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size() - 8, 0, fl) == 0;
+        }},
         { "file", [&]() {
             GGML_ASSERT(llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens_save.data(), tokens_save.size()) > 0);
             llama_memory_seq_rm(mem, 0, -1, -1);
