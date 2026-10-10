@@ -89,7 +89,7 @@ def host(gen, mpath):
 
     dm = subprocess.run(['sudo', '-n', 'dmesg'], capture_output=True, text=True).stdout
     mine = [l for l in dm.splitlines() if pci in l or pci[5:] in l]
-    for pat in (r'D3hot', r'device lost', r'GPU reset begin', r'reset failed', r'GPU recovery', r'SMU is in hanged state'):
+    for pat in (r'power state from D3', r'device inaccessible', r'device lost', r'GPU reset begin', r'reset failed', r'GPU recovery', r'SMU is in hanged state'):
         hits = [l for l in mine if re.search(pat, l)]
         if hits:
             problems.append('dmesg since boot: %s (%d lines; reboot to clear)' % (pat, len(hits)))
