@@ -14,7 +14,7 @@
    "card->APU 67108864": 6.94,
    "card->APU 8388608": 6.8
   },
-  "root_link": "16.0 GT/s x4",
+  "link": "16.0 GT/s x4",
   "vram_mib": 32624
  }
 }

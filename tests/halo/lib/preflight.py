@@ -2,7 +2,7 @@
 """Host-state checks before a GPU suite. A failure here means the machine is not in its reference state, so any
 number measured after it would be read as a code regression by mistake (2026-09-23: a pinned perf level cost 20-27%).
 
-  preflight.py host <gen> <machine.json>                 perf level, BAR, VRAM (GECC), root-port link, dmesg, cmdline
+  preflight.py host <gen> <machine.json> [--bless]       perf level, BAR, VRAM (GECC), the card's link, dmesg, cmdline
   preflight.py gemv <gen> <machine.json> <bin> [--bless]  six-shape q8_0 GEMV probe vs the machine's references
   preflight.py p2p  <gen> <machine.json> <p2p-bin> [--bless]  card <-> APU peer copies vs references
 
@@ -50,8 +50,24 @@ def sysfs(pci, name):
         return None
 
 
-def host(gen, mpath):
-    m = load(mpath).get(gen, {})
+def card_link(pci):
+    """The card's own PCIe link, between its topmost AMD port (the card's internal switch) and the port above it: a
+    root port in a slot, the dock's bridge behind USB4 (whose root port only shows the tunnel, 2.5 GT/s x1).
+    Negotiated = the slower end's max speed and the narrower end's max width; the trained width comes from the
+    card's port (its speed is not checked: link power management drops an idle card to 2.5 GT/s)."""
+    path = [p for p in os.path.realpath('/sys/bus/pci/devices/' + pci).split('/') if re.match(r'[0-9a-f]{4}:', p)]
+    i = path.index(pci)
+    while i > 0 and sysfs(path[i - 1], 'vendor') == '0x1002':
+        i -= 1
+    ends = path[max(i - 1, 0):i + 1]
+    speed = min(((sysfs(p, 'max_link_speed') or '0').split(' ')[0] for p in ends), key=float)
+    width = min(int(sysfs(p, 'max_link_width') or 0) for p in ends)
+    return ends[0], ends[-1], '%s GT/s x%d' % (speed, width), sysfs(path[i], 'current_link_width')
+
+
+def host(gen, mpath, bless):
+    data = load(mpath)
+    m = data.get(gen, {})
     c = card(gen)
     pci = c['pci']
     problems, notes = [], []
@@ -71,16 +87,18 @@ def host(gen, mpath):
     if bar < vram:
         problems.append('BAR0 %d MiB < VRAM %d MiB (small BAR: no full peer access)' % (bar, vram))
 
-    path = os.path.realpath('/sys/bus/pci/devices/' + pci).split('/')
-    root = path[path.index([p for p in path if p.startswith('pci')][0]) + 1]
-    link = '%s x%s' % ((sysfs(root, 'max_link_speed') or '?').split(' PCIe')[0], sysfs(root, 'max_link_width'))
-    ref_link = m.get('root_link')
+    up, down, link, trained = card_link(pci)
+    ref_link = m.get('link')
     if ref_link and link != ref_link:
-        problems.append('root port %s link %s vs reference %s' % (root, link, ref_link))
-    notes.append('root %s %s' % (root, link))
+        problems.append('link %s-%s %s vs reference %s' % (up, down, link, ref_link))
+    if trained != link.split(' x')[-1]:
+        problems.append('link %s-%s trained x%s of x%s' % (up, down, trained, link.split(' x')[-1]))
+    dock = sysfs(pci, 'removable') == 'removable'
+    notes.append('%s %s-%s %s' % ('dock' if dock else 'slot', up, down, link))
 
     cmd = open('/proc/cmdline').read()
-    for f in NEED_FLAGS.get(gen, []):
+    # a dock card keeps the BIOS-built tunnel and its full BAR only without the thunderbolt host reset
+    for f in NEED_FLAGS.get(gen, []) + (['thunderbolt.host_reset=false'] if dock else []):
         if f not in cmd:
             problems.append('kernel cmdline lacks %s' % f)
     for f in BAD_FLAGS:
@@ -99,6 +117,10 @@ def host(gen, mpath):
     if not dm:
         notes.append('dmesg not readable')
 
+    if (bless or not ref_vram or not ref_link) and not problems:
+        data.setdefault(gen, {}).update(vram_mib=vram, link=link)
+        save(mpath, data)
+        notes.append('recorded VRAM and link references')
     for p in problems:
         print('PROBLEM ' + p)
     print('detail: %s' % ('; '.join(problems) if problems else ', '.join(notes)))
@@ -168,7 +190,7 @@ def main():
     what, gen, mpath = sys.argv[1], sys.argv[2], sys.argv[3]
     bless = '--bless' in sys.argv
     if what == 'host':
-        sys.exit(host(gen, mpath))
+        sys.exit(host(gen, mpath, bless))
     if what == 'gemv':
         sys.exit(gemv(gen, mpath, sys.argv[4], bless))
     if what == 'p2p':
