@@ -7,11 +7,14 @@ logit matter, so a stale read or a reordered write shows up as a different token
 
   sched_check.py base  --bin <dir> --models <dir> --out <dir>    APU + RPC loopback (ROCR_VISIBLE_DEVICES = the APU)
   sched_check.py card  --bin <dir> --models <dir> --out <dir>    card + APU (ROCm0 = card, ROCm1 = APU)
+  sched_check.py fuse  --bin <dir> --models <dir> --out <dir>    CPU, every model: graph fast paths on vs off
+                                                                 (LLAMA_NO_GRAPH_FUSE=1)
 
 Every group of cases must produce identical output; the card mode also checks the lane-pair hazard model:
 every admitted pair has 0 cache hazards and the self-test (pair a delayed one split) finds some.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import os
 import random
@@ -26,12 +29,12 @@ COMMON = ['-n', '24', '--temp', '0', '--seed', '1', '-no-cnv', '-c', '8192', '-b
           '-ngl', '999', '-fa', 'on']
 
 
-def prompt_file(out):
+def prompt_file(out, n_words=1500):
     p = os.path.join(out, 'prompt.txt')
     rnd = random.Random(7)
     words = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau'.split()
     with open(p, 'w') as f:
-        f.write(' '.join(rnd.choice(words) for _ in range(1500)))
+        f.write(' '.join(rnd.choice(words) for _ in range(n_words)))
     return p
 
 
@@ -42,7 +45,8 @@ def run(a, tag, model, extra, env_extra=None):
            '-f', a.prompt] + COMMON + extra
     with open(log, 'w') as f:
         f.write(' '.join(cmd) + '\n' + ' '.join('%s=%s' % kv for kv in (env_extra or {}).items()) + '\n')
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+    # no stdin: a model whose template turns on interactive mode would wait on it forever
+    r = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
     with open(log, 'a') as f:
         f.write(r.stderr)
     if r.returncode != 0:
@@ -137,17 +141,23 @@ def mode_card(a):
     for model in MODELS:
         exps = ['-ot', r'ffn_(gate|up|down)_exps=ROCm1'] if 'moe' in model else []
         prod = ['-dev', 'ROCm0,ROCm1', '-ts', '1,0'] + exps   # production layout: experts on the APU
-        layer = ['-dev', 'ROCm0,ROCm1', '-ts', '1,1']
+        # an override that matches no tensor turns pipeline parallelism off, so the lanes run on the layer split;
+        # layer-pp is the same split with pipeline parallelism
+        layer_pp = ['-dev', 'ROCm0,ROCm1', '-ts', '1,1']
+        layer = layer_pp + ['-ot', 'no_such_tensor=ROCm0']
         lanes = {'LLAMA_PREFILL_LANES': '2', 'GGML_SCHED_PAIR_DEBUG': '2'}
         res_p = {'prod-1lane': run(a, 'prod-1lane', model, prod),
                  'prod-2lanes': run(a, 'prod-2lanes', model, prod, lanes)}
         res_l = {'layer-1lane': run(a, 'layer-1lane', model, layer),
-                 'layer-2lanes': run(a, 'layer-2lanes', model, layer, lanes)}
+                 'layer-2lanes': run(a, 'layer-2lanes', model, layer, lanes),
+                 'layer-pp': run(a, 'layer-pp', model, layer_pp)}
         check_group(model + '/prod', res_p, problems)
         check_group(model + '/layer', res_l, problems)
         for tag, (_, log, err) in (('prod-2lanes', res_p['prod-2lanes']), ('layer-2lanes', res_l['layer-2lanes'])):
-            if 'two-lane prefill enabled' not in err:
+            # (the INFO "two-lane prefill enabled" line is below llama-completion's log threshold)
+            if 'LLAMA_PREFILL_LANES ignored' in err:
                 problems.append('%s/%s: lanes not enabled' % (model, tag))
+                continue
             hz = HZ.findall(err)
             bad = [h for h in hz if int(h[4]) != 0]
             st = [int(x) for x in SELF.findall(err)]
@@ -162,7 +172,32 @@ def mode_card(a):
     if n_pairs == 0:
         problems.append('no lane pairs were checked (hazard log missing)')
     print('lane pairs checked: %d, self-tests that found hazards: %d' % (n_pairs, n_self))
-    return report(problems, len(MODELS) * 5)
+    return report(problems, len(MODELS) * 6)
+
+
+def mode_fuse(a):
+    # the fork's graph fast paths (a view instead of a state gather, fused qwen4exp blocks) must not change a token:
+    # the recurrent-state fast path skipped mamba's ssm scan at batch 1 (2026-10-10). A model that cannot generate
+    # (encoder-only, crashes both ways) is skipped; a crash on one side only is a problem.
+    problems = []
+    models = sorted(f[:-5] for f in os.listdir(a.models) if f.endswith('.gguf'))
+    # the tiny models are trained at 256 tokens and some have learned position embeddings: stay inside that,
+    # with several ubatches of prefill before the batch-1 decode
+    cpu = ['-dev', 'none', '-ngl', '0', '-t', '4', '-c', '256', '-b', '256', '-ub', '64']
+
+    def one(model):
+        return model, {'fast': run(a, 'fast', model, cpu), 'nofuse': run(a, 'nofuse', model, cpu, {'LLAMA_NO_GRAPH_FUSE': '1'})}
+
+    n_run = n_skip = 0
+    with concurrent.futures.ThreadPoolExecutor(6) as ex:
+        for model, res in ex.map(one, models):
+            if all(h is None for h, _, _ in res.values()):
+                n_skip += 1
+                continue
+            n_run += 1
+            check_group(model, res, problems)
+    print('models compared: %d, skipped (no output either way): %d' % (n_run, n_skip))
+    return report(problems, 2 * n_run)
 
 
 def report(problems, n):
@@ -175,21 +210,21 @@ def report(problems, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('mode', choices=['base', 'card'])
+    ap.add_argument('mode', choices=['base', 'card', 'fuse'])
     ap.add_argument('--bin', required=True)
     ap.add_argument('--models', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--known')
     a = ap.parse_args()
     global MODE
-    MODE = 'rpc' if a.mode == 'base' else 'card'
+    MODE = {'base': 'rpc', 'card': 'card', 'fuse': 'fuse'}[a.mode]
     if a.known:
         sys.path.insert(0, os.path.dirname(__file__))
         from state_check import known_list
         KNOWN.extend(known_list(a.known))
     os.makedirs(a.out, exist_ok=True)
-    a.prompt = prompt_file(a.out)
-    sys.exit(mode_base(a) if a.mode == 'base' else mode_card(a))
+    a.prompt = prompt_file(a.out, 180 if a.mode == 'fuse' else 1500)
+    sys.exit({'base': mode_base, 'card': mode_card, 'fuse': mode_fuse}[a.mode](a))
 
 
 if __name__ == '__main__':

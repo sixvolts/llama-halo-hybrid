@@ -70,6 +70,8 @@ suite_base() {
     step unit-cpu unit_cpu
     step models gen_models
     step state-cpu state_check "$CPU_BUILD/bin" cpu
+    step fuse-cpu  python3 "$HALO_DIR/lib/sched_check.py" fuse --bin "$CPU_BUILD/bin" --models "$RUN_DIR/models" \
+        --out "$RUN_DIR/fuse-cpu" --known "$HALO_DIR/known-failures.txt"
 
     prod_stop
     export ROCR_VISIBLE_DEVICES=$(python3 "$HALO_DIR/lib/devices.py" visible apu)
