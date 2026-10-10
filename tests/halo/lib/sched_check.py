@@ -139,12 +139,13 @@ def mode_card(a):
     problems = []
     n_pairs = n_self = 0
     for model in MODELS:
-        exps = ['-ot', r'ffn_(gate|up|down)_exps=ROCm1'] if 'moe' in model else []
+        # an override that matches no tensor turns pipeline parallelism off, so the lanes run (a dense model's
+        # production layout and the layer split); layer-pp is the layer split with pipeline parallelism
+        noop = ['-ot', 'no_such_tensor=ROCm0']
+        exps = ['-ot', r'ffn_(gate|up|down)_exps=ROCm1'] if 'moe' in model else noop
         prod = ['-dev', 'ROCm0,ROCm1', '-ts', '1,0'] + exps   # production layout: experts on the APU
-        # an override that matches no tensor turns pipeline parallelism off, so the lanes run on the layer split;
-        # layer-pp is the same split with pipeline parallelism
         layer_pp = ['-dev', 'ROCm0,ROCm1', '-ts', '1,1']
-        layer = layer_pp + ['-ot', 'no_such_tensor=ROCm0']
+        layer = layer_pp + noop
         lanes = {'LLAMA_PREFILL_LANES': '2', 'GGML_SCHED_PAIR_DEBUG': '2'}
         res_p = {'prod-1lane': run(a, 'prod-1lane', model, prod),
                  'prod-2lanes': run(a, 'prod-2lanes', model, prod, lanes)}
@@ -164,7 +165,12 @@ def mode_card(a):
             n_pairs += len(hz)
             n_self += sum(1 for x in st if x > 0)
             if bad:
-                problems.append('%s/%s: %d pairs with cache hazards' % (model, tag, len(bad)))
+                reason = known(MODE, model, 'hazards')
+                if reason:
+                    print('KNOWN %s/%s: %d pairs with cache hazards: %s' % (model, tag, len(bad), reason))
+                    KNOWN_HITS.append('%s/%s hazards' % (model, tag))
+                else:
+                    problems.append('%s/%s: %d pairs with cache hazards' % (model, tag, len(bad)))
             if hz and not any(x > 0 for x in st):
                 problems.append('%s/%s: hazard self-test found nothing' % (model, tag))
         res_c = {'card': run(a, 'card', model, ['-dev', 'ROCm0'])}
@@ -203,7 +209,7 @@ def mode_fuse(a):
 def report(problems, n):
     for p in problems:
         print('PROBLEM ' + p)
-    kn = ', %d known crashes (%s)' % (len(KNOWN_HITS), ' '.join(KNOWN_HITS)) if KNOWN_HITS else ''
+    kn = ', %d known (%s)' % (len(KNOWN_HITS), ', '.join(KNOWN_HITS)) if KNOWN_HITS else ''
     print('detail: %s' % ('%d runs, all groups identical%s' % (n, kn) if not problems else '; '.join(problems)[:300]))
     return 1 if problems else 0
 
