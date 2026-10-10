@@ -2730,7 +2730,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
             const bool log_hz      = (pair_debug || !same) && n_hz_logged < 8;
             const bool log_refusal = pair_debug || n_refused_logged < 4;
             int n_shared = 0;
-            const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, (log_hz || log_refusal) ? 8 : 0, &n_shared);
+            // per-hazard lines only with the pair's own line, or for a pair that would be refused (names match), so a
+            // serialised names-differ pair never prints orphan lines in production
+            const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, (log_hz || (same && log_refusal)) ? 8 : 0, &n_shared);
             if (log_hz) {
                 n_hz_logged++;
                 GGML_LOG_WARN("%s: names %s, %d vs %d splits, %d cache tensors shared, %d cache hazards\n", __func__,

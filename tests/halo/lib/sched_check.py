@@ -146,7 +146,10 @@ def admitted_hazards(err):
         if not m:
             continue
         n += 1
-        refused = i + 1 < len(lines) and (REFUSED in lines[i + 1] or DIFFERENT in lines[i + 1])
+        # with hazard checking on (the harness never turns it off) a names-differ pair is admitted only without
+        # hazards, so one with hazards was serialised even when its DIFFERENT line fell past that log's cap
+        refused = (m.group(1) == 'differ' or
+                   (i + 1 < len(lines) and (REFUSED in lines[i + 1] or DIFFERENT in lines[i + 1])))
         if int(m.group(5)) != 0 and not refused:
             bad += 1
     return n, bad
