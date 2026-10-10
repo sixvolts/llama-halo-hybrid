@@ -1,6 +1,5 @@
 # Failures the suites report as KNOWN instead of FAIL. Every line needs a date and a reason, and comes out when it is
 # fixed. Anything not listed here fails its step.
 # <test> <model regex> <subtest | abort | *> <date: reason>
-test-save-load-state ^(mamba|mamba2|jamba|granitehybrid|nemotron_h|nemotron_h_moe|plamo2|falcon-h1)- abort 2026-10-09: GGML_ASSERT view bounds in build_graph during test_seq_cp_scatter; upstream ec7630a64 passes (fork regression, mamba2-family SSM path, not a supported family) - open
 test-save-load-state ^glm5next- rf 2026-10-09: fragmented-ring restore of a sequence is not byte-identical (fork arch glm5next) - open
 sched-rpc ^glm5next-moe$ * 2026-10-09: rpc-server aborts in DSV4_HC_MIX (dsv4-hc.cu:927 asserts hc_dim == the fused kernel width); the random-weight model has a smaller hc_dim, local runs decline the op, RPC cannot. GLM-5.3-Flash itself matches - open

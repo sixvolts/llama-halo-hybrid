@@ -3839,9 +3839,15 @@ ggml_tensor * llm_graph_context::build_rs(
     // write back to (the copy map is the identity), nothing must be zeroed and there are no
     // extra cells to shuffle, the gather is a plain view of the cache rows -- two launches
     // fewer per recurrent layer at batch 1. s_copy() is side-effect free only without
-    // rollback slots (n_rs_seq == 0), so the check is limited to that case.
+    // rollback slots (n_rs_seq == 0), so the check is limited to that case. Only for the plain
+    // gather: a custom get_state_rows (mamba's and plamo2's ssm scan) computes the layer's
+    // output from the rows, and a view in its place skipped the scan (wrong output in cell 0,
+    // a view past the cache in cell 1, 2026-10-10).
     static const bool no_graph_fuse = getenv("LLAMA_NO_GRAPH_FUSE") != nullptr;
-    if (!no_graph_fuse && cparams.n_rs_seq == 0 && kv_state->get_rs_z() < 0 && kv_state->get_n_rs() == (uint32_t) n_seqs) {
+    using get_rows_ptr = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *);
+    const get_rows_ptr * plain = get_state_rows.target<get_rows_ptr>();
+    if (!no_graph_fuse && plain && *plain == ggml_get_rows &&
+            cparams.n_rs_seq == 0 && kv_state->get_rs_z() < 0 && kv_state->get_n_rs() == (uint32_t) n_seqs) {
         const uint32_t head = kv_state->get_head();
         bool identity = true;
         for (int32_t i = 0; i < n_seqs && identity; ++i) {
