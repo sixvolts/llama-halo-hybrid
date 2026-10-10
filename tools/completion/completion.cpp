@@ -951,9 +951,5 @@ int llama_completion(int argc, char ** argv) {
 
     llama_backend_free();
 
-    // the logger is never destroyed (common_log_main): drain it, or under CPU load the process exits with the last
-    // generated tokens still queued and stdout comes up short
-    common_log_pause(common_log_main());
-
     return 0;
 }
