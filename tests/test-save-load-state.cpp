@@ -590,13 +590,18 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
 
 
 // overwrite the tensor data with 0xff bytes (NaN when read as f16/f32), so that the restore fails
-static bool corrupt_state(std::vector<uint8_t> & data) {
+// late: corrupt the second half instead, so that a multi-part memory fails in a later part
+static bool corrupt_state(std::vector<uint8_t> & data, bool late = false) {
     if (data.size() < 3*4096) {
         LOG_ERR("%s: state of %zu bytes is too small to corrupt\n", __func__, data.size());
         return false;
     }
 
-    std::fill(data.begin() + 4096, data.end() - data.size()/4, 0xff);
+    if (late) {
+        std::fill(data.begin() + data.size()/2, data.end() - data.size()/8, 0xff);
+    } else {
+        std::fill(data.begin() + 4096, data.end() - data.size()/4, 0xff);
+    }
     return true;
 }
 
@@ -682,6 +687,17 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 
             return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
         }},
+        { "over-late", [&]() {
+            // the same, failing in a later part of the memory
+            std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) == state.size());
+
+            if (!corrupt_state(state, true)) {
+                return false;
+            }
+
+            return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
+        }},
         { "file", [&]() {
             GGML_ASSERT(llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens_save.data(), tokens_save.size()) > 0);
             llama_memory_seq_rm(mem, 0, -1, -1);
@@ -719,6 +735,12 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
         }
 
         if (!restore_failed()) {
+            // the late corruption can land on payload only (a recurrent state's floats), which no reader can validate:
+            // nothing failed, so there is nothing to check
+            if (strcmp(name, "over-late") == 0) {
+                LOG_TRC("%s: %s: the corruption hit payload only, the restore succeeded - not applicable\n", __func__, name);
+                continue;
+            }
             LOG_ERR("%s: %s: restoring a corrupted state did not fail\n", __func__, name);
             return false;
         }

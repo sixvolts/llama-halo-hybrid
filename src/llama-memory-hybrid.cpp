@@ -300,7 +300,8 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     // its cleanup (n_stream mismatch), and the indexer cache was missing from the undo altogether - its restored
     // cells stayed occupied with the blob's bytes (NaN logits on the other sequences, 2026-10-10). state_clear frees
     // and zeroes the cells: without flash attention a free cell's data still reaches the softmax. A partial-only
-    // restore touches the recurrent state alone, which cleans up after itself.
+    // restore drops it too: the attention part it did not touch would otherwise still hold the sequence the recurrent
+    // part no longer has (as llama_memory_hybrid_idx::state_drop does).
     try {
         if (read_attn) {
             mem_attn->state_read(io, seq_id, flags);
@@ -311,16 +312,14 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
 
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
-        if (read_attn) {
-            if (seq_id < 0) {
-                clear(true);
-            } else {
-                mem_attn->state_clear(seq_id);
-                if (mem_idx) {
-                    mem_idx->state_clear(seq_id);
-                }
-                mem_recr->seq_rm(seq_id, -1, -1);
+        if (seq_id < 0) {
+            clear(true);
+        } else {
+            mem_attn->state_clear(seq_id);
+            if (mem_idx) {
+                mem_idx->state_clear(seq_id);
             }
+            mem_recr->seq_rm(seq_id, -1, -1);
         }
 
         throw;

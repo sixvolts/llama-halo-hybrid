@@ -198,8 +198,20 @@ void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id s
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    mem_attn->state_read(io, seq_id, flags);
-    mem_recr->state_read(io, seq_id, flags);
+    // halo-hybrid: a failed restore drops the sequence from the attention caches and the recurrent state (see
+    // llama_kv_cache_iswa::state_read); the recurrent cells need no zeroing, a reused cell is zeroed through rs_z
+    try {
+        mem_attn->state_read(io, seq_id, flags);
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        if (seq_id < 0) {
+            clear(true);
+        } else {
+            mem_attn->state_clear(seq_id);
+            mem_recr->seq_rm(seq_id, -1, -1);
+        }
+        throw;
+    }
 }
 
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {

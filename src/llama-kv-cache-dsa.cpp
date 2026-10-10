@@ -167,16 +167,21 @@ void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id,
 }
 
 void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kv_mla->state_read(io, seq_id, flags);
-
+    // halo-hybrid: a failed restore drops the sequence from both caches, not only the MLA part restored before an
+    // indexer failure: when the MLA part fails, the indexer cache still held the sequence's pre-restore cells
+    // (restore over a live sequence, 2026-10-10)
     try {
+        kv_mla->state_read(io, seq_id, flags);
         kv_lid->state_read(io, seq_id, flags);
     } catch (...) {
-        // the MLA part is already restored - undo it, so that a failed restore leaves nothing behind
-        kv_mla->state_clear(seq_id);
-
+        state_clear(seq_id);
         throw;
     }
+}
+
+void llama_kv_cache_dsa::state_clear(llama_seq_id seq_id) {
+    kv_mla->state_clear(seq_id);
+    kv_lid->state_clear(seq_id);
 }
 
 llama_kv_cache * llama_kv_cache_dsa::get_mla() const {

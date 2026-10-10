@@ -83,6 +83,10 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // drop the sequence from every part (the whole cache for seq_id -1) and zero the freed cells: what a failed restore
+    // leaves behind
+    void state_clear(llama_seq_id seq_id);
+
     //
     // llama_kv_cache_iswa specific API
     //

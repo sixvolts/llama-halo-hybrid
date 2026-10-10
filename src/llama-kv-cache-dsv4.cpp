@@ -1626,49 +1626,58 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t mode = DSV4_STATE_MODE_FULL;
+    // halo-hybrid: a failed restore drops the sequence from every part - the raw SWA caches, the compressed caches
+    // and the compressor states - instead of leaving the parts restored (or not yet reached) before the failure
+    // holding it (2026-10-10). clear_compressed also resets the sequence's rollback slot.
+    try {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t mode = DSV4_STATE_MODE_FULL;
 
-    io.read(&magic,   sizeof(magic));
-    io.read(&version, sizeof(version));
+        io.read(&magic,   sizeof(magic));
+        io.read(&version, sizeof(version));
 
-    if (magic != DSV4_STATE_MAGIC) {
-        throw std::runtime_error("DSV4 state magic mismatch");
-    }
-    if (version != DSV4_STATE_VERSION) {
-        throw std::runtime_error("DSV4 state version mismatch");
-    }
+        if (magic != DSV4_STATE_MAGIC) {
+            throw std::runtime_error("DSV4 state magic mismatch");
+        }
+        if (version != DSV4_STATE_VERSION) {
+            throw std::runtime_error("DSV4 state version mismatch");
+        }
 
-    io.read(&mode, sizeof(mode));
-    if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL) {
-        throw std::runtime_error("DSV4 state mode mismatch");
-    }
+        io.read(&mode, sizeof(mode));
+        if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL) {
+            throw std::runtime_error("DSV4 state mode mismatch");
+        }
 
-    const bool partial_only = mode == DSV4_STATE_MODE_PARTIAL;
-    if (partial_only != !!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-        throw std::runtime_error("DSV4 state flags mismatch");
-    }
+        const bool partial_only = mode == DSV4_STATE_MODE_PARTIAL;
+        if (partial_only != !!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            throw std::runtime_error("DSV4 state flags mismatch");
+        }
 
-    kv_raw->state_read(io, seq_id, flags);
+        kv_raw->state_read(io, seq_id, flags);
 
-    if (!partial_only) {
+        if (!partial_only) {
+            clear_compressed(seq_id, true);
+
+            dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
+            dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
+            dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+        }
+
+        csa_state->state_read(io, seq_id, flags);
+        hca_state->state_read(io, seq_id, flags);
+        lid_state->state_read(io, seq_id, flags);
+
+        if (seq_id >= 0) {
+            GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+            rs_idx[seq_id] = 0;
+        } else {
+            std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        }
+    } catch (...) {
+        kv_raw->state_clear(seq_id);
         clear_compressed(seq_id, true);
-
-        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
-    }
-
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
-
-    if (seq_id >= 0) {
-        GGML_ASSERT((uint32_t) seq_id < n_seq_max);
-        rs_idx[seq_id] = 0;
-    } else {
-        std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        throw;
     }
 }
 

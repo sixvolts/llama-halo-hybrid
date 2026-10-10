@@ -242,11 +242,18 @@ void llama_kv_cache_dsa_iswa::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_kv_cache_dsa_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        kv_dsa->state_read(io, seq_id, flags);
-    }
+    // halo-hybrid: a failed restore drops the sequence from the DSA and the SWA caches (see llama_kv_cache_iswa)
+    try {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            kv_dsa->state_read(io, seq_id, flags);
+        }
 
-    kv_swa->state_read(io, seq_id, flags);
+        kv_swa->state_read(io, seq_id, flags);
+    } catch (...) {
+        kv_dsa->state_clear(seq_id);
+        kv_swa->state_clear(seq_id);
+        throw;
+    }
 }
 
 llama_kv_cache_dsa * llama_kv_cache_dsa_iswa::get_dsa() const {
