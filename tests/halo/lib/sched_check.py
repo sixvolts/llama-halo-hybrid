@@ -132,20 +132,21 @@ def mode_base(a):
 
 
 HZ = re.compile(r'names (match|differ), (\d+) vs (\d+) splits, (\d+) cache tensors shared, (\d+) cache hazards')
-REFUSED = 'running them one after the other'
+REFUSED = 'cache hazards: running them one after the other'      # names match, hazards: lanes serialised
+DIFFERENT = 'different split structures'                          # names differ, hazards: lanes serialised
 
 
 def admitted_hazards(err):
     """(pairs checked, admitted pairs with cache hazards): a pair with hazards is fine when the scheduler ran its lanes one
     after the other, which it logs right after the pair's hazard line"""
-    lines = [l for l in err.splitlines() if HZ.search(l) or REFUSED in l]
+    lines = [l for l in err.splitlines() if HZ.search(l) or REFUSED in l or DIFFERENT in l]
     n, bad = 0, 0
     for i, l in enumerate(lines):
         m = HZ.search(l)
         if not m:
             continue
         n += 1
-        refused = i + 1 < len(lines) and REFUSED in lines[i + 1]
+        refused = i + 1 < len(lines) and (REFUSED in lines[i + 1] or DIFFERENT in lines[i + 1])
         if int(m.group(5)) != 0 and not refused:
             bad += 1
     return n, bad
@@ -182,7 +183,7 @@ def mode_card(a):
             n_self += sum(1 for x in st if x > 0)
             n_refused = err.count(REFUSED)
             if n_refused:
-                print('%s/%s: %d pairs run one after the other (CPU split with cache hazards)' % (model, tag, n_refused))
+                print('%s/%s: %d matching pairs run one after the other (cache hazards)' % (model, tag, n_refused))
             if bad:
                 reason = known(MODE, model, 'hazards')
                 if reason:
