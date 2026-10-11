@@ -5971,6 +5971,53 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
 }
 
 // GGML_OP_MUL_MAT
+// halo-hybrid: one shape as `rot` distinct weight tensors in a single graph, so the perf loop streams the weights
+// from DRAM the way a decode step does instead of re-reading one tensor out of the Infinity Cache (RX 7800 XT:
+// 64 MB MALL holds every trunk GEMV of Swift). TBO_MMV_ROT="m:k[:n[:type]],...": us/run is the WHOLE graph, divide by rot.
+struct test_mul_mat_rot : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int rot;
+    const int fz;   // 0 plain, 1 bias (MUL_MAT + ADD), 2 gate/up + SwiGLU: the mmvq fusions a decode step runs
+    std::vector<ggml_tensor *> firsts;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_ROT"; }
+    std::string vars() override { return VARS_TO_STR6(type_a, m, n, k, rot, fz); }
+    bool perf_single_run() override { return true; }
+    std::vector<ggml_tensor *> expand_first() override { return firsts; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 2 * m * n * k * rot; }
+
+    test_mul_mat_rot(ggml_type type_a, int64_t m, int64_t n, int64_t k, int rot, int fz = 0)
+        : type_a(type_a), m(m), n(n), k(k), rot(rot), fz(fz) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * bias = fz == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, 1) : nullptr;
+        ggml_tensor * out = nullptr;
+        firsts.clear();
+        for (int r = 0; r < rot; r++) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+            ggml_set_name(a, ("a" + std::to_string(r)).c_str());
+            out = ggml_mul_mat(ctx, a, b);
+            if (fz == 1) {
+                out = ggml_add(ctx, out, bias);
+            } else if (fz == 2) {
+                ggml_tensor * g = ggml_new_tensor_2d(ctx, type_a, k, m);
+                ggml_set_name(g, ("g" + std::to_string(r)).c_str());
+                out = ggml_glu_split(ctx, ggml_mul_mat(ctx, g, b), out, GGML_GLU_OP_SWIGLU);
+            }
+            ggml_set_name(out, ("out" + std::to_string(r)).c_str());
+            if (r + 1 < rot) {
+                firsts.push_back(out);
+            }
+        }
+        return out;
+    }
+};
+
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -13466,11 +13513,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         while (pos < spec.size()) {
             size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
             std::string one = spec.substr(pos, end - pos); pos = end + 1;
-            int64_t m = 0, k = 0, n = 3;
-            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &m, &k, &n) >= 2 && m > 0 && k > 0) {
+            int64_t m = 0, k = 0, n = 3; char mode[8] = "g";
+            // mode g (default): gate/up + SwiGLU; b: bias only (the attn_qkv / hc_down fusions of a decode step)
+            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%7s", &m, &k, &n, mode) >= 2 && m > 0 && k > 0) {
+                const bool gate = mode[0] != 'b';
                 // ctor order is (n_tokens, rows, k)
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n, m, k,
-                    false, 1, 1, false, false, true, false, {1, 1}));
+                    false, 1, 1, false, !gate, gate, false, {1, 1}));
             }
         }
         return test_cases;
@@ -13528,6 +13577,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         return test_cases;
     }
 
+    // halo-hybrid: DRAM-streamed GEMV shapes (see test_mul_mat_rot), TBO_MMV_ROT="m:k[:n[:type]],..."
+    if (const char * env = getenv("TBO_MMV_ROT")) {
+        std::string spec(env);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
+            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+            int64_t m = 0, k = 0, n = 3; char tname[16] = "q8_0"; char mode[8] = "p";   // p plain, b bias, g gate
+            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15[^:]:%7s", &m, &k, &n, tname, mode) >= 2 && m > 0 && k > 0) {
+                ggml_type t = GGML_TYPE_Q8_0;
+                for (int i = 0; i < GGML_TYPE_COUNT; i++) { if (ggml_type_name((ggml_type) i) && strcmp(ggml_type_name((ggml_type) i), tname) == 0) { t = (ggml_type) i; } }
+                const int fz = mode[0] == 'b' ? 1 : mode[0] == 'g' ? 2 : 0;
+                const int64_t bytes = ggml_row_size(t, k) * m * (fz == 2 ? 2 : 1);
+                const int rot = (int) std::min<int64_t>(fz == 2 ? 128 : 256, std::max<int64_t>(2, ((int64_t) 256 << 20) / bytes + 1));
+                test_cases.emplace_back(new test_mul_mat_rot(t, m, n, k, rot, fz));
+            }
+        }
+        return test_cases;
+    }
     // Qwen3.8-Flash-Next attention on the R9700: 24 q heads over 2 kv heads, D=256, QSA selects ~8K cells per query
     if (getenv("TBO_Q38_FA") != nullptr) {
         for (int64_t kv : {4096, 8192}) {

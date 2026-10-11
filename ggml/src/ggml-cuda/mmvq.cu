@@ -526,7 +526,18 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+// halo-hybrid: RDNA3 launch variants for ncols_dst 2..4 beyond upstream's one wave per row, the 8-warp wide block
+// (halve_iters tag) and the 32-warp tall block (small_k tag): 2 or 4 warps splitting K, or one wave per 2 rows.
+// The host picks one per launch (see the ncols_dst 2..4 planner in mul_mat_vec_q_switch_ncols_dst).
+enum mmvq_lv : int { MMVQ_LV_NONE = 0, MMVQ_LV_2W = 1, MMVQ_LV_4W = 2, MMVQ_LV_RPB2 = 3 };
+static constexpr __host__ __device__ int mmvq_lv_nwarps(int lv) { return lv == MMVQ_LV_2W ? 2 : lv == MMVQ_LV_4W ? 4 : 1; }
+static constexpr __host__ __device__ int mmvq_lv_rows(int lv) { return lv == MMVQ_LV_RPB2 ? 2 : 1; }
+
+static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false, int lv = MMVQ_LV_NONE) {
+    if (lv != MMVQ_LV_NONE && table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst != 1 && ncols_dst <= 4 &&
+            calc_nwarps(type, ncols_dst, table_id, false, true) > 1) {   // the types the wide block is promoted for
+        return mmvq_lv_nwarps(lv);
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -695,7 +706,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, int lv = MMVQ_LV_NONE) {
+    if (lv != MMVQ_LV_NONE && table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst != 1 && ncols_dst <= 4) {
+        return mmvq_lv_rows(lv);
+    }
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
         // halo-hybrid: small-K rows-per-block mode on RDNA4 (K=2560 rows took 2 loop trips + an 8-warp reduction)
         return (ncols_dst == 1 && small_k) ? nwarps : 1;
@@ -760,8 +774,8 @@ static bool ggml_cuda_mmvq_rdna4_small_k() {
     return enabled;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int lv = MMVQ_LV_NONE>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters, lv)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -778,8 +792,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, lv);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, lv);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -891,46 +905,58 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+    // halo-hybrid: the K loop is instantiated once per gate state so its body carries no runtime branch: with
+    // `if (use_gate)` inside the loop the compiler emitted one basic block per column, each waiting on its own y
+    // (and re-loaded gate) fetch, so a fused trip cost one DRAM round trip plus ncols_dst serialized L2 round trips;
+    // branch-free, every load of a trip is issued before the first s_waitcnt (same arithmetic, same order).
+    const auto k_loop = [&](auto gate_tag) {
+        constexpr bool with_gate = decltype(gate_tag)::value;
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
-        // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+            // x block quant index when casting the quants to int
+            const int kqs = vdr * (tid % (qi/vdr));
 
 #if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
-        // start the next iterations' weight loads early
-        if constexpr (mmvq_should_prefetch(type)) {
-            constexpr int pf_dist = 2; // loop iterations, not blocks
-            const int kbx_pf = kbx + pf_dist*blocks_per_iter;
-            if (kbx_pf < blocks_per_row_x) {
+            // start the next iterations' weight loads early
+            if constexpr (mmvq_should_prefetch(type)) {
+                constexpr int pf_dist = 2; // loop iterations, not blocks
+                const int kbx_pf = kbx + pf_dist*blocks_per_iter;
+                if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
-                for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
-                    mmvq_prefetch_l2((const char *) vx + off);
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                        mmvq_prefetch_l2((const char *) vx + off);
+                        if constexpr (has_fusion && with_gate) {
                             mmvq_prefetch_l2((const char *) vgate + off);
                         }
                     }
                 }
             }
-        }
 #endif
 
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+            for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion && with_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
         }
+    };
+    if constexpr (has_fusion) {
+        if (use_gate) {
+            k_loop(std::true_type{});
+        } else {
+            k_loop(std::false_type{});
+        }
+    } else {
+        k_loop(std::false_type{});
     }
 
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
@@ -1186,16 +1212,16 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false, const int lv = MMVQ_LV_NONE) {
+    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, lv);
+    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, lv);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int lv = MMVQ_LV_NONE>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1213,7 +1239,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst <= 4) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, lv>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1224,7 +1250,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=4");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, lv>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1698,41 +1724,114 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 2:
         case 3:
         case 4: {
-            // halo-hybrid: RDNA4 and RDNA3 get the 8-warp block here too (split-K over the block); every other table
-            // keeps upstream's launch. Tag types keep the flags compile-time.
+            // halo-hybrid: RDNA4 and RDNA3 get more than upstream's one wave per row here; every other table keeps
+            // upstream's launch. Tag types keep the flags compile-time.
             const bool wide_table = (table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0) &&
                 ggml_cuda_mmvq_wide();
             const auto launch_n = [&](auto ncols_tag) {
                 static constexpr int c_ncols_dst = decltype(ncols_tag)::value;
-                const auto launch = [&](auto small_k_tag, auto wide_tag) {
+                const auto launch = [&](auto small_k_tag, auto wide_tag, auto lv_tag) {
                     // Types neither table promotes would compile a second, identical kernel.
                     constexpr bool c_promoted = calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, true) > 1 ||
                                                 calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA3_0, false, true) > 1;
-                    constexpr bool c_small_k  = decltype(small_k_tag)::value && c_promoted;   // = tall on RDNA4
+                    constexpr bool c_small_k  = decltype(small_k_tag)::value && c_promoted;   // = tall on RDNA4 / RDNA3
                     constexpr bool c_wide     = decltype(wide_tag)::value && c_promoted;
+                    constexpr int  c_lv       = c_promoted ? decltype(lv_tag)::value : MMVQ_LV_NONE;
                     const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                                  nsamples_dst, warp_size, table_id, c_small_k, c_wide);
-                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_wide>(
+                                                                                  nsamples_dst, warp_size, table_id, c_small_k, c_wide, c_lv);
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_wide, c_lv>(
                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                         stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                         stream);
                 };
+                const auto launch_up   = [&] { launch(std::false_type{}, std::false_type{}, std::integral_constant<int, MMVQ_LV_NONE>{}); };
+                const auto launch_wide = [&] { launch(std::false_type{}, std::true_type{},  std::integral_constant<int, MMVQ_LV_NONE>{}); };
+                const auto launch_tall = [&] { launch(std::true_type{},  std::false_type{}, std::integral_constant<int, MMVQ_LV_NONE>{}); };
                 if (wide_table && calc_nwarps(type, c_ncols_dst, table_id, false, true) > 1) {
-                    // wide (8 warps, 1 row/block) when the 8-way K split still gives every warp a full trip and
+                    // HIP reports RDNA WGPs as multiProcessorCount (32 on gfx1201, 30 on gfx1101, 20 on gfx1151):
+                    // 4 SIMD32 x 16 wave slots each.
+                    const int64_t slots    = (int64_t) ggml_cuda_info().devices[device].nsm * 64;
+                    const int64_t launches = (int64_t) nchannels_dst * nsamples_dst;
+                    // gfx1201 (and gfx1101) have a dispatch cliff when a launch's wave count lands within a few of
+                    // the part's wave slots: 2048x4096 at one wave per row took 19.5 us on the R9700 where 2032 rows
+                    // took 9.8, and 256 rows x 8 warps took 19.7 where 252 took 3.7. A shape that would land there
+                    // takes another launch.
+                    const auto on_cliff = [&](int64_t waves) { return waves >= slots - 12 && waves <= slots + 3; };
+                    static const bool no_tall = getenv("GGML_CUDA_MMVQ_NO_TALL") != nullptr;
+                    static const bool dbg     = getenv("GGML_CUDA_MMVQ_DEBUG") != nullptr;
+                    // GGML_CUDA_MMVQ_RDNA3_GATE=1 runs RDNA3 through the RDNA4 rule plus the rows/slots <= K/16384
+                    // occupancy gate it shipped with first (for A/B).
+                    static const bool rdna3_gate = getenv("GGML_CUDA_MMVQ_RDNA3_GATE") != nullptr;
+                    const bool can_tall = !no_tall && calc_nwarps(type, c_ncols_dst, table_id, true, false) > 1;
+                    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && !rdna3_gate) {
+                        // RDNA3 planner. Measured on the RX 7800 XT (1920 slots) with the weights streamed from DRAM
+                        // (test-backend-ops TBO_MMV_ROT, 256 MB of distinct weights per shape; the MALL-warm numbers of
+                        // the plain shape bench mislead here, the 64 MB Infinity Cache holds every trunk GEMV):
+                        //  - one wave per row already fills the card at >= slots waves: every launch is within 3%
+                        //    of DRAM speed (10240 / 12288 rows x K=2560 run at 455-480 GB/s under all of them), except
+                        //    that one wave per TWO rows wins 1.04-1.24x while the launch is at most two rounds of the
+                        //    slots (1920-2560 rows x K 640..6144) or the K loop is two trips or shorter (10240 rows x
+                        //    K=320), and loses 4-5% beyond (4096-12288 rows x K >= 2048);
+                        //  - below the slots the card idles, and splitting K across a block adds waves: 2 warps at
+                        //    512-640 rows (1.11-1.19x, the 8-warp block loses there), 4 warps at 256-320 rows
+                        //    (1.51 / 1.69x vs 8 warps 1.35 / 1.60), 8 warps at 64-128 rows (1.77-2.62x), 32 warps at
+                        //    24-32 rows (4.7x). The smallest split that brings the launch to half the slots is the one
+                        //    that wins, as long as every warp still gets two trips of the K loop (64 x 8192: 32 warps
+                        //    would be one trip, 8 warps 2.62x vs 2.27x).
+                        const int64_t waves = (int64_t) nrows_x * launches;
+                        const auto trips = [&](int nwarps) {
+                            return (blocks_per_row_x + nwarps * blocks_per_iter_1warp - 1) / (nwarps * blocks_per_iter_1warp);
+                        };
+                        int nwarps = 1, rpb = 1;
+                        if (waves >= slots) {
+                            if (nrows_x % 2 == 0 && (waves <= 2 * slots || trips(1) <= 2)) {
+                                rpb = 2;
+                            }
+                        } else {
+                            for (int w : {1, 2, 4, 8, 32}) {
+                                if ((w == 32 && !can_tall) || trips(w) < 2) {
+                                    break;
+                                }
+                                nwarps = w;
+                                if (waves * w * 2 >= slots) {
+                                    break;
+                                }
+                            }
+                        }
+                        if (on_cliff(waves / rpb * nwarps)) {
+                            if (rpb == 2) {
+                                rpb = 1;
+                            } else if (nwarps > 1) {
+                                nwarps = nwarps == 32 ? 8 : nwarps / 2;
+                            } else if (nrows_x % 2 == 0) {
+                                rpb = 2;
+                            }
+                        }
+                        if (dbg) {
+                            fprintf(stderr, "mmvq rdna3: rows=%d K=%d n=%d ch*s=%lld slots=%lld trips=%lld -> %d warps x %d rows\n",
+                                nrows_x, ncols_x, c_ncols_dst, (long long) launches, (long long) slots, (long long) trips(1), nwarps, rpb);
+                        }
+                        switch (nwarps) {
+                            case 32: launch_tall(); break;
+                            case 8:  launch_wide(); break;
+                            case 4:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, MMVQ_LV_4W>{}); break;
+                            case 2:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, MMVQ_LV_2W>{}); break;
+                            default:
+                                if (rpb == 2) {
+                                    launch(std::false_type{}, std::false_type{}, std::integral_constant<int, MMVQ_LV_RPB2>{});
+                                } else {
+                                    launch_up();
+                                }
+                        }
+                        return;
+                    }
+                    // RDNA4: wide (8 warps, 1 row/block) when the 8-way K split still gives every warp a full trip and
                     // the matrix is under 2^25 weights; otherwise upstream (1 wave, 1 row). In situ on the R9700
                     // (v3s decode, n=3, op timer): 24x16384 30.8 -> 14.8 us, 2048x4096 39.1 -> 28.6,
                     // 4096x2048 38.7 -> 27.8; >= 2^25 weights unchanged (enough waves, reduction costs 3-5%);
                     // K=256/512 shapes LOST 1.3-2.1x under wide (idle warps + reduction) and K=128 gained nothing
                     // from a rows-per-block variant, so short K keeps the upstream launch.
-                    // gfx1201 has a dispatch cliff when a launch's wave count lands within a few of the part's
-                    // 2048 wave slots (32 WGP x 4 SIMD32 x 16): 2048x4096 at one wave per row took 19.5 us where
-                    // 2032 rows took 9.8, and 256 rows x 8 warps took 19.7 where 252 took 3.7. The APU (1280
-                    // slots) has no such cliff. A shape that would land there takes the other launch.
-                    // HIP reports RDNA WGPs as multiProcessorCount (32 on gfx1201): 4 SIMD32 x 16 waves each.
-                    const int64_t slots    = (int64_t) ggml_cuda_info().devices[device].nsm * 64;
-                    const int64_t launches = (int64_t) nchannels_dst * nsamples_dst;
-                    const auto on_cliff = [&](int64_t waves) { return waves >= slots - 12 && waves <= slots + 3; };
                     const bool long_k = blocks_per_row_x >= 8 * blocks_per_iter_1warp;
                     // halo-hybrid experiment: GGML_CUDA_MMVQ_BIG_WIDE=1 keeps the wide launch for >= 2^25 weights too
                     // (in situ the 8192-row K=4096 KDA q projection ran at ~170 GB/s under the one-wave-per-row launch)
@@ -1741,11 +1840,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const int64_t w_wide = (int64_t) nrows_x * 8 * launches;
                     const int64_t w_up   = (int64_t) nrows_x * launches;
                     bool wide = long_k && !big;
-                    // RDNA3 (RX 7800 XT, 1920 wave slots, n=3): wide pays only while one wave per row leaves the card
-                    // short of waves for the K loop: 128 / 256 x 4096 1.12-1.42x, 512 x 16384 1.26-1.58x, but
-                    // 1024 x 4096 0.90x, 2048 x 4096 0.89x and 4096 x 2048 0.63x (q8_0; q4_K / q6_K alike). Rows
-                    // over slots <= K / 16384 separates every measured shape; the cliff flip below still applies
-                    // (1920 x 4096 one-wave-per-row 23.8 us, wide 14.2).
                     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && w_up * 16384 > slots * (int64_t) ncols_x) {
                         wide = false;
                     }
@@ -1753,24 +1847,22 @@ static void mul_mat_vec_q_switch_ncols_dst(
                         wide = !wide;
                     }
                     // tall: <= 64 rows over K >= 8192 (q8_0), 32 warps split the K loop 4x deeper than wide
-                    static const bool no_tall = getenv("GGML_CUDA_MMVQ_NO_TALL") != nullptr;
-                    const bool tall = !no_tall && wide && nrows_x <= 64 && blocks_per_row_x >= 32 * blocks_per_iter_1warp &&
-                        calc_nwarps(type, c_ncols_dst, table_id, true, false) > 1 && !on_cliff((int64_t) nrows_x * 32 * launches);
-                    static const bool dbg = getenv("GGML_CUDA_MMVQ_DEBUG") != nullptr;
+                    const bool tall = can_tall && wide && nrows_x <= 64 && blocks_per_row_x >= 32 * blocks_per_iter_1warp &&
+                        !on_cliff((int64_t) nrows_x * 32 * launches);
                     if (dbg) {
                         fprintf(stderr, "mmvq %s: rows=%d K=%d n=%d ch*s=%lld slots=%lld long_k=%d big=%d -> %s\n",
-                            table_id == MMVQ_PARAMETERS_RDNA4 ? "rdna4" : "rdna3", nrows_x, ncols_x, c_ncols_dst,
+                            table_id == MMVQ_PARAMETERS_RDNA4 ? "rdna4" : "rdna3-gate", nrows_x, ncols_x, c_ncols_dst,
                             (long long) launches, (long long) slots, long_k, big, tall ? "tall" : wide ? "wide" : "upstream");
                     }
                     if (tall) {
-                        launch(std::true_type{},  std::false_type{});
+                        launch_tall();
                     } else if (wide) {
-                        launch(std::false_type{}, std::true_type{});
+                        launch_wide();
                     } else {
-                        launch(std::false_type{}, std::false_type{});
+                        launch_up();
                     }
                 } else {
-                    launch(std::false_type{}, std::false_type{});
+                    launch_up();
                 }
             };
             switch (ncols_dst) {
