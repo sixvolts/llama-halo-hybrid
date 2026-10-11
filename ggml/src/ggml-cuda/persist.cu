@@ -206,15 +206,15 @@ __device__ __forceinline__ void pk_body_quant(const pk_task & t, int item) {
     if (e >= ne10p * ncols) return;
     const int64_t col = e / ne10p, k = e % ne10p;
     const float xi = k < ne10 ? ((const float *) ((const char *) t.p[1] + col * t.nb[1][1]))[k] : 0.0f;
-    float amax = fabsf(xi), sum = xi;
+    float amax = fabsf(xi);
     amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int sumq = warp_reduce_sum<QK8_1>((int) q);   // s = d*sum(q), as quantize_q8_1 (quantize.cu)
     block_q8_1 * y = (block_q8_1 *) t.p[0];
     const int64_t ib = e / QK8_1, iqs = e % QK8_1;
     y[ib].qs[iqs] = q;
-    if (iqs == 0) y[ib].ds = make_half2(d, sum);
+    if (iqs == 0) y[ib].ds = make_half2(d, d*sumq);
 }
 
 typedef float (*pk_vec_dot_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);

@@ -833,7 +833,7 @@ static __global__ void __launch_bounds__(DSV4_HC_SPLIT_T) dsv4_hc_mix_split_f32(
         const float mean = tmp / n_embd;
         const float scl  = rsqrtf(mean + ext.eps_rms);
         float v[NL];
-        float amax = 0.0f, sum = 0.0f;
+        float amax = 0.0f;
 #pragma unroll
         for (int q = 0; q < NL/4; ++q) {
             const float4 nw4 = *(const float4 *) (ext.nw + j0 + 4*q);
@@ -847,15 +847,17 @@ static __global__ void __launch_bounds__(DSV4_HC_SPLIT_T) dsv4_hc_mix_split_f32(
         }
         if (ext.q8) {
 #pragma unroll
-            for (int k = 0; k < NL; ++k) { amax = fmaxf(amax, fabsf(v[k])); sum += v[k]; }
+            for (int k = 0; k < NL; ++k) { amax = fmaxf(amax, fabsf(v[k])); }
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, WARP_SIZE));
-            sum += __shfl_xor_sync(0xffffffff, sum, 1, WARP_SIZE);
             const float d = amax / 127.0f;
             const int64_t col0 = (int64_t) it*n_embd + j0;
             block_q8_1 * b = ext.q8 + col0 / QK8_1;
             int8_t qs[NL];
+            int sumq = 0;   // s = d*sum(q), as quantize_q8_1 (quantize.cu)
 #pragma unroll
-            for (int k = 0; k < NL; ++k) { qs[k] = amax == 0.0f ? 0 : (int8_t) roundf(v[k] / d); }
+            for (int k = 0; k < NL; ++k) { qs[k] = amax == 0.0f ? 0 : (int8_t) roundf(v[k] / d); sumq += qs[k]; }
+            sumq += __shfl_xor_sync(0xffffffff, sumq, 1, WARP_SIZE);
+            const float sum = d*sumq;
 #pragma unroll
             for (int k = 0; k < NL/4; ++k) {   // qs is only 4-byte aligned in block_q8_1
                 *(int *) (b->qs + col0 % QK8_1 + 4*k) = *(const int *) (qs + 4*k);

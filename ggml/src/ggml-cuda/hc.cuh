@@ -53,16 +53,15 @@ block_q8_1 * ggml_cuda_q8_side_reserve_rows(ggml_backend_cuda_context & ctx, con
 // elements form a block; requires n % 32 == 0 and every lane of the 32-lane group active
 static __device__ __forceinline__ void q8_side_store(block_q8_1 * q8, const int64_t idx, const float v) {
     float amax = fabsf(v);
-    float sum  = v;
     amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    const int sumq = warp_reduce_sum<QK8_1>((int) q);   // s = d*sum(q), as quantize_q8_1 (quantize.cu)
     const int64_t ib  = idx / QK8_1;
     const int     iqs = idx % QK8_1;
     q8[ib].qs[iqs] = q;
     if (iqs == 0) {
-        q8[ib].ds = make_half2(d, sum);
+        q8[ib].ds = make_half2(d, d*sumq);
     }
 }
 

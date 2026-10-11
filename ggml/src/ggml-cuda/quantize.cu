@@ -83,13 +83,17 @@ static __global__ void quantize_q8_1(
     ggml_cuda_pdl_sync();
     const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
     float amax = fabsf(xi);
-    float sum = xi;
 
     amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
 
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    // block_q8_1.s is d*sum(qs) (ggml-common.h), i.e. the sum of the values the dot product actually consumes, as
+    // on the CPU. Summing the unquantized x instead leaves the offset/min term of q4_0, q4_1, q5_0 and q5_1 (and the
+    // MMQ mins of the k-quants) with the activation's rounding error, m*sum(x - d*q): a bias common to every output
+    // of the GEMV, ~2x the dot's own q8 noise, and a ~0.3 % NMSE flake against the CPU at m=16 n=1.
+    const int sumq = warp_reduce_sum<QK8_1>((int) q);
 
     y[ib].qs[iqs] = q;
 
@@ -97,7 +101,7 @@ static __global__ void quantize_q8_1(
         return;
     }
 
-    y[ib].ds = make_half2(d, sum);
+    y[ib].ds = make_half2(d, d*sumq);
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
@@ -501,17 +505,6 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
-    float sum;
-    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
-        sum = xi.x + xi.y + xi.z + xi.w;
-
-        // Calculate sums across vals_per_sum/4 threads.
-#pragma unroll
-        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
-        }
-    }
-
     const float d_inv = 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
@@ -519,6 +512,19 @@ static __global__ void quantize_mmq_q8_1(
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
     const float d = 1.0f / d_inv;
+
+    float sum;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        // the partial sums are d*sum(q) of the quantized values, as in quantize_q8_1 (see the comment there)
+        int sumq = q.x + q.y + q.z + q.w;
+
+        // Calculate sums across vals_per_sum/4 threads.
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            sumq += __shfl_xor_sync(0xFFFFFFFF, sumq, offset, WARP_SIZE);
+        }
+        sum = d*sumq;
+    }
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
