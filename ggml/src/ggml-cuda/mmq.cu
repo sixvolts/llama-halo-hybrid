@@ -154,7 +154,7 @@ static mmq_args ggml_cuda_mmq_moe_prepare(
     GGML_ASSERT(ne1 == n_expert_used);
 
     bufs.ids_src1.alloc(ne_get_rows);
-    bufs.ids_dst.alloc(ne_get_rows);
+    bufs.ids_dst.alloc(ne_get_rows + MMQ_J_MAX - 1); // a J-wide tile reads up to J - 1 entries past the end (upstream #29953)
     bufs.expert_bounds.alloc(ne02 + 1);
     ggml_cuda_pool_alloc<int32_t> & ids_src1      = bufs.ids_src1;
     ggml_cuda_pool_alloc<int32_t> & ids_dst       = bufs.ids_dst;
@@ -174,8 +174,7 @@ static mmq_args ggml_cuda_mmq_moe_prepare(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + ggml_cuda_mmq_src1_padding();
     bufs.src1_q8_1.alloc(nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<char>  & src1_q8_1  = bufs.src1_q8_1;
     ggml_cuda_pool_alloc<float> & src1_scale = bufs.src1_scale;
@@ -289,8 +288,7 @@ void ggml_cuda_mul_mat_q(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + ggml_cuda_mmq_src1_padding();
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         const char * src1_q8_1_pre = nullptr;
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
