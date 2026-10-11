@@ -2611,7 +2611,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 // run on the same backend stream and j <= i, so every write of a to a cache tensor must reach b's reads and writes of
 // it that way, and every read of a must precede b's writes the same way. Per whole cache tensor (conservative). Returns
 // the number of violations, logging the first n_log.
-static int ggml_backend_sched_pair_hazards(ggml_backend_sched_t sa, ggml_backend_sched_t sb, int n_log, int * n_shared = nullptr, int a_shift = 0) {
+static int ggml_backend_sched_pair_hazards(ggml_backend_sched_t sa, ggml_backend_sched_t sb, int n_log, int * n_shared = nullptr, int a_shift = 0, int * n_cross = nullptr) {
     struct acc { int split; int backend; bool write; };
     std::unordered_map<const ggml_tensor *, std::vector<acc>> use[2];
     auto root = [](const ggml_tensor * t) {
@@ -2656,6 +2656,9 @@ static int ggml_backend_sched_pair_hazards(ggml_backend_sched_t sa, ggml_backend
     if (n_shared) {
         *n_shared = 0;
     }
+    if (n_cross) {
+        *n_cross = 0;
+    }
     for (const auto & [r, ua] : use[0]) {
         const auto it = use[1].find(r);
         if (it == use[1].end()) {
@@ -2671,6 +2674,9 @@ static int ggml_backend_sched_pair_hazards(ggml_backend_sched_t sa, ggml_backend
                 }
                 if (x.split <= y.split && x.backend == y.backend) {
                     continue;
+                }
+                if (n_cross && x.backend != y.backend) {
+                    (*n_cross)++;
                 }
                 if (n_bad++ < n_log) {
                     GGML_LOG_WARN("  pair hazard on %s: a %s at split %d (%s) | b %s at split %d (%s)\n", r->name,
@@ -2723,16 +2729,25 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
         // DSV4_HC_MIX on the CPU, 2026-10-10), or a layout puts a cache reader on the other device. So with hazard
         // checking on, a pair is admitted only without cache hazards whether its names match or not (~0.2-0.5 ms per
         // pair; Swift's and GLM-5.3's production pairs have none). Quiet unless it refuses, then it names the tensors.
-        bool refused = false; // names match, but the lanes leave cache hazards
+        // A names-match pair is refused only for a hazard that crosses backends (the case the check was added for:
+        // a CPU split, or a cache reader on the other device). A same-backend reorder (a's access at a later split
+        // than b's on one stream) is what the name guard always admitted: in the soak layout (two slots, one lane a
+        // generating ubatch beside the other slot's prompt ubatch) every such pair showed 4 same-stream reorders on a
+        // recurrent state and no cross-backend hazard, and refusing them serialised the pair under every short
+        // answer (2026-10-11: short-answer decode 44 -> 36 t/s). Those lanes touch disjoint cells (different
+        // sequences), so the reorder is benign, as it was before the check.
+        bool refused = false; // names match, but the lanes leave cross-backend cache hazards
         if (pair_debug || pair_hazard) {
             static int n_hz_logged      = 0;
             static int n_refused_logged = 0;
+            static int n_reorder_logged = 0;
             const bool log_hz      = (pair_debug || !same) && n_hz_logged < 8;
             const bool log_refusal = pair_debug || n_refused_logged < 4;
             int n_shared = 0;
+            int n_cross  = 0;
             // per-hazard lines only with the pair's own line, or for a pair that would be refused (names match), so a
             // serialised names-differ pair never prints orphan lines in production
-            const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, (log_hz || (same && log_refusal)) ? 8 : 0, &n_shared);
+            const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, (log_hz || (same && log_refusal)) ? 8 : 0, &n_shared, 0, &n_cross);
             if (log_hz) {
                 n_hz_logged++;
                 GGML_LOG_WARN("%s: names %s, %d vs %d splits, %d cache tensors shared, %d cache hazards\n", __func__,
@@ -2745,14 +2760,17 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
             if (pair_hazard && !same && n_bad == 0) {
                 same      = true;
                 by_hazard = true;
-            } else if (pair_hazard && same && n_bad > 0) {
+            } else if (pair_hazard && same && n_cross > 0) {
                 same    = false;
                 refused = true;
                 if (log_refusal) {
                     n_refused_logged++;
-                    GGML_LOG_WARN("%s: the lanes match but leave %d cache hazards: running them one after the other\n",
-                        __func__, n_bad);
+                    GGML_LOG_WARN("%s: the lanes match but leave %d cache hazards (%d across backends): running them one after the other\n",
+                        __func__, n_bad, n_cross);
                 }
+            } else if (pair_hazard && same && n_bad > 0 && n_reorder_logged++ < 4) {
+                GGML_LOG_WARN("%s: the lanes match with %d same-stream reorders and no cross-backend hazard: interleaving (name guard)\n",
+                    __func__, n_bad);
             }
         }
         if (!same) {
