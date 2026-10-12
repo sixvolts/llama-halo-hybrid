@@ -1036,6 +1036,47 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+void llama_context::prefetch_hint(const llama_token * tokens, int32_t n_tokens, int32_t n_lead, llama_pos pos0, llama_seq_id seq_id) {
+    static const bool enabled = getenv("LLAMA_PREFETCH_HINT") == nullptr || atoi(getenv("LLAMA_PREFETCH_HINT")) != 0;
+    if (!enabled || !memory || tokens == nullptr || n_lead < 0 || n_tokens <= n_lead || seq_id < 0 ||
+            seq_id >= (llama_seq_id) cparams.n_seq_max) {
+        return;
+    }
+    // the ubatches the next llama_decode would cut from a batch holding only these tokens (at most n_batch of them: both
+    // lanes of a pair), each led by the n_lead tokens before it
+    const int32_t n_next = std::min<int32_t>(n_tokens - n_lead, (int32_t) cparams.n_batch);
+    const int32_t n_ub   = (int32_t) cparams.n_ubatch;
+    llama_seq_id                sid = seq_id;
+    std::vector<llama_token>    tok;
+    std::vector<llama_pos>      pos;
+    std::vector<int32_t>        n_seq_id;
+    std::vector<llama_seq_id *> seq_ptr;
+    for (int32_t c0 = 0; c0 < n_next; c0 += n_ub) {
+        const int32_t n     = std::min(n_ub, n_next - c0);
+        const int32_t first = c0;   // index in tokens of this ubatch's first lead token
+        const int32_t n_all = n_lead + n;
+        tok.assign(tokens + first, tokens + first + n_all);
+        pos.resize(n_all);
+        for (int32_t i = 0; i < n_all; ++i) {
+            pos[i] = pos0 + first + i;
+        }
+        n_seq_id.assign(n_all, 1);
+        seq_ptr.assign(n_all, &sid);
+        llama_ubatch ub = {};
+        ub.n_tokens     = (uint32_t) n_all;
+        ub.n_seq_tokens = (uint32_t) n_all;
+        ub.n_seqs       = 1;
+        ub.n_seqs_unq   = 1;
+        ub.n_pos        = 1;
+        ub.token        = tok.data();
+        ub.pos          = pos.data();
+        ub.n_seq_id     = n_seq_id.data();
+        ub.seq_id       = seq_ptr.data();
+        ub.seq_id_unq   = &sid;
+        model.prefetch_hint(ub, (uint32_t) n_lead, memory.get());
+    }
+}
+
 uint32_t llama_context::n_prefill_lanes() const {
     return cparams.prefill_lanes;
 }
@@ -4867,6 +4908,10 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
 
 uint32_t llama_n_prefill_lanes(const llama_context * ctx) {
     return ctx->n_prefill_lanes();
+}
+
+void llama_prefetch_hint(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_lead, llama_pos pos0, llama_seq_id seq_id) {
+    ctx->prefetch_hint(tokens, n_tokens, n_lead, pos0, seq_id);
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {

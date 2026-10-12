@@ -3982,10 +3982,42 @@ private:
             all_output &= batch.tokens[i].output && batch.view.tokens[i - off].seq_id == batch.view.tokens[0].seq_id;
         }
         const int64_t t_dec_cost0 = spec && all_output ? ggml_time_us() : 0;
+        // halo-hybrid: before the last view of the batch is submitted, hint each slot's next prompt chunk (up to n_batch
+        // tokens, both lanes of the next pair, with the 8 tokens before it as its lead) to the target, so its host-side
+        // input work (qwen4exp's PLE gather, ~90-140 ms per 4096 tokens at depth) runs while the devices compute this batch
+        // and the draft ingests it, instead of after both (llama_prefetch_hint). LLAMA_PREFETCH_HINT=0 turns it off
+        auto hint_next_chunks = [&]() {
+            if (off + n_view < (int32_t) batch.size()) {
+                return;
+            }
+            const size_t n_next = llama_n_batch(ctx_tgt);   // both lanes of the next pair
+            const size_t n_lead = 8;
+            std::vector<llama_token> next;
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_PROCESSING_PROMPT || !slot.task || slot.task->tokens.has_mtmd) {
+                    continue;
+                }
+                const auto & input_tokens = slot.task->tokens;
+                const size_t n0 = slot.prompt.n_tokens();
+                const size_t i0 = n0 - std::min(n0, n_lead);
+                next.clear();
+                for (size_t i = i0; i < (size_t) slot.task->n_tokens() && next.size() < (n0 - i0) + n_next; ++i) {
+                    if (input_tokens[i] == LLAMA_TOKEN_NULL) {
+                        break;
+                    }
+                    next.push_back(input_tokens[i]);
+                }
+                if (next.size() > n0 - i0) {
+                    llama_prefetch_hint(ctx_tgt, next.data(), (int32_t) next.size(), (int32_t) (n0 - i0),
+                                        slot.prompt.tokens.pos_next() - (llama_pos) (n0 - i0), slot.id);
+                }
+            }
+        };
         queue_tasks.yield_to_queue([&]() {
             if (spec) {
                 common_speculative_process_begin(spec.get(), batch.view);
             }
+            hint_next_chunks();
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (spec) {
                 common_speculative_process_end(spec.get());

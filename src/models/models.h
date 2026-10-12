@@ -2460,6 +2460,9 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     // the PLE host gather of a prefill ubatch, started early (see llama_model::prefetch_inputs)
     void prefetch_inputs(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, bool pending) const override;
+    void prefetch_hint(const llama_ubatch & ubatch, uint32_t n_lead, const llama_memory_i * mem) const override;
+    // starts the gather of the rows ple_rows() gives for (ubatch, prev), unless the same rows are already queued
+    void ple_prefetch_start(const llama_ubatch & ubatch, const std::vector<llama_token> & prev) const;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

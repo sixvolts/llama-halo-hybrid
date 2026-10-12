@@ -5,6 +5,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <system_error>
+#include <unordered_map>
 #include <thread>
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -1965,34 +1967,124 @@ struct ple_prefetch {
     std::vector<int32_t>                idx;
     std::shared_ptr<std::vector<float>> out;
     std::shared_future<void>            done;
+    int                                 age = 0; // prefill-sized takes since it was last used
 };
 std::mutex               ple_pf_mu;
 std::deque<ple_prefetch> ple_pf;   // the two lanes of a pair, plus stale guesses until they age out
-constexpr size_t         ple_pf_max = 4;
+constexpr size_t         ple_pf_max = 8;  // a pair's two lanes plus one hint per prompting slot, with room for stale guesses
 
-// the matching prefetch's rows (waits for its gather), or nullptr; *n_stale: this model's entries that did not match
-std::shared_ptr<std::vector<float>> ple_prefetch_take(const llama_model * model, const std::vector<int32_t> & idx, int * n_stale) {
+// the rows of idx (n_heads per token) from this model's prefetched gathers (waits for the one it uses), or nullptr.
+// An entry with exactly these rows is taken out of the queue and returned as is. Otherwise, for a prefill-sized ubatch
+// (decode steps never have a prefetch and must not pay for the search), the entry that shares the most tokens supplies
+// them: a token's rows depend only on its n-gram, so an equal row group carries equal data wherever it sits (the hint
+// guessed a ubatch one token off, or longer than the one cut); *missing gets the tokens left to gather and the entry
+// stays queued, as it may still be a later ubatch's exact match. Entries unused for ple_pf_max_age prefill-sized takes
+// are dropped. *n_stale: this model's entries not used
+constexpr int ple_pf_max_age = 4;
+std::shared_ptr<std::vector<float>> ple_prefetch_take(const llama_model * model, const std::vector<int32_t> & idx, int64_t n_heads,
+                                                      int64_t hd, std::vector<int32_t> * missing, int * n_stale) {
+    missing->clear();
+    const int64_t n_tok   = (int64_t) idx.size() / n_heads;
+    const bool    prefill = n_tok >= 64;
+    auto group_hash = [n_heads](const int32_t * g) {
+        uint64_t h = 1469598103934665603ull;
+        for (int64_t k = 0; k < n_heads; ++k) {
+            h = (h ^ (uint32_t) g[k]) * 1099511628211ull;
+        }
+        return h;
+    };
+
     ple_prefetch hit;
+    ple_prefetch best;
+    size_t best_k = SIZE_MAX;   // its index in ple_pf
+    std::vector<int32_t> best_src; // per token of idx: its token in best, or -1
+    std::vector<ple_prefetch> dropped;
     {
         std::lock_guard<std::mutex> lock(ple_pf_mu);
-        *n_stale = 0;
         for (auto it = ple_pf.begin(); it != ple_pf.end(); ++it) {
-            if (it->model != model) {
-                continue;
-            }
-            if (it->idx == idx) {
+            if (it->model == model && it->idx == idx) {
                 hit = std::move(*it);
                 ple_pf.erase(it);
                 break;
             }
-            ++*n_stale;
+        }
+        if (!hit.out && prefill) {
+            int64_t best_n = 0;
+            std::unordered_map<uint64_t, int32_t> at;
+            std::vector<int32_t> src(n_tok);
+            for (size_t k = 0; k < ple_pf.size(); ++k) {
+                const auto & e = ple_pf[k];
+                if (e.model != model || e.idx.size() % n_heads != 0) {
+                    continue;
+                }
+                at.clear();
+                for (int64_t t = (int64_t) e.idx.size() / n_heads - 1; t >= 0; --t) {
+                    at[group_hash(e.idx.data() + t*n_heads)] = (int32_t) t;   // the first token with a given row group
+                }
+                int64_t n = 0;
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    const auto f = at.find(group_hash(idx.data() + t*n_heads));
+                    src[t] = f != at.end() && std::equal(idx.begin() + t*n_heads, idx.begin() + (t + 1)*n_heads,
+                                                         e.idx.begin() + (int64_t) f->second*n_heads) ? f->second : -1;
+                    n += src[t] >= 0;
+                }
+                // a few shared n-grams (repeated text) are not worth the wait for a gather meant for another ubatch
+                if (n > best_n && n*2 >= n_tok) {
+                    best_n   = n;
+                    best_k   = k;
+                    best_src = src;
+                }
+            }
+            if (best_k != SIZE_MAX) {
+                best = ple_pf[best_k];   // a copy: shares the gather's output and future
+            }
+        }
+        *n_stale = 0;
+        if (prefill) {
+            // age the entries this take did not use; drop the old ones (their gathers finished long ago)
+            std::deque<ple_prefetch> keep;
+            for (size_t k = 0; k < ple_pf.size(); ++k) {
+                auto & e = ple_pf[k];
+                if (e.model == model) {
+                    if (k == best_k) {
+                        e.age = 0;
+                    } else {
+                        ++*n_stale;
+                        if (++e.age > ple_pf_max_age) {
+                            dropped.push_back(std::move(e));
+                            continue;
+                        }
+                    }
+                }
+                keep.push_back(std::move(e));
+            }
+            ple_pf.swap(keep);
         }
     }
-    if (!hit.out) {
+    for (auto & d : dropped) {
+        d.done.wait();
+    }
+    if (hit.out) {
+        hit.done.wait();
+        return hit.out->size() == idx.size()*hd ? hit.out : nullptr;
+    }
+    if (!best.out) {
         return nullptr;
     }
-    hit.done.wait();
-    return hit.out;
+    best.done.wait();
+    if (best.out->size() != best.idx.size()*hd) {
+        return nullptr;   // a failed gather: ages out with the rest
+    }
+    auto rows = std::make_shared<std::vector<float>>(idx.size()*hd);
+    const int64_t g = n_heads*hd;
+    for (int64_t t = 0; t < n_tok; ++t) {
+        if (best_src[t] >= 0) {
+            std::copy(best.out->begin() + best_src[t]*g, best.out->begin() + (best_src[t] + 1)*g, rows->begin() + t*g);
+        } else {
+            missing->push_back((int32_t) t);
+        }
+    }
+    return rows;
 }
 
 // drops this model's prefetches (all of them with model == nullptr), waiting for gathers still reading its table
@@ -2024,16 +2116,23 @@ llama_model_qwen4exp::~llama_model_qwen4exp() {
     ple_prefetch_drop(this);
 }
 
-void llama_model_qwen4exp::prefetch_inputs(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, bool pending) const {
+// whether a ubatch's PLE gather may start early: set_input gathers on the host for it and takes a matching prefetch
+static bool ple_prefetchable(const llama_model_qwen4exp & model, const llama_ubatch & ubatch) {
     static const bool enabled = !getenv("LLAMA_PLE_PREFETCH") || atoi(getenv("LLAMA_PLE_PREFETCH")) != 0;
-    if (!enabled || mctx == nullptr || hparams.ple_n_heads == 0 || ubatch.n_tokens < 64 || !ubatch.token ||
-            !ple_host_gather(*this)) {
-        return;
+    if (!enabled || model.hparams.ple_n_heads == 0 || ubatch.n_tokens < 64 || !ubatch.token || !ple_host_gather(model)) {
+        return false;
     }
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (ubatch.n_seq_id[i] != 1) {
-            return;   // set_input rejects these
+            return false;   // set_input rejects these
         }
+    }
+    return true;
+}
+
+void llama_model_qwen4exp::prefetch_inputs(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, bool pending) const {
+    if (mctx == nullptr || !ple_prefetchable(*this, ubatch)) {
+        return;
     }
 
     const auto * kv = static_cast<const llama_memory_hybrid_idx_context *>(mctx)->get_attn();
@@ -2046,7 +2145,37 @@ void llama_model_qwen4exp::prefetch_inputs(const llama_ubatch & ubatch, const ll
     } else {
         kv->get_prev_tokens(ubatch, n_prev, prev);
     }
+    ple_prefetch_start(ubatch, prev);
+}
 
+void llama_model_qwen4exp::prefetch_hint(const llama_ubatch & ubatch, uint32_t n_lead, const llama_memory_i * mem) const {
+    const auto *   hyb    = dynamic_cast<const llama_memory_hybrid *>(mem);
+    const uint32_t n_prev = hparams.ple_ngram_size - 1;
+    // the cache answers only for positions before the lead (the current batch is not applied yet): the lead must cover
+    // every predecessor inside the batch, or reach the start of the sequence
+    if (hyb == nullptr || ubatch.n_tokens <= n_lead || (n_lead < n_prev && ubatch.pos[0] > 0)) {
+        return;
+    }
+    llama_ubatch ub = ubatch; // the ubatch without its lead
+    ub.n_tokens     -= n_lead;
+    ub.n_seq_tokens -= n_lead;
+    ub.token        += n_lead;
+    ub.pos          += n_lead;
+    ub.n_seq_id     += n_lead;
+    ub.seq_id       += n_lead;
+    if (!ple_prefetchable(*this, ub)) {
+        return;
+    }
+    // predecessors with the lead counted as the ubatch's own tokens
+    std::vector<llama_token> prev;
+    if (!hyb->get_mem_attn()->get_prev_tokens_pending(ubatch, n_prev, prev)) {
+        return;
+    }
+    prev.erase(prev.begin(), prev.begin() + (size_t) n_lead*n_prev);
+    ple_prefetch_start(ub, prev);
+}
+
+void llama_model_qwen4exp::ple_prefetch_start(const llama_ubatch & ubatch, const std::vector<llama_token> & prev) const {
     ple_prefetch e;
     e.model = this;
     ple_rows(hparams, ubatch, prev, e.idx);
@@ -2060,10 +2189,22 @@ void llama_model_qwen4exp::prefetch_inputs(const llama_ubatch & ubatch, const ll
         }
     }
     e.out = std::make_shared<std::vector<float>>();
+    static const bool lanes_debug = getenv("LLAMA_LANES_DEBUG") && atoi(getenv("LLAMA_LANES_DEBUG")) >= 3;
+    if (lanes_debug) {
+        LLAMA_LOG_INFO("ple prefetch: start %u tokens at pos %d\n", ubatch.n_tokens, ubatch.pos[0]);
+    }
+    try {
     e.done = std::async(std::launch::async,
-        [w = per_layer_tok_embd, hd = (int64_t) hparams.ple_head_dim, idx = e.idx, out = e.out] {
+        [w = per_layer_tok_embd, hd = (int64_t) hparams.ple_head_dim, idx = e.idx, out = e.out, p0 = ubatch.pos[0]] {
+            const int64_t t0 = lanes_debug ? ggml_time_us() : 0;
             ple_gather(w, hd, idx, *out);
+            if (lanes_debug) {
+                LLAMA_LOG_INFO("ple prefetch: gathered pos %d in %.0f ms\n", p0, (ggml_time_us() - t0)/1000.0);
+            }
         }).share();
+    } catch (const std::system_error &) {
+        return;   // no thread for it: set_input gathers as without a prefetch
+    }
 
     ple_prefetch old;
     {
@@ -2099,12 +2240,29 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     if (emb) {
         int n_stale = 0;
-        std::shared_ptr<std::vector<float>> pf = ple_prefetch_take(&pmodel, idx, &n_stale);
+        std::vector<int32_t> missing;
+        std::shared_ptr<std::vector<float>> pf = ple_prefetch_take(&pmodel, idx, hp.ple_n_heads, hp.ple_head_dim, &missing, &n_stale);
         static const int lanes_debug = getenv("LLAMA_LANES_DEBUG") ? atoi(getenv("LLAMA_LANES_DEBUG")) : 0;
         if (lanes_debug >= 3 && n_tokens >= 64) {
-            LLAMA_LOG_INFO("ple prefetch: %" PRId64 " tokens %s, %d unmatched\n", n_tokens, pf ? "hit" : "miss", n_stale);
+            LLAMA_LOG_INFO("ple prefetch: %" PRId64 " tokens %s (%zu to gather), %d unmatched\n", n_tokens,
+                pf ? (missing.empty() ? "hit" : "partial") : "miss", pf ? missing.size() : (size_t) n_tokens, n_stale);
         }
         if (pf) {
+            if (!missing.empty()) {
+                // the tokens the prefetch did not cover, gathered here
+                const int64_t nh = hp.ple_n_heads;
+                std::vector<int32_t> sub;
+                sub.reserve(missing.size()*nh);
+                for (const int32_t t : missing) {
+                    sub.insert(sub.end(), idx.begin() + (int64_t) t*nh, idx.begin() + (int64_t) (t + 1)*nh);
+                }
+                std::vector<float> got;
+                ple_gather(pmodel.per_layer_tok_embd, hp.ple_head_dim, sub, got);
+                const int64_t g = nh*hp.ple_head_dim;
+                for (size_t k = 0; k < missing.size(); ++k) {
+                    std::copy(got.begin() + (int64_t) k*g, got.begin() + (int64_t) (k + 1)*g, pf->begin() + (int64_t) missing[k]*g);
+                }
+            }
             ggml_backend_tensor_set(emb, pf->data(), 0, pf->size()*sizeof(float));
             return;
         }

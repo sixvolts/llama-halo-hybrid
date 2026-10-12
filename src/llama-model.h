@@ -810,6 +810,13 @@ struct llama_model {
         GGML_UNUSED(ubatch); GGML_UNUSED(mctx); GGML_UNUSED(pending);
     }
 
+    // halo-hybrid: the same for a ubatch the caller expects to submit after the current batch (llama_prefetch_hint).
+    // ubatch: n_lead tokens that precede it (the end of the current batch, not applied to `mem` yet), then the ubatch
+    // itself; predecessors before the lead come from `mem`. Default: none
+    virtual void prefetch_hint(const llama_ubatch & ubatch, uint32_t n_lead, const llama_memory_i * mem) const {
+        GGML_UNUSED(ubatch); GGML_UNUSED(n_lead); GGML_UNUSED(mem);
+    }
+
 protected:
     llama_model_params params;
 

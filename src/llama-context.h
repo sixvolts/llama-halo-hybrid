@@ -68,6 +68,7 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_prefill_lanes() const; // halo-hybrid
+    void     prefetch_hint(const llama_token * tokens, int32_t n_tokens, int32_t n_lead, llama_pos pos0, llama_seq_id seq_id); // halo-hybrid
     uint32_t n_seq_max() const;
 
     uint32_t n_threads()       const;

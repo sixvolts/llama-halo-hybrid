@@ -584,6 +584,14 @@ extern "C" {
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
     // halo-hybrid: number of prefill lanes the context resolved (1, or 2 with LLAMA_PREFILL_LANES on an eligible layout)
     LLAMA_API uint32_t llama_n_prefill_lanes(const struct llama_context * ctx);
+    // halo-hybrid: the caller's next prompt tokens for seq_id, to call before submitting the current batch. tokens[0, n_lead)
+    // are the ones right before the next batch (the end of the current batch, not in the cache yet), tokens[n_lead, n_tokens)
+    // the next batch (at most n_batch are used); pos0 is the position of tokens[0]. A model with host-side input work
+    // (qwen4exp's PLE gather, which needs each token's 2 predecessors) starts it now for every ubatch of that batch, while
+    // the device runs the current one, and the next llama_decode takes the rows its ubatches share with it. Only a hint:
+    // nothing changes if it does not match
+    LLAMA_API void llama_prefetch_hint(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_lead,
+                                       llama_pos pos0, llama_seq_id seq_id);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
