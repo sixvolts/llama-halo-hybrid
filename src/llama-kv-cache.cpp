@@ -9,6 +9,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <system_error>
+#include <thread>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -1999,6 +2001,8 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 
     uint32_t lo; // column j is cell lo + j
+
+    int n_threads; // for the rows after each sequence's first; 0: LLAMA_KQ_MASK_THREADS (default 8)
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -2036,8 +2040,10 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
-            const uint32_t i = s*n_tps + ii;
+        // row i: rec == nullptr: copy the sequence's first row (srct) and update only the cells in idxs; otherwise fill it in
+        // full and record those cells in *rec. The threaded rows only read idxs
+        auto fill_row = [&](const uint32_t i, const uint32_t srct, const std::vector<uint32_t> & idxs, std::vector<uint32_t> * rec) {
+            const bool prev = rec == nullptr;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
@@ -2058,25 +2064,10 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             // keep track of those cells and shortcut the loop to save time
             // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-            bool prev = false;
+            if (prev) {
+                const uint64_t idst_prev = n_kv*srct;
 
-            auto & idxs = seq_idxs[seq_id];
-
-            if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
-
-                    const uint64_t idst_prev = n_kv*srct;
-
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
-                } else {
-                    idxs.clear();
-                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
-
-                    seq_srct[seq_id] = i;
-                }
+                std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
             }
 
             // halo-hybrid: a fresh row only visits the chunks that hold the sequence (llama_kv_cells::seq_chunk_range); the
@@ -2128,7 +2119,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     if (!prev) {
                         // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
                         if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                            idxs.push_back(j);
+                            rec->push_back(j);
                         }
                     }
                 }
@@ -2169,6 +2160,75 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 continue;
 skip:
                 data[idst + j] = mask_drop;
+            }
+        };
+
+        // halo-hybrid (after asf0/strix-llama.cpp 087fab319): the first row of every sequence is filled in full here, in
+        // token order, and records the cells that can differ; the other rows only copy it and update those cells, so they
+        // are independent and a large mask fills them on several threads. At 127K cells a 4096-token ubatch (1 GiB of
+        // f16 rows, mostly copies) took 52 ms on one thread while the GPUs waited. LLAMA_KQ_MASK_THREADS=1 keeps one
+        std::vector<uint32_t> rest;
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = s*n_tps + ii;
+
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+            auto & idxs = seq_idxs[seq_id];
+
+            if (!alibi) {
+                if (seq_srct.find(seq_id) != seq_srct.end()) {
+                    rest.push_back(i);
+                    continue;
+                }
+                idxs.clear();
+                idxs.reserve(ubatch->n_tokens + n_swa + 32);
+
+                seq_srct[seq_id] = i;
+            }
+            fill_row(i, 0, idxs, &idxs);
+        }
+
+        auto fill_rest = [&](const size_t r0, const size_t r1) {
+            for (size_t r = r0; r < r1; ++r) {
+                const uint32_t     i      = rest[r];
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+                fill_row(i, seq_srct.at(seq_id), seq_idxs.at(seq_id), nullptr);
+            }
+        };
+
+        static const int n_thr_max = [] {
+            const char * env = getenv("LLAMA_KQ_MASK_THREADS");
+            const int    hw  = std::max(1, (int) std::thread::hardware_concurrency());
+            return std::clamp(env ? atoi(env) : 8, 1, std::min(hw, 64));
+        }();
+        // below ~4M cells (8 MiB of f16) the threads cost more than they save; LLAMA_KQ_MASK_MIN_CELLS moves the bar (tests)
+        static const int64_t min_cells = [] {
+            const char * env = getenv("LLAMA_KQ_MASK_MIN_CELLS");
+            return env ? std::max<int64_t>(1, atoll(env)) : ((int64_t) 4 << 20);
+        }();
+        const int n_thr = (int64_t) rest.size()*n_kv >= min_cells ? (args.n_threads > 0 ? args.n_threads : n_thr_max) : 1;
+        if (n_thr == 1) {
+            fill_rest(0, rest.size());
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(n_thr - 1);   // only a thread's start can throw below, and it throws std::system_error
+            const size_t per = (rest.size() + n_thr - 1)/n_thr;
+            size_t done = per; // rows [per, done) went to workers; the rest run here, also if a thread cannot be started
+            try {
+                for (int t = 1; t < n_thr; ++t) {
+                    const size_t r0 = std::min(rest.size(), t*per);
+                    const size_t r1 = std::min(rest.size(), (t + 1)*per);
+                    if (r0 < r1) {
+                        workers.emplace_back(fill_rest, r0, r1);
+                        done = r1;
+                    }
+                }
+            } catch (const std::system_error &) {
+            }
+            fill_rest(0, std::min(rest.size(), per));
+            fill_rest(std::min(rest.size(), done), rest.size());
+            for (auto & w : workers) {
+                w.join();
             }
         }
     }
@@ -2245,12 +2305,31 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.lo               =*/ lo,
+        /*.n_threads        =*/ 0,
     };
+
+    // LLAMA_KQ_MASK_VERIFY=1: fill every mask on one thread as well and abort if the threaded fill differs (tests)
+    static const bool verify = getenv("LLAMA_KQ_MASK_VERIFY") && atoi(getenv("LLAMA_KQ_MASK_VERIFY")) != 0;
+    std::vector<uint8_t> ref;
+    if (verify) {
+        args_set_input_kq_mask args1 = args;
+        args1.n_threads = 1;
+        ref.resize(ggml_nbytes(dst));
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_impl<ggml_fp16_t>(args1, (ggml_fp16_t *) ref.data(), causal_attn);
+        } else {
+            set_input_kq_mask_impl<float>(args1, (float *) ref.data(), causal_attn);
+        }
+    }
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    if (verify && memcmp(ref.data(), dst->data, ref.size()) != 0) {
+        GGML_ABORT("KQ mask: the threaded fill differs from the one-thread fill (%u tokens, %lld cells)", n_tokens, (long long) n_kv);
     }
 
     //const int64_t t_end = ggml_time_us();
