@@ -196,7 +196,18 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 //     remarks); Q in shared memory and 32-cell K/V tiles spill 224 B. Dense walk per 2048-query call 25.5 -> 20.9 ms
 //     at 8K, 72 -> 60 ms at 16K (every causal cell), 163 -> 139 ms at 32K; the sparse union walk (fattn.cu,
 //     QSA) 28.7 -> 16.8 / 38.4 -> 22.2 / 46.3 -> 28.2 ms at 8K / 16K / 32K
-static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna3_5(const int DKQ, const int DV, const int ncols) {
+// 2026-10-12, dense causal prefill (Qwen3.5/3.6, the cache's head-interleaved K/V): the loop is latency-bound (removing
+//     every WMMA saves nothing; tile loads, LDS operand loads and barriers are the time), so 64-key tiles that halve the
+//     round trips, barriers, Q re-reads and rescales per key win despite 7 scratch reloads per iteration: causal nb 4096
+//     at 16K/32K 1.17-1.28x isolated; in situ (op timer) Qwen3.5-4B FA 3.94 -> 3.54 s at 30K, 68.6 -> 55.2 s at 124K
+//     (wall 111.4 -> 98.0 s), Qwen3.6-35B 4.91 -> 3.98 s at 30K. Staged/prefetched K/V loads, a transposed V tile and
+//     double-buffered WMMA operands were measured on top and did not help (~/bench/faapu). The sparse (QSA) union walk
+//     keeps 32-cell tiles: 64 were 1.38-1.45x slower on its 2051-cell budget at 16K-32K
+static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna3_5(
+        const int DKQ, const int DV, const int ncols, const bool use_sparse = false) {
+    if (!use_sparse) {
+        GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  64,  64,  64,  64, 1, false);
+    }
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  32, 128,  64,  64, 1, false);
 
     return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
@@ -289,6 +300,22 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
     GGML_UNUSED_VARS(DKQ, DV, ncols);
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 #endif // defined(AMPERE_MMA_AVAILABLE)
+}
+
+// halo-hybrid: the dense and sparse kernels of one (DKQ, DV, ncols) may use different KV tile sizes (rdna3_5 D=256);
+//     everything else in the config is shared
+static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config_kernel(const int DKQ, const int DV, const int ncols, const int cc, const bool use_sparse) {
+    return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA3_5(cc) ? ggml_cuda_fattn_mma_get_config_rdna3_5(DKQ, DV, ncols, use_sparse)
+                                                                : ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc);
+}
+
+static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_kernel(const int DKQ, const int DV, const int ncols, const bool use_sparse) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3_5)
+    return ggml_cuda_fattn_mma_get_config_rdna3_5(DKQ, DV, ncols, use_sparse);
+#else
+    GGML_UNUSED(use_sparse);
+    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols);
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3_5)
 }
 
 static __host__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, const int DV, const int ncols, const int cc) {
@@ -639,8 +666,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_config_kernel(DKQ, DV, ncols, use_sparse).nbatch_fa;
+    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_config_kernel(DKQ, DV, ncols, use_sparse).nbatch_K2;
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
@@ -1235,8 +1262,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_config_kernel (DKQ, DV, ncols, use_sparse).nbatch_fa;
+    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_config_kernel (DKQ, DV, ncols, use_sparse).nbatch_K2;
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
@@ -1901,7 +1928,7 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols     = ncols1 * ncols2;
-    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_config_kernel(DKQ, DV, ncols, use_sparse).nbatch_fa;
     constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
     constexpr int nwarps    = nthreads / warp_size;
 
@@ -2072,9 +2099,20 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
 
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+    size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+
+    // the sparse kernel may use other KV tiles (rdna3_5 D=256): size the dynamic LDS for the larger of the two
+    const fattn_mma_config config_sparse = ggml_cuda_fattn_mma_get_config_kernel(DKQ, DV, ncols, cc, true);
+    if (config_sparse.nbatch_fa != nbatch_fa || config_sparse.nbatch_K2 != nbatch_K2) {
+        GGML_ASSERT(nstages <= 1 && !V_is_K_view);
+        const int    stride_tile_K_s = ggml_cuda_fattn_smem_swizzle::tile_stride(config_sparse.nbatch_K2, cc);
+        const size_t nbytes_KV_s     = config_sparse.nbatch_fa * std::max(stride_tile_K_s, stride_tile_V) * sizeof(half2);
+        const size_t nbytes_mask_s   = ncols1 * (config_sparse.nbatch_fa/2 + 4) * sizeof(half2);
+        nbytes_shared_total = std::max(nbytes_shared_total, Q_in_reg ?
+            std::max(nbytes_shared_Q, nbytes_KV_s + nbytes_mask_s) : nbytes_shared_Q + nbytes_KV_s + nbytes_mask_s);
+    }
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
@@ -2135,7 +2173,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     }
 
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, use_sparse ? config_sparse.nbatch_fa : nbatch_fa, true, true, true, use_sparse, warp_size_host);
 }
 
 
