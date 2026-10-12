@@ -129,6 +129,96 @@ static __global__ void mm_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+// Histogram variant (port of asf0/strix-llama.cpp 5e9c68c22): one block counts every (token, slot) pair per expert in
+// shared memory, scans the counts into the bounds and scatters the pairs, O(n_tokens*n_used) work for up to
+// MM_IDS_HIST_MAX_EXPERTS experts. The wide kernel below reads every pair once per expert (twice): on gfx1151 with 10 of
+// 512 experts it takes 402 us at 4096 tokens against 39 here (52 vs 7 at 512), 96 calls per Swift ubatch.
+// The scatter takes a slot with an atomic, so the order of the rows inside one expert's slice varies between runs; every
+// consumer computes a row independently of its neighbours (ids_dst / the inverse map carry the position).
+static constexpr int MM_IDS_HIST_MAX_EXPERTS = 1024;
+static constexpr int MM_IDS_HIST_BLOCK       = 1024; // one thread per expert in the scan
+// on gfx1151 (512 experts, 10 used) it is the fastest helper from 8 tokens up: 2.8 / 3.0 / 4.8 / 39 us at 8 / 64 / 256 / 4096
+// against 3.2 / 9.3 / 30.5 / 396 for the warp and wide kernels, and MUL_MAT_ID outputs are bit-identical to theirs
+static constexpr int MM_IDS_HIST_MIN_DEFAULT = 1;    // tokens
+
+template <int n_expert_used_template>
+__launch_bounds__(MM_IDS_HIST_BLOCK, 1)
+static __global__ void mm_ids_helper_hist(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1,
+        const bool write_inverse) {
+    constexpr int warp_size = 32;
+    constexpr int n_warps   = MM_IDS_HIST_BLOCK / warp_size;
+    static_assert(n_warps <= warp_size, "the block scan reduces the warp sums in one warp");
+    const int n_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+
+    __shared__ int counts[MM_IDS_HIST_MAX_EXPERTS];  // per expert: count, then the slice start
+    __shared__ int cursors[MM_IDS_HIST_MAX_EXPERTS];
+    __shared__ int warp_sums[n_warps];
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+    const int warp = tid / warp_size;
+
+    for (int e = tid; e < n_experts; e += MM_IDS_HIST_BLOCK) {
+        counts[e]  = 0;
+        cursors[e] = 0;
+    }
+    __syncthreads();
+
+    // an id outside [0, n_experts) is dropped, as the per-expert kernels drop it, instead of indexing shared memory
+    const int n_slots = n_tokens * n_used;
+    for (int slot = tid; slot < n_slots; slot += MM_IDS_HIST_BLOCK) {
+        const int      it  = slot / n_used;
+        const int      iex = slot - it*n_used;
+        const unsigned e   = ids[it*si1 + iex];
+        if (e < (unsigned) n_experts) {
+            atomicAdd(&counts[e], 1);
+        }
+    }
+    __syncthreads();
+
+    // exclusive scan of the counts, one expert per thread
+    const int c    = tid < n_experts ? counts[tid] : 0;
+    const int incl = warp_prefix_inclusive_sum<int, warp_size>(c);
+    if (lane == warp_size - 1) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int w = warp_prefix_inclusive_sum<int, warp_size>(lane < n_warps ? warp_sums[lane] : 0);
+        if (lane < n_warps) {
+            warp_sums[lane] = w;
+        }
+    }
+    __syncthreads();
+    const int excl = incl - c + (warp > 0 ? warp_sums[warp - 1] : 0);
+    if (tid < n_experts) {
+        counts[tid]        = excl;
+        expert_bounds[tid] = excl;
+        if (tid == n_experts - 1) {
+            expert_bounds[n_experts] = excl + c;
+        }
+    }
+    __syncthreads();
+
+    for (int slot = tid; slot < n_slots; slot += MM_IDS_HIST_BLOCK) {
+        const int it     = slot / n_used;
+        const int iex    = slot - it*n_used;
+        const unsigned expert = ids[it*si1 + iex];
+        if (expert >= (unsigned) n_experts) {
+            continue;
+        }
+        const int itc = counts[expert] + atomicAdd(&cursors[expert], 1);
+        ids_dst[itc] = it*n_used + iex;
+        if (write_inverse) {
+            ids_src1[it*n_used + iex] = itc;
+        } else {
+            ids_src1[itc] = it*sis1 + iex % nchannels_y;
+        }
+    }
+}
+
 // Wide variant for large token counts: one block per expert, two passes over the (token, slot) array.
 // The warp kernel above runs one wave per expert that walks the tokens two at a time with a shared-memory
 // store the size of the ubatch, which makes it superlinear in the ubatch (measured on gfx1151 with 10 of
@@ -222,6 +312,16 @@ static __global__ void mm_ids_helper_wide(
     }
 }
 
+static bool mm_ids_helper_use_hist(const int n_experts, const int n_tokens) {
+    static const int min_tokens = [] {
+        const char * env = getenv("GGML_CUDA_MMID_HIST_MIN"); // 0 disables the histogram kernel
+        return env ? atoi(env) : MM_IDS_HIST_MIN_DEFAULT;
+    }();
+    // the block scan assumes 32-lane warps
+    return min_tokens > 0 && n_tokens >= min_tokens && n_experts <= MM_IDS_HIST_MAX_EXPERTS &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32;
+}
+
 static bool mm_ids_helper_use_wide(const int n_tokens) {
     static const int min_tokens = [] {
         const char * env = getenv("GGML_CUDA_MMID_WIDE_MIN"); // 0 disables the wide kernel
@@ -253,6 +353,17 @@ static void launch_mm_ids_helper(
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+    if (mm_ids_helper_use_hist(n_experts, n_tokens)) {
+        switch (n_expert_used) {
+            case  8: mm_ids_helper_hist< 8><<<1, MM_IDS_HIST_BLOCK, 0, stream>>>
+                (ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+            case 10: mm_ids_helper_hist<10><<<1, MM_IDS_HIST_BLOCK, 0, stream>>>
+                (ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+            default: mm_ids_helper_hist< 0><<<1, MM_IDS_HIST_BLOCK, 0, stream>>>
+                (ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+        }
+        return;
+    }
     if (mm_ids_helper_use_wide(n_tokens)) {
         constexpr int block_size = 256;
         mm_ids_helper_wide<block_size><<<n_experts, block_size, 0, stream>>>
