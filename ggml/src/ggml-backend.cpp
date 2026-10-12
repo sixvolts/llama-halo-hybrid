@@ -2768,7 +2768,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
                     GGML_LOG_WARN("%s: the lanes match but leave %d cache hazards (%d across backends): running them one after the other\n",
                         __func__, n_bad, n_cross);
                 }
-            } else if (pair_hazard && same && n_bad > 0 && n_reorder_logged++ < 4) {
+            } else if (pair_hazard && same && n_bad > 0 && (pair_debug || n_reorder_logged++ < 4)) {
                 GGML_LOG_WARN("%s: the lanes match with %d same-stream reorders and no cross-backend hazard: interleaving (name guard)\n",
                     __func__, n_bad);
             }

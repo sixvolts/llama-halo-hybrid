@@ -132,27 +132,33 @@ def mode_base(a):
 
 
 HZ = re.compile(r'names (match|differ), (\d+) vs (\d+) splits, (\d+) cache tensors shared, (\d+) cache hazards')
-REFUSED = 'cache hazards: running them one after the other'      # names match, hazards: lanes serialised
+REFUSED = re.compile(r'cache hazards( \(\d+ across backends\))?: running them one after the other')  # names match, cross-backend hazards: lanes serialised
+REORDER = 'same-stream reorders and no cross-backend hazard: interleaving'  # names match, same-stream reorders only: admitted (name guard)
 DIFFERENT = 'different split structures'                          # names differ, hazards: lanes serialised
 
 
 def admitted_hazards(err):
-    """(pairs checked, admitted pairs with cache hazards): a pair with hazards is fine when the scheduler ran its lanes one
-    after the other, which it logs right after the pair's hazard line"""
-    lines = [l for l in err.splitlines() if HZ.search(l) or REFUSED in l or DIFFERENT in l]
-    n, bad = 0, 0
+    """(pairs checked, admitted pairs with cache hazards, admitted same-stream reorders): a pair with hazards is fine when
+    the scheduler ran its lanes one after the other, or when every hazard is a reorder on one stream, which the name guard
+    has always admitted (5a8325082); it logs either right after the pair's hazard line (uncapped under
+    GGML_SCHED_PAIR_DEBUG). The 1-lane/2-lane exact-output comparison is what checks an admitted reorder."""
+    lines = [l for l in err.splitlines() if HZ.search(l) or REFUSED.search(l) or REORDER in l or DIFFERENT in l]
+    n, bad, reorder = 0, 0, 0
     for i, l in enumerate(lines):
         m = HZ.search(l)
         if not m:
             continue
         n += 1
+        nxt = lines[i + 1] if i + 1 < len(lines) else ''
         # with hazard checking on (the harness never turns it off) a names-differ pair is admitted only without
         # hazards, so one with hazards was serialised even when its DIFFERENT line fell past that log's cap
-        refused = (m.group(1) == 'differ' or
-                   (i + 1 < len(lines) and (REFUSED in lines[i + 1] or DIFFERENT in lines[i + 1])))
+        refused = m.group(1) == 'differ' or bool(REFUSED.search(nxt)) or DIFFERENT in nxt
         if int(m.group(5)) != 0 and not refused:
-            bad += 1
-    return n, bad
+            if REORDER in nxt:
+                reorder += 1
+            else:
+                bad += 1
+    return n, bad, reorder
 SELF = re.compile(r'self-test, a delayed one split: (\d+) cache hazards')
 
 
@@ -180,11 +186,13 @@ def mode_card(a):
             if 'LLAMA_PREFILL_LANES ignored' in err:
                 problems.append('%s/%s: lanes not enabled' % (model, tag))
                 continue
-            n_hz, bad = admitted_hazards(err)
+            n_hz, bad, n_reorder = admitted_hazards(err)
+            if n_reorder:
+                print('%s/%s: %d matching pairs interleaved with same-stream reorders only' % (model, tag, n_reorder))
             st = [int(x) for x in SELF.findall(err)]
             n_pairs += n_hz
             n_self += sum(1 for x in st if x > 0)
-            n_refused = err.count(REFUSED)
+            n_refused = len(REFUSED.findall(err))
             if n_refused:
                 print('%s/%s: %d matching pairs run one after the other (cache hazards)' % (model, tag, n_refused))
             if bad:
