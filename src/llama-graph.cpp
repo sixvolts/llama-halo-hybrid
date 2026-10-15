@@ -2793,7 +2793,7 @@ ggml_tensor * llm_graph_context::build_attn_top_k_gather(
             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
     res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
-    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+    ggml_prec_set_acc(cur, GGML_PREC_F32);
 
     // [d_v, n_head, 1, nt] -> [d_v*n_head, n_tokens], token order unchanged
     cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

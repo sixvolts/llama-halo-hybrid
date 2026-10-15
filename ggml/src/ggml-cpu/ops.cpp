@@ -11616,8 +11616,8 @@ void ggml_compute_forward_dsv4_hc_mix(
     GGML_ASSERT(hc_fn->ne[0] == hc_dim && hc_fn->ne[1] == hc_mix_dim);
     GGML_ASSERT(dst->ne[0] == n_embd + hc + hc*hc && dst->ne[1] == n_tokens);
 
-    const float   eps_norm = ((const float *) dst->op_params)[0];
-    const float   eps_hc   = ((const float *) dst->op_params)[1];
+    const float   eps_norm = ggml_get_op_params_f32(dst, 0);
+    const float   eps_hc   = ggml_get_op_params_f32(dst, 1);
     const int32_t n_iter   = ggml_get_op_params_i32(dst, 2);
 
     const size_t nbx1 = x->nb[1], nbx2 = x->nb[2];
