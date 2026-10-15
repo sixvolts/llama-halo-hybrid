@@ -160,7 +160,8 @@ Strix Halo + R9700 it is the whole hybrid prefill win (about 1,450 -> 2,200 tok/
 ## Two machines
 
 Both hosts must run `llama-server` / `ggml-rpc-server` built from the same commit of this tree: the RPC protocol is
-fork-local, and the handshake does not catch every mismatch (an upstream `rpc-server` is not refused yet). Layouts and launch lines:
+fork-local (major 107), and the handshake refuses a peer with a different protocol version or op table, upstream
+builds included. Layouts and launch lines:
 [multi-machine.md](halo-cookbook/multi-machine.md).
 
 ## Diagnostics

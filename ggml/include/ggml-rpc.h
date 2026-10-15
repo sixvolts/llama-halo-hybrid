@@ -6,27 +6,20 @@
 extern "C" {
 #endif
 
-// 7: halo-hybrid wire (GRAPH_COMPUTE / GRAPH_RECOMPUTE return an empty reply that the client waits for); an upstream
-//    6.x peer would hang on the missing reply or desync on the extra one, so the handshake must reject the pairing
-#define RPC_PROTO_MAJOR_VERSION    7
-// 7.4: GGML_OP_DSV4_HC_MIX appended to the op enum (ids before it unchanged) and the HELLO reply carries
-//      GGML_OP_COUNT, which the client compares: a peer built with a different op table is refused at the
-//      handshake instead of executing shifted op ids (the patch field is never compared, so a patch bump alone
-//      would not have protected the pairing)
-// 7.5: GGML_OP_KQ_MASK_BUILD appended (masks built on the device; both hosts must carry the op)
-// 7.7: GGML_OP_QSA_TOP_K appended (qwen4exp block-level QSA top-k)
-// 7.8: GGML_OP_QSA_HEAD_SUM appended (qwen4exp QSA indexer head reduction)
-// 7.9: SET_TENSOR carries upstream's cache_flag byte (merged with upstream 2026-10: the client asks the server to
-//      save a hash-cache entry only for weights it has just failed to find)
-// 7.10: RPC_CMD_SUPPORTS_OP: the client asks the server's backend instead of assuming every op is supported (a
-//       shape-restricted kernel aborted the server, 2026-10-09); an older server is never asked
-#define RPC_PROTO_MINOR_VERSION 10
-// 7.4.1: rpc_tensor.flags carries RPC_TENSOR_FLAG_WEIGHTS (client buffer usage WEIGHTS); the server marks the buffer so
-//        its scheduler places ops by their weights. Compatible both ways (an older peer ignores or never sets the bit).
+// halo-hybrid: the fork's RPC protocol. Its major (107) is outside upstream's number space, so an upstream rpc-server or
+// client is refused at the handshake instead of misreading this wire; the client also requires the same minor and the
+// same GGML_OP_COUNT, so both hosts must run the same build of this tree (there is no capability negotiation).
+// What the fork's wire adds to upstream 7.0: GRAPH_COMPUTE / GRAPH_RECOMPUTE return an empty reply that the client
+// waits for; the HELLO reply carries GGML_OP_COUNT; the fork ops (DSV4_HC_MIX, KQ_MASK_BUILD, QSA_TOP_K, QSA_HEAD_SUM);
+// SET_TENSOR's cache_flag byte (from upstream); rpc_tensor.flags carries RPC_TENSOR_FLAG_WEIGHTS and
+// GGML_TENSOR_FLAG_BOUNDARY; the commands COPY_TENSOR_ASYNC, GRAPH_COMPUTE_SCHED and SUPPORTS_OP (ids from 128).
+// The protocol was 7.0 to 7.10 until 2026-10-15; bump the minor for every wire change.
+#define RPC_PROTO_MAJOR_VERSION  107
+#define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT has changed - bump RPC_PROTO_MINOR_VERSION (the handshake compares major/minor only)");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT has changed - bump RPC_PROTO_MINOR_VERSION");
 static_assert(GGML_OP_COUNT <= 255, "GGML_OP_COUNT no longer fits the HELLO op_count byte - widen it");
 #endif
 

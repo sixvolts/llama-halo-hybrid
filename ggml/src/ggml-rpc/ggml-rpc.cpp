@@ -64,9 +64,9 @@ static_assert(sizeof(rpc_tensor) % 8 == 0, "rpc_tensor size must be multiple of 
 // server device, the expert GEMMs landed there only as leftovers (pass 3) after the down-expansion from the first device
 // had taken the GLU and the weighted reduction, so every such layer shipped its [n_ff, n_used, n_tokens] expert
 // intermediates across PCIe and back (~470 ms per 1024-token ubatch in a two-host GLM-5.3 layout). The server marks the buffer and strips
-// the bit; an older server ignores it, an older client never sets it.
+// the bit.
 #define RPC_TENSOR_FLAG_WEIGHTS (1 << 30)
-// an older server copies rpc_tensor.flags into ggml_tensor.flags unfiltered, so the bit must never alias a ggml flag
+// the server copies the other rpc_tensor.flags bits into ggml_tensor.flags, so the bit must never alias a ggml flag
 // (and stay clear of the int32 sign bit); extend this list when ggml gains a flag
 static_assert((RPC_TENSOR_FLAG_WEIGHTS & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_PARAM |
                GGML_TENSOR_FLAG_LOSS | GGML_TENSOR_FLAG_COMPUTE | GGML_TENSOR_FLAG_BOUNDARY)) == 0 &&
@@ -92,14 +92,17 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
-    RPC_CMD_COPY_TENSOR_ASYNC, // halo-hybrid: same-server cross-device copy, enqueued async on the server, empty reply
-    RPC_CMD_GRAPH_COMPUTE_SCHED, // halo-hybrid (proto 7.2): graph spanning the server's devices, scheduled by the server's own ggml_backend_sched
-    RPC_CMD_SUPPORTS_OP, // halo-hybrid (proto 7.10): ask the server's backend whether it supports an op
+    // halo-hybrid commands start at 128, far above the ids upstream appends to, so a sync cannot shift them
+    RPC_CMD_COPY_TENSOR_ASYNC = 128, // same-server cross-device copy, enqueued async on the server, empty reply
+    RPC_CMD_GRAPH_COMPUTE_SCHED,     // graph spanning the server's devices, scheduled by the server's own ggml_backend_sched
+    RPC_CMD_SUPPORTS_OP,             // ask the server's backend whether it supports an op
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
+static_assert(RPC_CMD_MEMSET_TENSOR < 64, "upstream's commands are growing towards the fork's (from 128)");
+static_assert(RPC_CMD_COUNT <= 256, "commands are sent as one byte");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -112,7 +115,7 @@ struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t op_count;   // halo-hybrid (7.4): GGML_OP_COUNT of the server build, 0 from older servers
+    uint8_t op_count;   // halo-hybrid: GGML_OP_COUNT of the server build (compared by the client)
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -397,7 +400,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint32_t & server_minor) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, const std::string & endpoint) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -406,18 +409,17 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint32_t & s
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
 
-    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
-        GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
-                       response.major, response.minor, response.patch);
-        return false;
-    }
-    if (response.minor >= 4 && response.op_count != (uint8_t) GGML_OP_COUNT) {
-        GGML_LOG_ERROR("RPC server op table mismatch: server GGML_OP_COUNT %d, client %d (rebuild both hosts on one commit)\n",
-                       response.op_count, (int) GGML_OP_COUNT);
+    // halo-hybrid: exact match - both hosts must run the same build of this tree
+    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor != RPC_PROTO_MINOR_VERSION ||
+            response.op_count != (uint8_t) GGML_OP_COUNT) {
+        GGML_LOG_ERROR("rpc-server at %s speaks protocol %d.%d.%d with %d ops; this client speaks %d.%d.%d with %d ops. "
+                       "Both hosts must run the same build of llama-halo-hybrid%s\n", endpoint.c_str(),
+                       response.major, response.minor, response.patch, response.op_count,
+                       RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION, RPC_PROTO_PATCH_VERSION, (int) GGML_OP_COUNT,
+                       response.major < 100 ? " (that server is an upstream llama.cpp build)" : "");
         return false;
     }
 
-    server_minor = response.minor; // halo-hybrid: gates capabilities added after proto 7.0 (see cpy_tensor_async)
     sock->update_caps(response.conn_caps);
     return true;
 }
@@ -464,7 +466,6 @@ private:
 
 class rpc_dispatcher {
 public:
-    uint32_t server_minor = 0; // negotiated protocol minor of the peer, set in start()
     rpc_dispatcher() {
     }
 
@@ -622,7 +623,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock, server_minor)) {
+    if (!negotiate_hello(sock, endpoint)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -881,7 +882,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     auto request = std::make_shared<rpc_msg_alloc_buffer_req>();
     auto dispatcher = get_dispatcher(buft_ctx->endpoint);
     request->device = buft_ctx->device;
-    if (buft_ctx->scratch && dispatcher->server_minor >= 3) {
+    if (buft_ctx->scratch) {
         request->device |= RPC_ALLOC_SCRATCH;
     }
     request->size = size;
@@ -1128,7 +1129,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     GGML_ASSERT(cgraph->n_nodes > 0);
     // halo-hybrid (proto 7.6): small graphs go to slot 1 so a decode step's two alternating graphs both RECOMPUTE
     static const bool no_slots = getenv("GGML_RPC_NO_GRAPH_SLOTS") != nullptr;
-    const uint32_t slot = (!no_slots && rpc_ctx->dispatcher->server_minor >= 6 && cgraph->n_nodes <= RPC_GRAPH_SMALL_NODES) ? 1 : 0;
+    const uint32_t slot = (!no_slots && cgraph->n_nodes <= RPC_GRAPH_SMALL_NODES) ? 1 : 0;
     uint64_t & slot_uid = slot == 1 ? rpc_dev_ctx->last_graph_uid_small : rpc_dev_ctx->last_graph_uid;
     bool reuse = cgraph->uid != 0 && slot_uid == cgraph->uid;
     // halo-hybrid: the server answers graph compute with an empty reply and the dispatcher waits for it
@@ -1183,9 +1184,6 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *) dst->buffer->context;
     if (src_ctx->dispatcher != dst_ctx->dispatcher) {
         return false; // different servers: the sync path stages through the client
-    }
-    if (src_ctx->dispatcher->server_minor < 1) {
-        return false; // server predates RPC_CMD_COPY_TENSOR_ASYNC (proto 7.1): fall back rather than send an unknown command
     }
     auto request = std::make_shared<rpc_msg_copy_tensor_req>();
     request->src = serialize_tensor(src);
@@ -1295,10 +1293,6 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
         /* .name       = */ dev_name,
         /* .composite  = */ ggml_backend_rpc_composite_enabled(),
     };
-    if (ctx->composite && dispatcher->server_minor < 2) {
-        GGML_ABORT("%s: GGML_RPC_COMPOSITE needs an rpc-server speaking protocol %d.2 or newer (%s reports minor %u)\n",
-                   __func__, RPC_PROTO_MAJOR_VERSION, endpoint, dispatcher->server_minor);
-    }
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_rpc_guid(),
@@ -2906,7 +2900,7 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
 
     bool supported = true;
     auto dispatcher = get_dispatcher(ctx->endpoint);
-    if (dispatcher->server_minor >= 10) {
+    {
         auto request = std::make_shared<rpc_msg_supports_op_req>();
         // with the dispatcher, a tensor in another endpoint's buffer goes over as buffer 0 (as in GRAPH_COMPUTE)
         request->tensor = serialize_tensor(op, dispatcher);
