@@ -307,7 +307,7 @@ struct gdn_ch_rows {
 
 // the prep's LDS: K and Q rows while K K^T and Q K^T are formed, then L of up to GDN_CH_HGRP v-heads
 template <int S_v>
-static constexpr int gdn_chunk_prep_union() {
+static constexpr __host__ __device__ int gdn_chunk_prep_union() {
     return 2 * GDN_CH_C * (S_v + 4) > GDN_CH_HGRP * GDN_CH_C * (GDN_CH_C + 4) ?
         2 * GDN_CH_C * (S_v + 4) : GDN_CH_HGRP * GDN_CH_C * (GDN_CH_C + 4);
 }
@@ -450,13 +450,13 @@ gdn_chunk_prep(const float * q, const float * k, const float * g, const float * 
 
 // the Q rows of gdn_chunk_scan, reused for T and P once Q S0 is done
 template <int S_v>
-static constexpr int gdn_chunk_scan_qrows() {
+static constexpr __host__ __device__ int gdn_chunk_scan_qrows() {
     return GDN_CH_C * (S_v + 4) > 2 * GDN_CH_C * (GDN_CH_C + 4) ? GDN_CH_C * (S_v + 4) : 2 * GDN_CH_C * (GDN_CH_C + 4);
 }
 
 // dynamic LDS of gdn_chunk_scan in floats
 template <int S_v, int NC>
-static constexpr int gdn_chunk_scan_lds() {
+static constexpr __host__ __device__ int gdn_chunk_scan_lds() {
     return GDN_CH_C * (S_v + 4) + gdn_chunk_scan_qrows<S_v>() + NC * (S_v + 4) + 2 * GDN_CH_C * (NC + 4) + 3 * GDN_CH_C;
 }
 
@@ -703,11 +703,11 @@ gdn_chunk_scan(const float * q, const float * k, const float * v, const float * 
 
 // GGML_CUDA_NO_GDN_CHUNKED=1: prefill keeps the token loop. GGML_CUDA_GDN_CHUNK_MIN: fewest tokens for the chunk path
 static bool gdn_chunked_disabled() {
-    static const bool d = getenv("GGML_CUDA_NO_GDN_CHUNKED") != nullptr;
+    static const bool d = ggml_env_flag("GGML_CUDA_NO_GDN_CHUNKED", false);
     return d;
 }
 static int64_t gdn_chunked_min_tokens() {
-    static const int64_t n = getenv("GGML_CUDA_GDN_CHUNK_MIN") ? atoll(getenv("GGML_CUDA_GDN_CHUNK_MIN")) : 64;
+    static const int64_t n = ggml_env_int("GGML_CUDA_GDN_CHUNK_MIN", 64);
     return n;
 }
 
@@ -868,7 +868,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // bf16 operands, fp32 accumulation and state: NMSE ~1.5e-5, KLD no worse than fp32 chunked; prefill +1-2.5%. Reads a
     // plain state (a deferred gather is copied out first), the K > 1 tail goes through the token loop. The kernels step
     // sequences by the token count they scan, so a split-off tail is only right for one sequence
-    static const bool gdn_bf16 = !getenv("GGML_CUDA_GDN_BF16") || atoi(getenv("GGML_CUDA_GDN_BF16")) != 0;
+    static const bool gdn_bf16 = ggml_env_flag("GGML_CUDA_GDN_BF16", true);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (gdn_bf16 && !kda && S_v == 128 && aligned && (n_tail == 0 || n_seqs == 1) && (state_idx == nullptr || n_seqs == 1) &&
             (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc)) &&
@@ -965,7 +965,7 @@ static __global__ void gdn_perturb_kernel(float * __restrict__ x, const int64_t 
 }
 
 static void gdn_perturb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static const float eps = getenv("GGML_CUDA_GDN_PERTURB") ? (float) atof(getenv("GGML_CUDA_GDN_PERTURB")) : 0.0f;
+    static const float eps = (float) ggml_env_float("GGML_CUDA_GDN_PERTURB", 0.0f);
     if (eps == 0.0f) {
         return;
     }
