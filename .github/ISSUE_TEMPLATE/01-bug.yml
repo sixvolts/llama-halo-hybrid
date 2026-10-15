@@ -1,0 +1,96 @@
+name: Bug
+description: A crash, wrong output, a hang or a large slowdown when running a model with this fork.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for the report. This tracker is for llama-halo-hybrid, a fork of
+        [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) for AMD Strix Halo with an optional
+        Radeon card or a second machine over RPC. If the problem also happens on upstream llama.cpp,
+        please report it there as well. The fields below are what a heterogeneous setup needs for triage.
+  - type: textarea
+    id: version
+    attributes:
+      label: Version
+      description: Output of `git describe --tags --always --dirty` in your checkout, and of `llama-server --version`.
+      placeholder: |
+        $ git describe --tags --always --dirty
+        $ ./build/bin/llama-server --version
+    validations:
+      required: true
+  - type: dropdown
+    id: setup
+    attributes:
+      label: Setup
+      description: One discrete card plus the APU per run; mixing card generations in one setup is not supported.
+      options:
+        - Strix Halo only (APU)
+        - Strix Halo + one dGPU in a PCIe slot, extender or OCuLink
+        - Strix Halo + one dGPU in a USB4 / Thunderbolt dock
+        - Two machines over ggml-rpc
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: dgpu
+    attributes:
+      label: Discrete GPU
+      description: Card model, or "none".
+      placeholder: e.g. Radeon AI PRO R9700, RX 7800 XT, Radeon Pro V620, none
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: ROCm version, `uname -r` and `cat /proc/cmdline`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: build
+    attributes:
+      label: Build command
+      description: The cmake configure line, including GPU_TARGETS.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: launch
+    attributes:
+      label: Launch command and environment
+      description: The full llama-server (and rpc-server) command line, plus `env | grep -E '^(LLAMA|GGML)_'`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: model
+    attributes:
+      label: Model files
+      description: Model GGUF (repo and quant), and the draft / MTP head file if you use one.
+    validations:
+      required: true
+  - type: dropdown
+    id: upstream
+    attributes:
+      label: Does it happen on upstream llama.cpp?
+      options:
+        - "Not tried"
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened
+      description: What you expected, what happened instead, and how to reproduce it.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: The server log from startup through the failure. Please paste it yourself rather than a summary.
+      render: shell

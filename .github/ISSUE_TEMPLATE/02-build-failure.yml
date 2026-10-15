@@ -1,0 +1,41 @@
+name: Build failure
+description: The tree does not configure or compile.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Tested here: HIP (ROCm) builds for gfx1151 with gfx1201, gfx1101 or gfx1030, and the CPU build.
+        CUDA, Vulkan and other backends are expected to compile but are not tested by this fork.
+  - type: textarea
+    id: version
+    attributes:
+      label: Version
+      description: Output of `git describe --tags --always --dirty` and `git log -1 --oneline`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: OS, compiler, ROCm (or CUDA) version, `cmake --version`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Commands
+      description: The cmake configure and build commands. If you updated an existing build directory, say so.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Build log
+      description: The first error and the lines around it.
+      render: shell
+    validations:
+      required: true

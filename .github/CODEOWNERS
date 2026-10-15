@@ -1,0 +1,2 @@
+# llama-halo-hybrid: one maintainer. The root CODEOWNERS is upstream ggml-org/llama.cpp's; GitHub reads this file first.
+* @sixvolts

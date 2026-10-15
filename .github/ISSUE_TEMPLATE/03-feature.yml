@@ -1,0 +1,25 @@
+name: Feature request
+description: A model, card, layout or capability you would like this fork to support.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: request
+    attributes:
+      label: Request
+      description: What you would like, and the hardware and models it is for.
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What it would let you do, and any numbers or prior art (other forks, engines, papers).
+  - type: dropdown
+    id: upstream
+    attributes:
+      label: Is it specific to this fork?
+      description: General llama.cpp features are usually better requested upstream at ggml-org/llama.cpp.
+      options:
+        - "Specific to Strix Halo / hybrid placement / this fork"
+        - "General llama.cpp feature"
+        - "Not sure"
