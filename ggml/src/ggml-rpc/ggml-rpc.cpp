@@ -63,7 +63,7 @@ static_assert(sizeof(rpc_tensor) % 8 == 0, "rpc_tensor size must be multiple of 
 // "an op with a weight source runs on the weight's device" rule: on a composite device whose experts sit on a second
 // server device, the expert GEMMs landed there only as leftovers (pass 3) after the down-expansion from the first device
 // had taken the GLU and the weighted reduction, so every such layer shipped its [n_ff, n_used, n_tokens] expert
-// intermediates across PCIe and back (~470 ms per 1024-token ubatch on mainframe). The server marks the buffer and strips
+// intermediates across PCIe and back (~470 ms per 1024-token ubatch in a two-host GLM-5.3 layout). The server marks the buffer and strips
 // the bit; an older server ignores it, an older client never sets it.
 #define RPC_TENSOR_FLAG_WEIGHTS (1 << 30)
 // an older server copies rpc_tensor.flags into ggml_tensor.flags unfiltered, so the bit must never alias a ggml flag
@@ -1929,7 +1929,7 @@ ggml_backend_t rpc_server::backend_for_buffer(ggml_backend_buffer_t buffer) cons
 // therefore read stale bytes with no error anywhere. Syncing the owning backend here makes the invariant
 // enforced instead of assumed: a pending copy is on src's stream (drained directly) and dst's stream carries
 // an event-wait on it (drained transitively). Cost is a no-op stream sync when the device is idle, which is
-// the common case because the server is serial. Raised in review by the mainframe session.
+// the common case because the server is serial.
 void rpc_server::sync_backend_for(ggml_backend_buffer_t buffer) const {
     ggml_backend_t b = backend_for_buffer(buffer);
     if (b != nullptr) {

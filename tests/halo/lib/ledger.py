@@ -51,5 +51,5 @@ if __name__ == '__main__':
     if sys.argv[1] == 'finish':
         finish(sys.argv[2], sys.argv[3], dict(a.split('=', 1) for a in sys.argv[4:]))
     elif sys.argv[1] == 'last':
-        last(sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser('~/bench/results/halo-test/ledger.jsonl'),
+        last(sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.environ.get('HALO_RESULTS') or os.path.join(os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state'), 'halo-test'), 'ledger.jsonl'),
              int(sys.argv[3]) if len(sys.argv) > 3 else 10)

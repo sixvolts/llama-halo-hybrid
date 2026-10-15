@@ -12,7 +12,8 @@ tests/halo/run.sh gpu rdna4 --bless     # record this machine's pre-flight refer
 tests/halo/run.sh last                  # recent runs from the ledger
 ```
 
-Results go to `~/bench/results/halo-test/<date>-<commit>-<host>-<suite>/`. Each run writes `summary.md`, `verdict.json`
+Results go to `$HALO_RESULTS/<date>-<commit>-<host>-<suite>/` (default `~/.local/state/halo-test`; `<host>.env` may set
+`HALO_RESULTS`). Each run writes `summary.md`, `verdict.json`
 and one log per step, plus one line in `ledger.jsonl`. The exit code is 0 only on `PASS`.
 
 | Suite | Steps |

@@ -8,8 +8,8 @@
 # options: --build <dir>   HIP build to build/use (default <repo>/build-halo, every cookbook GPU target)
 #          --no-build      use the existing build as is
 #          --bless         gpu: record this machine's pre-flight references (GEMV probe, peer copies)
-# Results: ~/bench/results/halo-test/<date>-<commit>-<host>-<suite>/ (summary.md, verdict.json, per-step logs),
-# one line per run in ~/bench/results/halo-test/ledger.jsonl. Exit 0 only on PASS.
+# Results: $HALO_RESULTS (default ~/.local/state/halo-test)/<date>-<commit>-<host>-<suite>/ (summary.md, verdict.json,
+# per-step logs), one line per run in $HALO_RESULTS/ledger.jsonl. Exit 0 only on PASS.
 set -u
 . "$(dirname "$0")/lib/common.sh"
 

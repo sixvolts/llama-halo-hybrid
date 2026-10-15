@@ -13691,7 +13691,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     if (getenv("TBO_GLM") != nullptr) {
-        // elementwise / memory-bound kernels at a 1024-token ubatch (mainframe's profile: rms_norm, cpy, the KDA
+        // elementwise / memory-bound kernels at a 1024-token ubatch (the remote host's profile in the two-host GLM-5.3 layout: rms_norm, cpy, the KDA
         // conv-state concat and the hyper-connection adds run far below the APU's bandwidth)
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {4096, 1024, 1, 1}, false, 1e-6f));
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {4096, 1024, 1, 1}));
@@ -13706,7 +13706,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_moe_reduce(4096, 8, 1024, false, true));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, 1024, 4096, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 288, 1024, 4096, {1, 1}, {1, 1}));
-        // routed experts (APU on gibson, mainframe): gate/up q4_K with the broadcast src1, down q5_K
+        // routed experts (on the APU of either host): gate/up q4_K with the broadcast src1, down q5_K
         // n = 1 decode, 3 draft verify, 128..4096 prefill ubatches
         for (int64_t n : {1, 3, 128, 512, 1024, 2048, 4096}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 288, 8, true,  2048, n, 4096));
@@ -13714,7 +13714,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             // gate + up + SwiGLU as one graph (ggml_cuda_mul_mat_q_gate_up; GGML_CUDA_MMQ_GATEUP=0/1/2 to compare)
             test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 288, 8, true, 2048, n, 4096));
         }
-        // dense q8_0 projections on the mainframe layers: shared expert, KDA qkv/out, MLA a/b, decode and prefill
+        // dense q8_0 projections on the remote host's layers: shared expert, KDA qkv/out, MLA a/b, decode and prefill
         for (int64_t n : {1, 3, 1024}) {
             for (auto [m, k] : std::vector<std::pair<int64_t,int64_t>>{{2048, 4096}, {4096, 2048}, {8192, 4096}, {4096, 8192}, {1536, 4096}, {512, 4096}}) {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));

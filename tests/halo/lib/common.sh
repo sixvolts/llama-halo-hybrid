@@ -7,7 +7,7 @@
 HALO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REPO=$(cd "$HALO_DIR/../.." && pwd)
 HOST=$(hostname -s)
-HALO_RESULTS=${HALO_RESULTS:-$HOME/bench/results/halo-test}
+HALO_RESULTS=${HALO_RESULTS:-${XDG_STATE_HOME:-$HOME/.local/state}/halo-test}   # <host>.env may set it
 HALO_LOCK=${HALO_LOCK:-/run/lock/llamabench.lock}
 export PATH=/opt/rocm/bin:$PATH
 

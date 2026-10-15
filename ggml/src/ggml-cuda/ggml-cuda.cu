@@ -1593,7 +1593,6 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
         // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
         // (56 files against 96), so first-choice loads miss and fall back far more often.
-        // See docs/halo-hybrid/GFX1201-INDEXER-BUG.md.
         (void) cudaGetLastError();
     } else if (ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
@@ -1613,7 +1612,6 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
         // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
         // (56 files against 96), so first-choice loads miss and fall back far more often.
-        // See docs/halo-hybrid/GFX1201-INDEXER-BUG.md.
         (void) cudaGetLastError();
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
@@ -1640,7 +1638,6 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
         // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
         // (56 files against 96), so first-choice loads miss and fall back far more often.
-        // See docs/halo-hybrid/GFX1201-INDEXER-BUG.md.
         (void) cudaGetLastError();
     } else {
         // use cublasGemmBatchedEx

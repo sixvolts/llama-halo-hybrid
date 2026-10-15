@@ -201,7 +201,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 //     round trips, barriers, Q re-reads and rescales per key win despite 7 scratch reloads per iteration: causal nb 4096
 //     at 16K/32K 1.17-1.28x isolated; in situ (op timer) Qwen3.5-4B FA 3.94 -> 3.54 s at 30K, 68.6 -> 55.2 s at 124K
 //     (wall 111.4 -> 98.0 s), Qwen3.6-35B 4.91 -> 3.98 s at 30K. Staged/prefetched K/V loads, a transposed V tile and
-//     double-buffered WMMA operands were measured on top and did not help (~/bench/faapu). The sparse (QSA) union walk
+//     double-buffered WMMA operands were measured on top and did not help. The sparse (QSA) union walk
 //     keeps 32-cell tiles: 64 were 1.38-1.45x slower on its 2051-cell budget at 16K-32K
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna3_5(
         const int DKQ, const int DV, const int ncols, const bool use_sparse = false) {

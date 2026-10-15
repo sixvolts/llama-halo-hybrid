@@ -1408,7 +1408,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // halo-hybrid: early ingest. The catch-up decode of a prompt batch runs per target ubatch, from inside the
     // target's llama_decode (llama_set_ubatch_done_callback), instead of once after it: on the two-host prefill
-    // pipeline it fills gibson's wait for the remote lane rather than adding ~2 s after a 25.8K prompt.
+    // pipeline it fills the local host's wait for the remote lane rather than adding ~2 s after a 25.8K prompt.
     // LLAMA_MTP_EARLY_MIN = smallest batch that uses it (default 256 tokens; 0 disables).
     struct early_ingest {
         bool                active   = false; // callback registered for the current target decode
