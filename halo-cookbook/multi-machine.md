@@ -8,9 +8,13 @@ Start with [getting started](README.md) for the kernel setup and placement rules
 
 | Layout | Status | Numbers (single stream, 128K context, MTP head) |
 |---|---|---|
-| [Two Strix Halos + an R9700 on each](#two-strix-halos--an-r9700-on-each) | production since 2026-09-21 | 896 tok/s prefill / 30 tok/s decode at 25.8K |
+| [Two Strix Halos + an R9700 on each](#two-strix-halos--an-r9700-on-each) | last measured 2026-09-28 (tag `halo-2026-09-28`) | 896 tok/s prefill / 30 tok/s decode at 25.8K |
 | [Two Strix Halos + an R9700 on the head node](#two-strix-halos--an-r9700-on-the-head-node) | superseded | 517 tok/s prefill / 20.5 tok/s decode at 13K |
 | [Two Strix Halos, no cards](#two-strix-halos-no-cards) | derived, not measured | - |
+
+Two hosts have not been run on hardware since 2026-09-28. Since then the tree has taken an upstream sync and RPC
+protocol changes; the single-box RPC loopback test in the [regression suites](../tests/halo/README.md) covers the
+protocol, not this layout.
 
 ## Build and network
 
@@ -19,13 +23,16 @@ Both boxes build the same commit with RPC on:
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DGGML_HIP=ON "-DGPU_TARGETS=gfx1151;gfx1201" -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang \
-  -DGGML_HIP_NO_VMM=ON -DGGML_HIP_GRAPHS=ON -DGGML_HIP_MMQ_MFMA=ON -DGGML_HIP_ROCWMMA_FATTN=OFF \
   -DGGML_RPC=ON
 ninja -C build llama-server ggml-rpc-server
 ```
 
-`-DGGML_RPC_RDMA=ON` (needs `libibverbs-dev`) adds RoCE RDMA, negotiated automatically when both ends have it;
-`GGML_RPC_NO_RDMA=1` forces TCP. The production layout runs over TCP (see the rules below).
+RoCE RDMA is built in automatically when `libibverbs-dev` is installed (`-DGGML_RPC_RDMA=OFF` leaves it out) and is
+negotiated when both ends have it; `GGML_RPC_NO_RDMA=1` forces TCP. The E810 RDMA path faulted here, so the layout
+below runs over TCP (see the rules at the end).
+
+`ggml-rpc-server` has no authentication and runs whatever graph a client sends: bind it only to the dedicated link
+address (`-H`) and firewall its port.
 
 The link: the two E810s cabled directly, static addresses (10.100.100.1 head node, 10.100.100.2 second box), MTU
 9000, rings 8160/8160, adaptive interrupt coalescing off at 10 us.
@@ -56,10 +63,15 @@ llama-server -m GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf --rpc 10.100.100.2:
 ```
 
 The draft head is exported from the model's own shards with `scripts/halo-hybrid/export_mtp.py`
-([rdna4.md](rdna4.md#glm-53-flash-at-ud-q2_k_xl) shows the command for the Q2 quant; the same works for Q4_K_XL).
+([rdna4.md](rdna4.md#glm-53-flash-at-ud-q2_k_xl) shows the command for the Q2 quant; the same works for Q4_K_XL). The
+measured line used a variant with its own LM head (`-q40head`: the export plus a q4_0 copy of `output.weight` as
+`shared_head_head`, added with `scripts/halo-hybrid/add_draft_head.py` like the Qwen3.8 head in
+[getting started](README.md#draft-head-with-its-own-lm-head)); the plain export runs with `-md` as it is.
 
-* **Four prefill lanes** run as a rolling pipeline across the link: the remote half works on ubatch k while the head
-  node runs k+1. `LLAMA_UBATCH_TAPER=3` makes the first ubatch partial so the pipeline fills sooner.
+* **Prefill lanes with a remote device:** `LLAMA_PREFILL_LANES=2` runs a rolling pipeline across the link (the
+  remote half works on ubatch k while the head node runs k+1); `4` adds two more lanes so a pair of ubatches runs on
+  the head node's two GPUs while the previous pair is on the remote. Without `--rpc`, any value of 2 or more is the
+  local two-lane pair. `LLAMA_UBATCH_TAPER=3` makes the first ubatch partial so the pipeline fills sooner.
 * **The server's scheduler keeps host syncs for its iGPU:** with scheduler events on the APU, the composite server
   faulted at the first decode step under the grouped MoE GEMV. The client keeps the events.
 * **rocBLAS serves one GPU architecture per process:** every dense tensor on each box's R9700, experts only on the
@@ -117,9 +129,8 @@ memory budget to check first.
 
 ## Running the second box
 
-Run the rpc-server as a systemd unit so it comes back after a reboot and outlives a crashed client. The binary
-flushes on SIGTERM but does not exit, hence `KillMode=mixed`; `LimitMEMLOCK=infinity` lets RDMA register its receive
-ring.
+Run the rpc-server as a systemd unit so it comes back after a reboot and outlives a crashed client. It has no signal
+handler, so stopping the unit ends it at once; `LimitMEMLOCK=infinity` lets RDMA register its receive ring.
 
 ```
 [Unit]
@@ -145,11 +156,12 @@ WantedBy=multi-user.target
 ## Rules that cost a day each to learn
 
 * **Both hosts on the same commit.** The RPC wire format is fork-local (the handshake compares the protocol version,
-  which includes the op table); a mismatched pair is refused. After a rebuild, `readlink /proc/<pid>/exe` on the
+  which includes the op table); two builds of this tree that differ are refused. A stock upstream `rpc-server` is not
+  refused at the handshake yet and does not work with this client, so never pair this tree with upstream builds. After a rebuild, `readlink /proc/<pid>/exe` on the
   server must not end in "(deleted)".
 * **Loading takes ~3.5 minutes** for the 86 GB remote half, bound by the loader's read-then-send loop, not the link.
 * **A peer rebooting looks like a bad link** from the other side (five "drops" in 25 minutes were the second box
   OOM-rebooting under a competing service). Check the peer's uptime before blaming the NIC.
 * **E810 firmware and RDMA:** NVM 3.00 threw "HMC Error" PF resets that kill an RDMA session mid-generation; after the
   update to NVM 5.01 the E810s still hit RDMA faults under load, so RDMA has been off on both hosts since 2026-09-23
-  and the production numbers above are over TCP.
+  and the measured numbers above are over TCP.

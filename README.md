@@ -1,6 +1,6 @@
 # llama-halo-hybrid - Strix Halo + dGPU
 
-llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on an AMD Strix Halo (and soon Gorgon Halo) with an added Radeon card as an accelerator. In many cases, this can dramatically improve prefill and decode speeds, such as on models like Qwen-3.8-flash-next and GLM-5.3-flash. The idea is that you can take an AMD GPU from most of the Navi Generations (2,3,4), and place dense parts of the model, KV, and some of the layers on the GPU and let the APU take the rest of the model. You can add the extra GPU through a PCIe extender (like on the framework desktop), Occulink, or a thunderbolt dock depending on which machine you have. This is not some custom inference engine that requires a custom quant to run. This is llama.cpp modified to run whatever you want, albeit mostly tuned for Qwen and GLM families. The tuning is done by adding updated kernels and fixes for the model architectures. It retains all the original functionality of llama.cpp and remains completely open source. Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant. Better performance at a lower cost: a Strix+GPU is $5k or less compared to the now $7k cost of 128GB DGX Spark.  
+llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on an AMD Strix Halo (and soon Gorgon Halo) with an added Radeon card as an accelerator. In many cases, this can dramatically improve prefill and decode speeds, such as on models like Qwen-3.8-flash-next and GLM-5.3-flash. The idea is that you can take an AMD GPU from most of the Navi Generations (2,3,4), and place dense parts of the model, KV, and some of the layers on the GPU and let the APU take the rest of the model. You can add the extra GPU through a PCIe extender (like on the framework desktop), Occulink, or a thunderbolt dock depending on which machine you have. This is not some custom inference engine that requires a custom quant to run. This is llama.cpp modified to run whatever you want, albeit mostly tuned for Qwen and GLM families. The tuning is done by adding updated kernels and fixes for the model architectures. It keeps llama.cpp's models and tools and remains completely open source; the AMD (ROCm/HIP) build is what this fork tests, while the other backends (CUDA, Vulkan) still compile but are untested here and may differ from upstream. Recent builds now perform better than DGX Spark running Qwen-3.8-flash-next and slightly better yet with the Swift-1.5 variant. Better performance at a lower cost: a Strix+GPU is $5k or less compared to the now $7k cost of 128GB DGX Spark.  
 
 
 Upfront/Note - if you are just using Strix Halo by itself, this is probably not the right tool. Check out Gufo (https://github.com/gufo-org/gufo), which looks very promising.
@@ -14,8 +14,11 @@ Upfront/Note - if you are just using Strix Halo by itself, this is probably not 
 
 You can run this fork on Strix Halo alone (but again, look at gufo), with a Radeon card next to it (in a slot or a USB4 dock), or across two
 boxes. Start with the [cookbook's getting-started page](halo-cookbook/README.md) (build, kernel setup, placement
-rules, model prep); cli launch commands for common cards are in the table. The kernel and scheduler changes
-behind them are in [HALO-HYBRID.md](HALO-HYBRID.md).
+rules, model prep); each row of the table below links to the page with that card's launch lines. The kernel and
+scheduler changes behind them are in [HALO-HYBRID.md](HALO-HYBRID.md).
+
+Build from source: upstream llama.cpp's releases, Docker images and llama.app (linked further down this README) do
+not contain these changes.
 
 <p>
 <img src="halo-cookbook/build.jpeg" width="51%" alt="The build: Framework Strix Halo board with the R9700 on an x4 riser, Noctua on the APU, Seasonic PSU">
@@ -28,7 +31,7 @@ behind them are in [HALO-HYBRID.md](HALO-HYBRID.md).
 | [+ RX 7800 XT (RDNA3, 16 GB)](halo-cookbook/rdna3.md) | Qwen3.8-Flash-Next, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 60 tok/s, 1,538 / 1,327 / 989 tok/s prefill at 7K / 28K / 113K |
 | [+ Radeon Pro V620 (RDNA2, 32 GB)](halo-cookbook/rdna2.md) | Qwen3.8-Flash-Next, Swift 1.5, GLM-5.3-Flash (UD-Q2_K_XL) | measured | 58 tok/s, 1,517 / 1,324 / 1,023 tok/s prefill at 7K / 28K / 113K; needs `amdgpu.ras_enable=0` |
 | [Any card in a USB4 / Thunderbolt dock](halo-cookbook/usb4-thunderbolt.md) | as the card's page | measured (RX 7800 XT) | same decode as a PCIe x4 slot; needs `thunderbolt.host_reset=false` |
-| [Two Strix Halos over a 100G link](halo-cookbook/multi-machine.md) | GLM-5.3-Flash (200 GB) | production (an R9700 on each) | 896 tok/s prefill / 30 tok/s decode at 25.8K |
+| [Two Strix Halos over a 100G link](halo-cookbook/multi-machine.md) | GLM-5.3-Flash (200 GB) | last measured 2026-09-28 (an R9700 on each) | 896 tok/s prefill / 30 tok/s decode at 25.8K |
 
 
 What that means:
@@ -51,6 +54,9 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --spec-type draft-mtp --spec-draft-n-max 2 \
   --host 0.0.0.0 --port 8080
 ```
+
+`--host 0.0.0.0` makes the server reachable from your network with no authentication; add `--api-key` or bind to
+`127.0.0.1` on a network you don't fully trust.
 
 On the Strix Halo alone: `-dev ROCm0` (the iGPU when it's the only device), no `-ot`, `-b 4096 -ub 4096`, and the
 same draft on the iGPU. The draft head gets its own q4_K output layer (commands in the [cookbook](halo-cookbook/README.md#draft-head-with-its-own-lm-head)).
@@ -144,6 +150,29 @@ the chunking and top-k changes, and they're kept here for the record.
 I kept going on tuning, and tried to reduce the number of kernel launches, which seemed to be holding back
 performance. I wasn't hitting anywhere near the right numbers per the theoretical bandwidth for each device. The
 kernel and scheduler changes that came out of that are listed in [HALO-HYBRID.md](HALO-HYBRID.md).
+
+### Versions and bug reports
+
+There are no binary releases. Dated tags (`halo-YYYY-MM-DD`) mark tested states of `main`; the last upstream sync was
+ggml-org/llama.cpp `ec7630a64` (2026-10-01). When you report a problem, include the output of
+`git describe --tags --always --dirty` and `llama-server --version`, and use the issue form: it asks for the setup,
+card, ROCm version and launch line that a hybrid setup needs. With two machines over RPC, both must run the same
+commit.
+
+### Credits and ported code
+
+| Source | What came from it | License |
+|---|---|---|
+| [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | the base this fork tracks; some of its pull requests were cherry-picked before they landed (authors kept in the git history) | MIT |
+| [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) | RDNA3.5 MMQ tile configs and the split-J Q8_0 tile, the Gated DeltaNet recurrence's waves per block on gfx1151 | MIT |
+| [asf0/strix-llama.cpp](https://github.com/asf0/strix-llama.cpp) | the histogram `mm_ids` helper, the threaded KQ mask fill | MIT |
+| [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) | the bf16 WMMA chunked Gated DeltaNet prefill | MIT ([licenses/LICENSE-llama-cpp-rdna-boosts](licenses/LICENSE-llama-cpp-rdna-boosts)) |
+| libr4d, now part of [radiance](https://codeberg.org/StillDeadcode/radiance) (Deadcode and the radiance contributors) | the WMMA kernels behind that prefill | Apache-2.0 ([licenses/LICENSE-radiance-libr4d](licenses/LICENSE-radiance-libr4d)) |
+| [gufo](https://github.com/gufo-org/gufo) | the routed F16-WMMA expert GEMM for RDNA3 / RDNA3.5 prefill (`mmid-f16.cu`) | MIT ([licenses/LICENSE-gufo](licenses/LICENSE-gufo)) |
+| [ucicelos/flashnext-hybrid](https://github.com/ucicelos/flashnext-hybrid) | the QSA row gather at depth for decode | MIT |
+| [pwilkin/llama.cpp](https://github.com/pwilkin/llama.cpp) | column-ordered TOP_K tie gathering | MIT |
+| [sixvolts/llama-navi21-furnace](https://github.com/sixvolts/llama-navi21-furnace) | RDNA2 (Navi21) flash attention and GEMV tuning | MIT |
+| [sixvolts/llamacpp-gfx906-furnace](https://github.com/sixvolts/llamacpp-gfx906-furnace) | fused QSA block scoring, the per-sequence window in the shared KV pool | MIT |
 
 
 

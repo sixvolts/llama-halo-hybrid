@@ -20,6 +20,8 @@ trunk = {t.name: t for r in [GGUFReader(p) for p in shards(trunk_p)] for t in r.
 reftype = {t.name: t.tensor_type for r in [GGUFReader(p) for p in shards(ref_p)] for t in r.tensors}
 arch = base[0].fields["general.architecture"]
 arch = bytes(arch.parts[arch.data[0]]).decode()
+if not dry:
+    os.makedirs(os.path.dirname(os.path.abspath(out_p)), exist_ok=True)
 w = GGUFWriter(out_p, arch, split_max_size=45 * 1024**3, dry_run=dry)
 
 # KV metadata from the base's first shard (split keys and the GGUF header fields are the writer's own)
@@ -73,3 +75,4 @@ w.write_header_to_file()
 w.write_kv_data_to_file()
 w.write_tensors_to_file(progress=True)
 w.close()
+print("wrote", " ".join(sorted(glob.glob(os.path.splitext(out_p)[0] + "-*-of-*.gguf"))) or out_p, flush=True)

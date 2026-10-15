@@ -12,6 +12,10 @@ ROCm0 is the card and ROCm1 the iGPU in every line here; check the device order 
 * Leave the card's power profile on `auto`. Forcing `high` (`rocm-smi --setperflevel high`) made launch-bound decode
   kernels 20-27% slower.
 * The R9700 does not need `amdgpu.ras_enable=0` (the V620 does); keeping it from another card is harmless.
+* **If the card drops off the bus at idle** (`journalctl -k` shows the SMU "in hanged state" or "device lost from
+  bus"): the test box had two such drops at deep idle and none since turning ASPM L1 off on the card's links, e.g.
+  `echo 0 | sudo tee /sys/bus/pci/devices/<card and its upstream bridge>/link/l1_aspm` at every boot. That is one
+  card's evidence over a few days, so treat it as a workaround to try, not a requirement.
 
 ## Qwen3.8-Flash-Next
 
@@ -47,8 +51,9 @@ prompts, T=0.7, 400 tokens, two seeds):
   Moving the expert split (layers 9-12) is a wash.
 * **Prefill lanes:** `LLAMA_PREFILL_LANES=2` is the whole win (one lane: 1,420-1,490 tok/s). `-b` must be at least
   twice `-ub`.
-* **Decode:** `--spec-draft-n-max 2` (3 loses 2.5%). The head only pays at one or two streams; for more users leave
-  the `-md`/`--spec-*` lines out.
+* **Decode:** measured at `--spec-draft-n-max 2`; 3 helps greedy requests, and sampled ones are capped at 2 drafts
+  either way ([getting started](README.md#placement-rules-apply-to-every-recipe)). The head only pays at one or two
+  streams; for more users leave the `-md`/`--spec-*` lines out.
 * **Memory:** ~51 GB of experts on the iGPU, the n-gram table in page cache, 23-26 GB plus the head on the R9700.
 
 ### 128K context
@@ -77,17 +82,27 @@ On that benchmark (40 prompts at T=0, needle-in-filler prefill): 65.5-67.3 tok/s
 
 ### Several streams
 
-Each slot (`-np N`) gets its own share of `-c` and its own KV stream. Two 128K slots, one for the WebUI and one for
-an agent, is the line this fork runs in production:
+Each slot (`-np N`) gets its own share of `-c` and its own KV stream, or, with `-kvu`, all slots share one pool. Two
+conversations (one for the WebUI, one for an agent) sharing one 256K pool is the line this fork runs in production:
 
 ```
-LLAMA_PREFILL_LANES=2 \
-llama-server -m Swift-1.5-Qwen3.8-Flash-Next-Q8trunk-00001-of-00003.gguf \
-  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 262144 -b 8192 -ub 4096 -np 2 \
+LLAMA_PREFILL_LANES=2 LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=2048 \
+llama-server -m Q8T/Swift-1.5-Qwen3.8-Flash-Next-Q8trunk-00001-of-00003.gguf \
+  -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 262144 -b 8192 -ub 4096 -np 2 -kvu --no-cache-idle-slots \
   -ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
-  -md mtp-Swift1.5-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
-  --spec-type draft-mtp --spec-draft-n-max 3
+  -md mtp-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --checkpoint-min-new 256 --jinja \
+  --host 0.0.0.0 --port 8080
 ```
+
+* `--checkpoint-min-new 256` skips the context checkpoint (and the prompt split) at the last user message when fewer
+  than 256 new tokens follow it, so a short chat turn runs as one batch.
+* `LLAMA_QSA_CHUNK_MB` (MiB) caps the indexer's prefill scratch on the card, which is built in chunks;
+  `LLAMA_SPEC_DRAFT_UB` caps the draft's ubatch (0 = the target's `-ub`).
+* Sampled requests draft at most 2 tokens (`LLAMA_SPEC_NMAX_SAMPLED`), greedy ones 3.
+
+For fixed slots instead (two 128K slots, each with its own cache), drop `-kvu --no-cache-idle-slots`;
+`LLAMA_QSA_CHUNK_MB` has no effect with separate slots.
 
 What fits on the R9700 (32 GB; Swift 1.5 Q8T with the draft head, every routed expert on the iGPU). The card holds
 4.5 GB of weights plus 1.9 GB of draft head, 3.6 GB of KV and indexer cache per 128K of total context, 0.33 GB of
@@ -111,13 +126,9 @@ joins consecutive slots; the server now hands new requests the idle slot that ke
 51.7 agg on two at 60K; with the draft head 56.5 on one stream and 63.6 agg on two. `GGML_CUDA_QSA_TK_REG=0` and
 `GGML_CUDA_NO_QSA_SCORE=1` switch them off.
 
-One shared pool instead of fixed slots (2026-10-07): with `-kvu` both slots draw on the whole 256K, so one
-conversation can run past 128K while the other is short. Same speed as 2 × 128K slots (56.3 tok/s on one stream at
-60K, 64.8 agg on two with the draft head), 30.7 GB on the card:
-
-```
-LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=2048 llama-server ... -c 262144 -b 8192 -ub 4096 -np 2 -kvu --no-cache-idle-slots ...
-```
+The shared pool (2026-10-07): with `-kvu` both slots draw on the whole 256K, so one conversation can run past 128K
+while the other is short. Same speed as 2 × 128K slots (56.3 tok/s on one stream at 60K, 64.8 agg on two with the
+draft head), 30.7 GB on the card.
 
 `--no-cache-idle-slots` is required: without it every idle conversation is saved and cleared on each new request
 and re-prefilled on its next turn.

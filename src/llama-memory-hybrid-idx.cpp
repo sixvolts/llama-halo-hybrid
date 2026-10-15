@@ -71,8 +71,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
-    // several sequences in one unified cache: attend only the span of the cells of the ubatch's sequences (after furnace
-    // b00e0d799). the indexer mirrors the attention cells, so both caches find the same window
+    // several sequences in one unified cache: attend only the span of the cells of the ubatch's sequences
+    // (after sixvolts/llamacpp-gfx906-furnace b00e0d799). the indexer mirrors the attention cells, so both caches
+    // find the same window
     get_mem_attn()->set_window(true);
     if (mem_idx) {
         mem_idx->set_window(true);
@@ -613,7 +614,7 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
 
 // the cells [lo, lo + n_kv) a ubatch attends, numbered from lo (llama_kv_cache::get_kv_window). the cells of sequences
 // outside the ubatch read as empty: every token masks them anyway, and inside a window their positions need not fit it
-// (after furnace b00e0d799)
+// (after sixvolts/llamacpp-gfx906-furnace b00e0d799)
 struct qsa_cells {
     const llama_kv_cells &          cells;
     const uint32_t                  lo;

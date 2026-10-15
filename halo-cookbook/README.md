@@ -1,6 +1,8 @@
 # Halo cookbook: getting started
 
-llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on an AMD Strix Halo (Ryzen AI Max+ 395, 128 GB unified memory) with an added Radeon card as an accelerator. In many cases, this can dramatically improve prefill and decode speeds, such as on models like Qwen-3.8-flash-next and GLM-5.3-flash. The routed experts stay in unified memory on the iGPU/APU and the dense parts (trunk, attention, KV cache, the MTP draft head) go on the added dGPU. Various AMD GPUs have been tested. Vulkan or NVidia devices are outside the scope of this project to keep the complexity manageable.  
+llama-halo-hybrid is designed to run larger (120B+) mixture-of-experts models on an AMD Strix Halo (Ryzen AI Max+ 395, 128 GB unified memory) with an added Radeon card as an accelerator. In many cases, this can dramatically improve prefill and decode speeds, such as on models like Qwen-3.8-flash-next and GLM-5.3-flash. The routed experts stay in unified memory on the iGPU/APU and the dense parts (trunk, attention, KV cache, the MTP draft head) go on the added dGPU. Various AMD GPUs have been tested. Vulkan or NVidia devices are outside the scope of this project to keep the complexity manageable: the CUDA and Vulkan backends still compile, but nothing here tests them and they may differ from upstream llama.cpp.
+
+Supported shapes: the Strix Halo alone, the Strix Halo with **one** Radeon card (in a slot, on an extender or OCuLink, or in a USB4 dock), or two machines over RPC. Two cards of different generations in one setup are not supported; with a second card installed, hide it with `ROCR_VISIBLE_DEVICES`. Build from source: upstream llama.cpp releases, Docker images and llama.app do not contain these changes.
 
 This page covers what every setup shares (build, kernel setup, placement rules, model preparation) and the Strix
 Halo on its own. Each other page is one hardware shape:
@@ -12,17 +14,22 @@ Halo on its own. Each other page is one hardware shape:
 | [rdna3.md](rdna3.md) | + RX 7800 XT (16 GB); 7900 XT / XTX untested | measured (2026-10-04) | 60 tok/s decode, 1,538 / 1,327 / 989 tok/s prefill at 7K / 28K / 113K |
 | [rdna2.md](rdna2.md) | + Radeon Pro V620 (32 GB); RX 6800 / 6900 XT | measured (2026-10-02) | 58 tok/s decode, 1,517 / 1,324 / 1,023 tok/s prefill at 7K / 28K / 113K |
 | [usb4-thunderbolt.md](usb4-thunderbolt.md) | Any of the cards above in a USB4 / Thunderbolt eGPU dock | measured with the RX 7800 XT (2026-10-04) | same decode as a PCIe x4 slot; 3.8 GB/s card <-> iGPU |
-| [multi-machine.md](multi-machine.md) | Two Strix Halos over a 100G link, with or without cards | production (GLM-5.3-Flash, 200 GB) | 896 tok/s prefill / 30 tok/s decode at 25.8K |
+| [multi-machine.md](multi-machine.md) | Two Strix Halos over a 100G link, with or without cards | last measured 2026-09-28 (GLM-5.3-Flash, 200 GB) | 896 tok/s prefill / 30 tok/s decode at 25.8K |
 
 
 ## Build
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_HIP=ON "-DGPU_TARGETS=gfx1151;gfx1201" -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang \
-  -DGGML_HIP_NO_VMM=ON -DGGML_HIP_GRAPHS=ON -DGGML_HIP_MMQ_MFMA=ON -DGGML_HIP_ROCWMMA_FATTN=OFF
-ninja -C build llama-server
+  -DGGML_HIP=ON "-DGPU_TARGETS=gfx1151;gfx1201" -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang
+ninja -C build llama-server llama-quantize
 ```
+
+The binaries land in `build/bin/`; the launch lines on these pages call them by name, so put `build/bin` on your
+`PATH` or prefix the path.
+
+**Updating:** after `git pull`, run the `cmake -S . -B build ...` line again before `ninja`. New source files are picked
+up only when CMake re-runs, and an old build directory otherwise fails to link.
 
 `GPU_TARGETS` is `gfx1151` (the Strix Halo iGPU) plus the card's architecture:
 
@@ -34,8 +41,11 @@ ninja -C build llama-server
 | RX 7800 XT / 7700 XT (RDNA3) | `gfx1101` |
 | Radeon Pro V620, W6800, RX 6800 / 6900 XT (RDNA2) | `gfx1030` |
 
-For two machines add `-DGGML_RPC=ON` (see [multi-machine.md](multi-machine.md)). ROCm 7.2 is what this tree is built
-and tested with.
+For two machines add `-DGGML_RPC=ON` (see [multi-machine.md](multi-machine.md)). The test box runs ROCm 7.2.2 on
+Ubuntu with Linux 7.0. To check a build on your own machine, see the [regression suites](../tests/halo/README.md).
+
+The tested targets are gfx1151 with gfx1201, gfx1101 or gfx1030. gfx1100, gfx1102, gfx1150 and gfx1200 compile but
+have not been run here.
 
 ## Kernel setup
 
@@ -51,6 +61,8 @@ GRUB_CMDLINE_LINUX="amdgpu.ras_enable=0 amdgpu.runpm=0"
 * **`amdgpu.lockup_timeout`** gives long kernels (prefill on a 100K+ prompt) more time before the driver calls a hang.
 * **`amdgpu.runpm=0`** with a card: an RX 7800 XT failed to wake from runtime power-down after ~9 minutes idle, and
   the stuck card took ROCm down for the iGPU as well. The cost is that the card never powers down at idle.
+* **`amd_iommu=off`**: the card <-> iGPU peer copies have only been run with the IOMMU off on the test box.
+  `iommu=pt`, the usual ROCm recommendation, has not been tried here.
 * **`amdgpu.ras_enable=0`** is needed for the V620 ([rdna2.md](rdna2.md)); it does no harm on the other cards.
 * An eGPU dock also needs `thunderbolt.host_reset=false` ([usb4-thunderbolt.md](usb4-thunderbolt.md)).
 
@@ -73,19 +85,35 @@ Run `sudo update-grub` and reboot after changing these.
 * **The MTP draft head** (`-md <draft.gguf> --spec-type draft-mtp --spec-draft-n-max 2 -devd <device>`) goes on the
   device that holds the dense trunk; it borrows the target's embeddings, so `-devd` must name a device that has them.
   Give it its own q4_K LM head ([below](#draft-head-with-its-own-lm-head)): drafting then reads 341 MB instead of
-  the target's 680 MB q8_0 output layer twice per step. n-max 2 measured best (3 loses 2.5%).
+  the target's 680 MB q8_0 output layer twice per step.
+* **Draft length:** the measured lines on these pages use `--spec-draft-n-max 2`. With 3, greedy requests (T=0) draft
+  three tokens, and that raised the median on short answers by ~8%. Sampled requests (T > 0) are capped at 2 drafts
+  anyway, because acceptance drops when sampling and a third draft no longer pays for its verify. The cap is
+  `LLAMA_SPEC_NMAX_SAMPLED` (default 2, 0 = no cap). The production line on [rdna4.md](rdna4.md) runs n-max 3.
 * **`LLAMA_PREFILL_LANES=2`** runs consecutive ubatches on two schedulers so the iGPU's expert GEMMs overlap the
   card's attention (`-b` at least twice `-ub`). It needs two GPU devices; on the iGPU alone it is ignored. It is the
-  whole hybrid prefill win (one lane: ~1,450 tok/s at 16K instead of ~2,200 on the R9700).
-* **Device names** are what ROCm enumerates: with a card, `ROCm0` is usually the card and `ROCm1` the iGPU. Check the
-  startup log before copying a line.
+  whole hybrid prefill win (one lane: ~1,450 tok/s at 16K instead of ~2,200 on the R9700). Unset or 1 is off; any
+  value of 2 or more gives two local lanes. With a remote RPC device, 2 runs the rolling pipeline and 4 the paired one
+  ([multi-machine.md](multi-machine.md)).
+* **Device names** are what ROCm enumerates: with a card, `ROCm0` is usually the card and `ROCm1` the iGPU. Check with
+  `llama-server --list-devices` before copying a line.
+* **`--host 0.0.0.0`** in the lines below makes the server and its web UI reachable from your network, with no
+  authentication. Add `--api-key <key>` or bind to `127.0.0.1` on a network you do not fully trust.
 
 ## Models and draft heads
 
 * **Qwen3.8-Flash-Next:** `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL (four shards, 111 GB). The MTP draft head is
-  in that repo's `MTP/` folder.
+  in that repo's `MTP/` folder; `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` is the one the recipe below starts from, and
+  it also runs as-is with `-md` (about 1 ms per draft step slower than with its own head):
+
+  ```
+  hf download unsloth/Qwen3.8-Flash-Next-GGUF --include 'UD-Q4_K_XL/*' 'MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --local-dir .
+  ```
+
 * **GLM-5.3-Flash:** unsloth UD-Q4_K_XL (200 GB, two machines) or UD-Q2_K_XL (108.7 GB, one machine). The draft head
   is exported from the model's own shards ([rdna4.md](rdna4.md#glm-53-flash-at-ud-q2_k_xl)).
+* **Python tools** (the converter and `scripts/halo-hybrid/`): `python3 -m pip install -r
+  requirements/requirements-convert_hf_to_gguf.txt`, in a virtual environment.
 * **API:** use `/v1/chat/completions` (a bare prompt on `/completion` stops after one token with Qwen3.8). Qwen3.8
   thinks by default; `"chat_template_kwargs": {"enable_thinking": false}` turns it off per request.
 
@@ -93,11 +121,12 @@ Run `sudo update-grub` and reboot after changing these.
 
 The published Qwen3.8 MTP head drafts through the target's q8_0 output layer. A q4_K copy of that layer inside the
 head file makes each draft step cheaper (hybrid 36.5 -> 35.4 ms/step, APU-only 58.5 -> 55.6, same acceptance);
-verification still uses the target's layer. The tools are in [`scripts/halo-hybrid/`](../scripts/halo-hybrid):
+verification still uses the target's layer. The tools are in [`scripts/halo-hybrid/`](../scripts/halo-hybrid); shard 2
+of the UD-Q4_K_XL files holds `output.weight`, and the quantize step also turns the head's q8_0 experts into q4_K:
 
 ```
-python3 scripts/halo-hybrid/add_draft_head.py mtp-Qwen3.8-Flash-Next-shared-exps-q4k.gguf \
-  Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf output.weight mtp-head-q8.gguf
+python3 scripts/halo-hybrid/add_draft_head.py MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf output.weight mtp-head-q8.gguf
 llama-quantize --allow-requantize --tensor-type indexer=bf16 --tensor-type ffn_gate_exps=q4_K \
   --tensor-type ffn_up_exps=q4_K --tensor-type ffn_down_exps=q5_1 --tensor-type shared_head_head=q4_K \
   mtp-head-q8.gguf mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf Q8_0
@@ -118,13 +147,16 @@ prefer the Q4_K_M; prefill is the same.
 
 ```bash
 S=scripts/halo-hybrid; R=ukisai/Swift1.5-Qwen3.8-Flash-Next
+# the published Q4_K_M (its experts are kept); the trunk's tensor types are copied from the UD-Q4_K_XL files above
+hf download ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF --include 'Q4_K_M/*' --local-dir .
 # MTP head (5 GB of range requests), shared embeddings, indexer kept bf16 like unsloth's heads
 python3 $S/fetch_hf_tensors.py $R mtp-src
-python convert_hf_to_gguf.py mtp-src --mtp --mtp-shared-embd --outtype bf16 --outfile mtp-bf16.gguf
+python3 convert_hf_to_gguf.py mtp-src --mtp --mtp-shared-embd --outtype bf16 --outfile mtp-bf16.gguf
 # q8_0 trunk (9.4 GB fetch, 20 GB f32 intermediate, 121 GB output)
 python3 $S/fetch_hf_tensors.py $R trunk-src . 'mlp\.experts\.|ngram_embedding\.shard_|^model\.visual\.|^mtp\.'
-python convert_hf_to_gguf.py trunk-src --no-mtp --outtype f32 --outfile trunk-f32.gguf
-python3 $S/merge_trunk.py Swift-...-Q4_K_M-00001-of-00003.gguf trunk-f32.gguf Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+python3 convert_hf_to_gguf.py trunk-src --no-mtp --outtype f32 --outfile trunk-f32.gguf
+python3 $S/merge_trunk.py Q4_K_M/Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf trunk-f32.gguf \
+  UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   Q8T/Swift-1.5-Qwen3.8-Flash-Next-Q8trunk.gguf --name="Swift 1.5 Qwen3.8-Flash-Next (q8_0 trunk, ukisai Q4_K_M experts)"
 # draft head with its own q4_K LM head (lm_head.weight from the trunk conversion)
 python3 $S/add_draft_head.py mtp-bf16.gguf trunk-f32.gguf output.weight mtp-head-f32.gguf
@@ -132,7 +164,9 @@ llama-quantize --tensor-type indexer=bf16 --tensor-type ffn_gate_exps=q4_K --ten
   --tensor-type ffn_down_exps=q5_1 --tensor-type shared_head_head=q4_K mtp-head-f32.gguf mtp-shared-exps-q4k-head-q4_K.gguf Q8_0
 ```
 
-Run it with the same lines as the base model, swapping `-m` and `-md`.
+`merge_trunk.py` writes three ~45 GB shards, `Q8T/Swift-1.5-Qwen3.8-Flash-Next-Q8trunk-0000{1,2,3}-of-00003.gguf`. Run it
+with the same lines as the base model, with `-m Q8T/Swift-1.5-Qwen3.8-Flash-Next-Q8trunk-00001-of-00003.gguf` and
+`-md mtp-shared-exps-q4k-head-q4_K.gguf`.
 
 ## One Strix Halo by itself
 
