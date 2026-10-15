@@ -1,0 +1,71 @@
+name: halo-ci
+
+# Compile checks for llama-halo-hybrid on GitHub-hosted runners: the CPU build with warnings as errors plus its
+# tests, and compile-only HIP, CUDA and Vulkan builds. Nothing here needs a GPU; the GPU suites are tests/halo.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'halo-cookbook/**', 'docs/**', 'tests/halo/**']
+  pull_request:
+    paths-ignore: ['**/*.md', 'halo-cookbook/**', 'docs/**', 'tests/halo/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
+      - name: Build (warnings as errors)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_FATAL_WARNINGS=ON -DGGML_NATIVE=OFF
+          cmake --build build -j 4
+      - name: Tests
+        run: ctest --test-dir build -L main --output-on-failure -j 4
+
+  hip:
+    runs-on: ubuntu-24.04
+    container: rocm/dev-ubuntu-24.04:7.2.1-complete
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: apt-get update && apt-get install -y ninja-build cmake git libssl-dev
+      - name: Build (gfx1151, gfx1201)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON "-DGPU_TARGETS=gfx1151;gfx1201" \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang -DGGML_RPC=ON -DGGML_NATIVE=OFF
+          cmake --build build -j 4 --target ggml-hip llama-server ggml-rpc-server
+
+  cuda:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: apt-get update && apt-get install -y ninja-build cmake git libssl-dev
+      - name: Build (compile only)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=89;120a" \
+            -DGGML_RPC=ON -DGGML_NATIVE=OFF
+          cmake --build build -j 4 --target ggml-cuda llama-server
+
+  vulkan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev libvulkan-dev glslc spirv-headers
+      - name: Build (compile only)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_NATIVE=OFF
+          cmake --build build -j 4 --target ggml-vulkan llama-server
