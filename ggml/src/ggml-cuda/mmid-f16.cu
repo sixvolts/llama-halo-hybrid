@@ -1,7 +1,7 @@
 // halo-hybrid: routed (MoE) expert GEMM in F16 WMMA for RDNA3 / RDNA3.5 at prefill widths.
 //
 // Adapted from gufo (https://github.com/gufo-org/gufo, src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp,
-// RoutedF16GEMMKernel), MIT License, Copyright (c) 2026 gufo contributors. The kernel body is kept close to the original;
+// RoutedF16GEMMKernel), MIT License, Copyright (c) 2026 gufo contributors (licenses/LICENSE-gufo). The kernel body is kept close to the original;
 // the adapter below feeds it ggml's MUL_MAT_ID inputs: the forward row maps of ggml_cuda_launch_mm_ids_helper
 // (compact row -> src1 row / dst row, per-expert bounds, no padding - the kernel bounds-checks every row), a tile list
 // (expert | token_tile << 16, -1 for unused slots) and the activations converted to F16 rows once.

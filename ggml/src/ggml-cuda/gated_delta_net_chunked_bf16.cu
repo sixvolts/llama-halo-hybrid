@@ -1,19 +1,25 @@
+// Provenance and license: the WMMA kernels below derive from libr4d (radiance,
+// https://codeberg.org/StillDeadcode/radiance), Copyright 2026 Deadcode and the radiance contributors,
+// Apache License 2.0, via stew675/llama-cpp-rdna-boosts (MIT). Modified in llama-halo-hybrid: ported to
+// ggml's GATED_DELTA_NET op and split per architecture. See licenses/LICENSE-radiance-libr4d and
+// licenses/LICENSE-llama-cpp-rdna-boosts.
+
 #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 
 // ---------------------------------------------------------------------------------------------
 // Fused chunked GGML_OP_GATED_DELTA_NET prefill on the gfx1201 bf16 WMMA units.
 // RDNA4 (gfx12) ONLY: this is the fork's validated RDNA4-only kernel file
-// (chunked-gdn tip 99bbd1b20, 46/46 on gfx1201 per the d222767c7 record), restored
+// (rdna-boosts chunked-gdn tip 99bbd1b20, 46/46 on gfx1201 there), restored
 // verbatim after the in-place dual-arch refactor regressed the gfx12 path (NaN/inf
 // on the bf16 chunked GDN, llama-cpp-rdna-boosts report). The gfx11 (RDNA3/RDNA3.5)
 // first-gen WMMA port lives in its own file (gated_delta_net_chunked_bf16_gfx11.cu)
 // with its own dispatch; the two architectures never share kernel code, so they
 // cannot cross-regress. This file compiles to no-op stub kernels on non-RDNA4 device
-// passes (the gfx12 wmma intrinsic does not exist there - issue #1); the runtime-cc
+// passes (the gfx12 wmma intrinsic does not exist there - rdna-boosts issue #1); the runtime-cc
 // dispatch in gated_delta_net.cu launches it only when the device is RDNA4.
 //
 // This is the tensor-core half of the chunked-GDN lever: the SAME chunked algorithm as the
-// fp32 path (gated_delta_net_chunked.cu), but every GEMM runs on the RDNA4 WMMA instruction
+// fp32 path (gated_delta_net.cu), but every GEMM runs on the RDNA4 WMMA instruction
 // with bf16 operands and fp32 accumulation, and the recurrent state lives in WMMA
 // accumulators across the whole chunk loop. Ported from libr4d's r4d_gdn_kkt_solve_k128_c64
 // and r4d_gdn_chunk_scan_k128_v128_c64 (validated on this exact hardware against FLA), adapted
@@ -24,7 +30,7 @@
 // operands, fp32 accumulation, fp32 prefix sums, fp32 H-state carried across chunks, bf16
 // only for the staged WMMA operands. Near-lossless, NOT bit-exact -- the dispatch in
 // gated_delta_net.cu makes bf16 the S_v == 128 default on RDNA4 (opt-OUT via
-// GGML_CUDA_GDN_CHUNKED_BF16=0); the bit-exact fp32 chunked path stays the fallback.
+// GGML_CUDA_GDN_BF16=0); the bit-exact fp32 chunked path stays the fallback.
 //
 // Decay is carried on a per-chunk reference c = (g_first + g_last)/2 so the (i,j) factor
 // separates exactly:
@@ -848,7 +854,7 @@ gdn_bf16_scan_cuda(
 
 #else // !defined(RDNA4)
 
-// No-op stub definitions: the gfx12 wmma intrinsic does not exist on older targets (issue #1).
+// No-op stub definitions: the gfx12 wmma intrinsic does not exist on older targets (rdna-boosts issue #1).
 // The runtime-cc dispatch never launches these on non-RDNA4 hardware; they exist only so the
 // host-pass launch stubs in the launchers below link on every arch.
 template <int HG_RATIO>

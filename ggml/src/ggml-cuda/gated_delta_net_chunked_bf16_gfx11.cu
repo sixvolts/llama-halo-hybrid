@@ -1,3 +1,9 @@
+// Provenance and license: the WMMA kernels below derive from libr4d (radiance,
+// https://codeberg.org/StillDeadcode/radiance), Copyright 2026 Deadcode and the radiance contributors,
+// Apache License 2.0, via stew675/llama-cpp-rdna-boosts (MIT). Modified in llama-halo-hybrid: ported to
+// ggml's GATED_DELTA_NET op and split per architecture. See licenses/LICENSE-radiance-libr4d and
+// licenses/LICENSE-llama-cpp-rdna-boosts.
+
 #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 
 // ---------------------------------------------------------------------------------------------
@@ -10,10 +16,10 @@
 // two architectures share no kernel code and cannot cross-regress; the runtime-cc dispatch
 // in gated_delta_net.cu picks the kernel by device cc (RDNA3 -> this file, RDNA4 -> the
 // gfx12 file). This file compiles to no-op stub kernels on non-RDNA3 device passes (the
-// first-gen wmma intrinsic needs the gfx11 target features - issue #1 class).
+// first-gen wmma intrinsic needs the gfx11 target features - rdna-boosts issue #1 class).
 //
 // This is the tensor-core half of the chunked-GDN lever: the SAME chunked algorithm as the
-// fp32 path (gated_delta_net_chunked.cu), but every GEMM runs on the WMMA instruction
+// fp32 path (gated_delta_net.cu), but every GEMM runs on the WMMA instruction
 // with bf16 operands and fp32 accumulation, and the recurrent state lives in WMMA
 // accumulators across the whole chunk loop. Ported from libr4d's r4d_gdn_kkt_solve_k128_c64
 // and r4d_gdn_chunk_scan_k128_v128_c64 (validated on gfx1201 against FLA), adapted
@@ -25,7 +31,7 @@
 // operands, fp32 accumulation, fp32 prefix sums, fp32 H-state carried across chunks, bf16
 // only for the staged WMMA operands. Near-lossless, NOT bit-exact -- the dispatch in
 // gated_delta_net.cu makes bf16 the S_v == 128 default on RDNA3 and RDNA4 (opt-OUT via
-// GGML_CUDA_GDN_CHUNKED_BF16=0); the bit-exact fp32 chunked path stays the fallback.
+// GGML_CUDA_GDN_BF16=0); the bit-exact fp32 chunked path stays the fallback.
 //
 // Decay is carried on a per-chunk reference c = (g_first + g_last)/2 so the (i,j) factor
 // separates exactly:
