@@ -222,7 +222,7 @@ gdn_bf16_kkt_cuda(
         const float * __restrict__ beta,    // [1, H, T, N] fp32
         unsigned short * __restrict__ A_sc, // [n_chunks][H][n_seqs][64][64] bf16
         int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
-        int64_t sq1, int64_t sq2, int64_t sq3, int dbg)
+        int64_t sq1, int64_t sq2, int64_t sq3)
 {
     __shared__ gdn_bf16_kkt_smem s;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -436,7 +436,7 @@ gdn_bf16_scan_cuda(
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
         const uint3 neqk1_magic, const uint3 rq3_magic,
-        float scale, int64_t state_seq_stride, int dbg)
+        float scale, int64_t state_seq_stride)
 {
     __shared__ gdn_bf16_scan_smem s;
     const int tid = threadIdx.x;
@@ -861,14 +861,14 @@ template <int HG_RATIO>
 __global__ static void gdn_bf16_kkt_cuda(
         const float * __restrict__ k, const float * __restrict__ g, const float * __restrict__ beta,
         unsigned short * __restrict__ A_sc, int64_t H, int64_t H_k, int64_t n_tokens,
-        int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3, int dbg) {}
+        int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3) {}
 __global__ static void gdn_bf16_scan_cuda(
         const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
         const float * __restrict__ g, const float * __restrict__ beta, const float * __restrict__ state_in,
         float * __restrict__ attn_out, float * __restrict__ state_out,
         const unsigned short * __restrict__ A_sc, int64_t H, int64_t H_k, int64_t n_tokens,
         int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
-        uint3 neqk1_magic, uint3 rq3_magic, float scale, int64_t state_seq_stride, int dbg) {}
+        uint3 neqk1_magic, uint3 rq3_magic, float scale, int64_t state_seq_stride) {}
 
 #endif // defined(RDNA4)
 
@@ -879,13 +879,13 @@ template <int HG_RATIO>
 static bool launch_gdn_bf16_kkt(
         const float * k_d, const float * g_d, const float * b_d, unsigned short * A_sc,
         int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
-        int64_t sq1, int64_t sq2, int64_t sq3, cudaStream_t stream, int dbg) {
+        int64_t sq1, int64_t sq2, int64_t sq3, cudaStream_t stream) {
     const int n_chunks = (int) ((n_tokens + GDN_BF16_BT - 1) / GDN_BF16_BT);
     const dim3 grid((unsigned) n_chunks, (unsigned) H_k, (unsigned) n_seqs);
     const dim3 block(GDN_BF16_KKT_NTHR);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
     return ggml_cuda_kernel_launch_try(gdn_bf16_kkt_cuda<HG_RATIO>, launch_params,
-        k_d, g_d, b_d, A_sc, H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, dbg);
+        k_d, g_d, b_d, A_sc, H, H_k, n_tokens, n_seqs, sq1, sq2, sq3);
 }
 
 static bool launch_gdn_bf16_scan(
@@ -896,7 +896,7 @@ static bool launch_gdn_bf16_scan(
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_seq_stride, cudaStream_t stream, int dbg) {
+        float scale, int64_t state_seq_stride, cudaStream_t stream) {
     const dim3 grid((unsigned) (GDN_BF16_VD / GDN_BF16_BV), (unsigned) H, (unsigned) n_seqs);
     const dim3 block(GDN_BF16_NTHR);
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
@@ -905,7 +905,7 @@ static bool launch_gdn_bf16_scan(
     return ggml_cuda_kernel_launch_try(gdn_bf16_scan_cuda, launch_params,
         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc,
         H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-        neqk1_magic, rq3_magic, scale, state_seq_stride, dbg);
+        neqk1_magic, rq3_magic, scale, state_seq_stride);
 }
 
 bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext, int64_t n_tokens_limit, const float * s_d_ext) {
@@ -965,40 +965,18 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, 
         (size_t) n_chunks * H * n_seqs * GDN_BF16_BT * GDN_BF16_BT);
 
     const int64_t hg_ratio = H / neqk1;
-    static const int dbg = getenv("GDN_DBG_P") != nullptr ? 1 : (getenv("GDN_DBG_ONES") != nullptr ? 2 : 0);
     switch (hg_ratio) {
-        case 1:  if (!launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
-        case 2:  if (!launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
-        case 3:  if (!launch_gdn_bf16_kkt<3>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
-        case 4:  if (!launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
-        case 6:  if (!launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
-        case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
+        case 1:  if (!launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream)) return false; break;
+        case 2:  if (!launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream)) return false; break;
+        case 3:  if (!launch_gdn_bf16_kkt<3>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream)) return false; break;
+        case 4:  if (!launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream)) return false; break;
+        case 6:  if (!launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream)) return false; break;
+        case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream)) return false; break;
         default: return false; // halo-hybrid: other GQA ratios keep the fp32 path (was an abort)
-    }
-    static const bool dbg_a = getenv("GDN_DBG_A") != nullptr;
-    if (dbg_a) {
-        // temp debug: dump the first A matrix per (chunk, head) for the first seq
-        const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * H * GDN_BF16_BT * GDN_BF16_BT;
-        std::vector<unsigned short> dump(m);
-        GGML_ASSERT(hipStreamSynchronize(stream) == hipSuccess);
-        GGML_ASSERT(hipMemcpy(dump.data(), A_sc.get(), m * 2, hipMemcpyDeviceToHost) == hipSuccess);
-        const auto h2f = [](unsigned short h) {
-            union { unsigned u; float f; } x; x.u = (unsigned) h << 16; return x.f;
-        };
-        for (int64_t cc = 0; cc < 2 && cc < n_chunks; ++cc)
-            for (int64_t hh = 0; hh < H; ++hh) {
-                // layout: A_sc[((chunk*64 + r)*H + h)*64 + c]
-                const auto at = [&](int r, int c) -> float {
-                    return h2f(dump[((size_t) (cc * GDN_BF16_BT + r) * H + hh) * GDN_BF16_BT + c]);
-                };
-                if (hh < 4 || hh % 8 == 0)
-                    printf("  A[c=%lld][h=%lld]: a00=%f a10=%f a11=%f a63=%f\n",
-                           (long long) cc, (long long) hh, at(0, 0), at(1, 0), at(1, 1), at(63, 63));
-            }
     }
     return launch_gdn_bf16_scan(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(),
         H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3,
-        scale, state_seq_stride, stream, dbg);
+        scale, state_seq_stride, stream);
 }
 
 #endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__

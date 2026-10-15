@@ -310,11 +310,6 @@ void ggml_cuda_mul_mat_q(
             } else if (const char * pre = ggml_cuda_mmq_side_find(ctx, src1, src0->type)) {
                 // halo-hybrid: the producer already wrote this exact copy (hc.cu, k_hc_combine_norm)
                 src1_q8_1_pre = pre;
-                static int n_dbg = getenv("GGML_CUDA_MMQ_SIDE_DEBUG") ? 4 : 0;
-                if (n_dbg > 0) {
-                    n_dbg--;
-                    GGML_LOG_WARN("mmq-side: %s [%lld x %lld] took the producer's q8_1 copy\n", dst->name, (long long) ne10, (long long) ne11);
-                }
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);

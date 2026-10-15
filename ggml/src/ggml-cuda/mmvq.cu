@@ -1760,11 +1760,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const auto on_cliff = [&](int64_t waves) { return waves >= slots - 12 && waves <= slots + 3; };
                     static const bool no_tall = getenv("GGML_CUDA_MMVQ_NO_TALL") != nullptr;
                     static const bool dbg     = getenv("GGML_CUDA_MMVQ_DEBUG") != nullptr;
-                    // GGML_CUDA_MMVQ_RDNA3_GATE=1 runs RDNA3 through the RDNA4 rule plus the rows/slots <= K/16384
-                    // occupancy gate it shipped with first (for A/B).
-                    static const bool rdna3_gate = getenv("GGML_CUDA_MMVQ_RDNA3_GATE") != nullptr;
                     const bool can_tall = !no_tall && calc_nwarps(type, c_ncols_dst, table_id, true, false) > 1;
-                    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && !rdna3_gate) {
+                    if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
                         // RDNA3 planner. Measured on the RX 7800 XT (1920 slots) with the weights streamed from DRAM
                         // (test-backend-ops TBO_MMV_ROT, 256 MB of distinct weights per shape; the MALL-warm numbers of
                         // the plain shape bench mislead here, the 64 MB Infinity Cache holds every trunk GEMV):
@@ -1840,9 +1837,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const int64_t w_wide = (int64_t) nrows_x * 8 * launches;
                     const int64_t w_up   = (int64_t) nrows_x * launches;
                     bool wide = long_k && !big;
-                    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && w_up * 16384 > slots * (int64_t) ncols_x) {
-                        wide = false;
-                    }
                     if (wide ? on_cliff(w_wide) : on_cliff(w_up)) {
                         wide = !wide;
                     }
@@ -1850,8 +1844,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const bool tall = can_tall && wide && nrows_x <= 64 && blocks_per_row_x >= 32 * blocks_per_iter_1warp &&
                         !on_cliff((int64_t) nrows_x * 32 * launches);
                     if (dbg) {
-                        fprintf(stderr, "mmvq %s: rows=%d K=%d n=%d ch*s=%lld slots=%lld long_k=%d big=%d -> %s\n",
-                            table_id == MMVQ_PARAMETERS_RDNA4 ? "rdna4" : "rdna3-gate", nrows_x, ncols_x, c_ncols_dst,
+                        fprintf(stderr, "mmvq rdna4: rows=%d K=%d n=%d ch*s=%lld slots=%lld long_k=%d big=%d -> %s\n",
+                            nrows_x, ncols_x, c_ncols_dst,
                             (long long) launches, (long long) slots, long_k, big, tall ? "tall" : wide ? "wide" : "upstream");
                     }
                     if (tall) {

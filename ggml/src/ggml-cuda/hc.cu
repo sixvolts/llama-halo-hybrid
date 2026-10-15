@@ -153,15 +153,6 @@ block_q8_1_mmq * ggml_cuda_mmq_side_reserve(ggml_backend_cuda_context & ctx, con
 
 const char * ggml_cuda_mmq_side_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0) {
     const ggml_tensor * e = ctx.mmq_side_prod;
-    {
-        static int n_dbg = getenv("GGML_CUDA_MMQ_SIDE_DEBUG") ? 12 : 0;
-        if (n_dbg > 0 && src1->ne[1] > 8) {
-            n_dbg--;
-            GGML_LOG_WARN("mmq-side find: src1 %s [%lld,%lld] data %p view_src %s | prod %s data %p ne0 %lld ne1 %lld\n", src1->name,
-                (long long) src1->ne[0], (long long) src1->ne[1], src1->data, src1->view_src ? src1->view_src->name : "-",
-                e ? e->name : "-", e ? e->data : nullptr, (long long) ctx.mmq_side_ne0, (long long) ctx.mmq_side_ne1);
-        }
-    }
     if (e == nullptr || mmq_side_disabled() || mmq_get_q8_1_ds_layout(type_src0) != MMQ_Q8_1_DS_LAYOUT_D4 ||
             src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src1->ne[0] != ctx.mmq_side_ne0 || src1->ne[1] != ctx.mmq_side_ne1) {
@@ -347,13 +338,6 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_te
     if (!q8 && nrows > 8 && n_embd % QK8_1_MMQ == 0 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) {
         mmq = ggml_cuda_mmq_side_reserve(ctx, xn, hc*n_embd, nt);
     }
-    {
-        static int n_dbg = getenv("GGML_CUDA_MMQ_SIDE_DEBUG") ? 6 : 0;
-        if (n_dbg > 0 && nt > 8) {
-            n_dbg--;
-            GGML_LOG_WARN("mmq-side producer: %s dev %d nt %lld q8 %p mmq %p\n", xn->name, ctx.device, (long long) nt, (void *) q8, (void *) mmq);
-        }
-    }
     const dim3 grid(hc, nt, 1);
     const int gamma_rows = (int) gamma->ne[1];
     if (n_embd < 1024) {
@@ -431,19 +415,4 @@ void ggml_cuda_op_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(b) && ggml_is_contiguous(a) && ggml_is_contiguous(dst));
     const int64_t n = ggml_nelements(dst);
     k_gdn_gate<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data, (const float *) a->data, (float *) dst->data, n, x->ne[0]);
-}
-
-// halo-hybrid: measurement aid (GGML_CUDA_PAD_KERNELS). An empty dependent kernel: it touches one float so the
-// compiler keeps it, and it runs on the compute stream so every instance pays a full dispatch boundary.
-static __global__ void k_pad_noop(float * p) {
-    if (threadIdx.x == 0 && blockIdx.x == 0 && p) { *p = *p; }
-}
-
-void ggml_cuda_pad_kernels(ggml_backend_cuda_context & ctx, int n) {
-    static float * dummy = nullptr;
-    if (!dummy) { CUDA_CHECK(cudaMalloc((void **) &dummy, sizeof(float))); CUDA_CHECK(cudaMemset(dummy, 0, sizeof(float))); }
-    for (int i = 0; i < n; ++i) {
-        k_pad_noop<<<1, 32, 0, ctx.stream()>>>(dummy);
-    }
-    CUDA_CHECK(cudaGetLastError());
 }

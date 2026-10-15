@@ -1015,15 +1015,6 @@ public:
 
         llama_memory_hybrid_idx::qsa_plan plan;
         const int mode_now = blk_mode_for(mctx, params.ubatch, ratio, scores, n_re_for(params.ubatch.n_tokens / n_stream, ratio), n_stream, shared, plan);
-        {
-            static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 40 : 0;
-            if (n_dbg > 0 && (mode_now != blk_mode || !res)) {
-                n_dbg--;
-                LLAMA_LOG_WARN("qsa-blk can_reuse: n_tokens %u mode built %d now %d, other checks %d, n_bid %d first %d\n",
-                    params.ubatch.n_tokens, blk_mode, mode_now, (int) res, plan.n_bid.empty() ? 0 : plan.n_bid[0],
-                    plan.first.empty() ? 0 : plan.first[0]);
-            }
-        }
         res &= mode_now == blk_mode;
         res &= mode_now == 0 || plan.s0 == blk_s0;
         res &= n_re == n_re_for(params.ubatch.n_tokens / n_stream, ratio);
@@ -1155,15 +1146,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 if (qsa->blk_topk) {
                     qsa->n_bid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, shared ? 2*n_stream : n_stream);
                     ggml_set_input(qsa->n_bid_t);
-                }
-            }
-            {
-                static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 40 : 0;
-                if (n_dbg > 0) {
-                    n_dbg--;
-                    LLAMA_LOG_WARN("qsa-blk build: n_tokens %u n_stream %lld n_kv %lld mode %d topk %d s0 %u n_bid[0] %d first[0] %d\n",
-                        ubatch.n_tokens, (long long) n_stream, (long long) n_kv, qsa->blk_mode, (int) qsa->blk_topk, plan.s0,
-                        plan.n_bid.empty() ? 0 : plan.n_bid[0], plan.first.empty() ? 0 : plan.first[0]);
                 }
             }
             if (qsa->blk_mode == 2) {

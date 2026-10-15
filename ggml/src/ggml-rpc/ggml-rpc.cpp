@@ -734,8 +734,7 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const std::shared
         result.op_params[i] = tensor->op_params[i];
     }
     result.flags = tensor->flags;
-    static const bool no_weights_flag = getenv("GGML_RPC_NO_WEIGHTS_FLAG") != nullptr; // A/B: the pre-7.4.1 placement
-    if (!no_weights_flag && result.buffer != 0 && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+    if (result.buffer != 0 && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         result.flags |= RPC_TENSOR_FLAG_WEIGHTS;
     }
     for (uint32_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -2291,26 +2290,6 @@ bool rpc_server::run_sched_graph_on(ggml_backend_sched_t sched, stored_graph & s
             GGML_LOG_ERROR("[%s] server-side scheduler could not allocate the graph (%d nodes)\n", __func__, sg.graph->n_nodes);
             return false;
         }
-    }
-    static const bool dbg = getenv("GGML_RPC_SCHED_DEBUG") != nullptr;
-    if (dbg && fresh) {
-        auto show = [&](const char * tag, const ggml_tensor * t) {
-            if (!t) return;
-            const char * bname = t->buffer ? ggml_backend_buffer_name(t->buffer) : "-";
-            fprintf(stderr, "  %s %-28s op=%-10s type=%s ne=[%lld,%lld] data=%p buffer=%p(%s base=%p size=%zu) view_src=%s\n",
-                    tag, t->name, ggml_op_name(t->op), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], t->data, (void *) t->buffer, bname,
-                    t->buffer ? ggml_backend_buffer_get_base(t->buffer) : nullptr, t->buffer ? ggml_backend_buffer_get_size(t->buffer) : (size_t) 0,
-                    t->view_src ? t->view_src->name : "-");
-        };
-        fprintf(stderr, "=== RPC SCHED DEBUG: %d nodes, %d leafs, %d splits, %zu boundary outputs ===\n", sg.graph->n_nodes, sg.graph->n_leafs,
-                ggml_backend_sched_get_n_splits(sched), sg.outs.size());
-        for (const boundary_out & o : sg.outs) { show("OUT ", o.tensor); }
-        for (int i = 0; i < sg.graph->n_nodes && i < 4; i++) {
-            const ggml_tensor * n = sg.graph->nodes[i];
-            show("NODE", n);
-            for (int j = 0; j < GGML_MAX_SRC; j++) { if (n->src[j]) show("  src", n->src[j]); }
-        }
-        fflush(stderr);
     }
     ggml_status status = ggml_backend_sched_graph_compute(sched, sg.graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");

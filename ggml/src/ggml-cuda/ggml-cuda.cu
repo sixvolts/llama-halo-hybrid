@@ -1905,27 +1905,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    // halo-hybrid: GGML_CUDA_TRACE_MM=<substring> logs the dispatch decision for matching weights. Added while
-    // chasing a "no kernel image" on gfx1201 that only appears with whole-layer placement plus a draft head.
-    {
-        static const char * trace = getenv("GGML_CUDA_TRACE_MM");
-        if (trace && src0->name[0] && strstr(src0->name, trace)) {
-            const int dev_now = ggml_cuda_get_device();
-            const int cc_now  = ggml_cuda_info().devices[dev_now].cc;
-            const int cc_ctx  = ggml_cuda_info().devices[ctx.device].cc;
-            GGML_LOG_ERROR("TRACE_MM %s: ctx.device=%d cc_ctx=%d | current_device=%d cc_now=%d | %s x %s "
-                           "ne00=%lld ne01=%lld ne11=%lld | a0=%d a1=%d s01=%lld s11=%lld | mmf=%d mmvq=%d mmq=%d\n",
-                src0->name, ctx.device, cc_ctx, dev_now, cc_now,
-                ggml_type_name(src0->type), ggml_type_name(src1->type),
-                (long long) ne00, (long long) ne01, (long long) ne11,
-                (int) ((uintptr_t) src0->data % 256), (int) ((uintptr_t) src1->data % 256),
-                (long long) (src0->nb[1]/ggml_type_size(src0->type)), (long long) (src1->nb[1]/sizeof(float)),
-                (int) ggml_cuda_should_use_mmf(src0->type, cc_ctx, ggml_cuda_info().devices[ctx.device].warp_size, src0->ne, src0->nb, ne11, false),
-                (int) ggml_cuda_should_use_mmvq(src0->type, cc_ctx, ne11),
-                (int) ggml_cuda_should_use_mmq(src0->type, cc_ctx, ne11, 0));
-        }
-    }
-
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
@@ -2777,20 +2756,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src, 
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            // (GGML_SCHED_OVERLAP_CUT orders its copies in the scheduler instead, only for cut graphs)
-            static const bool lazy_inputs = getenv("GGML_SCHED_LAZY_INPUTS") != nullptr;
-            if (lazy_inputs) {
-                // With GGML_SCHED_LAZY_INPUTS a split may still be running on the destination device
-                // when this copy is issued, and the destination buffer may alias memory that work is
-                // using. Make the source stream wait for everything currently queued on the
-                // destination before copying. The copy itself stays on the source stream (HIP is
-                // happier that way), and the dst stream waits for it below as before.
-                cudaEvent_t ev_dst = cuda_ctx_dst->next_copy_event();
-                ggml_cuda_set_device(cuda_ctx_dst->device);
-                CUDA_CHECK(cudaEventRecord(ev_dst, cuda_ctx_dst->stream()));
-                ggml_cuda_set_device(cuda_ctx_src->device);
-                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), ev_dst, 0));
-            }
+            // (a copy into a destination that may still be running: GGML_SCHED_OVERLAP_CUT orders those in the scheduler)
             const size_t nbytes = ggml_nbytes(dst);
             const bool kernel_copy = nbytes > 0 && nbytes <= ggml_cuda_kernel_copy_max() &&   // an empty copy would launch a zero-block grid
                 ((uintptr_t) src->data % 16 == 0) && ((uintptr_t) dst->data % 16 == 0) &&
@@ -2880,8 +2846,7 @@ static bool ggml_backend_cuda_cpy_tensors_async_nowait(ggml_backend_t backend_sr
     GGML_UNUSED_VARS(backend_src, backend_dst, n, srcs, dsts);
     return false;
 #else
-    static const bool disabled = getenv("GGML_CUDA_NO_PEER_COPY_BATCH") != nullptr ||
-                                 getenv("GGML_SCHED_LAZY_INPUTS") != nullptr; // the lazy-inputs wait is per copy
+    static const bool disabled = getenv("GGML_CUDA_NO_PEER_COPY_BATCH") != nullptr;
     if (disabled || n <= 0 || backend_src == backend_dst ||
             !ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
@@ -4122,33 +4087,6 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
                             hc_param(sc1, 0), hc_param(sc1, 1), hc_param(sc2, 0), hc_param(sc2, 1), hc_param(rms, 0), add, xn);
                     return j7 - i;
                 }
-            }
-        }
-        {   // rev/decode-profile: GGML_CUDA_HC_DEBUG=<n> reports the first n boundary declines (combine not joined with the norm)
-            static const int dbg = getenv("GGML_CUDA_HC_DEBUG") ? atoi(getenv("GGML_CUDA_HC_DEBUG")) : 0;
-            static int logged = 0;
-            if (dbg > 0 && logged < dbg) {
-                logged++;
-                const int j6 = hc_next(cgraph, j5 + 1);
-                const int j7 = j6 < n ? hc_next(cgraph, j6 + 1) : n;
-                const ggml_tensor * t6 = j6 < n ? cgraph->nodes[j6] : nullptr;
-                const ggml_tensor * t7 = j7 < n ? cgraph->nodes[j7] : nullptr;
-                int why = 0;
-                if (!t6 || t6->op != GGML_OP_RMS_NORM) { why = 1; }
-                else if (t6->src[0] != add) { why = 2; }
-                else if (!hc_uses1(cgraph, j6)) { why = 3; }
-                else if (!t7 || t7->op != GGML_OP_MUL || t7->src[0] != t6) { why = 4; }
-                else {
-                    const ggml_tensor * xn = t7; const ggml_tensor * gamma = xn->src[1];
-                    auto sod = [](const ggml_tensor * o, const ggml_tensor * in) { return o->data == in->data || hc_disjoint(o, in); };
-                    if (!(gamma->type == GGML_TYPE_F32 && ggml_is_contiguous(gamma) && gamma->ne[0] == n_embd && (gamma->ne[1] == 1 || gamma->ne[1] == hc))) { why = 5; }
-                    else if (!hc_views_belong(cgraph, i, j7, { sc2, add, t6, hc_root(gamma) })) { why = 6; }
-                    else if (!sod(add, x)) { why = 7; } else if (!sod(xn, x)) { why = 8; } else if (!hc_disjoint(xn, add)) { why = 9; }
-                    else if (!hc_disjoint(xn, b) || !hc_disjoint(xn, inj)) { why = 10; } else if (!hc_disjoint(xn, gamma)) { why = 11; }
-                    else { why = 12; }
-                }
-                GGML_LOG_WARN("hc-debug dev %d: combine %s (%d nodes) not joined: reason %d; next %s(%s) %s(%s)\n", cuda_ctx->device, add->name,
-                    cgraph->n_nodes, why, t6 ? ggml_op_name(t6->op) : "-", t6 ? t6->name : "-", t7 ? ggml_op_name(t7->op) : "-", t7 ? t7->name : "-");
             }
         }
         ggml_cuda_op_hc_combine(*cuda_ctx, x, b, inj, n_embd, hc, nt,
@@ -6682,12 +6620,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    {   // rev/decode-profile: GGML_CUDA_DISABLE_GRAPHS_DEV=<n> runs device n's splits eagerly (the others keep graphs)
-        static const int no_graph_dev = getenv("GGML_CUDA_DISABLE_GRAPHS_DEV") ? atoi(getenv("GGML_CUDA_DISABLE_GRAPHS_DEV")) : -1;
-        if (cuda_ctx->device == no_graph_dev) {
-            graph->disable_due_to_gpu_arch = true;
-        }
-    }
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
             if (!graph->disable_due_to_gpu_arch) {
@@ -6708,15 +6640,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_q8_side_reset(*cuda_ctx);   // per-graph registry of producer-side q8_1 activation copies
     ggml_cuda_dsv4_hc_mix_scratch_init(*cuda_ctx);   // once per context, before any capture
     ggml_cuda_mmvq_grp_init(*cuda_ctx);              // once per context, before any capture
-
-    {   // halo-hybrid: GGML_CUDA_PAD_KERNELS=<n> appends n empty dependent kernels to every graph. The slope of
-        // tok/s against n is the marginal cost of one kernel boundary in the real decode loop, which is what any
-        // "fuse to fewer kernels" plan is actually buying.
-        static const int pad = getenv("GGML_CUDA_PAD_KERNELS") ? atoi(getenv("GGML_CUDA_PAD_KERNELS")) : 0;
-        if (pad > 0) {
-            ggml_cuda_pad_kernels(*cuda_ctx, pad);
-        }
-    }
 
     {   // halo-hybrid: GGML_CUDA_DUMP_GRAPH=<n> prints the n-th graph's node list once (op, shapes, sources), which
         // is how the per-layer kernel inventory is counted
@@ -7073,11 +6996,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    // The multi-device gate is lifted when GGML_CUDA_GRAPH_OPT_MULTI=1: the optimisation works
-    // per backend context on that context's own graph, and on a two-GPU MoE layout the
-    // ~1900 per-token dispatch gaps are the dominant idle (experiment, 2026-08-26).
-    static const bool allow_multi = getenv("GGML_CUDA_GRAPH_OPT_MULTI") != nullptr;
-    if (!use_cuda_graph || (!allow_multi && ggml_backend_cuda_get_device_count() != 1)) {
+    if (!use_cuda_graph) {
         return;
     }
 

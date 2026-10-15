@@ -169,14 +169,6 @@ llama_memory_hybrid_idx::qsa_plan llama_memory_hybrid_idx::qsa_blk_plan(const ll
 
 llama_memory_hybrid_idx::qsa_plan llama_memory_hybrid_idx::qsa_blk_plan_cells(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re, uint32_t lo, uint32_t n_kv) const {
     qsa_plan p;
-    {
-        static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 6 : 0;
-        if (n_dbg > 0) {
-            n_dbg--;
-            LLAMA_LOG_WARN("qsa-blk plan entry: have_cache %d mem_idx %d ratio %u n_tokens %u n_seqs_unq %u\n", (int) !qsa_blk_k.empty(),
-                (int) (mem_idx != nullptr), ratio, ubatch.n_tokens, ubatch.n_seqs_unq);
-        }
-    }
     // (qwen4exp's text positions are 4-section mrope rows, so is_pos_2d() holds for every batch; what matters is that no
     // position repeats - set_input_qsa ranks cells only then - and the hole-free check below already guarantees it)
     if (!mem_idx || ratio == 0 || ubatch.n_tokens == 0) {
@@ -216,14 +208,6 @@ llama_memory_hybrid_idx::qsa_plan llama_memory_hybrid_idx::qsa_blk_plan_cells(co
         }
         const llama_pos pmin = cells.seq_pos_min(seq);
         const llama_pos pmax = cells.seq_pos_max(seq);
-        {
-            static int n_dbg = getenv("LLAMA_QSA_BLK_DEBUG") ? 12 : 0;
-            if (n_dbg > 0) {
-                n_dbg--;
-                LLAMA_LOG_WARN("qsa-blk plan: group %u seq %d stream %u pmin %d pmax %d used %u size %u\n", g, seq, strm, pmin, pmax,
-                    cells.get_used(), cells.size());
-            }
-        }
         // hole-free from position 0: then the complete blocks are exactly 0 .. (pmax+1)/r - 1, and block id = position / r
         if (pmin != 0 || pmax < 0 || (int64_t) cells.get_used() != (int64_t) pmax + 1) {
             return p;

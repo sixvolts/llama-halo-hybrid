@@ -822,7 +822,7 @@ struct ggml_backend_sched {
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
-    int                 * hv_tensor_split_ids;   // [hash_set.size] split that produced the tensor (GGML_SCHED_LAZY_INPUTS)
+    int                 * hv_tensor_split_ids;   // [hash_set.size] split that produced the tensor (overlap cut, boundary flagging)
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
 
     int * node_backend_ids; // [graph_size]
@@ -1431,20 +1431,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
 
-            // GGML_SCHED_LAZY_INPUTS=1: a split waits for ALL of its cross-backend inputs before any of
-            // it runs. When a node consumes an activation produced by the immediately preceding split
-            // (on another backend) and the current split already holds work that does not depend on
-            // it, cut the split here so that work is enqueued -- and overlaps the producer -- instead
-            // of queueing behind the wait. Inputs consumed by a split's first node are unaffected.
-            static const bool lazy_inputs = getenv("GGML_SCHED_LAZY_INPUTS") != nullptr;
-            // halo-hybrid: GGML_SCHED_OVERLAP_CUT=N (N >= 1): the same cut, but only when the split already holds at
-            // least N non-view nodes of independent work and the producer is a LOCAL device (no remote splits: every
-            // cut costs a split boundary, which is why the unconditional LAZY_INPUTS lost). Target: the shared-expert
-            // FFN, which ran on the card only after the card waited ~1.8 ms for the APU's routed experts.
+            // halo-hybrid: a split waits for ALL of its cross-backend inputs before any of it runs. When a node consumes
+            // an activation that the immediately preceding split produced on another LOCAL device, and the current split
+            // already holds at least GGML_SCHED_OVERLAP_CUT (default 4, 0 disables) non-view nodes of work that does
+            // not depend on it, cut the split here so that work is enqueued and overlaps the producer instead of
+            // queueing behind the wait. No remote splits: every cut costs a split boundary (an unconditional cut was a
+            // net loss). Target: the shared-expert FFN, which ran on the card only after the card waited ~1.8 ms for
+            // the APU's routed experts.
             static const int overlap_cut = getenv("GGML_SCHED_OVERLAP_CUT") ? atoi(getenv("GGML_SCHED_OVERLAP_CUT")) : 4; // default on (4 nodes); 0 disables
             // only on one backend (default 0, the card): the APU's own expert split gains nothing from a cut
             static const int overlap_cut_be = getenv("GGML_SCHED_OVERLAP_CUT_BACKEND") ? atoi(getenv("GGML_SCHED_OVERLAP_CUT_BACKEND")) : 0;
-            if (!lazy_inputs && overlap_cut > 0 && sched->overlap_cut_ok && node_backend_id == cur_backend_id && i > split->i_start &&
+            if (overlap_cut > 0 && sched->overlap_cut_ok && node_backend_id == cur_backend_id && i > split->i_start &&
                     cur_backend_id == overlap_cut_be && !ggml_backend_sched_backend_is_remote(sched->backends[cur_backend_id])) {
                 int n_work = 0;
                 for (int k = split->i_start; k < i; k++) {
@@ -1476,34 +1473,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
             }
-            if (lazy_inputs && node_backend_id == cur_backend_id && i > split->i_start) {
-                for (int j = 0; j < GGML_MAX_SRC; j++) {
-                    struct ggml_tensor * src = node->src[j];
-                    if (src == NULL || (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
-                        continue;
-                    }
-                    const size_t sid = hash_id(src);
-                    const int src_backend_id = sched->hv_tensor_backend_ids[sid];
-                    if (src_backend_id == -1 || src_backend_id == cur_backend_id || sched->hv_tensor_split_ids[sid] != i_split - 1) {
-                        continue;
-                    }
-                    if (ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                        continue;
-                    }
-                    bool already_input = false;
-                    for (int k = 0; k < split->n_inputs; k++) {
-                        if (split->inputs[k] == src) {
-                            already_input = true;
-                            break;
-                        }
-                    }
-                    if (!already_input) {
-                        need_new_split = true;
-                        break;
-                    }
-                }
-            }
-
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1594,11 +1563,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // and the RESULT of an in-place op (cpy, set_rows, *_inplace) has view_src too but new contents,
                     // which a root copy made before the write would not carry
                     const bool pure_view = src->op == GGML_OP_VIEW || src->op == GGML_OP_RESHAPE || src->op == GGML_OP_PERMUTE || src->op == GGML_OP_TRANSPOSE;
-                    if (getenv("GGML_SCHED_VIEW_ROUTE_DEBUG") && src->view_src != NULL && ggml_nbytes(src) >= (1u << 20) &&
-                            !(pure_view && src->nb[0] == ggml_type_size(src->type) && tensor_id_copy(src_id, cur_backend_id, 0) == NULL && split->n_view_copies < 8)) {
-                        GGML_LOG_WARN("view-route: NOT routing %s op=%s nb0=%zu tsize=%zu view_src=%s (op=%s) copy=%p nvc=%d\n", src->name, ggml_op_name(src->op),
-                            src->nb[0], ggml_type_size(src->type), src->view_src->name, ggml_op_name(src->view_src->op), (void *) tensor_id_copy(src_id, cur_backend_id, 0), split->n_view_copies);
-                    }
                     if (!no_view_route && sched->n_copies == 1 && src->view_src != NULL && pure_view && src->nb[0] == ggml_type_size(src->type) &&
                             tensor_id_copy(src_id, cur_backend_id, 0) == NULL && split->n_view_copies < 8) {
                         struct ggml_tensor * root = src->view_src;
@@ -1629,9 +1593,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                     src->nb[1], src->nb[2], src->nb[3], src->view_offs);
                             ggml_format_name(view_copy, "%s#%s#v", ggml_backend_name(sched->backends[cur_backend_id]), src->name);
                             tensor_id_copy(src_id, cur_backend_id, 0) = view_copy;
-                            if (getenv("GGML_SCHED_VIEW_ROUTE_DEBUG")) {
-                                GGML_LOG_WARN("view-route: slot %d %s (%s of %s) %.2f MiB\n", split->n_view_copies, src->name, ggml_op_name(src->op), root->name, ggml_nbytes(src) / 1048576.0);
-                            }
                             split->view_copies[split->n_view_copies++] = view_copy;
                             SET_CAUSE(view_copy, "4.vcp");
                             node->src[j] = view_copy;
@@ -2078,16 +2039,13 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        // GGML_SCHED_LAZY_INPUTS: a split without cross-backend inputs is exactly the one that
-        // should overlap the previous split on the other device; its own stream order already
-        // protects everything it touches, so skip the host-side wait.
-        static const bool lazy_inputs = getenv("GGML_SCHED_LAZY_INPUTS") != nullptr;
-        // (GGML_SCHED_OVERLAP_CUT: the same between two local devices; its stream order protects the split's own
-        // memory, and its peer copies wait for the destination's progress)
+        // halo-hybrid (GGML_SCHED_OVERLAP_CUT): between two local devices a split without cross-backend inputs is
+        // exactly the one that should overlap the previous split on the other device; its own stream order
+        // protects the memory it touches and its peer copies wait for the destination's progress, so skip the
+        // host-side wait
         static const bool overlap_cut = getenv("GGML_SCHED_OVERLAP_CUT") == nullptr || atoi(getenv("GGML_SCHED_OVERLAP_CUT")) > 0;
-        static const bool keep_wait = getenv("GGML_SCHED_OVERLAP_KEEP_WAIT") != nullptr;   // diagnostic
-        const bool skip_noinput_wait = lazy_inputs || (overlap_cut && sched->overlap_cut_ok && !keep_wait && prev_backend_id >= 0 &&
-                !ggml_backend_sched_backend_is_remote(sched->backends[prev_backend_id]) && !ggml_backend_sched_backend_is_remote(split_backend));
+        const bool skip_noinput_wait = overlap_cut && sched->overlap_cut_ok && prev_backend_id >= 0 &&
+                !ggml_backend_sched_backend_is_remote(sched->backends[prev_backend_id]) && !ggml_backend_sched_backend_is_remote(split_backend);
         if (!skip_noinput_wait && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             st.n_wait_noinput++;
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
@@ -2151,17 +2109,6 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                 continue;
             }
 
-            // halo-hybrid (diagnostic): GGML_SCHED_LOG_REMOTE_INPUTS=N lists the inputs of the first N remote splits with sizes
-            {
-                static const int log_n = getenv("GGML_SCHED_LOG_REMOTE_INPUTS") ? atoi(getenv("GGML_SCHED_LOG_REMOTE_INPUTS")) : 0;
-                static int logged = 0;
-                if (log_n > 0 && logged < log_n && ggml_backend_sched_backend_is_remote(split_backend)) {
-                    if (input_id == 0) { logged++; }
-                    GGML_LOG_WARN("remote-input: split %d/%d input %d/%d %-28s %s ne=[%lld,%lld,%lld] %.1f MiB%s\n", split_id, sched->n_splits, input_id, split->n_inputs, input->name,
-                        ggml_type_name(input->type), (long long) input->ne[0], (long long) input->ne[1], (long long) input->ne[2], ggml_nbytes(input) / 1048576.0,
-                        (input->buffer && ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) ? " (weights)" : "");
-                }
-            }
             if (sched->remote_fetch && split->stages && ggml_backend_sched_backend_is_remote(split_backend) &&
                     !ggml_backend_buffer_is_host(input->buffer) &&
                     ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
@@ -3148,27 +3095,23 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_record_output_events(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    // GGML_SCHED_OUTPUT_EVENTS_ALL=1: every backend with events (the first version); default: only the backends that
-    // hold one of the graph's output tensors, the only ones the caller reads from
-    static const bool all = getenv("GGML_SCHED_OUTPUT_EVENTS_ALL") != nullptr;
+    // only the backends that hold one of the graph's output tensors, the only ones the caller reads from
     bool has_out[GGML_SCHED_MAX_BACKENDS] = { false };
-    if (!all) {
-        for (int i = 0; i < sched->n_splits; i++) {
-            const struct ggml_backend_sched_split * sp = &sched->splits[i];
-            if (has_out[sp->backend_id]) {
-                continue;
-            }
-            for (int j = 0; j < sp->graph.n_nodes; j++) {
-                if (sp->graph.nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) {
-                    has_out[sp->backend_id] = true;
-                    break;
-                }
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * sp = &sched->splits[i];
+        if (has_out[sp->backend_id]) {
+            continue;
+        }
+        for (int j = 0; j < sp->graph.n_nodes; j++) {
+            if (sp->graph.nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                has_out[sp->backend_id] = true;
+                break;
             }
         }
     }
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_event_t ev = sched->events[i][sched->cur_copy];
-        if (ev != NULL && (all || has_out[i])) {
+        if (ev != NULL && has_out[i]) {
             ggml_backend_event_record(ev, sched->backends[i]);
             // the eager-copy fence (compute_splits): only needed when another stream can write into this backend
             const int slot = (sched->out_ev_last[i] + 1) % 3;

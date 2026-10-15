@@ -463,16 +463,12 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
-        // halo-hybrid: tensor overrides normally disable pipeline parallelism, but on a two-device
-        // MoE split the dense trunk of ubatch k+1 can overlap the experts of ubatch k during prefill.
-        // LLAMA_PIPELINE_PARALLEL_FORCE=1 keeps it on despite -ot (needs n_batch > n_ubatch to matter).
-        static const bool pp_force = getenv("LLAMA_PIPELINE_PARALLEL_FORCE") != nullptr && atoi(getenv("LLAMA_PIPELINE_PARALLEL_FORCE")) != 0;
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            (!model.has_tensor_overrides() || pp_force);
+            !model.has_tensor_overrides();
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -568,15 +564,8 @@ llama_context::llama_context(
 void llama_context::ingest_flush(bool run) {
     for (const auto & pi : ingest_pending) {
         if (run) {
-            static const bool ing_dbg = getenv("LLAMA_MTP_INGEST_DEBUG") != nullptr;
-            const int64_t t0 = ing_dbg ? ggml_time_us() : 0;
             ggml_backend_event_synchronize(pi.ev);
-            const int64_t t1 = ing_dbg ? ggml_time_us() : 0;
             ubatch_done_cb(ubatch_done_ud, embd_nextn.data, pi.i0, pi.n);
-            if (ing_dbg) {
-                LLAMA_LOG_INFO("ingest-debug: deferred %d tokens at %d: event wait %.1f ms, draft call %.1f ms\n",
-                    pi.n, pi.i0, (t1 - t0) / 1000.0, (ggml_time_us() - t1) / 1000.0);
-            }
         }
         ingest_ev_free.push_back(pi.ev);
     }
@@ -2175,26 +2164,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
-    static const bool dec_timing = getenv("LLAMA_DECODE_TIMING") != nullptr;
-    const bool dec_t = dec_timing && n_tokens_all >= 256;
-    const int64_t td0 = dec_t ? ggml_time_us() : 0;
     sched_reserve();
-    const int64_t td1 = dec_t ? ggml_time_us() : 0;
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
     memory_update(false);
-    const int64_t td2 = dec_t ? ggml_time_us() : 0;
-    struct dec_timing_report {
-        bool on; int64_t t0, t1, t2; const llama_context * ctx; int32_t n;
-        ~dec_timing_report() {
-            if (on) {
-                LLAMA_LOG_INFO("decode-timing ctx %p, %d tokens: reserve %.1f ms, memory_update %.1f ms, rest %.1f ms\n",
-                    (const void *) ctx, n, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (ggml_time_us() - t2) / 1000.0);
-            }
-        }
-    } dec_rep { dec_t, td0, td1, td2, this, (int32_t) n_tokens_all };
 
     llama_memory_context_ptr mctx;
 
@@ -2489,15 +2464,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         return;
                     }
                 }
-                static const bool ing_dbg = getenv("LLAMA_MTP_INGEST_DEBUG") != nullptr;
-                const int64_t t_i0 = ing_dbg ? ggml_time_us() : 0;
                 ggml_backend_synchronize(backend_h);
-                const int64_t t_i1 = ing_dbg ? ggml_time_us() : 0;
                 ubatch_done_cb(ubatch_done_ud, embd_nextn.data, (int32_t) n_tokens_prev, (int32_t) ubatch.n_tokens);
-                if (ing_dbg) {
-                    LLAMA_LOG_INFO("ingest-debug: ubatch %u tokens at %d: target sync %.1f ms, draft call %.1f ms\n",
-                        ubatch.n_tokens, (int) n_tokens_prev, (t_i1 - t_i0) / 1000.0, (ggml_time_us() - t_i1) / 1000.0);
-                }
             }
         }
 
@@ -2864,11 +2832,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             continue;
         }
 
-        const int64_t tpu0 = dec_t ? ggml_time_us() : 0;
         const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status);
-        if (dec_t) {
-            LLAMA_LOG_INFO("decode-timing ctx %p: process_ubatch %u tokens %.1f ms\n", (const void *) this, ubatch.n_tokens, (ggml_time_us() - tpu0) / 1000.0);
-        }
 
         if (!res) {
             return handle_failure({&ubatch}, status);
@@ -3404,24 +3368,6 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
 
-    // debug: LLAMA_RESERVE_DUMP=N prints the N largest nodes of each reserved graph
-    {
-        static const int n_dump = getenv("LLAMA_RESERVE_DUMP") ? atoi(getenv("LLAMA_RESERVE_DUMP")) : 0;
-        if (n_dump > 0 && gf && !split_only) {
-            std::vector<ggml_tensor *> nodes;
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                nodes.push_back(ggml_graph_node(gf, i));
-            }
-            std::sort(nodes.begin(), nodes.end(), [](ggml_tensor * a, ggml_tensor * b) { return ggml_nbytes(a) > ggml_nbytes(b); });
-            LLAMA_LOG_INFO("%s: lane %d, %u tokens, %zu nodes; largest:\n", __func__, lane, n_tokens, nodes.size());
-            for (int i = 0; i < n_dump && i < (int) nodes.size(); ++i) {
-                ggml_tensor * t = nodes[i];
-                LLAMA_LOG_INFO("  %8.1f MiB %-8s %-14s %s [%lld %lld %lld %lld]%s\n", ggml_nbytes(t) / 1048576.0, ggml_type_name(t->type),
-                        ggml_op_desc(t), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
-                        t->view_src ? " (view)" : "");
-            }
-        }
-    }
 
     // initialize scheduler with the specified graph
     if (split_only) {
