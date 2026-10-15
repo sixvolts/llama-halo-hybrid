@@ -28,8 +28,9 @@ after it would mean anything), `SETUP` (a device or tool is missing).
 Devices are found by gfx name (`lib/devices.py`) and exposed with `ROCR_VISIBLE_DEVICES`, one card plus the APU, so
 a second card in the machine (a dock) never joins a run. Mixed-generation setups are not supported.
 
-`machines/<host>.env` names the production launcher, pidfile and health URL. `machines/<host>.json` holds the
-pre-flight references per generation (the card's link, VRAM, GEMV probe times, peer-copy bandwidth). The first run
+Per-machine files live in `$HALO_MACHINE_DIR` (default `~/.config/halo-test`), not in the tree; see
+[machines/README.md](machines/README.md). `<host>.env` names the production launcher, pidfile and health URL; without
+it nothing is stopped or restarted. `<host>.json` holds the pre-flight references per generation (the card's link, VRAM, GEMV probe times, peer-copy bandwidth). The first run
 of a generation on a machine records them; `--bless` re-records them. The link is the card's own one, between its
 topmost AMD port and the port above it: the root port in a slot, the dock's bridge behind USB4 (the USB4 root port
 only shows the tunnel). A dock card also needs `thunderbolt.host_reset=false` for its full BAR.

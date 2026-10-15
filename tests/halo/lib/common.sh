@@ -11,9 +11,11 @@ HALO_RESULTS=${HALO_RESULTS:-$HOME/bench/results/halo-test}
 HALO_LOCK=${HALO_LOCK:-/run/lock/llamabench.lock}
 export PATH=/opt/rocm/bin:$PATH
 
-# machine settings: production launcher, pidfile, health URL, link references (see machines/README.md)
+# per-machine settings and pre-flight references live outside the tree (see machines/README.md):
+# $HALO_MACHINE_DIR/<host>.env (production launcher, pidfile, health URL) and <host>.json (link, VRAM, GEMV, p2p)
+HALO_MACHINE_DIR=${HALO_MACHINE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/halo-test}
 PROD_LAUNCHER=; PROD_PIDFILE=; PROD_HEALTH=
-[ -f "$HALO_DIR/machines/$HOST.env" ] && . "$HALO_DIR/machines/$HOST.env"
+[ -f "$HALO_MACHINE_DIR/$HOST.env" ] && . "$HALO_MACHINE_DIR/$HOST.env"
 
 halo_init() {   # halo_init <suite> <level>
     SUITE=$1; LEVEL=$2

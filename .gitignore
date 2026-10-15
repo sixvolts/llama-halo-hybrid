@@ -156,3 +156,6 @@ AGENTS.local.md
 
 # halo-hybrid: internal write-ups, kept local
 /docs/halo-hybrid/
+
+# rocprofv3 output directories
+.rocprofv3/

@@ -1,11 +1,12 @@
 # gpu-<gen>: one card generation + the APU (ROCm0 = card, ROCm1 = APU). Sourced by run.sh; $GEN is rdna2|rdna3|rdna4.
 # Uses the build from the base suite ($BUILD); run base first on a new commit.
-#   pre-flight (stops the run with HOST-STATE): host state, GEMV probe, peer copies, against machines/<host>.json
+#   pre-flight (stops the run with HOST-STATE): host state, GEMV probe, peer copies, against $HALO_MACHINE_DIR/<host>.json
 #   card: op cases + model shapes, random-weight architectures vs CPU, then gpu/<gen>.sh's gen_steps if it exists
 #         (a generation's own cases, e.g. rdna3's fallback paths)
 #   two devices: batched peer copies, scheduler exactness over card + APU (lanes, hazard model)
 
-MACHINE_JSON="$HALO_DIR/machines/$HOST.json"
+MACHINE_JSON="$HALO_MACHINE_DIR/$HOST.json"
+mkdir -p "$HALO_MACHINE_DIR"
 
 build_p2p() {   # the peer-copy probe (host code only, so one binary for every card)
     local exe="$BUILD/bin/halo-p2p"

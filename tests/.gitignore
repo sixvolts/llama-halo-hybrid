@@ -8,4 +8,9 @@ ggml-common.h
 !peg-parser
 !halo/
 !halo/*/
+!halo/**
+halo/machines/*
+!halo/machines/README.md
+!halo/machines/example.env
+!halo/machines/reference.json
 __pycache__/
