@@ -1375,8 +1375,8 @@ static __global__ void flash_attn_tile(
 // GGML_CUDA_FA_TILE_SPARSE_MIN_RATIO (default 3) is the cache / selection ratio from which it is used.
 static bool ggml_cuda_fattn_tile_shall_use_sparse(const int cc, const ggml_tensor * dst) {
 #ifdef GGML_USE_HIP
-    static const bool enabled = getenv("GGML_CUDA_FA_TILE_SPARSE") == nullptr || atoi(getenv("GGML_CUDA_FA_TILE_SPARSE")) != 0;
-    static const int64_t min_ratio = getenv("GGML_CUDA_FA_TILE_SPARSE_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_TILE_SPARSE_MIN_RATIO")) : 3;
+    static const bool enabled = ggml_env_flag("GGML_CUDA_FA_TILE_SPARSE", true);
+    static const int64_t min_ratio = ggml_env_int("GGML_CUDA_FA_TILE_SPARSE_MIN_RATIO", 3);
     if (!enabled || !GGML_CUDA_CC_IS_RDNA2(cc)) {
         return false;
     }
@@ -1425,7 +1425,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     // sparse: a 16-column tile (8 for D=512 on RDNA2, see above) keeps the query group's union small
     if constexpr ((DKQ == 256 || DKQ == 512) && DV == DKQ && ncols2 <= 8) {
         if (ggml_cuda_fattn_tile_shall_use_sparse(cc, dst)) {
-            static const int sp_cols = getenv("GGML_CUDA_FA_TILE_SPARSE_COLS") ? atoi(getenv("GGML_CUDA_FA_TILE_SPARSE_COLS")) : 32;
+            static const int sp_cols = (int) ggml_env_int("GGML_CUDA_FA_TILE_SPARSE_COLS", 32);
             auto launch_sparse = [&](auto cols_c) {
                 constexpr int cols_per_block = decltype(cols_c)::value;
                 const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;

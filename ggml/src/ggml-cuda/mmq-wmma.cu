@@ -455,7 +455,7 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     // (halo-hybrid, 2026-09-26: 16M -> 8M. Qwen3.8's 2560 x 6144 ssm_out / attn_output and 6144 x 2560 attn_gate
     //  (15.7M each) read f32 in-kernel at 17.7 / 28 TFLOPS; with the pre-pass 2.49 vs 3.45 ms and 2.09 vs 2.40 ms per
     //  2048 tokens on gfx1151. The f16 rounding of the activations is the same either way.)
-    static const int64_t prepass_min = getenv("GGML_CUDA_Q8_WMMA_PREPASS_MIN") ? atoll(getenv("GGML_CUDA_Q8_WMMA_PREPASS_MIN")) : (int64_t) 8 * 1024 * 1024;
+    static const int64_t prepass_min = ggml_env_int("GGML_CUDA_Q8_WMMA_PREPASS_MIN", (int64_t) 8 * 1024 * 1024);
     const bool prepass = M * K > prepass_min;
     if ((mode >= 2 && mode <= 10) || (mode <= 1 && prepass)) {
         ggml_cuda_pool_alloc<half> x16(ctx.pool(), (size_t) N * K);
@@ -494,7 +494,7 @@ bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_ten
 #else
     // GGML_CUDA_Q8_WMMA: 0 = off (MMQ), 1 = auto (default on RDNA3; RDNA4's int8 WMMA rate keeps MMQ ahead there, so
     // off unless asked), 2-10 fixed configs on an f16 pre-pass, 11-13 fixed configs reading f32 (tuning knobs)
-    static const int mode = getenv("GGML_CUDA_Q8_WMMA") ? atoi(getenv("GGML_CUDA_Q8_WMMA")) : -1;
+    static const int mode = (int) ggml_env_int("GGML_CUDA_Q8_WMMA", -1);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!(GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
         return false;
@@ -502,7 +502,7 @@ bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_ten
     // k-quants (q4_K / q5_K / q6_K): GGML_CUDA_KQ_WMMA = 0 off (MMQ), unset / 1 on for RDNA3 / RDNA4. MMQ applies a float
     // scale per 16 (q6_K) or 32 (q4_K / q5_K) K per output element; on gfx1201 that leaves q6_K at 37 and q4_K at 67 TFLOPS
     // against 88 for q8_0, while this kernel runs every type at the q8_0 rate.
-    static const int kq_mode = getenv("GGML_CUDA_KQ_WMMA") ? atoi(getenv("GGML_CUDA_KQ_WMMA")) : -1;
+    static const int kq_mode = (int) ggml_env_int("GGML_CUDA_KQ_WMMA", -1);
     const bool kq = src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K;
     if (kq) {
         if (kq_mode == 0 || !(GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {

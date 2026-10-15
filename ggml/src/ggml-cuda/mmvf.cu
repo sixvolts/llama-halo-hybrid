@@ -499,7 +499,7 @@ int ggml_cuda_mmvf_block_size(const int device, const int64_t ncols, const int64
     // halo-hybrid: gfx1201's dispatch cliff (see mmvq.cu) also sits at multiples of its 2048 wave slots: Qwen3.8's
     // 512-row f32 router launched 512 blocks x 8 waves = 4096 waves and ran 23.5 us vs 7.9 us at 513 rows. Step the
     // block down a warp until the wave count is clear of it.
-    static const bool no_cliff_guard = getenv("GGML_CUDA_MMVF_NO_CLIFF") != nullptr;
+    static const bool no_cliff_guard = ggml_env_flag("GGML_CUDA_MMVF_NO_CLIFF", false);
     if (!no_cliff_guard && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
         const int64_t slots    = (int64_t) ggml_cuda_info().devices[device].nsm * 64;
         const auto on_cliff = [&](int64_t bs) {

@@ -336,7 +336,7 @@ static bool mul_mat_q_gate_up_case(ggml_backend_cuda_context & ctx, const mmq_ar
     // on RDNA3.5 narrow tiles are bandwidth-bound and the fused GEMM itself is ~6% slower than the two it replaces, so
     // only the shared preparation pays there (GLM q4_K 2048 x 4096 at J = 16, 512 tokens: fused 1.5-2.5% slower than
     // mode 1). GGML_CUDA_MMQ_GATEUP_MIN_J overrides the smallest fused tile (default 24 on RDNA3.5, 8 elsewhere)
-    static const int min_j_env = getenv("GGML_CUDA_MMQ_GATEUP_MIN_J") ? atoi(getenv("GGML_CUDA_MMQ_GATEUP_MIN_J")) : -1;
+    static const int min_j_env = (int) ggml_env_int("GGML_CUDA_MMQ_GATEUP_MIN_J", -1);
     const int min_j = min_j_env >= 0 ? min_j_env : (GGML_CUDA_CC_IS_RDNA3_5(cc) ? 24 : 8);
     if (J_fused < min_j) {
         return false;

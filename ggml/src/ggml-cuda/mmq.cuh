@@ -1690,10 +1690,7 @@ static __global__ void mmq_moe_tile_list(const int32_t * __restrict__ expert_bou
 }
 
 static bool mmq_moe_use_tile_list() {
-    static const bool use = [] {
-        const char * env = getenv("GGML_CUDA_MMQ_MOE_TILE_LIST"); // 0 disables the compact tile list
-        return env == nullptr || atoi(env) != 0;
-    }();
+    static const bool use = ggml_env_flag("GGML_CUDA_MMQ_MOE_TILE_LIST", true); // 0 disables the compact tile list
     return use;
 }
 

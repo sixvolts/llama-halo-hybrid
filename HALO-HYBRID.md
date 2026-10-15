@@ -27,31 +27,35 @@ do not pin it with `-ot per_layer_token_embd=CPU` or `--load-mode none`.
 
 ## Changes, on by default
 
-Switches marked "presence" act when the variable is set to any value, including `0`; the others take `0` / `1`.
+Every switch reads unset as its default, `0`, `false`, `off`, `no` or an empty value as off, and anything else as on
+(numeric settings take an integer; a malformed one logs a warning and keeps the default). At startup the log lists
+the `GGML_*` and `LLAMA_*` variables that are set, so a bug report shows them. Until 2026-10-15 about 40 of the
+`..._NO_...` switches reacted to the variable being set at all, so `NAME=0` also switched the feature off; now it
+leaves it on.
 
 ### Scheduler and cross-device copies
 
 | What | Off switch |
 |---|---|
-| Split boundaries between local GPUs are GPU-side event waits instead of host syncs (+5-7% hybrid). RPC and CPU backends keep upstream's host synchronize. | `GGML_SCHED_NO_EVENTS` (presence) |
+| Split boundaries between local GPUs are GPU-side event waits instead of host syncs (+5-7% hybrid). RPC and CPU backends keep upstream's host synchronize. | `GGML_SCHED_NO_EVENTS` |
 | The APU (an integrated GPU) gets the same events instead of a host stream sync per split (hybrid decode +6%). The rpc-server turns them off for its own scheduler. | `GGML_SCHED_IGPU_EVENTS=0` |
-| Cross-device copies are pushed right behind their producer (eager copies) from a pool of copy events, because on ROCm a queued event wait binds to the event's newest record; eager input copies are allocated at their producer split. | `GGML_SCHED_NO_EAGER_PRODUCER_ALLOC` (presence) for the allocation |
-| Small cross-device copies (up to 256 KB) run as a push kernel into peer-mapped memory; several copies to one split go out as one batched kernel with one event. | `GGML_CUDA_KERNEL_COPY_MAX=0`, `GGML_CUDA_NO_PEER_COPY_BATCH` (presence), `GGML_SCHED_NO_COPY_BATCH` (presence) |
-| A full-size view of a tensor that crosses devices is copied once and viewed, not copied once per view. | `GGML_SCHED_NO_VIEW_ROUTE` (presence) |
+| Cross-device copies are pushed right behind their producer (eager copies) from a pool of copy events, because on ROCm a queued event wait binds to the event's newest record; eager input copies are allocated at their producer split. | `GGML_SCHED_NO_EAGER_PRODUCER_ALLOC` for the allocation |
+| Small cross-device copies (up to 256 KB) run as a push kernel into peer-mapped memory; several copies to one split go out as one batched kernel with one event. | `GGML_CUDA_KERNEL_COPY_MAX=0`, `GGML_CUDA_NO_PEER_COPY_BATCH`, `GGML_SCHED_NO_COPY_BATCH` |
+| A full-size view of a tensor that crosses devices is copied once and viewed, not copied once per view. | `GGML_SCHED_NO_VIEW_ROUTE` |
 | A split with enough independent work (e.g. the shared expert) is cut so it starts before a cross-device input arrives. | `GGML_SCHED_OVERLAP_CUT=0` |
-| Output reads re-record the split events after async reads, so the next ubatch's inputs cannot overwrite data still being read. | `GGML_SCHED_NO_OUTPUT_EVENTS` (presence; unsafe, for bisecting only) |
-| For a remote split, host-resident inputs are sent before tensors produced by earlier splits. | `GGML_SCHED_NO_INPUT_ORDER` (presence) |
+| Output reads re-record the split events after async reads, so the next ubatch's inputs cannot overwrite data still being read. | `GGML_SCHED_NO_OUTPUT_EVENTS` (unsafe, for bisecting only) |
+| For a remote split, host-resident inputs are sent before tensors produced by earlier splits. | `GGML_SCHED_NO_INPUT_ORDER` |
 | rocBLAS instead of hipBLASLt for f32 GEMMs (hipBLASLt's gfx1201 sgemm kernels are fallbacks). Set by `ggml_cuda_init` unless the variable is already set. | `ROCBLAS_USE_HIPBLASLT=1` |
 
 ### Matrix-vector (decode) kernels
 
 | What | Off switch |
 |---|---|
-| Grouped GEMV: adjacent matmuls that read the same activation quantize it once and run as one launch. | `GGML_CUDA_NO_MMVQ_GROUP` (presence), `GGML_CUDA_NO_GEMV_GROUP=1` |
+| Grouped GEMV: adjacent matmuls that read the same activation quantize it once and run as one launch. | `GGML_CUDA_NO_MMVQ_GROUP`, `GGML_CUDA_NO_GEMV_GROUP=1` |
 | Fused kernels that produce a one-row activation also write its q8_1 copy, which the GEMVs pick up (bit-identical). | `GGML_CUDA_NO_Q8_SIDE=1` |
-| Decode GEMVs that read the same activation are hoisted next to each other; gate/up/GLU triples join as one paired launch. | `GGML_CUDA_NO_GEMV_HOIST` (presence), `GGML_CUDA_NO_GEMV_PAIR` (presence) |
+| Decode GEMVs that read the same activation are hoisted next to each other; gate/up/GLU triples join as one paired launch. | `GGML_CUDA_NO_GEMV_HOIST`, `GGML_CUDA_NO_GEMV_PAIR` |
 | `mul_mat_vec_q` small-K mode on RDNA4 (short rows such as Qwen3.8's [10240 x 320] hyper-connection projections: 23 -> 7 us). | `GGML_CUDA_MMVQ_NO_SMALLK=1` |
-| RDNA3/RDNA4 GEMV launch planner for 2-4 tokens (verify batches): multi-wave blocks, and launches kept clear of gfx1201's dispatch cliff near its 2048 wave slots. The f32 GEMV has the same cliff guard. | `GGML_CUDA_MMVQ_NO_WIDE=1`, `GGML_CUDA_MMVQ_NO_TALL` (presence), `GGML_CUDA_MMVF_NO_CLIFF` (presence) |
+| RDNA3/RDNA4 GEMV launch planner for 2-4 tokens (verify batches): multi-wave blocks, and launches kept clear of gfx1201's dispatch cliff near its 2048 wave slots. The f32 GEMV has the same cliff guard. | `GGML_CUDA_MMVQ_NO_WIDE=1`, `GGML_CUDA_MMVQ_NO_TALL`, `GGML_CUDA_MMVF_NO_CLIFF` |
 | Grouped MoE GEMV for verify batches: each distinct expert is read once per batch. | `GGML_CUDA_MMVQ_GROUPED=0` |
 | MoE tail at decode (RDNA3/RDNA4): down-projection of the used experts, router weighting, the gated shared expert and the residual add in one launch. | `GGML_CUDA_NO_MOE_TAIL=1` |
 | Load pipelining in the f32/f16/bf16 GEMV (four loads in flight per thread, same accumulation order). | none |
@@ -68,7 +72,7 @@ Switches marked "presence" act when the variable is set to any value, including 
 | k-quant (q4_K/q5_K/q6_K) GEMMs on WMMA for RDNA3/RDNA4. | `GGML_CUDA_KQ_WMMA=0` |
 | Routed expert GEMM in F16 WMMA for RDNA3 / RDNA3.5 prefill (adapted from gufo), at the shapes where it measured faster. | `GGML_CUDA_MMID_F16=0` |
 | Thin f32 matrices: `[K -> 2..8]` at prefill widths run as a swapped GEMV plus a transpose; a tiled f32 GEMM takes the MoE router shape instead of rocBLAS. | `GGML_CUDA_NO_MMVF_SWAP=1`, `GGML_CUDA_NO_F32_TILE=1` |
-| The KDA/Mamba conv-state concat with a transposed operand runs as a tiled kernel; small dim-0 concats at decode as a row kernel. | `GGML_CUDA_NO_CONCAT_ROWS` (presence) for the row kernel |
+| The KDA/Mamba conv-state concat with a transposed operand runs as a tiled kernel; small dim-0 concats at decode as a row kernel. | `GGML_CUDA_NO_CONCAT_ROWS` for the row kernel |
 
 ### Attention
 
@@ -78,7 +82,7 @@ Switches marked "presence" act when the variable is set to any value, including 
 | Sparse flash attention on RDNA: GLM-5.3's DSA layers (D=512) and Qwen3.8's QSA layers (D=256) walk only the selected keys, above a per-architecture context ratio. | `GGML_CUDA_FA_NO_SPARSE=1`, `GGML_CUDA_FA_SPARSE_D256=0`; tuning `GGML_CUDA_FA_SPARSE_MIN_RATIO`, `GGML_CUDA_FA_SPARSE_PAIRS`, `GGML_CUDA_FA_SPARSE_HEADS` |
 | QSA (Qwen3.8 sparse attention) at depth: above a cell threshold a decode step gathers the ~2K selected K/V rows (from ucicelos/flashnext-hybrid). | `LLAMA_QSA_GATHER=0`, or the threshold in cells |
 | QSA block-key cache and block top-k per KV stream; top-k from registers; fused block scoring at decode. | `LLAMA_QSA_BLK_CACHE=0`, `LLAMA_QSA_BLOCK_TOPK=0`, `LLAMA_QSA_INPUT_FAST=0`, `GGML_CUDA_QSA_TK_REG=0`, `GGML_CUDA_NO_QSA_SCORE=1` |
-| KQ masks built on the device from per-cell / per-query indices instead of uploading `[n_kv, n_tokens]`; the host fill of the rest runs on 8 threads for large masks. | `LLAMA_NO_MASK_DEVICE` (presence), `LLAMA_KQ_MASK_THREADS=1` |
+| KQ masks built on the device from per-cell / per-query indices instead of uploading `[n_kv, n_tokens]`; the host fill of the rest runs on 8 threads for large masks. | `LLAMA_NO_MASK_DEVICE`, `LLAMA_KQ_MASK_THREADS=1` |
 | Fused lightning-indexer scoring for GLM-5.3's DSA layers. | `LLAMA_FUSED_LID_DISABLE=1` |
 | GLM-5.3 DSA indexer pool compressor in one launch. | `GGML_CUDA_NO_KPOOL_COMPRESS=1` |
 
@@ -86,7 +90,7 @@ Switches marked "presence" act when the variable is set to any value, including 
 
 | What | Off switch |
 |---|---|
-| Chunked prefill scan instead of the token loop. | `GGML_CUDA_NO_GDN_CHUNKED` (presence); `GGML_CUDA_GDN_CHUNK_MIN` (default 64 tokens) |
+| Chunked prefill scan instead of the token loop. | `GGML_CUDA_NO_GDN_CHUNKED`; `GGML_CUDA_GDN_CHUNK_MIN` (default 64 tokens) |
 | bf16 WMMA chunked prefill for S_v = 128 on RDNA3/RDNA4 (from stew675/llama-cpp-rdna-boosts and libr4d; near-lossless, not bit-exact). | `GGML_CUDA_GDN_BF16=0` |
 | More waves per block for the recurrence on RDNA3.5. | none |
 
@@ -96,16 +100,16 @@ Switches marked "presence" act when the variable is set to any value, including 
 |---|---|
 | Qwen3.8 (`qwen4exp`) hyper-connection mix and combine, gate chains and the MoE weighted sum fused by op pattern (bit-identical). | `GGML_CUDA_NO_HC_FUSE=1` |
 | Generic element-wise chain fusion (mul/add/scale/activation chains with single-use intermediates). | `GGML_CUDA_NO_EWCHAIN=1` |
-| DeepSeek-V4 hyper-connection prologue as one op (`DSV4_HC_MIX`). | `LLAMA_NO_HC_MIX` (presence) |
-| Graph tidy-ups: identity recurrent-state gathers become views, one `l2_norm` over q and k. | `LLAMA_NO_GRAPH_FUSE` (presence) |
-| Qwen3.8's per-layer n-gram rows gathered on the host in `set_input` (no CPU split), started early for the next ubatch. | `LLAMA_PLE_GET_ROWS` (presence), `LLAMA_PLE_PREFETCH=0`, `LLAMA_PREFETCH_HINT=0` |
-| DFlash drafts run their sliding-window layers causally, as the reference does. | `LLAMA_DFLASH_SWA_BIDIR` (presence) |
+| DeepSeek-V4 hyper-connection prologue as one op (`DSV4_HC_MIX`). | `LLAMA_NO_HC_MIX` |
+| Graph tidy-ups: identity recurrent-state gathers become views, one `l2_norm` over q and k. | `LLAMA_NO_GRAPH_FUSE` |
+| Qwen3.8's per-layer n-gram rows gathered on the host in `set_input` (no CPU split), started early for the next ubatch. | `LLAMA_PLE_GET_ROWS`, `LLAMA_PLE_PREFETCH=0`, `LLAMA_PREFETCH_HINT=0` |
+| DFlash drafts run their sliding-window layers causally, as the reference does. | `LLAMA_DFLASH_SWA_BIDIR` |
 
 ### KV cache and server
 
 | What | Off switch |
 |---|---|
-| Shared KV pool (`-kvu`): each ubatch attends only its own sequences' window, per-sequence QSA groups, per-sequence dense attention spans, and cell moves when one conversation grows into another's cells. | `LLAMA_KV_NO_WINDOW` (presence), `LLAMA_QSA_SHARED=0`, `LLAMA_KV_NO_SPANS` (presence), `LLAMA_MTP_NO_WINDOW` (presence), `LLAMA_KV_NO_MOVE=1` |
+| Shared KV pool (`-kvu`): each ubatch attends only its own sequences' window, per-sequence QSA groups, per-sequence dense attention spans, and cell moves when one conversation grows into another's cells. | `LLAMA_KV_NO_WINDOW`, `LLAMA_QSA_SHARED=0`, `LLAMA_KV_NO_SPANS`, `LLAMA_MTP_NO_WINDOW`, `LLAMA_KV_NO_MOVE=1` |
 | Idle-slot purge with a unified cache saves the least recently used idle slot to the RAM prompt cache. Run a shared pool with `--no-cache-idle-slots`. | none |
 | New tasks prefer idle slots that keep busy slots contiguous (one ubatch only joins consecutive KV streams). | `LLAMA_SERVER_SLOT_CONTIG=0` |
 | `--checkpoint-min-new N`: no checkpoint or prompt split at the last user message when fewer than N new tokens follow it. | default 0 (always split) |

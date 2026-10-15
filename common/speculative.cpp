@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include "common.h"
 #include "ggml.h"
@@ -1246,7 +1247,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 //     so the first k-1 draft tokens (accepted 0.6-0.95 of the time on GLM-5.3-Flash regardless of the
                 //     selector's confidence) are always kept; cutting them left steps with no draft at all, which cost
                 //     a full target step for one token (p_min 0.85 measured 19 t/s against 22 with no cut)
-                static const int32_t pmin_from = getenv("LLAMA_DFLASH_PMIN_FROM") ? atoi(getenv("LLAMA_DFLASH_PMIN_FROM")) : 4;
+                static const int32_t pmin_from = (int) ggml_env_int("LLAMA_DFLASH_PMIN_FROM", 4);
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
@@ -1537,7 +1538,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        static const int min_tokens = getenv("LLAMA_MTP_EARLY_MIN") ? atoi(getenv("LLAMA_MTP_EARLY_MIN")) : 256;
+        static const int min_tokens = (int) ggml_env_int("LLAMA_MTP_EARLY_MIN", 256);
         if (min_tokens <= 0 || is_mem_shared || chain_heads || n_in < min_tokens ||
                 !batch_in.has_token() || batch_in.has_embd()) {
             return;
@@ -2718,7 +2719,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // ubatch although it runs one layer. LLAMA_SPEC_DRAFT_UB=<n> caps it (ingest is chunked by the draft's own
     // n_ubatch). Not for block drafts, which decode a whole noise block in one pass.
     if (!has_block_draft) {
-        static const int32_t draft_ub = getenv("LLAMA_SPEC_DRAFT_UB") ? atoi(getenv("LLAMA_SPEC_DRAFT_UB")) : 0;
+        static const int32_t draft_ub = (int) ggml_env_int("LLAMA_SPEC_DRAFT_UB", 0);
         if (draft_ub > 0 && draft_ub < result.n_ubatch) {
             result.n_ubatch = draft_ub;
         }

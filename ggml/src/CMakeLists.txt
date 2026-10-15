@@ -196,11 +196,13 @@ add_library(ggml-base
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
             ../include/gguf.h
+            ../include/ggml-env.h   # halo-hybrid
             ggml.c
             ggml.cpp
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
+            ggml-env.cpp            # halo-hybrid
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h

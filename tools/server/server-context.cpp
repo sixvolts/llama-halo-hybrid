@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "ggml-env.h"   // halo-hybrid
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -481,7 +482,7 @@ struct server_slot {
         const bool spec_mtp = task && std::find(task->params.speculative.types.begin(), task->params.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != task->params.speculative.types.end();
         if (task && spec_mtp && task->params.sampling.temp > 0.0f) {
-            static const int nmax_sampled = getenv("LLAMA_SPEC_NMAX_SAMPLED") ? atoi(getenv("LLAMA_SPEC_NMAX_SAMPLED")) : 2;
+            static const int nmax_sampled = (int) ggml_env_int("LLAMA_SPEC_NMAX_SAMPLED", 2);
             if (nmax_sampled > 0) {
                 // never below the draft's n_min: a shorter draft would be discarded entirely
                 const int cap = std::max(nmax_sampled, (int) task->params.speculative.draft.n_min);
@@ -1582,7 +1583,7 @@ private:
     // LLAMA_SERVER_SLOT_CONTIG=0 restores the plain similarity / LRU choice.
     std::vector<bool> contiguous_candidates() const {
         std::vector<bool> ok(slots.size(), true);
-        static const bool enabled = getenv("LLAMA_SERVER_SLOT_CONTIG") == nullptr || atoi(getenv("LLAMA_SERVER_SLOT_CONTIG")) != 0;
+        static const bool enabled = ggml_env_flag("LLAMA_SERVER_SLOT_CONTIG", true);
         if (!enabled || params_base.kv_unified || slots.size() < 2) {
             return ok;
         }
@@ -3130,7 +3131,7 @@ private:
                         // halo-hybrid: lossless speculative sampling when the task samples (LLAMA_SPEC_RS=1)
                         slot.spec_draft_q.clear();
                         {
-                            static const bool spec_rs = getenv("LLAMA_SPEC_RS") == nullptr || atoi(getenv("LLAMA_SPEC_RS")) != 0;
+                            static const bool spec_rs = ggml_env_flag("LLAMA_SPEC_RS", true);
                             const float temp = slot.task->params.sampling.temp;
                             if (spec_rs && temp > 0.0f) {
                                 auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
@@ -3692,7 +3693,7 @@ private:
                             // draft's acceptance measured 0.84 / 0.86 vs 0.81 / 0.83 without, decode 20.5 vs 20.0,
                             // prefill 430 vs 457 tok/s at 13K; the ubatch boundaries move with it and so do the
                             // hidden states at the noise level)
-                            static const int tail_ckpt = getenv("LLAMA_TAIL_CKPT") ? atoi(getenv("LLAMA_TAIL_CKPT")) : 0;
+                            static const int tail_ckpt = (int) ggml_env_int("LLAMA_TAIL_CKPT", 0);
                             const int prefill_lanes = std::max(1, (int) llama_n_prefill_lanes(ctx_tgt));
                             const int checkpoint_offsets[] = {prefill_lanes >= 2 && tail_ckpt != 2 ? 4 : 4 + prefill_lanes * n_ubatch, 4};
 
@@ -3718,7 +3719,7 @@ private:
                     // halo-hybrid: only the batches that START at a checkpoint offset before the end count as
                     // "near the end" (the original `task < prompt + n_ubatch` was true for every batch of a short
                     // prompt, so a 30-token turn saved two 145 MiB checkpoints)
-                    const int  tail_span       = 4 + ((llama_n_prefill_lanes(ctx_tgt) >= 2 && !(getenv("LLAMA_TAIL_CKPT") && atoi(getenv("LLAMA_TAIL_CKPT")) == 2)) ? 0 : (int) llama_n_prefill_lanes(ctx_tgt) * n_ubatch);
+                    const int  tail_span       = 4 + ((llama_n_prefill_lanes(ctx_tgt) >= 2 && !(ggml_env_int("LLAMA_TAIL_CKPT", 0) == 2)) ? 0 : (int) llama_n_prefill_lanes(ctx_tgt) * n_ubatch);
                     const bool near_prompt_end = slot.task->n_tokens() - n_tokens_start <= tail_span;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);

@@ -897,7 +897,7 @@ static void dsv4_hc_mix_split_dispatch(bool post, bool norm, const int nt, cudaS
 }
 
 void ggml_cuda_dsv4_hc_mix_scratch_init(ggml_backend_cuda_context & ctx) {
-    static const bool disabled = getenv("GGML_CUDA_NO_HC_MIX_SPLIT") != nullptr && atoi(getenv("GGML_CUDA_NO_HC_MIX_SPLIT"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_HC_MIX_SPLIT", false);
     if (disabled || ctx.hc_mix_scratch != nullptr) {
         return;
     }

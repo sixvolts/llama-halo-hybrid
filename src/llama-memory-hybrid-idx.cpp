@@ -1,4 +1,5 @@
 #include "llama-memory-hybrid-idx.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include <algorithm>
 #include <cmath>
@@ -86,7 +87,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
     // halo-hybrid (C6): the block-key cache, one sequence per stream, or per slab in a shared pool (a unified cache
     // without the window pools per sequence set, which this indexing by position cannot follow; qsa_blk_plan declines)
-    static const bool enabled = getenv("LLAMA_QSA_BLK_CACHE") == nullptr || atoi(getenv("LLAMA_QSA_BLK_CACHE")) != 0;
+    static const bool enabled = ggml_env_flag("LLAMA_QSA_BLK_CACHE", true);
     if (!enabled || !mem_idx || model.hparams.no_alloc) {
         return;
     }
@@ -229,7 +230,7 @@ llama_memory_hybrid_idx::qsa_plan llama_memory_hybrid_idx::qsa_blk_plan_cells(co
 // another sequence among them. find_slot_window appends a sequence's tokens after its last cell, so the order holds
 // whenever the count and the end cells do; LLAMA_QSA_LAYOUT_CHECK=1 verifies every cell.
 llama_memory_hybrid_idx::qsa_plan llama_memory_hybrid_idx::qsa_blk_plan_shared(const llama_ubatch & ubatch, uint32_t ratio, int32_t n_re, uint32_t lo, uint32_t n_kv) const {
-    static const bool check = getenv("LLAMA_QSA_LAYOUT_CHECK") != nullptr && atoi(getenv("LLAMA_QSA_LAYOUT_CHECK")) != 0;
+    static const bool check = ggml_env_flag("LLAMA_QSA_LAYOUT_CHECK", false);
 
     qsa_plan p;
     const uint32_t n_ns = ubatch.n_seqs_unq;
@@ -761,7 +762,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         // writes instead of the grouping scan below (~1.5 ms per stream per step at 59K). Same values as the general
         // path for that layout: full block b = cells [b*r, b*r + r), the incomplete tail and the empty cells point at the
         // spare block. Block-level bias only (the decode graphs); LLAMA_QSA_INPUT_FAST=0 always takes the scan.
-        static const bool fast_inputs = getenv("LLAMA_QSA_INPUT_FAST") == nullptr || atoi(getenv("LLAMA_QSA_INPUT_FAST")) != 0;
+        static const bool fast_inputs = ggml_env_flag("LLAMA_QSA_INPUT_FAST", true);
         if (fast_inputs && blk_bias && one_seq && cells.seq_pos_min(seq_of_stream) == 0 &&
                 (int64_t) cells.seq_pos_max(seq_of_stream) + 1 == (int64_t) cells.get_used() && (int64_t) cells.get_used() <= n_kv) {
             const int64_t used = cells.get_used();

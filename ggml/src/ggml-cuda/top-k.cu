@@ -338,7 +338,7 @@ static __global__ void top_k_small(const float * __restrict__ src, int * __restr
 }
 
 static bool top_k_small_enabled() {
-    static const bool disabled = getenv("GGML_CUDA_NO_TOPK_SMALL") != nullptr;
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_TOPK_SMALL", false);
     return !disabled;
 }
 

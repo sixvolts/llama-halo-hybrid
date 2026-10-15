@@ -210,7 +210,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
         (const half *) mask->data, indices, int(mask->ne[0]), cap, group, int(mask->ne[1]), s31, s33);
     // debug (with GGML_CUDA_DISABLE_GRAPHS=1): GGML_CUDA_FA_UNION_STATS=1 prints the mean / max list length per call
-    static const bool union_stats = getenv("GGML_CUDA_FA_UNION_STATS") != nullptr;
+    static const bool union_stats = ggml_env_flag("GGML_CUDA_FA_UNION_STATS", false);
     if (union_stats) {
         const int64_t n_lists = int64_t(blocks_num.x) * blocks_num.y;
         std::vector<int32_t> h(n_lists * (int64_t(cap) + 1));
@@ -250,7 +250,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
     // halo-hybrid: RDNA (WMMA) parts too - GLM-5.3-Flash's DSA layers select 2051 of the cache's cells per
     // query and otherwise walk the whole context under a mask (GGML_CUDA_FA_NO_SPARSE=1 restores that)
-    static const bool no_sparse = getenv("GGML_CUDA_FA_NO_SPARSE") != nullptr && atoi(getenv("GGML_CUDA_FA_NO_SPARSE")) != 0;
+    static const bool no_sparse = ggml_env_flag("GGML_CUDA_FA_NO_SPARSE", false);
     const bool amd = !no_sparse && amd_wmma_available(cc);
     const bool arch_ok = (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd;
     // RDNA, measured on gfx1201 / gfx1151 at DKQ = DV = 512, 64 heads, bound 2052 (GGML_CUDA_FA_SPARSE_MIN_RATIO
@@ -262,15 +262,14 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     // with two blocks per WGP for the 16-column tile and 32 heads per tile (fattn-mma-f16.cuh): 19-21 ms (gfx1201)
     // / 76-78 ms (gfx1151) per 1024 queries against a dense walk of 2.8 / 7.7 ms per 1K of context, break-even
     // ~6.7K (ratio 3.3) on gfx1201 and ~10K (ratio 4.9) on gfx1151
-    static const int64_t amd_pp_ratio = getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_SPARSE_MIN_RATIO"))
-                                      : (GGML_CUDA_CC_IS_RDNA4(cc) ? 3 : 5);
+    static const int64_t amd_pp_ratio = ggml_env_int("GGML_CUDA_FA_SPARSE_MIN_RATIO", (GGML_CUDA_CC_IS_RDNA4(cc) ? 3 : 5));
     const int64_t min_ratio = amd && Q->ne[1] > 8 ? amd_pp_ratio : 2;
     // halo-hybrid: Qwen3.8's QSA layers (D = 256, GQA 12, 2051 cells of top-k per query): only prefill-width
     // batches, whose 16-query tiles walk the union of their selections (fattn-mma-f16.cuh, (256, 256, 16, 4));
     // decode keeps the dense walk (and the graph's gather path). GGML_CUDA_FA_SPARSE_D256=0 disables it
     if (K->ne[0] == 256 && dst->src[2]->ne[0] == 256) {
-        static const bool d256 = getenv("GGML_CUDA_FA_SPARSE_D256") == nullptr || atoi(getenv("GGML_CUDA_FA_SPARSE_D256")) != 0;
-        static const int64_t d256_ratio = getenv("GGML_CUDA_FA_SPARSE_D256_MIN_RATIO") ? atoll(getenv("GGML_CUDA_FA_SPARSE_D256_MIN_RATIO")) : 4;
+        static const bool d256 = ggml_env_flag("GGML_CUDA_FA_SPARSE_D256", true);
+        static const int64_t d256_ratio = ggml_env_int("GGML_CUDA_FA_SPARSE_D256_MIN_RATIO", 4);
         // WMMA cards only (RDNA2 has its own walk in the tile kernel). On RDNA3 (gfx1101, RX 7800 XT) a 2560-query
         // batch against 28K of context takes 38.5 ms sparse vs 97 ms dense; at 8K the gate keeps it dense
         const bool d256_arch = GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
@@ -364,11 +363,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         if (use_gqa_opt && gqa_ratio % 16 == 0 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
             // prefill: two consecutive queries share one gathered tile (the union of their selections, 32
             // columns = the tuned config); decode and the verify batch keep the one-query variant
-            static const bool pairs = getenv("GGML_CUDA_FA_SPARSE_PAIRS") == nullptr || atoi(getenv("GGML_CUDA_FA_SPARSE_PAIRS")) != 0;
+            static const bool pairs = ggml_env_flag("GGML_CUDA_FA_SPARSE_PAIRS", true);
             // 32 heads of one query per tile (GGML_CUDA_FA_SPARSE_HEADS=16 restores the 16-head tiles): the
             // same 32-column tile as the pair variant, but every column shares the query's exact selection,
             // so each gathered row feeds twice the MMA work of a 16-head tile and the union padding is gone
-            static const int sparse_heads = getenv("GGML_CUDA_FA_SPARSE_HEADS") ? atoi(getenv("GGML_CUDA_FA_SPARSE_HEADS")) : 32;
+            static const int sparse_heads = (int) ggml_env_int("GGML_CUDA_FA_SPARSE_HEADS", 32);
             if (sparse_heads == 32 && gqa_ratio % 32 == 0) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 32>(ctx, dst);
             } else if (pairs && Q->ne[1] > 8) {
@@ -380,7 +379,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
         // one query per sequence slot (a per-token gathered key set): 16 heads fill the tile instead of
         // padding 4 query columns with one query (GGML_CUDA_FA_NCOLS16=0 restores the 8-head dispatch)
-        static const bool ncols16 = getenv("GGML_CUDA_FA_NCOLS16") == nullptr || atoi(getenv("GGML_CUDA_FA_NCOLS16")) != 0;
+        static const bool ncols16 = ggml_env_flag("GGML_CUDA_FA_NCOLS16", true);
         if (ncols16 && use_gqa_opt && gqa_ratio % 16 == 0 && Q->ne[1] == 1) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 16>(ctx, dst);
             return;
@@ -390,7 +389,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         // Qwen3.8 QSA prefill: 16 queries x 4 heads per tile over the union of the queries' selections
         // (GGML_CUDA_FA_SPARSE_NCOLS1=8 takes the 32-column tile of 8 queries)
         if (use_gqa_opt && gqa_ratio % 4 == 0 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
-            static const int sparse_ncols1 = getenv("GGML_CUDA_FA_SPARSE_NCOLS1") ? atoi(getenv("GGML_CUDA_FA_SPARSE_NCOLS1")) : 16;
+            static const int sparse_ncols1 = (int) ggml_env_int("GGML_CUDA_FA_SPARSE_NCOLS1", 16);
             if (sparse_ncols1 == 8) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 4>(ctx, dst);
             } else {
@@ -887,13 +886,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     //     -1 disables): the 64-column prefill config halves the tile kernel on the R9700, the 16-column config used by the
     //     3-token verify batch is slower than tile, so small batches stay on it
     if (amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256) {
-        static const int min_cols = getenv("GGML_CUDA_FA_MMA256_MIN") ? atoi(getenv("GGML_CUDA_FA_MMA256_MIN")) : 64;
+        static const int min_cols = (int) ggml_env_int("GGML_CUDA_FA_MMA256_MIN", 64);
         if (min_cols >= 0 && Q->ne[1] * gqa_ratio_eff > min_cols) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
     }
     if (amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] == 512 && V->ne[0] == 512) {
-        static const int min_cols = getenv("GGML_CUDA_FA_MMA512_MIN") ? atoi(getenv("GGML_CUDA_FA_MMA512_MIN")) : 8;
+        static const int min_cols = (int) ggml_env_int("GGML_CUDA_FA_MMA512_MIN", 8);
         if (min_cols >= 0 && Q->ne[1] * gqa_ratio_eff > min_cols) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }

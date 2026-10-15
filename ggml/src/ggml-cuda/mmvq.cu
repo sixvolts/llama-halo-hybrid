@@ -328,8 +328,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 //     assume. GGML_CUDA_MMID_MMVQ_MAX_RDNA3=<n> / _RDNA4=<n> caps the vector path at n tokens for the K-quants on
 //     that family (lowering only; the compiled kernels cover every smaller width).
 static int get_mmvq_mmid_max_batch_env_cap(int cc) {
-    static const int cap3 = getenv("GGML_CUDA_MMID_MMVQ_MAX_RDNA3") ? atoi(getenv("GGML_CUDA_MMID_MMVQ_MAX_RDNA3")) : 0;
-    static const int cap4 = getenv("GGML_CUDA_MMID_MMVQ_MAX_RDNA4") ? atoi(getenv("GGML_CUDA_MMID_MMVQ_MAX_RDNA4")) : 0;
+    static const int cap3 = (int) ggml_env_int("GGML_CUDA_MMID_MMVQ_MAX_RDNA3", 0);
+    static const int cap4 = (int) ggml_env_int("GGML_CUDA_MMID_MMVQ_MAX_RDNA4", 0);
     if (GGML_CUDA_CC_IS_RDNA4(cc)) { return cap4; }
     if (GGML_CUDA_CC_IS_RDNA3(cc)) { return cap3; }
     return 0;
@@ -759,18 +759,12 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 // halo-hybrid: 8-warp blocks for ncols_dst 2..4 on RDNA4 and RDNA3 (see calc_nwarps). GGML_CUDA_MMVQ_NO_WIDE=1
 // restores the upstream one-wave-per-row launch for A/B.
 static bool ggml_cuda_mmvq_wide() {
-    static const bool enabled = []() {
-        const char * env = getenv("GGML_CUDA_MMVQ_NO_WIDE");
-        return env == nullptr || atoi(env) == 0;
-    }();
+    static const bool enabled = !ggml_env_flag("GGML_CUDA_MMVQ_NO_WIDE", false);
     return enabled;
 }
 
 static bool ggml_cuda_mmvq_rdna4_small_k() {
-    static const bool enabled = []() {
-        const char * env = getenv("GGML_CUDA_MMVQ_NO_SMALLK");
-        return env == nullptr || atoi(env) == 0;
-    }();
+    static const bool enabled = !ggml_env_flag("GGML_CUDA_MMVQ_NO_SMALLK", false);
     return enabled;
 }
 
@@ -1522,7 +1516,7 @@ bool ggml_cuda_mmvq_moe_grouped_enabled(ggml_type type) {
     // default on (2026-09-27): reads each distinct expert once per verify batch; Qwen3.8 base and Swift Q8T hybrid
     // decode -1.1 to -1.2 ms/step, KLD 0.042 at ub 3 (perturbation floor ~0.032), acceptance unchanged over 5 seeds.
     // GGML_CUDA_MMVQ_GROUPED=0 restores the per-pair kernel.
-    static const bool enabled = getenv("GGML_CUDA_MMVQ_GROUPED") == nullptr || atoi(getenv("GGML_CUDA_MMVQ_GROUPED")) != 0;
+    static const bool enabled = ggml_env_flag("GGML_CUDA_MMVQ_GROUPED", true);
     if (!enabled) {
         return false;
     }
@@ -1758,8 +1752,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     // took 9.8, and 256 rows x 8 warps took 19.7 where 252 took 3.7. A shape that would land there
                     // takes another launch.
                     const auto on_cliff = [&](int64_t waves) { return waves >= slots - 12 && waves <= slots + 3; };
-                    static const bool no_tall = getenv("GGML_CUDA_MMVQ_NO_TALL") != nullptr;
-                    static const bool dbg     = getenv("GGML_CUDA_MMVQ_DEBUG") != nullptr;
+                    static const bool no_tall = ggml_env_flag("GGML_CUDA_MMVQ_NO_TALL", false);
+                    static const bool dbg     = ggml_env_flag("GGML_CUDA_MMVQ_DEBUG", false);
                     const bool can_tall = !no_tall && calc_nwarps(type, c_ncols_dst, table_id, true, false) > 1;
                     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
                         // RDNA3 planner. Measured on the RX 7800 XT (1920 slots) with the weights streamed from DRAM
@@ -1832,7 +1826,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const bool long_k = blocks_per_row_x >= 8 * blocks_per_iter_1warp;
                     // halo-hybrid experiment: GGML_CUDA_MMVQ_BIG_WIDE=1 keeps the wide launch for >= 2^25 weights too
                     // (in situ the 8192-row K=4096 KDA q projection ran at ~170 GB/s under the one-wave-per-row launch)
-                    static const bool big_wide = getenv("GGML_CUDA_MMVQ_BIG_WIDE") != nullptr;
+                    static const bool big_wide = ggml_env_flag("GGML_CUDA_MMVQ_BIG_WIDE", false);
                     const bool big    = !big_wide && (int64_t) nrows_x * ncols_x >= (1 << 25);
                     const int64_t w_wide = (int64_t) nrows_x * 8 * launches;
                     const int64_t w_up   = (int64_t) nrows_x * launches;
@@ -2232,7 +2226,7 @@ static void mul_mat_vec_q_group_ncols(const mmvq_group_args & a, const void * vy
 // true when the group ran; the caller falls back to one launch per matrix otherwise
 bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n,
                                    const ggml_tensor * src1, const char * src1_q8_1) {
-    static const bool disabled = getenv("GGML_CUDA_NO_GEMV_GROUP") != nullptr && std::atoi(getenv("GGML_CUDA_NO_GEMV_GROUP"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_GEMV_GROUP", false);
     if (disabled || n < 2 || n > MMVQ_GROUP_MAX || !src1_q8_1) {
         return false;
     }
@@ -2257,7 +2251,7 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
         // default 512 (2026-09-27): Qwen3.8's hc_attn/ffn_down group (320 rows x K=10240 + the f32 inject) ran ~18 us in the
         // group kernel vs ~4 us per-matrix on gfx1201 (the group kernel's one wave per row leaves most CUs idle):
         // Swift Q8T decode 36.7 -> 36.2 ms/step. 0 = always group.
-        static const int64_t min_rows = getenv("GGML_CUDA_GEMV_GROUP_MINROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_MINROWS")) : 512;
+        static const int64_t min_rows = ggml_env_int("GGML_CUDA_GEMV_GROUP_MINROWS", 512);
         if (min_rows > 0) {
             int64_t rows = 0;
             for (int k = 0; k < n; ++k) {
@@ -2466,7 +2460,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
         {   // halo-hybrid: GGML_CUDA_GEMV_GROUPS=1 names any activation that still needs a standalone quantize launch
             // (none during decode on Qwen3.8: the producer-side q8_1 registry and the shared-activation group cover it)
-            static const int who = getenv("GGML_CUDA_GEMV_GROUPS") ? atoi(getenv("GGML_CUDA_GEMV_GROUPS")) : 0;
+            static const int who = (int) ggml_env_int("GGML_CUDA_GEMV_GROUPS", 0);
             if (who) {
                 GGML_LOG_WARN("q8-quantize: %s <- %s (%s) ne %lld x %lld, consumer %s\n",
                     src1->name, src1->src[0] ? src1->src[0]->name : "-", ggml_op_name(src1->op),
@@ -2686,7 +2680,7 @@ static bool mmvq_moe_tail_type_ok(ggml_type te, ggml_type ts) {
 
 bool ggml_cuda_mmvq_moe_tail_supported(int device, const ggml_tensor * down_exps, const ggml_tensor * act, const ggml_tensor * down_shexp,
                                        const ggml_tensor * sact, int64_t n_used, int64_t n_tokens) {
-    static const bool disabled = getenv("GGML_CUDA_NO_MOE_TAIL") != nullptr && std::atoi(getenv("GGML_CUDA_NO_MOE_TAIL"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_MOE_TAIL", false);
     if (disabled) {
         return false;
     }
@@ -2784,7 +2778,7 @@ void ggml_cuda_mmvq_moe_tail(ggml_backend_cuda_context & ctx,
     // rows per wave, measured in situ on gfx1151 (Qwen3.8, 2560 rows, K = 640, 10 experts + shared, rocprofv3 median):
     // q5_1 experts 76.7 / 72.1 / 73.7 / 75.2 us and q8_0 experts 106.4 / 100.3 / 96.7 / 99.6 us at 1 / 2 / 4 / 8.
     // GGML_CUDA_MOE_TAIL_ROWS=1|2|4|8 overrides.
-    static const int rows_env = getenv("GGML_CUDA_MOE_TAIL_ROWS") ? atoi(getenv("GGML_CUDA_MOE_TAIL_ROWS")) : 0;
+    static const int rows_env = (int) ggml_env_int("GGML_CUDA_MOE_TAIL_ROWS", 0);
     int rows = rows_env == 1 || rows_env == 2 || rows_env == 4 || rows_env == 8 ? rows_env : (down_exps->type == GGML_TYPE_Q8_0 ? 4 : 2);
     while (rows > 1 && a.nrows % rows != 0) {
         rows /= 2;

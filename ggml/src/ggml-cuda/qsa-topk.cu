@@ -349,7 +349,7 @@ void ggml_cuda_op_qsa_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // the register variant up to 64K blocks (262K context). It wins at every row count, prefill batches included
     // (1024 rows at 113K: 4.4 -> 0.27 ms on the R9700, 10.6 -> 0.83 ms on the 8060S). GGML_CUDA_QSA_TK_REG=0 restores
     // the per-row kernel above.
-    static const bool reg = getenv("GGML_CUDA_QSA_TK_REG") == nullptr || atoi(getenv("GGML_CUDA_QSA_TK_REG")) != 0;
+    static const bool reg = ggml_env_flag("GGML_CUDA_QSA_TK_REG", true);
     const int64_t nblk = score->ne[0];
     if (reg && nblk <= 64*QSA_TK3_NT) {
         auto launch = [&](auto kern) {

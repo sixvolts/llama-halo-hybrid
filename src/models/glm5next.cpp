@@ -1,4 +1,5 @@
 #include "models.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
@@ -661,7 +662,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         // on the cache and the copy indices) is not visited before this layer's tail: with the tail after it, the
         // scheduler cut one remote graph per step into two (a 6-node state split, a 6-node local split, the model)
         // (opt-in until the folded head is accepted by the rpc-server's allocator: LLAMA_LAYER_EXPAND=1)
-        static const bool layer_expand = getenv("LLAMA_LAYER_EXPAND") != nullptr;
+        static const bool layer_expand = ggml_env_flag("LLAMA_LAYER_EXPAND", false);
         if (layer_expand) {
             ggml_build_forward_expand(gf, inpL);
         }

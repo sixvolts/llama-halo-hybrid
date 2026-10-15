@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml-env.h"   // halo-hybrid
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -1438,9 +1439,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // queueing behind the wait. No remote splits: every cut costs a split boundary (an unconditional cut was a
             // net loss). Target: the shared-expert FFN, which ran on the card only after the card waited ~1.8 ms for
             // the APU's routed experts.
-            static const int overlap_cut = getenv("GGML_SCHED_OVERLAP_CUT") ? atoi(getenv("GGML_SCHED_OVERLAP_CUT")) : 4; // default on (4 nodes); 0 disables
+            static const int overlap_cut = (int) ggml_env_int("GGML_SCHED_OVERLAP_CUT", 4); // default on (4 nodes); 0 disables
             // only on one backend (default 0, the card): the APU's own expert split gains nothing from a cut
-            static const int overlap_cut_be = getenv("GGML_SCHED_OVERLAP_CUT_BACKEND") ? atoi(getenv("GGML_SCHED_OVERLAP_CUT_BACKEND")) : 0;
+            static const int overlap_cut_be = (int) ggml_env_int("GGML_SCHED_OVERLAP_CUT_BACKEND", 0);
             if (overlap_cut > 0 && sched->overlap_cut_ok && node_backend_id == cur_backend_id && i > split->i_start &&
                     cur_backend_id == overlap_cut_be && !ggml_backend_sched_backend_is_remote(sched->backends[cur_backend_id])) {
                 int n_work = 0;
@@ -1557,7 +1558,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // root once and read a view of that copy, instead of copying the same bytes once per view (the
                     // hyper-connection mixer reads the residual as [n_embd, hc, n] and as [n_embd*hc, n]: 2 x 64 MiB
                     // per 1024-token ubatch over the host link before this)
-                    static const bool no_view_route = getenv("GGML_SCHED_NO_VIEW_ROUTE") != nullptr;
+                    static const bool no_view_route = ggml_env_flag("GGML_SCHED_NO_VIEW_ROUTE", false);
                     // only pure view ops with an element-size nb[0] qualify: the routed view is rebuilt with
                     // ggml_view_4d (nb[0] = element size), so a transpose that moves dim 0 would read wrong strides,
                     // and the RESULT of an in-place op (cpy, set_rows, *_inplace) has view_src too but new contents,
@@ -1749,7 +1750,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // nothing in between can alias them. GGML_SCHED_NO_EAGER_PRODUCER_ALLOC=1 restores the consumer-position allocation.
     // eager_producer[c][k] is the producer split of consumer split c's input k, or -1 when the copy stays at the consumer.
     std::vector<std::vector<int>> eager_producer;
-    static const bool no_producer_alloc = getenv("GGML_SCHED_NO_EAGER_PRODUCER_ALLOC") != nullptr;
+    static const bool no_producer_alloc = ggml_env_flag("GGML_SCHED_NO_EAGER_PRODUCER_ALLOC", false);
     if (sched->eager_copies && !no_producer_alloc) {
         eager_producer.resize(sched->n_splits);
         for (int c = 0; c < sched->n_splits; c++) {
@@ -2012,7 +2013,7 @@ struct ggml_backend_sched_compute_state {
 };
 
 static bool ggml_backend_sched_trace_waits() {
-    static const bool v = getenv("GGML_SCHED_TRACE_WAITS") != nullptr;
+    static const bool v = ggml_env_flag("GGML_SCHED_TRACE_WAITS", false);
     return v;
 }
 
@@ -2043,7 +2044,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
         // exactly the one that should overlap the previous split on the other device; its own stream order
         // protects the memory it touches and its peer copies wait for the destination's progress, so skip the
         // host-side wait
-        static const bool overlap_cut = getenv("GGML_SCHED_OVERLAP_CUT") == nullptr || atoi(getenv("GGML_SCHED_OVERLAP_CUT")) > 0;
+        static const bool overlap_cut = ggml_env_flag("GGML_SCHED_OVERLAP_CUT", true);
         const bool skip_noinput_wait = overlap_cut && sched->overlap_cut_ok && prev_backend_id >= 0 &&
                 !ggml_backend_sched_backend_is_remote(sched->backends[prev_backend_id]) && !ggml_backend_sched_backend_is_remote(split_backend);
         if (!skip_noinput_wait && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -2063,7 +2064,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
         // start, fire-and-forget) BEFORE the tensors produced by earlier splits, whose copy blocks on their producer;
         // the server then receives and unpacks the small messages while the local devices still compute, and only
         // the produced tensor is left on the critical path. GGML_SCHED_NO_INPUT_ORDER=1 restores graph order.
-        static const bool no_input_order = getenv("GGML_SCHED_NO_INPUT_ORDER") != nullptr;
+        static const bool no_input_order = ggml_env_flag("GGML_SCHED_NO_INPUT_ORDER", false);
         std::vector<int> ord(split->n_inputs);
         for (int i = 0; i < split->n_inputs; i++) { ord[i] = i; }
         if (!no_input_order && ggml_backend_sched_backend_is_remote(split_backend) && split->n_inputs > 1) {
@@ -2269,7 +2270,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                     // (9375f16ec) a server-side scheduler (card + APU behind ggml-rpc, no overlap cut) had the card
                     // overwrite the APU's expert ids mid-read: out-of-range experts, APU page faults at GLM decode.
                     {
-                        static const bool oc = getenv("GGML_SCHED_OVERLAP_CUT") == nullptr || atoi(getenv("GGML_SCHED_OVERLAP_CUT")) > 0;
+                        static const bool oc = ggml_env_flag("GGML_SCHED_OVERLAP_CUT", true);
                         // (scoped to an integrated-GPU destination, the case 9375f16ec moved onto events; discrete-GPU
                         // destinations have run on events since before the lanes and keep their measured ordering)
                         const bool dst_events = sched->events[split_backend_id][sched->cur_copy] != NULL && split_backend->device != NULL &&
@@ -2405,7 +2406,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
         // only this consumer split waits on it, so sharing it does not create the re-record serialisation of a
         // per-device event. GGML_SCHED_NO_COPY_BATCH=1 disables it.
         if (sched->eager_copies && split_backend->iface.cpy_tensor_async_nowait) {
-            static const bool no_batch = getenv("GGML_SCHED_NO_COPY_BATCH") != nullptr;
+            static const bool no_batch = ggml_env_flag("GGML_SCHED_NO_COPY_BATCH", false);
             const bool batch = !no_batch && split_backend->iface.cpy_tensors_async_nowait != NULL;
             const int64_t t_eager_start = ggml_time_us();
             for (int c = split_id + 1; c < sched->n_splits; c++) {
@@ -2418,7 +2419,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                 // reads still use (a differently allocated next graph): wait on the destination's output-read event once.
                 // Integrated-GPU destinations only, as in the copy path above: a discrete destination's reads are
                 // ordered by its own stream ahead of this graph's first split there, which every eager source depends on
-                static const bool no_eager_fence = getenv("GGML_SCHED_NO_EAGER_FENCE") != nullptr;
+                static const bool no_eager_fence = ggml_env_flag("GGML_SCHED_NO_EAGER_FENCE", false);
                 ggml_backend_event_t out_ev = sched->out_ev[cs->backend_id][sched->out_ev_last[cs->backend_id]];
                 if (!no_eager_fence && sched->out_ev_pending[cs->backend_id] && out_ev != NULL &&
                         dst_backend->device != NULL && ggml_backend_dev_type(dst_backend->device) == GGML_BACKEND_DEVICE_TYPE_IGPU &&
@@ -2504,7 +2505,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
 // halo-hybrid: GGML_SCHED_TRACE_SPLITS=N lists the split structure of the first N graphs with 40+ splits computed on
 // the single path (a two-host decode step), and times the input sends of their remote splits
 static int ggml_backend_sched_trace_splits_n() {
-    static const int n = getenv("GGML_SCHED_TRACE_SPLITS") ? atoi(getenv("GGML_SCHED_TRACE_SPLITS")) : 0;
+    static const int n = (int) ggml_env_int("GGML_SCHED_TRACE_SPLITS", 0);
     return n;
 }
 static bool ggml_backend_sched_trace_splits_now(ggml_backend_sched_t sched) {
@@ -2668,8 +2669,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
         // a pair whose split names differ still interleaves when it has no cache hazards (a batch that starts a sequence:
         // 2 x 4096 tokens 4.8 -> 3.1 s; GGML_SCHED_PAIR_HAZARD=0 keeps the name guard alone);
         // GGML_SCHED_PAIR_DEBUG=1 counts the cache hazards of every pair (accepted or not)
-        static const bool pair_debug  = getenv("GGML_SCHED_PAIR_DEBUG")  != nullptr && atoi(getenv("GGML_SCHED_PAIR_DEBUG"))  != 0;
-        static const bool pair_hazard = getenv("GGML_SCHED_PAIR_HAZARD") == nullptr || atoi(getenv("GGML_SCHED_PAIR_HAZARD")) != 0;
+        static const bool pair_debug  = ggml_env_flag("GGML_SCHED_PAIR_DEBUG", false);
+        static const bool pair_hazard = ggml_env_flag("GGML_SCHED_PAIR_HAZARD", true);
         // the name guard's argument (a's accesses to a layer's cache are queued on the same stream ahead of b's) needs
         // every cache tensor to stay on one backend. A split on another backend breaks it: an op the GPU kernels do not
         // take at that shape reads a cache the GPU writes (the random-weight glm5next: MLA flash attention and
@@ -2699,7 +2700,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
                 n_hz_logged++;
                 GGML_LOG_WARN("%s: names %s, %d vs %d splits, %d cache tensors shared, %d cache hazards\n", __func__,
                     same ? "match" : "differ", sched_a->n_splits, sched_b->n_splits, n_shared, n_bad);
-                if (getenv("GGML_SCHED_PAIR_DEBUG") && atoi(getenv("GGML_SCHED_PAIR_DEBUG")) >= 2) {
+                if (ggml_env_int("GGML_SCHED_PAIR_DEBUG", 0) >= 2) {
                     GGML_LOG_WARN("%s: self-test, a delayed one split: %d cache hazards\n", __func__,
                         ggml_backend_sched_pair_hazards(sched_a, sched_b, 2, nullptr, 1));
                 }
@@ -2773,7 +2774,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
     // every backend. GGML_SCHED_PAIR_LOCKSTEP=1 restores the alternating order. A pair admitted by the hazard check
     // keeps that guarantee only with the remote split at the same index in both lanes (else b's splits between them
     // would run before a's): otherwise it alternates, the order the check validated.
-    static const bool lockstep = getenv("GGML_SCHED_PAIR_LOCKSTEP") != nullptr;
+    static const bool lockstep = ggml_env_flag("GGML_SCHED_PAIR_LOCKSTEP", false);
     auto first_remote_split = [](ggml_backend_sched_t sched) -> int {
         for (int i = 0; i < sched->n_splits; i++) {
             ggml_backend_t backend = sched->backends[sched->splits[i].backend_id];
@@ -2899,13 +2900,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
         // split loop relied on and the client read stale results back (GLM-5.3-Flash over
         // ggml-rpc: garbage from token one, 2026-09-06). Such backends keep upstream's host
         // synchronize unless pipeline parallelism asks for events.
-        static const bool no_events = getenv("GGML_SCHED_NO_EVENTS") != nullptr;
+        static const bool no_events = ggml_env_flag("GGML_SCHED_NO_EVENTS", false);
         ggml_backend_dev_t dev = backends[b]->device;
         // halo-hybrid: an integrated GPU (the Strix Halo APU reports IGPU) is the same local HIP backend with the same
         // stream-ordered copies, but was left without events, so every split reading an input on it did a host
         // hipStreamSynchronize of its stream. On by default (hybrid decode +6%, greedy text and perplexity identical);
         // GGML_SCHED_IGPU_EVENTS=0 restores the old behaviour. Remote (RPC) backends stay excluded: no cpy_tensor_async_nowait.
-        static const bool igpu_events = getenv("GGML_SCHED_IGPU_EVENTS") == nullptr || atoi(getenv("GGML_SCHED_IGPU_EVENTS")) > 0;
+        static const bool igpu_events = ggml_env_flag("GGML_SCHED_IGPU_EVENTS", true);
         const bool eligible = dev != NULL && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
             (igpu_events && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) &&
             backends[b]->iface.cpy_tensor_async_nowait != NULL;
@@ -3026,7 +3027,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     // debug: GGML_SCHED_TIME=1 prints the split and allocation time of every graph that takes over 1 ms
-    static const bool sched_time = getenv("GGML_SCHED_TIME") != nullptr;
+    static const bool sched_time = ggml_env_flag("GGML_SCHED_TIME", false);
     const int64_t ts0 = sched_time ? ggml_time_us() : 0;
 
     ggml_backend_sched_split_graph(sched, graph);
@@ -3047,7 +3048,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // halo-hybrid (diagnostic): GGML_SCHED_ZERO_BUFFERS=1 zeroes the local compute buffers after every allocation
     // (=2 the remote ones as well); a result that changes reads compute memory before writing it
-    static const int zero_bufs = getenv("GGML_SCHED_ZERO_BUFFERS") ? atoi(getenv("GGML_SCHED_ZERO_BUFFERS")) : 0;
+    static const int zero_bufs = (int) ggml_env_int("GGML_SCHED_ZERO_BUFFERS", 0);
     if (zero_bufs) {
         ggml_backend_sched_synchronize_local(sched);
         ggml_gallocr_fill_buffers(sched->galloc, 0, zero_bufs < 2);

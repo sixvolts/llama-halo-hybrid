@@ -10,10 +10,7 @@
 // GGML_CUDA_MMQ_MOE_J_FACTOR=f (default 1, 0 = off): size the MoE column tile for f x the expected tokens per
 // expert instead of the whole ubatch (mul_mat_q_switch_J); the grid still covers every column
 static int64_t ggml_cuda_mmq_moe_ncols_hint(const int64_t n_tokens, const int64_t n_expert_used, const int64_t n_expert) {
-    static const float factor = [] {
-        const char * env = getenv("GGML_CUDA_MMQ_MOE_J_FACTOR");
-        return env ? (float) atof(env) : 1.0f;
-    }();
+    static const float factor = (float) ggml_env_float("GGML_CUDA_MMQ_MOE_J_FACTOR", 1.0);
     if (factor <= 0.0f || n_expert <= 0) {
         return 0;
     }
@@ -341,10 +338,7 @@ void ggml_cuda_mul_mat_q(
 
 // GGML_CUDA_MMQ_GATEUP: 0 off, 1 gate/up share one quantize + expert sort, 2 (default) fused gate+up+GLU kernel
 static int ggml_cuda_mmq_gate_up_mode() {
-    static const int mode = [] {
-        const char * env = getenv("GGML_CUDA_MMQ_GATEUP");
-        return env ? atoi(env) : 2;
-    }();
+    static const int mode = (int) ggml_env_int("GGML_CUDA_MMQ_GATEUP", 2);
     return mode;
 }
 
@@ -383,7 +377,7 @@ int ggml_cuda_mul_mat_q_gate_up(ggml_backend_cuda_context & ctx, const ggml_tens
     const int64_t n_tokens = src1->ne[2];
     // rev/decode-profile: GGML_CUDA_MMQ_GATEUP_DECODE=1 also takes the verify widths at which mul_mat_id already runs MMQ
     // (n_tokens above the type's MMVQ cap: 3..8 for q4_K on RDNA3.5), instead of two separately prepared GEMMs
-    static const bool decode_widths = getenv("GGML_CUDA_MMQ_GATEUP_DECODE") != nullptr && atoi(getenv("GGML_CUDA_MMQ_GATEUP_DECODE")) > 0;
+    static const bool decode_widths = ggml_env_int("GGML_CUDA_MMQ_GATEUP_DECODE", 0) > 0;
     const bool vec_width = decode_widths ? n_tokens <= get_mmvq_mmid_max_batch(src0_g->type, cc) : n_tokens <= MMVQ_MAX_BATCH_SIZE;
     if (vec_width || !ggml_cuda_should_use_mmq(src0_g->type, cc, n_tokens, src0_g->ne[2])) {
         return 0;

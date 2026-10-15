@@ -114,7 +114,7 @@ static __global__ void __launch_bounds__(SGT_THREADS) mul_mat_f32_tile(
 }
 
 bool ggml_cuda_mul_mat_f32_tile(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    static const bool disabled = getenv("GGML_CUDA_NO_F32_TILE") != nullptr && atoi(getenv("GGML_CUDA_NO_F32_TILE")) != 0;
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_F32_TILE", false);
     if (disabled) {
         return false;
     }

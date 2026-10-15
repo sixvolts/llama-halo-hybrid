@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -2926,7 +2927,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                         // the qwen4exp MTP head is plain attention over its own cells, so it can take the
                         // per-sequence KV window like the target's hybrid memory
-                        if (mtp_on_hybrid_qwen && arch == LLM_ARCH_QWEN4EXP && getenv("LLAMA_MTP_NO_WINDOW") == nullptr) {
+                        if (mtp_on_hybrid_qwen && arch == LLM_ARCH_QWEN4EXP && !ggml_env_flag("LLAMA_MTP_NO_WINDOW", false)) {
                             kv->set_window(true);
                         }
 

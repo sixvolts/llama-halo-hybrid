@@ -68,7 +68,7 @@ static void launch_moe_weighted_reduction(const float * experts,
                                           int           n_expert_used,
                                           cudaStream_t  stream) {
     constexpr int threads = 256;
-    static const bool cols = getenv("GGML_CUDA_MOE_WR_COLS") != nullptr;
+    static const bool cols = ggml_env_flag("GGML_CUDA_MOE_WR_COLS", false);
     const bool aligned = n_embd % 4 == 0 && ((uintptr_t) experts % 16) == 0 && ((uintptr_t) dst % 16) == 0;
     if (!cols && aligned) {
         moe_weighted_reduction_f32_rows

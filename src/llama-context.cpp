@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -244,13 +245,12 @@ llama_context::llama_context(
 
     cparams.fused_lid = true;
     // halo-hybrid: masks built on the device from per-cell/per-query ints instead of [n_kv, n_tokens] uploads
-    cparams.mask_device = getenv("LLAMA_NO_MASK_DEVICE") == nullptr;
+    cparams.mask_device = !ggml_env_flag("LLAMA_NO_MASK_DEVICE", false);
     cparams.auto_flid = false;
 
     {
         // the fused kernel sums heads in a different order, so a near-tied top-k can differ
-        const char * LLAMA_FUSED_LID_DISABLE = getenv("LLAMA_FUSED_LID_DISABLE");
-        if (LLAMA_FUSED_LID_DISABLE && atoi(LLAMA_FUSED_LID_DISABLE) != 0) {
+        if (ggml_env_flag("LLAMA_FUSED_LID_DISABLE", false)) {
             cparams.fused_lid = false;
             cparams.auto_flid = false;
         }
@@ -259,7 +259,7 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
-    cparams.fused_dsv4_hc_mix  = getenv("LLAMA_NO_HC_MIX") == nullptr;
+    cparams.fused_dsv4_hc_mix  = !ggml_env_flag("LLAMA_NO_HC_MIX", false);
     cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
@@ -325,6 +325,7 @@ llama_context::llama_context(
         }
     }
 
+    ggml_env_log_set(__func__);   // halo-hybrid: the GGML_* / LLAMA_* switches this run uses, once per process
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
@@ -504,7 +505,7 @@ llama_context::llama_context(
         // LLAMA_PREFILL_LANES=2 enables it; needs two non-CPU backends, no pipeline parallelism.
         cparams.prefill_lanes = 1;
         {
-            const char * env = getenv("LLAMA_PREFILL_LANES");
+            const int64_t lanes_req = ggml_env_int("LLAMA_PREFILL_LANES", 1);
             int n_gpu = 0;
             for (auto & backend : backends) {
                 if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -524,14 +525,14 @@ llama_context::llama_context(
             // with a remote device the lanes run as a rolling pipeline (prefill_pipeline: the remote computes
             // ubatch k while the local devices run k+1; see decode); LLAMA_PREFILL_LANES_RPC=1 keeps the older
             // pair schedule for comparison
-            static const bool lanes_rpc = getenv("LLAMA_PREFILL_LANES_RPC") != nullptr;
+            static const bool lanes_rpc = ggml_env_flag("LLAMA_PREFILL_LANES_RPC", false);
             has_remote_backend = has_remote;
-            if (env && atoi(env) >= 2 && has_remote && !lanes_rpc) {
+            if (lanes_req >= 2 && has_remote && !lanes_rpc) {
                 prefill_pipeline = true;
             }
             // a draft-only MTP head keeps one lane: its prefill is small and the second set of compute buffers
             // would not fit next to the target's on the R9700
-            if (env && atoi(env) >= 2 && !model.hparams.mtp_only) {
+            if (lanes_req >= 2 && !model.hparams.mtp_only) {
                 if (n_gpu >= 2 && !cparams.pipeline_parallel && !model.hparams.no_alloc) {
                     cparams.prefill_lanes = 2;
                     LLAMA_LOG_INFO("%s: two-lane prefill enabled (LLAMA_PREFILL_LANES)\n", __func__);
@@ -853,8 +854,7 @@ void llama_context::sched_reserve() {
     // that reads a host-resident input otherwise pays a host wait for that device plus a synchronous copy;
     // GLM-5.3-Flash's sparse-attention pool inputs are read by dozens of splits per token.
     {
-        const char * env = getenv("LLAMA_ASYNC_INPUTS");
-        if (env && atoi(env) != 0 && !model.hparams.no_alloc) {
+        if (ggml_env_flag("LLAMA_ASYNC_INPUTS", false) && !model.hparams.no_alloc) {
             async_inputs = true;
             ggml_backend_sched_set_async_inputs(sched.get(), true);
             LLAMA_LOG_INFO("%s: stream-ordered graph input copies enabled (LLAMA_ASYNC_INPUTS)\n", __func__);
@@ -885,14 +885,13 @@ void llama_context::sched_reserve() {
         if (prefill_pipeline) {
             // remote boundaries without draining the remote's queue, on both lanes (LLAMA_REMOTE_FETCH=0 reverts
             // to the synchronous copies; the pipeline then only overlaps the local work of one lane)
-            const char * rf = getenv("LLAMA_REMOTE_FETCH");
-            const bool remote_fetch = rf == nullptr || atoi(rf) != 0;
+            const bool remote_fetch = ggml_env_flag("LLAMA_REMOTE_FETCH", true);
             remote_fetch_enabled = remote_fetch;
             ggml_backend_sched_set_remote_fetch(sched.get(),      remote_fetch);
             ggml_backend_sched_set_remote_fetch(sched_lane.get(), remote_fetch);
-            const char * mt = getenv("LLAMA_PIPELINE_MIN_TOKENS");
-            if (mt && atoi(mt) > 0) {
-                pipe_min_tokens = atoi(mt);
+            const int64_t mt = ggml_env_int("LLAMA_PIPELINE_MIN_TOKENS", 0);
+            if (mt > 0) {
+                pipe_min_tokens = (uint32_t) mt;
             }
             LLAMA_LOG_INFO("%s: rolling two-lane prefill pipeline across the remote device (remote fetch %s, ubatches of >= %u tokens)\n",
                     __func__, remote_fetch ? "on" : "off", pipe_min_tokens);
@@ -907,8 +906,7 @@ void llama_context::sched_reserve() {
 
         // halo-hybrid: LLAMA_PREFILL_LANES=4 with a remote device - two more lanes, so a pair of ubatches can run its
         // heads interleaved on the local devices while the previous pair is on the remote
-        const char * lanes_env = getenv("LLAMA_PREFILL_LANES");
-        if (prefill_pipeline && lanes_env && atoi(lanes_env) >= 4) {
+        if (prefill_pipeline && ggml_env_int("LLAMA_PREFILL_LANES", 1) >= 4) {
             for (int x = 0; x < 2; ++x) {
                 gf_res_prev_lane_x[x].reset(new llm_graph_result(max_nodes));
                 sched_lane_x[x].reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
@@ -1026,7 +1024,7 @@ uint32_t llama_context::n_ubatch() const {
 }
 
 void llama_context::prefetch_hint(const llama_token * tokens, int32_t n_tokens, int32_t n_lead, llama_pos pos0, llama_seq_id seq_id) {
-    static const bool enabled = getenv("LLAMA_PREFETCH_HINT") == nullptr || atoi(getenv("LLAMA_PREFETCH_HINT")) != 0;
+    static const bool enabled = ggml_env_flag("LLAMA_PREFETCH_HINT", true);
     if (!enabled || !memory || tokens == nullptr || n_lead < 0 || n_tokens <= n_lead || seq_id < 0 ||
             seq_id >= (llama_seq_id) cparams.n_seq_max) {
         return;
@@ -1680,7 +1678,7 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
 
     ggml_backend_sched_t sch = lane_sched(lane);
 
-    static const bool prep_debug = getenv("LLAMA_LANES_DEBUG") != nullptr;
+    static const bool prep_debug = ggml_env_flag("LLAMA_LANES_DEBUG", false);
     const int64_t tp0 = prep_debug ? ggml_time_us() : 0;
 
     if (mctx && !mctx->apply()) {
@@ -1789,7 +1787,7 @@ llm_graph_result * llama_context::prepare_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
-    static const int prep_debug_lvl = getenv("LLAMA_LANES_DEBUG") ? atoi(getenv("LLAMA_LANES_DEBUG")) : 0;
+    static const int prep_debug_lvl = (int) ggml_env_int("LLAMA_LANES_DEBUG", 0);
     if (prep_debug && ubatch.n_tokens < 32 && prep_debug_lvl >= 2) {
         const int64_t tp5 = ggml_time_us();
         LLAMA_LOG_INFO("prep-debug-us: %u tokens: %s build %lld, alloc %lld, sync %lld, set_inputs %lld\n", ubatch.n_tokens,
@@ -2012,7 +2010,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // halo-hybrid: as in decode's extract_outputs - the reads above were queued after the split events were recorded
     {
-        static const bool no_out_ev = getenv("GGML_SCHED_NO_OUTPUT_EVENTS") != nullptr;
+        static const bool no_out_ev = ggml_env_flag("GGML_SCHED_NO_OUTPUT_EVENTS", false);
         if (!no_out_ev) {
             ggml_backend_sched_record_output_events(sched.get());
         }
@@ -2180,8 +2178,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // the plain split.
     uint32_t n_ubatch_eff = cparams.n_ubatch;
     if (cparams.prefill_lanes >= 2 && sched_lane && cparams.cb_eval == nullptr) {
-        static const uint32_t split_min  = getenv("LLAMA_LANES_SPLIT_MIN") ? (uint32_t) atoi(getenv("LLAMA_LANES_SPLIT_MIN")) : 1024;
-        static const double   split_frac = getenv("LLAMA_LANES_SPLIT_FRAC") ? atof(getenv("LLAMA_LANES_SPLIT_FRAC")) : 0.55;
+        static const uint32_t split_min  = (uint32_t) ggml_env_int("LLAMA_LANES_SPLIT_MIN", 1024);
+        static const double   split_frac = std::clamp(ggml_env_float("LLAMA_LANES_SPLIT_FRAC", 0.55), 0.1, 0.9);
         const uint32_t n = (uint32_t) n_tokens_all;
         if (split_min > 0 && n >= split_min && n < 2*cparams.n_ubatch) {
             n_ubatch_eff = std::min(cparams.n_ubatch, (uint32_t) GGML_PAD((uint32_t) (n*split_frac + 0.5), 64));
@@ -2431,7 +2429,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // their reads were still in flight (MTP drafts with several sequences read hidden-state floats as token ids).
         // Re-record the events behind the reads. GGML_SCHED_NO_OUTPUT_EVENTS=1 restores the old behaviour.
         {
-            static const bool no_out_ev = getenv("GGML_SCHED_NO_OUTPUT_EVENTS") != nullptr;
+            static const bool no_out_ev = ggml_env_flag("GGML_SCHED_NO_OUTPUT_EVENTS", false);
             if (!no_out_ev) {
                 ggml_backend_sched_record_output_events(sch);
             }
@@ -2446,7 +2444,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (backend_h && !ggml_backend_sched_backend_is_remote_ext(backend_h)) {
                 // deferred (two local lanes): record an event behind the h rows' copy; the hook runs after the next
                 // pair is submitted, so the draft overlaps it instead of stalling both devices (LLAMA_MTP_INGEST_DEFER=0)
-                static const bool defer_env = getenv("LLAMA_MTP_INGEST_DEFER") == nullptr || atoi(getenv("LLAMA_MTP_INGEST_DEFER")) != 0;
+                static const bool defer_env = ggml_env_flag("LLAMA_MTP_INGEST_DEFER", true);
                 if (defer_env && ingest_defer_active) {
                     ggml_backend_event_t ev = nullptr;
                     if (!ingest_ev_free.empty()) {
@@ -2554,8 +2552,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             //     has_remote_backend, not prefill_pipeline: LLAMA_PREFILL_LANES_RPC=1 keeps a remote without the pipeline): the
             // crossing copies go out right behind their producer (base Qwen3.8 real-content decode 40.0 -> 39.0
             // ms/step). LLAMA_LANES_SMALL_EAGER=0/1 forces it off/on.
-            static const char * small_eager_env = getenv("LLAMA_LANES_SMALL_EAGER");
-            const bool small_eager = small_eager_env ? atoi(small_eager_env) != 0 : !has_remote_backend;
+            const bool small_eager = ggml_env_flag("LLAMA_LANES_SMALL_EAGER", !has_remote_backend);
             const bool big = ubatch.n_tokens >= pipe_min_tokens;
             ggml_backend_sched_set_eager_copies(sched.get(), big || small_eager);
             ggml_backend_sched_set_remote_fetch(sched.get(), prefill_pipeline && (big || small_eager) && remote_fetch_enabled);
@@ -2566,7 +2563,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int lb = la + 1;
             pg_next ^= 1;
 
-            static const bool pipe_debug = getenv("LLAMA_LANES_DEBUG") != nullptr;
+            static const bool pipe_debug = ggml_env_flag("LLAMA_LANES_DEBUG", false);
             const int64_t t0_us = pipe_debug ? ggml_time_us() : 0;
 
             pipeline_active = true;
@@ -2679,7 +2676,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int lane = pipe_next_lane;
             pipe_next_lane ^= 1;
 
-            static const bool pipe_debug = getenv("LLAMA_LANES_DEBUG") != nullptr;
+            static const bool pipe_debug = ggml_env_flag("LLAMA_LANES_DEBUG", false);
             const int64_t t0_us = pipe_debug ? ggml_time_us() : 0;
 
             pipeline_active = true;
@@ -2793,7 +2790,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }
 
                 // LLAMA_LANES_DEBUG=4: the per-lane prep timings without this pair-end wait, which hides cross-call overlap
-                static const bool lanes_debug = getenv("LLAMA_LANES_DEBUG") != nullptr && atoi(getenv("LLAMA_LANES_DEBUG")) < 4;
+                static const bool lanes_debug = ggml_env_int("LLAMA_LANES_DEBUG", 0) >= 1 && ggml_env_int("LLAMA_LANES_DEBUG", 0) < 4;
                 const int64_t t_pair_us = lanes_debug ? ggml_time_us() : 0;
 
                 status = graph_compute_pair(true);

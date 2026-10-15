@@ -221,7 +221,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     // halo-hybrid: dim-0 concat with few columns (the KDA conv-state concat at decode: 3 state columns + n_tokens),
     //     any strides: one thread per destination row. The contiguous-path kernel below is one thread per element
     //     with 64-bit index math (19 us for 4 x 16384 on gfx1201); the row kernel is 3.5 us.
-    static const bool no_rows = getenv("GGML_CUDA_NO_CONCAT_ROWS") != nullptr;
+    static const bool no_rows = ggml_env_flag("GGML_CUDA_NO_CONCAT_ROWS", false);
     if (!no_rows && dim == 0 && dst->ne[0] <= 32 && dst->nb[0] == ggml_type_size(dst->type) && src0->ne[1] == src1->ne[1] &&
             src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3]) {
         dim3 grid((src1->ne[1] + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, dst->ne[2] * dst->ne[3], 1);

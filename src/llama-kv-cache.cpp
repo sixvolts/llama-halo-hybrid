@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -1223,7 +1224,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot_window(const llama_ubatch & 
 }
 
 std::vector<llama_kv_cache::cell_move> llama_kv_cache::plan_moves(const std::vector<llama_ubatch> & ubatches) {
-    static const bool disabled = getenv("LLAMA_KV_NO_MOVE") != nullptr && atoi(getenv("LLAMA_KV_NO_MOVE")) != 0;
+    static const bool disabled = ggml_env_flag("LLAMA_KV_NO_MOVE", false);
 
     if (moves_done) {
         // the retry after a move
@@ -1569,7 +1570,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 }
 
 void llama_kv_cache::set_window(bool enable) {
-    static const bool disabled = getenv("LLAMA_KV_NO_WINDOW") != nullptr;
+    static const bool disabled = ggml_env_flag("LLAMA_KV_NO_WINDOW", false);
 
     window = enable && !disabled && n_stream == 1 && n_seq_max > 1;
 }
@@ -1620,7 +1621,7 @@ void llama_kv_cache::get_kv_window(const slot_info & sinfo, const llama_ubatch &
 }
 
 std::vector<llama_kv_cache::seq_span> llama_kv_cache::get_seq_spans(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t lo, uint32_t n_kv) const {
-    static const bool disabled = getenv("LLAMA_KV_NO_SPANS") != nullptr;
+    static const bool disabled = ggml_env_flag("LLAMA_KV_NO_SPANS", false);
 
     std::vector<seq_span> res;
     if (disabled || !window || sinfo.n_stream() != 1 || ubatch.n_tokens == 0) {
@@ -2197,15 +2198,11 @@ skip:
         };
 
         static const int n_thr_max = [] {
-            const char * env = getenv("LLAMA_KQ_MASK_THREADS");
-            const int    hw  = std::max(1, (int) std::thread::hardware_concurrency());
-            return std::clamp(env ? atoi(env) : 8, 1, std::min(hw, 64));
+            const int hw = std::max(1, (int) std::thread::hardware_concurrency());
+            return (int) std::clamp<int64_t>(ggml_env_int("LLAMA_KQ_MASK_THREADS", 8), 1, std::min(hw, 64));
         }();
         // below ~4M cells (8 MiB of f16) the threads cost more than they save; LLAMA_KQ_MASK_MIN_CELLS moves the bar (tests)
-        static const int64_t min_cells = [] {
-            const char * env = getenv("LLAMA_KQ_MASK_MIN_CELLS");
-            return env ? std::max<int64_t>(1, atoll(env)) : ((int64_t) 4 << 20);
-        }();
+        static const int64_t min_cells = std::max<int64_t>(1, ggml_env_int("LLAMA_KQ_MASK_MIN_CELLS", (int64_t) 4 << 20));
         const int n_thr = (int64_t) rest.size()*n_kv >= min_cells ? (args.n_threads > 0 ? args.n_threads : n_thr_max) : 1;
         if (n_thr == 1) {
             fill_rest(0, rest.size());
@@ -2309,7 +2306,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     };
 
     // LLAMA_KQ_MASK_VERIFY=1: fill every mask on one thread as well and abort if the threaded fill differs (tests)
-    static const bool verify = getenv("LLAMA_KQ_MASK_VERIFY") && atoi(getenv("LLAMA_KQ_MASK_VERIFY")) != 0;
+    static const bool verify = ggml_env_flag("LLAMA_KQ_MASK_VERIFY", false);
     std::vector<uint8_t> ref;
     if (verify) {
         args_set_input_kq_mask args1 = args;

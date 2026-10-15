@@ -1,4 +1,5 @@
 #include "llama-memory-hybrid.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include <algorithm>
 #include <cstdlib>
@@ -99,7 +100,7 @@ llama_memory_hybrid::llama_memory_hybrid(
 // of stall per prompt on the two-host layout; as the first unit the remote is idle and the queries return at once.
 static uint32_t llama_ubatch_taper(uint32_t n_ubatch, uint32_t n_total, uint32_t n_used) {
     // 1 = half unit first + equal final pair; 2 = equal final pair only; 3 = partial unit first
-    static const int mode = getenv("LLAMA_UBATCH_TAPER") ? atoi(getenv("LLAMA_UBATCH_TAPER")) : 0;
+    static const int mode = (int) ggml_env_int("LLAMA_UBATCH_TAPER", 0);
     if (mode <= 0 || n_total <= n_ubatch || n_ubatch < 256) {
         return n_ubatch;
     }

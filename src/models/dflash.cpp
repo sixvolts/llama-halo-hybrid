@@ -1,4 +1,5 @@
 #include "models.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
@@ -105,7 +106,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         // reference semantics: `is_causal = layer_type == "sliding_attention"` -- SWA layers are causal,
         // the full-attention layers are bidirectional within the block. LLAMA_DFLASH_SWA_BIDIR=1 restores
         // the previous (all-bidirectional) behaviour for A/B comparison.
-        hparams.swa_causal_override = std::getenv("LLAMA_DFLASH_SWA_BIDIR") == nullptr;
+        hparams.swa_causal_override = !ggml_env_flag("LLAMA_DFLASH_SWA_BIDIR", false);
         LLAMA_LOG_INFO("%s: dflash sliding-window layers are %s\n", __func__,
                 hparams.swa_causal_override ? "causal (reference semantics)" : "bidirectional (LLAMA_DFLASH_SWA_BIDIR)");
     }

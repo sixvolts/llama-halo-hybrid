@@ -313,20 +313,14 @@ static __global__ void mm_ids_helper_wide(
 }
 
 static bool mm_ids_helper_use_hist(const int n_experts, const int n_tokens) {
-    static const int min_tokens = [] {
-        const char * env = getenv("GGML_CUDA_MMID_HIST_MIN"); // 0 disables the histogram kernel
-        return env ? atoi(env) : MM_IDS_HIST_MIN_DEFAULT;
-    }();
+    static const int min_tokens = (int) ggml_env_int("GGML_CUDA_MMID_HIST_MIN", MM_IDS_HIST_MIN_DEFAULT); // 0 disables the histogram kernel
     // the block scan assumes 32-lane warps
     return min_tokens > 0 && n_tokens >= min_tokens && n_experts <= MM_IDS_HIST_MAX_EXPERTS &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32;
 }
 
 static bool mm_ids_helper_use_wide(const int n_tokens) {
-    static const int min_tokens = [] {
-        const char * env = getenv("GGML_CUDA_MMID_WIDE_MIN"); // 0 disables the wide kernel
-        return env ? atoi(env) : 512;
-    }();
+    static const int min_tokens = (int) ggml_env_int("GGML_CUDA_MMID_WIDE_MIN", 512); // 0 disables the wide kernel
     return min_tokens > 0 && n_tokens >= min_tokens;
 }
 

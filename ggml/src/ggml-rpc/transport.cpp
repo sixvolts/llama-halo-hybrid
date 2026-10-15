@@ -1,4 +1,5 @@
 #include "transport.h"
+#include "ggml-env.h"   // halo-hybrid
 #include "ggml-impl.h"
 
 #ifdef _WIN32
@@ -468,7 +469,7 @@ bool socket_t::impl::rdma_send(const void * data, size_t size) {
     int inflight = 0; // signaled sends posted and not yet reaped (RC completes them in order)
     int next     = 0; // ring slot for the next chunk
     // GGML_RPC_SEND_TRACE=1: phase timing of bulk sends (>= 8 MiB)
-    static const bool trace = getenv("GGML_RPC_SEND_TRACE") != nullptr;
+    static const bool trace = ggml_env_flag("GGML_RPC_SEND_TRACE", false);
     const bool tr = trace && size >= 8u * 1024 * 1024;
     int64_t t_start = 0, t_copy = 0, t_post = 0, t_poll = 0, t_poll_max = 0;
     if (tr) { t_start = ggml_time_us(); }

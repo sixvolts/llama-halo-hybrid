@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-env.h"   // halo-hybrid
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
 
@@ -1444,7 +1445,7 @@ struct ggml_cuda_stream_context {
 };
 
 static inline bool ggml_cuda_mmvq_group_disabled_env() {
-    static const bool v = getenv("GGML_CUDA_NO_MMVQ_GROUP") != nullptr;
+    static const bool v = ggml_env_flag("GGML_CUDA_NO_MMVQ_GROUP", false);
     return v;
 }
 
@@ -1498,7 +1499,7 @@ struct ggml_backend_cuda_context {
     // halo-hybrid: a hybrid decode step submits ~76 card splits (plus the draft's), so the old 64-entry LRU evicted
     // every key before its reuse (4% replays). Default 256; GGML_CUDA_MAX_GRAPHS=<n> overrides the per-device size.
     static size_t max_cuda_graphs_n() {
-        static const size_t n = getenv("GGML_CUDA_MAX_GRAPHS") ? (size_t) atoi(getenv("GGML_CUDA_MAX_GRAPHS")) : 256;
+        static const size_t n = (size_t) std::max<int64_t>(1, ggml_env_int("GGML_CUDA_MAX_GRAPHS", 256));
         return n;
     }
 

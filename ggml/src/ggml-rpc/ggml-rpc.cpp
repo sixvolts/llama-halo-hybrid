@@ -1,4 +1,5 @@
 #include "ggml-rpc.h"
+#include "ggml-env.h"   // halo-hybrid
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
@@ -518,7 +519,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = nullptr;
     msg->output_size = 0;
-    static const bool trace = getenv("GGML_RPC_SEND_TRACE") != nullptr;
+    static const bool trace = ggml_env_flag("GGML_RPC_SEND_TRACE", false);
     const int64_t t0 = trace ? ggml_time_us() : 0;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
@@ -548,7 +549,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
-    static const bool trace = getenv("GGML_RPC_SEND_TRACE") != nullptr;
+    static const bool trace = ggml_env_flag("GGML_RPC_SEND_TRACE", false);
     const int64_t t0 = trace ? ggml_time_us() : 0;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
@@ -1128,7 +1129,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     // halo-hybrid (proto 7.6): small graphs go to slot 1 so a decode step's two alternating graphs both RECOMPUTE
-    static const bool no_slots = getenv("GGML_RPC_NO_GRAPH_SLOTS") != nullptr;
+    static const bool no_slots = ggml_env_flag("GGML_RPC_NO_GRAPH_SLOTS", false);
     const uint32_t slot = (!no_slots && cgraph->n_nodes <= RPC_GRAPH_SMALL_NODES) ? 1 : 0;
     uint64_t & slot_uid = slot == 1 ? rpc_dev_ctx->last_graph_uid_small : rpc_dev_ctx->last_graph_uid;
     bool reuse = cgraph->uid != 0 && slot_uid == cgraph->uid;
@@ -2704,6 +2705,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         RPC_PROTO_PATCH_VERSION);
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    ggml_env_log_set("rpc-server");   // halo-hybrid: the GGML_* / LLAMA_* switches this server uses
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
@@ -2771,7 +2773,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 // ggml_backend_sched over its devices for each incoming graph (RPC_CMD_GRAPH_COMPUTE_SCHED). Off by default;
 // GGML_RPC_COMPOSITE=1 enables it. Built for N hybrid nodes behind one head: nothing here assumes two devices.
 static bool ggml_backend_rpc_composite_enabled() {
-    static const bool v = getenv("GGML_RPC_COMPOSITE") != nullptr && atoi(getenv("GGML_RPC_COMPOSITE")) != 0;
+    static const bool v = ggml_env_flag("GGML_RPC_COMPOSITE", false);
     return v;
 }
 
@@ -2852,7 +2854,7 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 // the op's shape and its sources' shapes and buffers; an older server is not asked (every op supported, as before).
 // GGML_RPC_NO_SUPPORTS_OP=1 restores that for A/B.
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_RPC_NO_SUPPORTS_OP") != nullptr;
+    static const bool disabled = ggml_env_flag("GGML_RPC_NO_SUPPORTS_OP", false);
     if (disabled) {
         return true;
     }

@@ -1890,7 +1890,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     // pair to the fused MMQ path, which at a 3-token verify batch read the 71 MB pair at ~350 GB/s on gfx1201
     // (201 us vs 2 x 74 us for the plain GEMVs). The mmvq kernel's fused epilogue is generic over ncols_dst, so
     // allow it up to 4 columns. GGML_CUDA_MMVQ_FUSE_N1=1 restores the upstream rule.
-    static const bool fuse_n1_only = getenv("GGML_CUDA_MMVQ_FUSE_N1") != nullptr && atoi(getenv("GGML_CUDA_MMVQ_FUSE_N1")) != 0;
+    static const bool fuse_n1_only = ggml_env_flag("GGML_CUDA_MMVQ_FUSE_N1", false);
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && (fuse_n1_only || dst->ne[1] > 4)) {
         return false;
     }
@@ -1945,7 +1945,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // A thin f32 matrix (a few output rows, many tokens) is a batched dot product over the activations:
     // run MMVF with the operands swapped (the activations are the "weights", the rows the batch) into a
     // [ne11, ne01] scratch and transpose it into dst. hipBLASLt runs this shape at a fifth of the bandwidth.
-    static const bool no_mmvf_swap = getenv("GGML_CUDA_NO_MMVF_SWAP") != nullptr && atoi(getenv("GGML_CUDA_NO_MMVF_SWAP")) != 0;
+    static const bool no_mmvf_swap = ggml_env_flag("GGML_CUDA_NO_MMVF_SWAP", false);
     // A thin bf16 / f16 weight (Swift-1.5's hc_*_inject: 4 x 10240 bf16) is widened to f32 first (exact, one tiny launch)
     // and takes the same path; otherwise it lands on a generic GEMM at ~10x the time.
     if (!no_mmvf_swap && ne01 > 1 && ne01 <= MMVF_MAX_BATCH_SIZE && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
@@ -2684,10 +2684,7 @@ static __global__ void k_peer_copy_bytes(const uint4 * __restrict__ src, uint4 *
 }
 
 static size_t ggml_cuda_kernel_copy_max() {
-    static const size_t v = [] {
-        const char * env = getenv("GGML_CUDA_KERNEL_COPY_MAX");
-        return env ? (size_t) atoll(env) : (size_t) 262144;
-    }();
+    static const size_t v = (size_t) ggml_env_int("GGML_CUDA_KERNEL_COPY_MAX", 262144);
     return v;
 }
 
@@ -2846,7 +2843,7 @@ static bool ggml_backend_cuda_cpy_tensors_async_nowait(ggml_backend_t backend_sr
     GGML_UNUSED_VARS(backend_src, backend_dst, n, srcs, dsts);
     return false;
 #else
-    static const bool disabled = getenv("GGML_CUDA_NO_PEER_COPY_BATCH") != nullptr;
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_PEER_COPY_BATCH", false);
     if (disabled || n <= 0 || backend_src == backend_dst ||
             !ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
@@ -4246,7 +4243,7 @@ static bool hc_f32_rows16(const ggml_tensor * t) {   // f32, contiguous dim 0, 1
            t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
 }
 static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_NO_HC_NORM_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_HC_NORM_FUSE"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_HC_NORM_FUSE", false);
     if (disabled) {
         return 0;
     }
@@ -4254,7 +4251,7 @@ static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml
     ggml_tensor * node = cgraph->nodes[i];
     ggml_tensor * post = nullptr;
     int im = i;
-    static const bool no_post = getenv("GGML_CUDA_NO_HC_POST_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_HC_POST_FUSE"));
+    static const bool no_post = ggml_env_flag("GGML_CUDA_NO_HC_POST_FUSE", false);
     if (node->op == GGML_OP_DSV4_HC_POST) {
         if (no_post) {
             return 0;
@@ -4320,7 +4317,7 @@ static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml
 }
 
 static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_NO_EWCHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_NO_EWCHAIN"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_EWCHAIN", false);
     if (disabled) {
         return 0;
     }
@@ -4338,7 +4335,7 @@ static int ggml_cuda_try_fuse_ewchain(ggml_backend_cuda_context * cuda_ctx, ggml
 // written in full, V is read from it through a view. Decode widths only (n_t <= 8); prefill keeps the unfused path.
 // GGML_CUDA_NO_KDA_CONV_L2=1 disables.
 static int ggml_cuda_try_fuse_kda_conv_l2(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_NO_KDA_CONV_L2") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KDA_CONV_L2"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_KDA_CONV_L2", false);
     if (disabled) {
         return 0;
     }
@@ -4448,7 +4445,7 @@ struct ggml_cuda_kda_conv_rows_match {
 };
 
 static bool ggml_cuda_kda_conv_rows_disabled() {
-    static const bool disabled = getenv("GGML_CUDA_NO_KDA_CONV_ROWS") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KDA_CONV_ROWS"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_KDA_CONV_ROWS", false);
     return disabled;
 }
 
@@ -4649,7 +4646,7 @@ struct ggml_cuda_gdn_conv_front_match {
 };
 
 static bool ggml_cuda_gdn_conv_front_disabled() {
-    static const bool disabled = getenv("GGML_CUDA_NO_GDN_CONV_FRONT") != nullptr && std::atoi(getenv("GGML_CUDA_NO_GDN_CONV_FRONT"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_GDN_CONV_FRONT", false);
     return disabled;
 }
 
@@ -4836,7 +4833,7 @@ static bool ggml_cuda_fusion_disabled() {
 // column's snapshots, so the gdn -> cache cpy fusion writing into the row it reads from is safe.
 // GGML_CUDA_NO_KDA_STATE_GATHER=1 disables it.
 static bool ggml_cuda_gdn_state_gather_disabled() {
-    static const bool disabled = getenv("GGML_CUDA_NO_KDA_STATE_GATHER") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KDA_STATE_GATHER"));
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_KDA_STATE_GATHER", false);
     return disabled;
 }
 
@@ -4940,7 +4937,7 @@ static bool kda_gate_rowshape(const ggml_tensor * t, int64_t nrows, int64_t ncol
 }
 
 static int ggml_cuda_try_fuse_kda_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_NO_KDA_GATE_PROLOGUE") != nullptr && atoi(getenv("GGML_CUDA_NO_KDA_GATE_PROLOGUE")) != 0;
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_KDA_GATE_PROLOGUE", false);
     const int n = cgraph->n_nodes;
     ggml_tensor * mm = cgraph->nodes[i];
     if (disabled || mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
@@ -5093,7 +5090,7 @@ static int ggml_cuda_try_fuse_kda_gate(ggml_backend_cuda_context * cuda_ctx, ggm
 //     dst strides (token stride = the cont's nb[2], head stride = its nb[1]); the cpy launch goes away. Same kernel
 //     and arguments as the unfused GEMV otherwise. GGML_CUDA_NO_MLA_V_PERMUTE=1 disables.
 static int ggml_cuda_try_fuse_mla_v_permute(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_NO_MLA_V_PERMUTE") != nullptr && atoi(getenv("GGML_CUDA_NO_MLA_V_PERMUTE")) != 0;
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_MLA_V_PERMUTE", false);
     const int n = cgraph->n_nodes;
     ggml_tensor * mm = cgraph->nodes[i];
     if (disabled || mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || mm->ne[3] != 1 ||
@@ -5260,7 +5257,7 @@ static int ggml_cuda_try_fuse_moe_tail(ggml_backend_cuda_context * cuda_ctx, ggm
 // (qsa-topk.cu ggml_cuda_qsa_score_fused), only where the unfused MUL_MAT runs mul_mat_vec_f, whose arithmetic it
 // replays: the result is bit-identical. GGML_CUDA_NO_QSA_SCORE=1 disables it.
 static int ggml_cuda_try_fuse_qsa_score(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_NO_QSA_SCORE") != nullptr && atoi(getenv("GGML_CUDA_NO_QSA_SCORE")) != 0;
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_QSA_SCORE", false);
     ggml_tensor * mm = cgraph->nodes[i];
     const ggml_tensor * k = mm->src[0];
     const ggml_tensor * q = mm->src[1];
@@ -5335,7 +5332,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // halo-hybrid: glm5next DSA indexer pool compressor, 9 launches -> 1 (kpool-compress.cu)
     if (node->op == GGML_OP_GET_ROWS) {
-        static const bool no_kpool = getenv("GGML_CUDA_NO_KPOOL_COMPRESS") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KPOOL_COMPRESS"));
+        static const bool no_kpool = ggml_env_flag("GGML_CUDA_NO_KPOOL_COMPRESS", false);
         ggml_cuda_kpool_compress_match km;
         if (!no_kpool && ggml_cuda_kpool_compress_match_graph(cgraph, i, km)) {
             ggml_cuda_op_kpool_compress(*cuda_ctx, km);
@@ -5364,7 +5361,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    static const bool no_hc_fuse = getenv("GGML_CUDA_NO_HC_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_HC_FUSE"));
+    static const bool no_hc_fuse = ggml_env_flag("GGML_CUDA_NO_HC_FUSE", false);
     if (!no_hc_fuse) {
         const int skip = ggml_cuda_try_fuse_hc(cuda_ctx, cgraph, i);
         if (skip > 0) {
@@ -5570,7 +5567,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // admits only members with at least n rows; set it huge to exclude them). An f32 matrix may also
                 // lead (the MoE router precedes the shared expert's gate/up); the launcher still needs a quantized
                 // member somewhere in the group, and falls back to the plain paths otherwise.
-                static const int64_t f32_rows = getenv("GGML_CUDA_GEMV_GROUP_F32ROWS") ? atoll(getenv("GGML_CUDA_GEMV_GROUP_F32ROWS")) : 0;
+                static const int64_t f32_rows = ggml_env_int("GGML_CUDA_GEMV_GROUP_F32ROWS", 0);
                 GGML_UNUSED(leader);
                 return w->ne[0] == src1->ne[0] && w->ne[1] >= f32_rows;
             }
@@ -5593,7 +5590,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // a (gate, up, GLU) triple joins as ONE pair member, represented by its GLU node: the kernel dots
                 // both rows in the same wave and applies the GLU on the way out. Anything else next to a GLU is
                 // left to the dedicated fused path.
-                static const bool no_pair = getenv("GGML_CUDA_NO_GEMV_PAIR") != nullptr;
+                static const bool no_pair = ggml_env_flag("GGML_CUDA_NO_GEMV_PAIR", false);
                 if (!no_pair && j + 2 < cgraph->n_nodes && cgraph->nodes[j + 2]->op == GGML_OP_GLU && eligible(cgraph->nodes[j + 1], false) &&
                     cgraph->nodes[j + 2]->src[0] == t && cgraph->nodes[j + 2]->src[1] == cgraph->nodes[j + 1] &&
                     ggml_is_quantized(t->src[0]->type) && cgraph->nodes[j + 1]->src[0]->type == t->src[0]->type &&
@@ -5614,7 +5611,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             {   // halo-hybrid: GGML_CUDA_GEMV_GROUPS=1 reports how many consecutive GEMVs share this activation, i.e. how
                 // many launches a grouped GEMV kernel would replace with one
-                static const int who = getenv("GGML_CUDA_GEMV_GROUPS") ? atoi(getenv("GGML_CUDA_GEMV_GROUPS")) : 0;
+                static const int who = (int) ggml_env_int("GGML_CUDA_GEMV_GROUPS", 0);
                 if (who) {
                     std::string names;
                     for (int k = 0; k < n; ++k) { names += " "; names += cgraph->nodes[idx[k]]->src[0]->name; }
@@ -6310,7 +6307,7 @@ struct ggml_cuda_optimer {
     std::vector<double> bytes;        // bytes moved per pair (external sources + output, an estimate)
     size_t used = 0;
     uint64_t graphs = 0;
-    static bool enabled() { static const bool e = getenv("GGML_CUDA_TIME_OPS") != nullptr; return e; }
+    static bool enabled() { static const bool e = ggml_env_flag("GGML_CUDA_TIME_OPS", false); return e; }
     cudaEvent_t next_event() {
         if (used >= ev.size()) { cudaEvent_t e; CUDA_CHECK(ggml_cuda_optimer_create(&e)); ev.push_back(e); }
         return ev[used++];
@@ -6348,14 +6345,14 @@ struct ggml_cuda_optimer {
             acc & a = by_key[keys[i]]; a.n++; a.us += ms * 1000.0; a.bytes += bytes[i];
         }
         used = 0; keys.clear(); bytes.clear(); graphs++;
-        static const uint64_t every = getenv("GGML_CUDA_TIME_OPS_EVERY") ? (uint64_t) atoll(getenv("GGML_CUDA_TIME_OPS_EVERY")) : 200;
+        static const uint64_t every = (uint64_t) ggml_env_int("GGML_CUDA_TIME_OPS_EVERY", 200);
         if (graphs % every == 0) {
             std::vector<std::pair<std::string, acc>> v(by_key.begin(), by_key.end());
             std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
             double tot = 0; uint64_t n = 0; for (auto & e : v) { tot += e.second.us; n += e.second.n; }
             fprintf(stderr, "\n=== OPTIMER dev %d after %llu graphs: %llu launches, %.1f ms total (%.3f ms/graph)\n",
                     device, (unsigned long long) graphs, (unsigned long long) n, tot / 1000.0, tot / 1000.0 / graphs);
-            static const size_t top = getenv("GGML_CUDA_TIME_OPS_TOP") ? (size_t) atoi(getenv("GGML_CUDA_TIME_OPS_TOP")) : 40;
+            static const size_t top = (size_t) ggml_env_int("GGML_CUDA_TIME_OPS_TOP", 40);
             for (size_t i = 0; i < v.size() && i < top; i++) {
                 fprintf(stderr, "OPTIMER dev %d %-64s n=%8llu  %9.2f ms  mean %8.2f us  %7.1f GB/s\n", device, v[i].first.c_str(),
                         (unsigned long long) v[i].second.n, v[i].second.us / 1000.0, v[i].second.us / v[i].second.n,
@@ -6372,7 +6369,7 @@ static std::string ggml_cuda_optimer_key(const ggml_tensor * node, int n_fused) 
         char b[160]; snprintf(b, sizeof(b), " %s %lldx%lld n=%lld", ggml_type_name(node->src[0]->type),
                  (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1], (long long) node->src[1]->ne[1]);
         k += b;
-        static const bool names = getenv("GGML_CUDA_TIME_OPS_NAMES") != nullptr;
+        static const bool names = ggml_env_flag("GGML_CUDA_TIME_OPS_NAMES", false);
         if (names) {   // weight name with the layer number stripped, so the classes still merge across layers
             std::string nm = node->src[0]->name; size_t p0 = nm.find("blk."); 
             if (p0 != std::string::npos) { size_t p1 = nm.find('.', p0 + 4); if (p1 != std::string::npos) { nm = nm.substr(p1 + 1); } }
@@ -6643,7 +6640,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     {   // halo-hybrid: GGML_CUDA_DUMP_GRAPH=<n> prints the n-th graph's node list once (op, shapes, sources), which
         // is how the per-layer kernel inventory is counted
-        static const int dump = getenv("GGML_CUDA_DUMP_GRAPH") ? atoi(getenv("GGML_CUDA_DUMP_GRAPH")) : 0;
+        static const int dump = (int) ggml_env_int("GGML_CUDA_DUMP_GRAPH", 0);
         static int seen = 0;
         if (dump && ++seen == dump) {
             for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -6701,7 +6698,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     {   // halo-hybrid (rev/decode-profile): GGML_CUDA_GRAPH_STATS=<n> prints, per device every n graph computes, how many
         // were replayed, captured or run directly, and the size of the graph cache
-        static const int every = getenv("GGML_CUDA_GRAPH_STATS") ? atoi(getenv("GGML_CUDA_GRAPH_STATS")) : 0;
+        static const int every = (int) ggml_env_int("GGML_CUDA_GRAPH_STATS", 0);
         if (every > 0) {
             static uint64_t n_replay[GGML_CUDA_MAX_DEVICES], n_capture[GGML_CUDA_MAX_DEVICES], n_direct[GGML_CUDA_MAX_DEVICES];
             const int d = cuda_ctx->device;
@@ -6886,7 +6883,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // the router that reads the same vector. Moving a node EARLIER is always dependency-safe when its inputs are a
     // weight and the anchor's own activation; this runs before allocation, so lifetimes follow the new order.
     // Decode only (activation of at most 4 columns). GGML_CUDA_NO_GEMV_HOIST=1 disables it.
-    static const bool no_hoist = getenv("GGML_CUDA_NO_GEMV_HOIST") != nullptr;
+    static const bool no_hoist = ggml_env_flag("GGML_CUDA_NO_GEMV_HOIST", false);
     if (!disable_fusion && !no_hoist && !cuda_ctx->mmvq_group_disabled) {
         auto is_weight_gemv = [&](const ggml_tensor * t) {
             if (t->op != GGML_OP_MUL_MAT || !t->src[0] || !t->src[1] || t->type != GGML_TYPE_F32) return false;

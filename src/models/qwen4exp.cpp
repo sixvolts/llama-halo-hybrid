@@ -1,4 +1,5 @@
 #include "models.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include <algorithm>
 #include <deque>
@@ -89,7 +90,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // halo-hybrid: the MTP block carries its own indexer, but the converter writes ratio 0 for it (dense, see
     // graph_mtp). LLAMA_MTP_QSA=1 gives it the trunk's ratio so the draft attends through QSA (opt-in: measured worse).
     {
-        static const bool mtp_qsa = getenv("LLAMA_MTP_QSA") != nullptr && atoi(getenv("LLAMA_MTP_QSA")) != 0;
+        static const bool mtp_qsa = ggml_env_flag("LLAMA_MTP_QSA", false);
         if (mtp_qsa && hparams.n_layer_nextn > 0) {
             uint32_t r_trunk = 0;
             for (uint32_t il = 0; il < hparams.n_layer() && r_trunk == 0; ++il) { r_trunk = hparams.dsv4_compress_ratios[il]; }
@@ -652,8 +653,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // Always-on it cost decode (acceptance 0.63 -> 0.62, -1%, 2026-09-27), but the prompt ingest's batched product
     // is n_tokens tiny GEMVs (51 ms per 4096-token ubatch on the R9700, 1.8 s of a 113K prefill): batches of at least
     // LLAMA_MTP_EH_PROJ_2D_MIN tokens (default 256; 0 = never) take the 2D GEMM, decode keeps the batched product
-    static const bool eh_2d_all = getenv("LLAMA_MTP_EH_PROJ_2D") && atoi(getenv("LLAMA_MTP_EH_PROJ_2D")) > 0;
-    static const int  eh_2d_min = getenv("LLAMA_MTP_EH_PROJ_2D_MIN") ? atoi(getenv("LLAMA_MTP_EH_PROJ_2D_MIN")) : 256;
+    static const bool eh_2d_all = ggml_env_int("LLAMA_MTP_EH_PROJ_2D", 0) > 0;
+    static const int  eh_2d_min = (int) ggml_env_int("LLAMA_MTP_EH_PROJ_2D_MIN", 256);
     const bool eh_3d = !(eh_2d_all || (eh_2d_min > 0 && n_tokens >= eh_2d_min));
     ggml_tensor * res_hc;
     if (eh_3d) {
@@ -674,7 +675,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // block's K/V in the cache; the attention of its queries is dropped by the out_ids rows below anyway (dense over
     // the whole context: most of a 4096-token ingest at 16-30K). Store K/V and skip the query side.
     // LLAMA_MTP_INGEST_FULL=1 runs the full block as before
-    static const bool ingest_full = getenv("LLAMA_MTP_INGEST_FULL") != nullptr && atoi(getenv("LLAMA_MTP_INGEST_FULL")) != 0;
+    static const bool ingest_full = ggml_env_flag("LLAMA_MTP_INGEST_FULL", false);
     const bool kv_only = !ingest_full && !mtp_qsa && n_outputs == 0 && inp_out_ids != nullptr && !cparams.training &&
         inp_attn->self_k_rot == nullptr && inp_attn->self_v_rot == nullptr;   // (a rotated cache keeps the full path)
 
@@ -864,7 +865,7 @@ public:
 
     // halo-hybrid: the scores (and their inputs) are only needed when the KV window is wider than top-k returns
     static bool need_scores(int64_t n_kv, uint32_t ratio, uint32_t top_k) {
-        static const bool always = getenv("LLAMA_QSA_ALWAYS_SCORE") != nullptr;
+        static const bool always = ggml_env_flag("LLAMA_QSA_ALWAYS_SCORE", false);
         return always || n_kv > (int64_t) top_k + (int64_t) ratio - 1;
     }
     virtual ~llm_graph_input_qsa() = default;
@@ -892,8 +893,8 @@ public:
     // LLAMA_QSA_SHARED=0: one group over the whole window, as without the plan
     static bool shared_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
             bool causal_attn, llama_memory_hybrid_idx::qsa_plan & plan) {
-        static const bool enabled = getenv("LLAMA_QSA_SHARED") == nullptr || atoi(getenv("LLAMA_QSA_SHARED")) != 0;
-        static const bool topk    = getenv("LLAMA_QSA_BLOCK_TOPK") == nullptr || atoi(getenv("LLAMA_QSA_BLOCK_TOPK")) != 0;
+        static const bool enabled = ggml_env_flag("LLAMA_QSA_SHARED", true);
+        static const bool topk    = ggml_env_flag("LLAMA_QSA_BLOCK_TOPK", true);
         plan = {};
         const llama_memory_hybrid_idx * mem = mctx ? mctx->get_mem() : nullptr;
         if (!enabled || !topk || !scores || !causal_attn || mem == nullptr || !mem->qsa_shared_pool()) {
@@ -1054,7 +1055,7 @@ public:
     ggml_tensor * n_bid_t   = nullptr;   // I32 [n_stream], [2*n_stream] with the groups' base cells when shared
     static bool blk_topk_for(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub, uint32_t ratio, bool scores,
             bool blk_bias, int64_t n_stream, bool shared, llama_memory_hybrid_idx::qsa_plan & plan) {
-        static const bool enabled = getenv("LLAMA_QSA_BLOCK_TOPK") == nullptr || atoi(getenv("LLAMA_QSA_BLOCK_TOPK")) != 0;
+        static const bool enabled = ggml_env_flag("LLAMA_QSA_BLOCK_TOPK", true);
         plan = {};
         if (!enabled || !scores || !blk_bias || !mctx || !mctx->get_mem()) {
             return false;
@@ -1249,7 +1250,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // halo-hybrid: GGML_OP_QSA_HEAD_SUM does the relu, the head sum and the bias add in one pass (the separate ops made
     // ~4x the passes over [n_blocks, n_tokens] floats, the largest depth-growing elementwise cost). LLAMA_QSA_HEAD_SUM=0
     // restores the separate ops. bias: added in the same pass when given (the caller then skips its own add)
-    static const bool fused_head_sum = getenv("LLAMA_QSA_HEAD_SUM") == nullptr || atoi(getenv("LLAMA_QSA_HEAD_SUM")) != 0;
+    static const bool fused_head_sum = ggml_env_flag("LLAMA_QSA_HEAD_SUM", true);
     auto score_heads = [&](int64_t c0, int64_t n_c, ggml_tensor * bias) -> ggml_tensor * {
         ggml_tensor * q_c = c0 == 0 && n_c == n_tps ? q : ggml_view_3d(ctx0, q, idx_dim, n_idx_h, n_c, q->nb[1], q->nb[2], c0*q->nb[2]);
 
@@ -1303,7 +1304,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // only; LLAMA_QSA_CHUNK_MB=0 disables it.
     int64_t n_chunk = n_tps;
     if (n_stream == 1) {
-        static const int64_t budget = (getenv("LLAMA_QSA_CHUNK_MB") ? atoll(getenv("LLAMA_QSA_CHUNK_MB")) : 2048) * 1024 * 1024;
+        static const int64_t budget = (ggml_env_int("LLAMA_QSA_CHUNK_MB", 2048)) * 1024 * 1024;
         if (budget > 0) {
             const int64_t n_kv_max  = std::max<int64_t>(n_kv, n_ctx);
             const int64_t per_token = std::max<int64_t>(n_kv_max, ((n_kv_max + r - 1)/r)*n_idx_h) * (int64_t) sizeof(float);
@@ -1464,7 +1465,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // halo-hybrid: the FA op carries the per-query bound (top-k width), which lets the backend walk each query
     // tile's union of selections instead of the whole causal context at prefill (ggml-cuda fattn.cu,
     // shall_use_sparse; the op stays exact, the masked cells are never visited). LLAMA_QSA_SPARSE_FA=0 = dense walk
-    static const bool sparse_fa = getenv("LLAMA_QSA_SPARSE_FA") == nullptr || atoi(getenv("LLAMA_QSA_SPARSE_FA")) != 0;
+    static const bool sparse_fa = ggml_env_flag("LLAMA_QSA_SPARSE_FA", true);
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr,
             sparse_fa ? top_k->ne[0] : 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -1673,7 +1674,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const float eps_norm = hparams.f_norm_rms_eps;
 
     // q and k are adjacent in the conv output: one l2_norm over both instead of two launches
-    static const bool no_graph_fuse = getenv("LLAMA_NO_GRAPH_FUSE") != nullptr;
+    static const bool no_graph_fuse = ggml_env_flag("LLAMA_NO_GRAPH_FUSE", false);
     if (!no_graph_fuse) {
         ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
                 ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv * n_seq_tokens, 0);
@@ -1726,7 +1727,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     ggml_tensor * exp_in = cur;
     ggml_tensor * logits = nullptr;
     {
-        static const bool f16_cross = getenv("LLAMA_MOE_F16_CROSS") == nullptr || atoi(getenv("LLAMA_MOE_F16_CROSS")) != 0;
+        static const bool f16_cross = ggml_env_flag("LLAMA_MOE_F16_CROSS", true);
         const ggml_tensor * we = model.layers[il].ffn_gate_exps ? model.layers[il].ffn_gate_exps : model.layers[il].ffn_gate_up_exps;
         ggml_backend_buffer_type_t buft_exp = (we && we->buffer) ? ggml_backend_buffer_get_type(we->buffer) : nullptr;
         ggml_backend_dev_t dev_exp = buft_exp ? ggml_backend_buft_get_device(buft_exp) : nullptr;
@@ -1894,7 +1895,7 @@ static void ple_gather(const ggml_tensor * w, int64_t hd, const std::vector<int3
 #if defined(__linux__)
     // the table is mmapped and mostly cold: ask for every page this ubatch reads up front, so the kernel reads
     // them in parallel instead of one fault at a time inside the dequant loop (adjacent pages merged per call)
-    static const bool willneed = !getenv("LLAMA_PLE_WILLNEED") || atoi(getenv("LLAMA_PLE_WILLNEED")) > 0;
+    static const bool willneed = ggml_env_flag("LLAMA_PLE_WILLNEED", true);
     if (willneed) {
         static const long pg = sysconf(_SC_PAGESIZE);
         std::vector<uintptr_t> pages;
@@ -1916,7 +1917,7 @@ static void ple_gather(const ggml_tensor * w, int64_t hd, const std::vector<int3
     }
 #endif
     // dequant on a few threads: page faults that the read-ahead has not satisfied yet then overlap
-    static const int n_thr_env = getenv("LLAMA_PLE_THREADS") ? atoi(getenv("LLAMA_PLE_THREADS")) : 8;
+    static const int n_thr_env = (int) ggml_env_int("LLAMA_PLE_THREADS", 8);
     const int n_thr = (int) std::max<int64_t>(1, std::min<int64_t>(n_thr_env, (int64_t) idx.size() / 256));
     auto work = [&](int t) {
         const size_t r0 = idx.size() * t / n_thr, r1 = idx.size() * (t + 1) / n_thr;
@@ -2091,7 +2092,7 @@ void ple_prefetch_drop(const llama_model * model) {
 
 static bool ple_host_gather(const llama_model & model) {
     return model.per_layer_tok_embd != nullptr && model.per_layer_tok_embd->buffer != nullptr &&
-        ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer) && getenv("LLAMA_PLE_GET_ROWS") == nullptr;
+        ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer) && !ggml_env_flag("LLAMA_PLE_GET_ROWS", false);
 }
 
 llama_model_qwen4exp::~llama_model_qwen4exp() {
@@ -2100,7 +2101,7 @@ llama_model_qwen4exp::~llama_model_qwen4exp() {
 
 // whether a ubatch's PLE gather may start early: set_input gathers on the host for it and takes a matching prefetch
 static bool ple_prefetchable(const llama_model_qwen4exp & model, const llama_ubatch & ubatch) {
-    static const bool enabled = !getenv("LLAMA_PLE_PREFETCH") || atoi(getenv("LLAMA_PLE_PREFETCH")) != 0;
+    static const bool enabled = ggml_env_flag("LLAMA_PLE_PREFETCH", true);
     if (!enabled || model.hparams.ple_n_heads == 0 || ubatch.n_tokens < 64 || !ubatch.token || !ple_host_gather(model)) {
         return false;
     }
@@ -2171,7 +2172,7 @@ void llama_model_qwen4exp::ple_prefetch_start(const llama_ubatch & ubatch, const
         }
     }
     e.out = std::make_shared<std::vector<float>>();
-    static const bool lanes_debug = getenv("LLAMA_LANES_DEBUG") && atoi(getenv("LLAMA_LANES_DEBUG")) >= 3;
+    static const bool lanes_debug = ggml_env_int("LLAMA_LANES_DEBUG", 0) >= 3;
     if (lanes_debug) {
         LLAMA_LOG_INFO("ple prefetch: start %u tokens at pos %d\n", ubatch.n_tokens, ubatch.pos[0]);
     }
@@ -2224,7 +2225,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         int n_stale = 0;
         std::vector<int32_t> missing;
         std::shared_ptr<std::vector<float>> pf = ple_prefetch_take(&pmodel, idx, hp.ple_n_heads, hp.ple_head_dim, &missing, &n_stale);
-        static const int lanes_debug = getenv("LLAMA_LANES_DEBUG") ? atoi(getenv("LLAMA_LANES_DEBUG")) : 0;
+        static const int lanes_debug = (int) ggml_env_int("LLAMA_LANES_DEBUG", 0);
         if (lanes_debug >= 3 && n_tokens >= 64) {
             LLAMA_LOG_INFO("ple prefetch: %" PRId64 " tokens %s (%zu to gather), %d unmatched\n", n_tokens,
                 pf ? (missing.empty() ? "hit" : "partial") : "miss", pf ? missing.size() : (size_t) n_tokens, n_stale);

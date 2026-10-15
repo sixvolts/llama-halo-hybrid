@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "ggml-env.h"   // halo-hybrid
 
 #include <typeinfo>
 
@@ -1396,7 +1397,7 @@ void llm_graph_result::reset() {
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     // LLAMA_LANES_DEBUG >= 3: time every input of a prefill ubatch and log the slowest
-    static const bool timed = getenv("LLAMA_LANES_DEBUG") && atoi(getenv("LLAMA_LANES_DEBUG")) >= 3;
+    static const bool timed = ggml_env_int("LLAMA_LANES_DEBUG", 0) >= 3;
     if (!timed || ubatch->n_tokens < 32) {
         for (auto & input : inputs) {
             input->set_input(ubatch);
@@ -2686,12 +2687,8 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
 // dense walk is relatively cheaper (-3.5% at 15.5K, +3% at 31K, crossover ~23K): default 24576 there.
 int64_t llm_graph_context::attn_top_k_gather_n_sel(int64_t n_kv, int64_t width, bool igpu) const {
     static const int64_t min_kv_env = [] {
-        const char * env = getenv("LLAMA_QSA_GATHER");
-        if (env == nullptr) {
-            return (int64_t) -1;
-        }
-        const int64_t v = atoll(env);
-        return v <= 0 ? INT64_MAX : v;
+        const int64_t v = ggml_env_int("LLAMA_QSA_GATHER", INT64_MIN);   // unset: the per-device default; <= 0: off
+        return v == INT64_MIN ? (int64_t) -1 : (v <= 0 ? INT64_MAX : v);
     }();
     const int64_t min_kv = min_kv_env >= 0 ? min_kv_env : (igpu ? 24576 : 16384);
 
@@ -3843,7 +3840,7 @@ ggml_tensor * llm_graph_context::build_rs(
     // gather: a custom get_state_rows (mamba's and plamo2's ssm scan) computes the layer's
     // output from the rows, and a view in its place skipped the scan (wrong output in cell 0,
     // a view past the cache in cell 1, 2026-10-10).
-    static const bool no_graph_fuse = getenv("LLAMA_NO_GRAPH_FUSE") != nullptr;
+    static const bool no_graph_fuse = ggml_env_flag("LLAMA_NO_GRAPH_FUSE", false);
     using get_rows_ptr = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *);
     const get_rows_ptr * plain = get_state_rows.target<get_rows_ptr>();
     if (!no_graph_fuse && plain && *plain == ggml_get_rows &&

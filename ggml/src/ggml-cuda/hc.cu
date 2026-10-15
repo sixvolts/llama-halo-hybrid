@@ -16,13 +16,13 @@ static __device__ __forceinline__ float hc_sigmoid(float x) {
 // halo-hybrid: GGML_CUDA_NO_HC_BOUNDARY=1 turns off both halves of the qwen4exp hc boundary (the reshape match of
 // the q8_1 side copy and the fused combine+rms_norm*w kernel); =2 turns off only the fused kernel
 bool ggml_cuda_hc_boundary_disabled(int level) {
-    static const int v = getenv("GGML_CUDA_NO_HC_BOUNDARY") ? atoi(getenv("GGML_CUDA_NO_HC_BOUNDARY")) : 0;
+    static const int v = (int) ggml_env_int("GGML_CUDA_NO_HC_BOUNDARY", 0);
     return v != 0 && v <= level;
 }
 
 // ---- q8_1 side copies -------------------------------------------------------------------------
 static bool q8_side_disabled() {
-    static const bool v = getenv("GGML_CUDA_NO_Q8_SIDE") != nullptr && atoi(getenv("GGML_CUDA_NO_Q8_SIDE"));
+    static const bool v = ggml_env_flag("GGML_CUDA_NO_Q8_SIDE", false);
     return v;
 }
 
@@ -108,7 +108,7 @@ const char * ggml_cuda_q8_side_find(ggml_backend_cuda_context & ctx, const ggml_
 
 // halo-hybrid: producer-side MMQ copies (see ggml_backend_cuda_context::mmq_side_*). GGML_CUDA_NO_MMQ_SIDE=1 disables.
 static bool mmq_side_disabled() {
-    static const bool d = getenv("GGML_CUDA_NO_MMQ_SIDE") != nullptr && atoi(getenv("GGML_CUDA_NO_MMQ_SIDE")) != 0;
+    static const bool d = ggml_env_flag("GGML_CUDA_NO_MMQ_SIDE", false);
     return d;
 }
 

@@ -775,7 +775,7 @@ static void mmid_f16_launch(const void * w, const __half * x, const int32_t * ti
 
 // GGML_CUDA_MMID_F16: unset = auto (the shapes where it measured faster, see ggml_cuda_mmid_f16), 0 = off, 1 = always
 static int ggml_cuda_mmid_f16_mode() {
-  static const int mode = getenv("GGML_CUDA_MMID_F16") ? (atoi(getenv("GGML_CUDA_MMID_F16")) != 0 ? 1 : 0) : -1;
+  static const int mode = getenv("GGML_CUDA_MMID_F16") ? (ggml_env_flag("GGML_CUDA_MMID_F16", false) ? 1 : 0) : -1;
   return mode;
 }
 
@@ -803,7 +803,7 @@ static bool mmid_f16_check(ggml_backend_cuda_context & ctx, const ggml_tensor * 
   const int64_t k = src0->ne[0], m = src0->ne[1], n_experts = src0->ne[2];
   const int64_t block_elems = (type == WeightType::kQ4_K || type == WeightType::kQ5_K) ? 256 : 64;
   const int64_t n_used = ids->ne[0], n_tokens = ids->ne[1];
-  static const int64_t min_tokens = getenv("GGML_CUDA_MMID_F16_MIN") ? atoll(getenv("GGML_CUDA_MMID_F16_MIN")) : 64;
+  static const int64_t min_tokens = ggml_env_int("GGML_CUDA_MMID_F16_MIN", 64);
   if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || k % block_elems != 0 || n_tokens < min_tokens ||
       n_experts > 1024 || src1->ne[0] != k || src1->nb[0] != sizeof(float) || src1->ne[3] != 1 ||
       !ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) || dst->ne[0] != m || dst->ne[1] != n_used ||
@@ -887,7 +887,7 @@ bool ggml_cuda_mmid_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src
 // reader (the caller checks). GGML_CUDA_MMID_F16_PAIR=0 disables.
 bool ggml_cuda_mmid_f16_moe(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
                             const ggml_tensor * glu, ggml_tensor * down) {
-  static const bool disabled = getenv("GGML_CUDA_MMID_F16_PAIR") != nullptr && atoi(getenv("GGML_CUDA_MMID_F16_PAIR")) == 0;
+  static const bool disabled = !ggml_env_flag("GGML_CUDA_MMID_F16_PAIR", true);
   if (disabled) {
     return false;
   }
