@@ -175,7 +175,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     //     (9.2 KB, two K passes per tile) is 26.0 KB -> two blocks, two waves per SIMD (the same occupancy the 32-column
     //     config gets from its 8 waves): 13K sparse per 1024 queries 28.4 -> 23.4 ms gfx1201, 131 -> 122 gfx1151, the
     //     3-token verify batch's kernel 242 -> 155 us. The kernel still spills (256 VGPRs: the 16 x 512 VKQ accumulator
-    //     alone is 128 per lane); see HALO-HYBRID.md for the first-principles account
+    //     alone is 128 per lane)
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 1,  64,  32,  32,  64, 1, false);
     // gfx1151 / gfx1201, measured 2026-09-08 (GLM-5.3-Flash MLA): 8 waves, one block per CU; larger K/V batches overflow
     //     the 64 KiB of LDS next to the 32 KiB Q tile, occupancy 2 spills the 128-VGPR VKQ accumulator
