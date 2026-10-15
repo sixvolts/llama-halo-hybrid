@@ -1135,11 +1135,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
-        // halo-hybrid: LLAMA_SPEC_TRACE=1 times the prompt-feature injection per target batch (the drafter runs it
-        //     synchronously between target batches, so this is dead time for the two-lane prefill pipeline)
-        static const bool trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
-        const int64_t t_proc0 = trace ? ggml_time_us() : 0;
-
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1186,11 +1181,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        if (trace) {
-            LOG_INF("spec-trace: dflash inject %d tokens (pos %d..%d) in %.1f ms\n", n_tokens,
-                    (int) batch_in.tokens[0].pos[0], (int) batch_in.tokens[n_tokens - 1].pos[0], (ggml_time_us() - t_proc0) / 1000.0);
-        }
-
         return true;
     }
 
@@ -1229,15 +1219,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
-        static const bool trace_draft = getenv("LLAMA_SPEC_TRACE") != nullptr;
-        const int64_t t_dd0 = trace_draft ? ggml_time_us() : 0;
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
-        }
-        if (trace_draft) {
-            LOG_INF("spec-trace: dflash draft decode %.1f ms (n=%d)\n", (ggml_time_us() - t_dd0) / 1000.0, (int) batch.size());
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1283,7 +1268,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                 }
 
-                // halo-hybrid: per-step draft length from the caller (adaptive policy); the block is always decoded whole
+                // halo-hybrid: per-step draft length from the caller (e.g. the sampled-request cap); the block is always decoded whole
                 if (dp.n_max > 0 && result.size() > (size_t) dp.n_max) {
                     result.resize(dp.n_max);
                 }
@@ -1359,13 +1344,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// halo-hybrid: LLAMA_SPEC_TRACE=1 prints, per draft() call, where the host chain's time goes (ms):
-//   ingest = the accept() decode of the accepted tokens, dec[i] = each draft decode, smp[i] = its sampling
-static bool spec_trace_enabled() { static const bool v = getenv("LLAMA_SPEC_TRACE") != nullptr; return v; }
-struct spec_trace_acc { int64_t t_ingest = 0; int64_t t_dec[8] = {0}; int64_t t_smp[8] = {0}; int n = 0; };
-
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-    spec_trace_acc trace;
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     common_batch batch;
@@ -1615,9 +1594,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
         }
 
-        const int64_t t0 = spec_trace_enabled() ? ggml_time_us() : 0;
         const int32_t rc = llama_process(this->params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        if (spec_trace_enabled()) { trace.t_ingest += ggml_time_us() - t0; }
         if (rc != 0) {
             SPC_WRN("early ingest: llama_process(ctx_dft) failed rc=%d at pos %d; the rest is ingested after the batch\n",
                     (int) rc, (int) src.tokens[i0].pos[0]);
@@ -1698,7 +1675,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             bool ok = true;
-            const int64_t t_ing0 = spec_trace_enabled() ? ggml_time_us() : 0;
             for (int head = 0; head < n_mtp_layers; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
@@ -1723,7 +1699,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
-            if (spec_trace_enabled()) { trace.t_ingest = ggml_time_us() - t_ing0; }
             if (!ok) {
                 return false;
             }
@@ -1784,8 +1759,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
-        const bool tr = spec_trace_enabled();
-        if (tr) { trace.n = 0; }
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
@@ -1803,14 +1776,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            const int64_t t_d0 = tr ? ggml_time_us() : 0;
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
             }
-            const int64_t t_d1 = tr ? ggml_time_us() : 0;
-            if (tr && i < 8) { trace.t_dec[i] = t_d1 - t_d0; trace.n = i + 1; }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
@@ -1886,11 +1856,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         }
                         q.resize(std::max<size_t>(1, keep));
                     }
-                    // the draft's own temperature need not equal the target's: any q keeps the verify lossless as long
-                    // as the draft token is drawn from it, and acceptance is sum(min(p, q)). LLAMA_SPEC_RS_TEMP_SCALE
-                    // scales the draft temperature (debug / calibration)
-                    static const double t_scale = getenv("LLAMA_SPEC_RS_TEMP_SCALE") ? atof(getenv("LLAMA_SPEC_RS_TEMP_SCALE")) : 1.0;
-                    const double t_d = dp.temp * t_scale;
+                    // the draft samples at the target's temperature (any q keeps the verify lossless as long as the
+                    // draft token is drawn from it; acceptance is sum(min(p, q)))
+                    const double t_d = dp.temp;
                     double z = 0.0;
                     for (auto & c : q) {
                         c.p = (float) std::exp((double) (c.logit - lmax) / t_d);
@@ -1959,13 +1927,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 break;
             }
 
-            if (tr && i < 8) { trace.t_smp[i] = ggml_time_us() - t_d1; }
             ++i;
-        }
-        if (tr) {
-            char buf[320]; int p = snprintf(buf, sizeof(buf), "spec-trace: ingest %.2f ms", trace.t_ingest/1000.0);
-            for (int q = 0; q < trace.n; ++q) { p += snprintf(buf + p, sizeof(buf) - p, " | dec%d %.2f smp%d %.2f", q, trace.t_dec[q]/1000.0, q, trace.t_smp[q]/1000.0); }
-            LOG_INF("%s\n", buf);
         }
 
         if (chain_heads) {
