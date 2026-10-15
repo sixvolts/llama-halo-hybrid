@@ -1,6 +1,6 @@
 # Cookbook: Strix Halo + an RDNA2 card (Navi 21: Radeon Pro V620, W6800, RX 6800 / 6900 XT)
 
-Measured 2026-10-02 on gibson: one Strix Halo (Ryzen AI Max+ 395) plus a **Radeon Pro V620** (gfx1030, 32 GB GDDR6,
+Measured 2026-10-02 on the test box: one Strix Halo (Ryzen AI Max+ 395) plus a **Radeon Pro V620** (gfx1030, 32 GB GDDR6,
 ~512 GB/s, 250 W VBIOS cap) on a PCIe Gen4 x4 link. The RX 6800 / 6800 XT / 6900 XT are the same chip with 16 GB; for
 those use the 16 GB layouts of the [RX 9070 XT recipe](rdna4.md#radeon-rx-9070-xt-16-gb-simulated)
 (not measured on RDNA2).
@@ -43,7 +43,7 @@ iGPU. ROCm0 is the V620, ROCm1 the iGPU (check the startup log).
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
 
 LLAMA_PREFILL_LANES=2 \
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+llama-server -m UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 131072 -b 5120 -ub 2560 -np 1 \
   -ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \

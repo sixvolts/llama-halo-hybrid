@@ -2,9 +2,6 @@
 !*.*
 !snapshots/
 !fusion/
-*.o
-ggml-common.h
-**/*.swp
 !peg-parser
 !halo/
 !halo/*/
@@ -13,4 +10,7 @@ halo/machines/*
 !halo/machines/README.md
 !halo/machines/example.env
 !halo/machines/reference.json
+*.o
+ggml-common.h
+**/*.swp
 __pycache__/

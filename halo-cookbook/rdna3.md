@@ -1,6 +1,6 @@
 # Cookbook: Strix Halo + an RDNA3 card (Navi 32: RX 7800 XT / 7700 XT; Navi 31: RX 7900 XT / XTX)
 
-Measured 2026-10-04 on gibson: one Strix Halo (Ryzen AI Max+ 395) plus a **Radeon RX 7800 XT** (gfx1101, 16 GB GDDR6,
+Measured 2026-10-04 on the test box: one Strix Halo (Ryzen AI Max+ 395) plus a **Radeon RX 7800 XT** (gfx1101, 16 GB GDDR6,
 ~624 GB/s) in a **USB4 eGPU dock** ([usb4-thunderbolt.md](usb4-thunderbolt.md)). The RX 7900 XT / XTX (gfx1100, 20 / 24 GB) and RX 7700 XT (gfx1101, 12 GB) run the same kernels but were not
 measured; with 20 GB or more, start from these layouts and raise `-ub`.
 
@@ -17,7 +17,7 @@ stays dense, as on the other cards.
 * **In a USB4 / Thunderbolt dock**, as measured here, follow [usb4-thunderbolt.md](usb4-thunderbolt.md) first
   (`thunderbolt.host_reset=false`, or the card gets a 256 MB BAR and no peer access).
 * **Device order:** ROCm0 is the card and ROCm1 the iGPU (check the startup log).
-* **This card on a riser cable:** it logged PCIe link errors even at idle on gibson's Gen4 x4 riser, hung
+* **This card on a riser cable:** it logged PCIe link errors even at idle on the test box's Gen4 x4 riser, hung
   llama-server twice and dropped off the bus when its link speed was changed, while an R9700 and a V620 on the same
   cable were clean. In the dock it logged none. If a card hangs, check the link's error counters first
   ([usb4-thunderbolt.md](usb4-thunderbolt.md#troubleshooting)).
@@ -35,7 +35,7 @@ dense trunk, KV cache and the MTP draft head on the card, every routed expert on
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
 
 LLAMA_PREFILL_LANES=2 LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512 \
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+llama-server -m UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 131072 -b 4096 -ub 2048 -np 1 \
   -ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \

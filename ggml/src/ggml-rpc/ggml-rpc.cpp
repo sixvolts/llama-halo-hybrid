@@ -408,7 +408,13 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, const std::s
     sock->get_caps(request.conn_caps);
 
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        // halo-hybrid: a HELLO reply of another size is a server with another protocol, not a crash
+        GGML_LOG_ERROR("rpc-server at %s did not answer HELLO in protocol %d.%d's format: it is an upstream llama.cpp build "
+                       "or a different build of llama-halo-hybrid. Both hosts must run the same build\n",
+                       endpoint.c_str(), RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION);
+        return false;
+    }
 
     // halo-hybrid: exact match - both hosts must run the same build of this tree
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor != RPC_PROTO_MINOR_VERSION ||
@@ -417,7 +423,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, const std::s
                        "Both hosts must run the same build of llama-halo-hybrid%s\n", endpoint.c_str(),
                        response.major, response.minor, response.patch, response.op_count,
                        RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION, RPC_PROTO_PATCH_VERSION, (int) GGML_OP_COUNT,
-                       response.major < 100 ? " (that server is an upstream llama.cpp build)" : "");
+                       response.major < 100 ? " (that server is upstream llama.cpp, or this fork from before 2026-10-15)" : "");
         return false;
     }
 
@@ -2849,10 +2855,9 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
     GGML_UNUSED(dev);
 }
 
-// halo-hybrid (proto 7.10): the server's backend answers, so an op its kernels cannot run at this shape (DSV4_HC_MIX
-// at a width other than 4 x 4096, 2026-10-09) is placed elsewhere instead of aborting the server. Answers are cached by
-// the op's shape and its sources' shapes and buffers; an older server is not asked (every op supported, as before).
-// GGML_RPC_NO_SUPPORTS_OP=1 restores that for A/B.
+// halo-hybrid: the server's backend answers, so an op its kernels cannot run at this shape (DSV4_HC_MIX at a width other
+// than 4 x 4096, 2026-10-09) is placed elsewhere instead of aborting the server. Answers are cached by the op's shape and
+// its sources' shapes and buffers. GGML_RPC_NO_SUPPORTS_OP=1 assumes every op is supported (unsafe, for A/B).
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     static const bool disabled = ggml_env_flag("GGML_RPC_NO_SUPPORTS_OP", false);
     if (disabled) {

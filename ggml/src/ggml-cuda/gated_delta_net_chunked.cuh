@@ -1,5 +1,5 @@
 #pragma once
-// bf16 WMMA chunked GATED_DELTA_NET prefill (S_v == 128), ported from stew675/llama-cpp-rdna-boosts block 03:
+// bf16 WMMA chunked GATED_DELTA_NET prefill (S_v == 128), ported from stew675/llama-cpp-rdna-boosts block 02 (block 03 there since):
 // gated_delta_net_chunked_bf16.cu (gfx12) and gated_delta_net_chunked_bf16_gfx11.cu (gfx11). Plain layouts only.
 // Derived from libr4d (Apache-2.0) via rdna-boosts (MIT): licenses/LICENSE-radiance-libr4d, LICENSE-llama-cpp-rdna-boosts.
 #include "common.cuh"

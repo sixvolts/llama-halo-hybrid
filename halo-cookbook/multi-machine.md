@@ -156,8 +156,8 @@ WantedBy=multi-user.target
 ## Rules that cost a day each to learn
 
 * **Both hosts on the same build.** The RPC protocol is fork-local (major 107, outside upstream's numbers): the
-  handshake requires the same protocol version and op table on both ends and refuses an upstream `rpc-server` with a
-  message naming both versions. After a rebuild, `readlink /proc/<pid>/exe` on the
+  handshake requires the same protocol version and op table on both ends and refuses an upstream `rpc-server` (or an
+  older build of this fork) with an error that says so. After a rebuild, `readlink /proc/<pid>/exe` on the
   server must not end in "(deleted)".
 * **Loading takes ~3.5 minutes** for the 86 GB remote half, bound by the loader's read-then-send loop, not the link.
 * **A peer rebooting looks like a bad link** from the other side (five "drops" in 25 minutes were the second box

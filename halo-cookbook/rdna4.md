@@ -26,7 +26,7 @@ table read on demand from the page cache. Single user, 40K context:
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
 
 LLAMA_PREFILL_LANES=2 \
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+llama-server -m UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 40960 -b 5120 -ub 2560 -np 1 \
   -ot 'blk\.(1[1-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
@@ -63,7 +63,7 @@ comparison](../README.md#against-a-dgx-spark-2026-09-30) uses):
 
 ```
 LLAMA_PREFILL_LANES=2 \
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+llama-server -m UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 131072 -b 8192 -ub 4096 -np 1 \
   -ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
@@ -216,7 +216,7 @@ The 32 GB preset spends 14 GB on compute (`-ub 4096`, two prefill lanes), so on 
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'   # drain the iGPU's TTM pool before a big load
 
 LLAMA_PREFILL_LANES=2 \
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+llama-server -m UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 131072 -b 2048 -ub 1024 -np 1 \
   -ot 'blk\.([0-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \

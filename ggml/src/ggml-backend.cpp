@@ -2044,7 +2044,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
         // exactly the one that should overlap the previous split on the other device; its own stream order
         // protects the memory it touches and its peer copies wait for the destination's progress, so skip the
         // host-side wait
-        static const bool overlap_cut = ggml_env_flag("GGML_SCHED_OVERLAP_CUT", true);
+        static const bool overlap_cut = ggml_env_int("GGML_SCHED_OVERLAP_CUT", 4) > 0;   // the node count read above; 0 disables
         const bool skip_noinput_wait = overlap_cut && sched->overlap_cut_ok && prev_backend_id >= 0 &&
                 !ggml_backend_sched_backend_is_remote(sched->backends[prev_backend_id]) && !ggml_backend_sched_backend_is_remote(split_backend);
         if (!skip_noinput_wait && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -2270,7 +2270,7 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                     // (9375f16ec) a server-side scheduler (card + APU behind ggml-rpc, no overlap cut) had the card
                     // overwrite the APU's expert ids mid-read: out-of-range experts, APU page faults at GLM decode.
                     {
-                        static const bool oc = ggml_env_flag("GGML_SCHED_OVERLAP_CUT", true);
+                        static const bool oc = ggml_env_int("GGML_SCHED_OVERLAP_CUT", 4) > 0;
                         // (scoped to an integrated-GPU destination, the case 9375f16ec moved onto events; discrete-GPU
                         // destinations have run on events since before the lanes and keep their measured ordering)
                         const bool dst_events = sched->events[split_backend_id][sched->cur_copy] != NULL && split_backend->device != NULL &&

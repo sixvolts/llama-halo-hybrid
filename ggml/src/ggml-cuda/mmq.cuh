@@ -1698,10 +1698,7 @@ static bool mmq_moe_use_tile_list() {
 //     GGML_CUDA_MMQ_SUBTILE_SKIP=0 disables the 16-column subtile skip, GGML_CUDA_MMQ_KTAIL_SKIP=0 the K-tail skip
 static int mmq_opt_flags() {
     static const int flags = [] {
-        auto on = [](const char * name) {
-            const char * env = getenv(name);
-            return env == nullptr || atoi(env) != 0;
-        };
+        auto on = [](const char * name) { return ggml_env_flag(name, true); };
         return (on("GGML_CUDA_MMQ_SUBTILE_SKIP") ? MMQ_OPT_SUBTILE_SKIP : 0) |
                (on("GGML_CUDA_MMQ_KTAIL_SKIP")   ? MMQ_OPT_KTAIL_SKIP   : 0);
     }();

@@ -1,9 +1,9 @@
 Portions of the bf16 WMMA chunked GATED_DELTA_NET prefill (ggml/src/ggml-cuda/
 gated_delta_net_chunked_bf16.cu, gated_delta_net_chunked_bf16_gfx11.cu and their dispatch in
 gated_delta_net.cu) come from stew675/llama-cpp-rdna-boosts
-(https://github.com/stew675/llama-cpp-rdna-boosts), patch
-0003-rdna-boosts-block-03-chunked-gated-delta-net-prefill, which in turn derives from libr4d
-(see LICENSE-radiance-libr4d). The llama-cpp-rdna-boosts changes are under the MIT License:
+(https://github.com/stew675/llama-cpp-rdna-boosts), its chunked gated-delta-net prefill patch
+(patches/0002-rdna-boosts-block-02-fused-chunked-gated-delta-net-p.patch when it was ported, 2026-10-08; the repository
+has renumbered it block 03 since), which in turn derives from libr4d (see LICENSE-radiance-libr4d). The llama-cpp-rdna-boosts changes are under the MIT License:
 
 MIT License
 

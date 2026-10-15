@@ -47,7 +47,7 @@ The launch line for the Strix Halo + R9700 layout:
 
 ```
 LLAMA_PREFILL_LANES=2 \
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+llama-server -m UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 40960 -b 5120 -ub 2560 -np 1 \
   -ot 'blk\.(1[1-9]|[2-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
@@ -133,7 +133,7 @@ At 256K, run the fast layout with a 256 MB chunk budget and a smaller draft ubat
 
 ```
 LLAMA_PREFILL_LANES=2 LLAMA_QSA_CHUNK_MB=256 LLAMA_SPEC_DRAFT_UB=512 \
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+llama-server -m UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -dev ROCm0,ROCm1 -ts 1,0 --fit off -fa on -ngl 999 -c 262144 -b 5120 -ub 2560 -np 1 \
   -ot 'blk\.([5-9]|[1-4][0-9])\.ffn_(gate|up|down)_exps=ROCm1' \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 \
@@ -155,7 +155,7 @@ kernel and scheduler changes that came out of that are listed in [HALO-HYBRID.md
 
 There are no binary releases. Dated tags (`halo-YYYY-MM-DD`) mark tested states of `main`; the last upstream sync was
 ggml-org/llama.cpp `ec7630a64` (2026-10-01). When you report a problem, include the output of
-`git describe --tags --always --dirty` and `llama-server --version`, and use the issue form: it asks for the setup,
+`git describe --tags --match 'halo-*' --always --dirty` and `llama-server --version`, and use the issue form: it asks for the setup,
 card, ROCm version and launch line that a hybrid setup needs. With two machines over RPC, both must run the same
 commit.
 

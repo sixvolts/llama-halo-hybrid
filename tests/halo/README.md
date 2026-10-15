@@ -7,7 +7,7 @@ restores it on exit.
 ```
 tests/halo/run.sh base [smoke|full]     # infra + APU; builds build-halo (all cookbook GPU targets) + build-halo-cpu
 tests/halo/run.sh gpu rdna4             # R9700 / RX 9070 + APU, using the base build
-tests/halo/run.sh gpu rdna3             # RX 7800 XT / 7900 + APU (gibson: the USB4 dock)
+tests/halo/run.sh gpu rdna3             # RX 7800 XT / 7900 + APU (on the test box: the USB4 dock)
 tests/halo/run.sh gpu rdna4 --bless     # record this machine's pre-flight references (first run on a machine)
 tests/halo/run.sh last                  # recent runs from the ledger
 ```

@@ -21,6 +21,7 @@ concurrency:
 jobs:
   cpu:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies
@@ -35,6 +36,7 @@ jobs:
 
   hip:
     runs-on: ubuntu-24.04
+    timeout-minutes: 240
     container: rocm/dev-ubuntu-24.04:7.2.1-complete
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +50,7 @@ jobs:
 
   cuda:
     runs-on: ubuntu-24.04
+    timeout-minutes: 240
     container: nvidia/cuda:12.8.1-devel-ubuntu24.04
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +64,7 @@ jobs:
 
   vulkan:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies

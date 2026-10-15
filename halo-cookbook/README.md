@@ -179,7 +179,7 @@ Qwen3.8-Flash-Next, single stream, 40K context, draft head with its own q4_K LM 
 
 ```
 sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'
-llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+llama-server -m UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -dev ROCm0 --fit off -fa on -ngl 999 -c 40960 -b 4096 -ub 4096 -np 1 \
   -md mtp-Qwen3.8-Flash-Next-shared-exps-q4k-head-q4_K.gguf -devd ROCm0 -ngld 999 --spec-type draft-mtp --spec-draft-n-max 2 \
   --host 0.0.0.0 --port 8080

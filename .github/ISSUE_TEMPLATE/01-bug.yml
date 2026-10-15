@@ -13,9 +13,9 @@ body:
     id: version
     attributes:
       label: Version
-      description: Output of `git describe --tags --always --dirty` in your checkout, and of `llama-server --version`.
+      description: Output of `git describe --tags --match 'halo-*' --always --dirty` in your checkout, and of `llama-server --version`.
       placeholder: |
-        $ git describe --tags --always --dirty
+        $ git describe --tags --match 'halo-*' --always --dirty
         $ ./build/bin/llama-server --version
     validations:
       required: true
@@ -60,7 +60,7 @@ body:
     id: launch
     attributes:
       label: Launch command and environment
-      description: The full llama-server (and rpc-server) command line, plus `env | grep -E '^(LLAMA|GGML)_'`.
+      description: The full llama-server (and rpc-server) command line, plus `env | grep -E '^(LLAMA|GGML)_' | grep -v '^LLAMA_ARG_'` (do not paste API keys).
       render: shell
     validations:
       required: true

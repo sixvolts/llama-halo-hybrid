@@ -1,7 +1,7 @@
 # Cookbook: a card in a USB4 / Thunderbolt eGPU dock
 
 The Strix Halo has two 40 Gb/s USB4 ports, so a card can sit in an eGPU dock instead of a PCIe slot. Measured
-2026-10-04 on gibson with an **RX 7800 XT** in a Thunderbolt 5 dock (Intel JHL9480 hub, its own power supply, a PCIe
+2026-10-04 on the test box with an **RX 7800 XT** in a Thunderbolt 5 dock (Intel JHL9480 hub, its own power supply, a PCIe
 x16 slot) on one of the USB4 ports. The recipes are the card's own page ([rdna3.md](rdna3.md) for this card); this
 page is the setup and what the link costs.
 
@@ -69,7 +69,7 @@ Not measured: an R9700 or another 32 GB card in the dock, where prefill moves mo
   even at idle on a Gen4 x4 riser cable (where an R9700 and a V620 were clean), hung `llama-server` twice and
   dropped off the bus when its link speed was changed; in the dock it ran every benchmark with zero errors. Clear the
   counters with `sudo setpci -s <bdf> ECAP_AER+0x10.L=0xffffffff` and watch whether they come back.
-* **Do not change a card's link speed with `setpci` while amdgpu is bound to it.** On gibson that dropped the card
+* **Do not change a card's link speed with `setpci` while amdgpu is bound to it.** On the test box that dropped the card
   off the bus and hard-reset the box.
 * **Card gone after the box idles for a while:** runtime power management; set `amdgpu.runpm=0`.
 * **Peer access missing or HIP crashes on a cross-device copy:** the small-BAR case above. Check `Region 0` and boot
