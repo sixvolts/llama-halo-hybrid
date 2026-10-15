@@ -34,7 +34,6 @@
 #include "ggml-cuda/sgemm-tile.cuh"
 #include "ggml-cuda/mmq-wmma.cuh"
 #include "ggml-cuda/ewchain.cuh"
-#include "ggml-cuda/persist.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmid-f16.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -236,7 +235,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
     // (a [2560 -> 512] x 1024 sgemm runs at 2.5 TFLOPS; rocBLAS' own Tensile kernels reach 11).
     // Prefer rocBLAS unless the user chose explicitly.
     if (getenv("ROCBLAS_USE_HIPBLASLT") == nullptr) {
+#ifdef _WIN32
+        _putenv_s("ROCBLAS_USE_HIPBLASLT", "0");
+#else
         setenv("ROCBLAS_USE_HIPBLASLT", "0", 1);
+#endif
     }
 #endif // GGML_USE_HIP
 
@@ -2628,8 +2631,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     return true;
 }
 
-// halo-hybrid: the persistent-region verifier (persist.cu, GGML_CUDA_PERSIST_VERIFY=1) re-runs nodes on the normal path
-bool ggml_cuda_compute_forward_node(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+// halo-hybrid: one node on the normal path, for callers outside this file's dispatch loop (the grouped GEMV fallback)
+static bool ggml_cuda_compute_forward_node(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     return ggml_cuda_compute_forward(ctx, dst);
 }
 
@@ -4317,12 +4320,9 @@ bool ggml_cuda_ewchain_match(const ggml_cgraph * cgraph, int i, ggml_cuda_ew_mat
                 o.ne1[d] = others[c]->ne[d];
                 o.nb1[d] = others[c]->nb[d];
             }
-            m.others[m.n_others++] = others[c];
         }
     }
     m.last = last;
-    m.in0  = in0;
-    m.out  = out;
     return true;
 }
 
@@ -6624,15 +6624,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // halo-hybrid: a run of supported nodes as one resident kernel (persist.cu, GGML_CUDA_PERSIST=1)
-                {
-                    const int consumed = ggml_cuda_persist_region(*cuda_ctx, cgraph, i);
-                    if (consumed > 0) {
-                        i += consumed - 1;
-                        continue;
-                    }
-                }
-
                 const bool optimer_on = ggml_cuda_optimer::enabled() && !use_cuda_graph;
                 if (optimer_on) { auto & t = ggml_cuda_optimer_for(cuda_ctx->device); t.begin(cuda_ctx->stream(), ggml_cuda_optimer_key(node, 0)); t.set_bytes(cgraph, i, 0); }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
@@ -6840,7 +6831,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-    ggml_cuda_persist_debug_after(*cuda_ctx);
 
     return GGML_STATUS_SUCCESS;
 }

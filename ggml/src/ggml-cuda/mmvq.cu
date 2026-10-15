@@ -2654,7 +2654,9 @@ static __global__ void mul_mat_vec_q_moe_tail(const mmvq_moe_tail_args a) {
     const float sig = 1.0f / (1.0f + expf(-gv));
     float r;
     {
+#if defined(__clang__)
 #pragma clang fp contract(off)
+#endif
         const float gated = part[a.n_used][i] * sig;
         r = sum + gated;
     }

@@ -29,14 +29,10 @@ struct ggml_cuda_ew_chain {
     int64_t          ne[4];
 };
 
-// what the matcher found: the chain itself plus the tensors it touches (persist.cu needs them for hazard ranges)
+// what the matcher found: the chain and the last graph node it consumes
 struct ggml_cuda_ew_match {
     ggml_cuda_ew_chain  ch;
-    int                 last;                          // last graph node index the chain consumes
-    const ggml_tensor * in0;
-    const ggml_tensor * out;
-    const ggml_tensor * others[GGML_CUDA_EW_MAX_OPS];  // broadcast operands, in chain order
-    int                 n_others;
+    int                 last;
 };
 
 // true when cgraph->nodes[i] starts a chain of at least two element-wise nodes (ggml-cuda.cu)

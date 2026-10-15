@@ -137,6 +137,7 @@ __device__ __forceinline__ std::uint32_t SpreadHighBits(std::uint32_t bits) {
   return (__umul24(bits, 0x00204081U) & 0x01010101U) << 4U;
 }
 
+#ifdef GGML_MMID_F16_DEVICE
 /// Four halves from four code bytes: 1024 + q as F16, minus `magic` (1024,
 /// or 1152 for a signed byte carried as q + 128), then the affine.
 __device__ __forceinline__ void CodesToHalves(std::uint32_t codes,
@@ -151,8 +152,6 @@ __device__ __forceinline__ void CodesToHalves(std::uint32_t codes,
   hi = __hfma2(__hadd2(__builtin_bit_cast(__half2, p1), magic), scale2, bias2);
 }
 
-
-#ifdef GGML_MMID_F16_DEVICE
 template<WeightType kType, int BM, int BN, int BK, bool kPair = false>
 __launch_bounds__(256) __global__
     void RoutedF16GEMMKernel(const void* __restrict__ w,

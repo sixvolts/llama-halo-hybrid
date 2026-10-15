@@ -1213,6 +1213,8 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .event_record            = */ ggml_backend_rpc_event_record,
     /* .event_wait              = */ ggml_backend_rpc_event_wait,
     /* .graph_optimize          = */ NULL,
+    /* .cpy_tensor_async_nowait = */ NULL,
+    /* .cpy_tensors_async_nowait = */ NULL,
 };
 
 ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
@@ -1249,7 +1251,7 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
 // halo-hybrid V3: the scratch buffer type of an endpoint (composite mode). Same endpoint/device 0 as the default
 // buft (so supports_buft and the buffer interface are unchanged), distinct name, and allocations ask the server for
 // scratch placement. Exposed to llama through the registry proc address "ggml_backend_dev_scratch_buffer_type".
-ggml_backend_buffer_type_t ggml_backend_rpc_scratch_buffer_type(const char * endpoint) {
+static ggml_backend_buffer_type_t ggml_backend_rpc_scratch_buffer_type(const char * endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     std::string buft_name = "RPC0[" + std::string(endpoint) + "]#scratch";
@@ -2228,7 +2230,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
 // MoE GEMV; gone with serialized kernels or GGML_SCHED_IGPU_EVENTS=0; root cause open, 2026-09-28). The server step
 // measured the same without them (90-92 ms). An explicit GGML_SCHED_IGPU_EVENTS in the environment still wins.
 static void rpc_server_sched_defaults() {
+#ifdef _WIN32
+    if (getenv("GGML_SCHED_IGPU_EVENTS") == nullptr) {
+        _putenv_s("GGML_SCHED_IGPU_EVENTS", "0");
+    }
+#else
     setenv("GGML_SCHED_IGPU_EVENTS", "0", /*overwrite=*/ 0);
+#endif
 }
 
 bool rpc_server::run_sched_graph(stored_graph & sg, bool fresh) {
