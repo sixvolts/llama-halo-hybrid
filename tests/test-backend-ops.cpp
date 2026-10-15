@@ -3811,7 +3811,7 @@ struct test_mul_mat_shared : public test_case {
     }
 };
 
-// halo-hybrid: SCALE -> SILU -> MUL_MAT(q8_0) on a short activation: the GEMV applies the prologue itself (f32act.cu)
+// halo-hybrid: SCALE -> SILU -> MUL_MAT(q8_0) on a short activation (the fused scale+silu feeding a GEMV)
 struct test_scale_silu_mm : public test_case {
     const ggml_type type;
     const int64_t m, n, k;
