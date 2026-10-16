@@ -2734,24 +2734,6 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
-    // halo-hybrid: the whole hyper-connection prologue of a sublayer as one op (decode, few tokens):
-    //   flat  = x[:, :, t] as a vector of hc*n_embd (stream-major)
-    //   xn    = rms_norm(flat, eps_norm)
-    //   mixes = hc_fn . xn                                 [(2 + hc)*hc]
-    //   pre   = sigmoid(mixes[0:hc]*scale[0] + base[0:hc]) + eps_hc
-    //   post  = 2*sigmoid(mixes[hc:2hc]*scale[1] + base[hc:2hc])
-    //   comb  = sinkhorn(mixes[2hc:]*scale[2] + base[2hc:], eps_hc, n_iter)   (as ggml_dsv4_hc_comb)
-    //   out   = sum_h pre[h]*x[:, h, t]                    (as ggml_dsv4_hc_pre)
-    // x [n_embd, hc, n_tokens] f32; hc_fn [hc*n_embd, (2+hc)*hc] (f32 or q8_0); scale [>=3]; base [(2+hc)*hc]
-    // result [n_embd + hc + hc*hc, n_tokens] f32: per token [out | post | comb(idst + hc*isrc)]
-    // halo-hybrid: build an attention mask on the device instead of uploading [n_kv, n_tokens] halves per ubatch.
-    //   pos_kv  [n_kv]     i32  position of the cell, -1 when empty or another sequence
-    //   pos_q   [n_tokens] i32  query positions
-    //   mode 0 (KQ):   keep iff pos_kv[j] <= pos_q[i]                          (causal, one sequence, no SWA)
-    //   mode 1 (SEL):  keep iff visible && pos_kv[j] >= tail_start[i]          (GLM-5-Next indexer pool tail)
-    //   mode 2 (CAND): keep iff visible && (pool_of[j] < bo_vis[i] || pos_kv[j] >= tail_start[i])
-    // pool_of [n_kv] i32 (-1 = no pool), tail_start / bo_vis [n_tokens] i32; only read by modes 1-2 (NULL for mode 0)
-    // result [n_kv, n_tokens] of `type` (F16 or F32): 0 keeps, -INFINITY drops. Comparisons on -1 are unsigned, as on the host.
     // halo-hybrid: the cell-level top-k of qwen4exp's block-sparse attention (QSA), computed from block scores.
     // Layout: cell j holds position j (one sequence, no holes); block b is cells [b*ratio, b*ratio + ratio).
     // For query row i (position q = q_pos[i]) cell j is scored iff j < n_bid*ratio and j <= q, with value
@@ -2780,6 +2762,14 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * bias);
 
+    // halo-hybrid: build an attention mask on the device instead of uploading [n_kv, n_tokens] halves per ubatch.
+    //   pos_kv  [n_kv]     i32  position of the cell, -1 when empty or another sequence
+    //   pos_q   [n_tokens] i32  query positions
+    //   mode 0 (KQ):   keep iff pos_kv[j] <= pos_q[i]                          (causal, one sequence, no SWA)
+    //   mode 1 (SEL):  keep iff visible && pos_kv[j] >= tail_start[i]          (GLM-5-Next indexer pool tail)
+    //   mode 2 (CAND): keep iff visible && (pool_of[j] < bo_vis[i] || pos_kv[j] >= tail_start[i])
+    // pool_of [n_kv] i32 (-1 = no pool), tail_start / bo_vis [n_tokens] i32; only read by modes 1-2 (NULL for mode 0)
+    // result [n_kv, n_tokens] of `type` (F16 or F32): 0 keeps, -INFINITY drops. Comparisons on -1 are unsigned, as on the host.
     GGML_API struct ggml_tensor * ggml_kq_mask_build(
             struct ggml_context * ctx,
             struct ggml_tensor  * pos_kv,
@@ -2790,6 +2780,16 @@ extern "C" {
             int32_t               mode,
             enum ggml_type        type);
 
+    // halo-hybrid: the whole hyper-connection prologue of a sublayer as one op (decode, few tokens):
+    //   flat  = x[:, :, t] as a vector of hc*n_embd (stream-major)
+    //   xn    = rms_norm(flat, eps_norm)
+    //   mixes = hc_fn . xn                                 [(2 + hc)*hc]
+    //   pre   = sigmoid(mixes[0:hc]*scale[0] + base[0:hc]) + eps_hc
+    //   post  = 2*sigmoid(mixes[hc:2hc]*scale[1] + base[hc:2hc])
+    //   comb  = sinkhorn(mixes[2hc:]*scale[2] + base[2hc:], eps_hc, n_iter)   (as ggml_dsv4_hc_comb)
+    //   out   = sum_h pre[h]*x[:, h, t]                    (as ggml_dsv4_hc_pre)
+    // x [n_embd, hc, n_tokens] f32; hc_fn [hc*n_embd, (2+hc)*hc] (f32 or q8_0); scale [>=3]; base [(2+hc)*hc]
+    // result [n_embd + hc + hc*hc, n_tokens] f32: per token [out | post | comb(idst + hc*isrc)]
     GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
