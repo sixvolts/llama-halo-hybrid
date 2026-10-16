@@ -6671,7 +6671,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
-#endif // USE_CUDA_GRAPH
 
     {   // halo-hybrid (rev/decode-profile): GGML_CUDA_GRAPH_STATS=<n> prints, per device every n graph computes, how many
         // were replayed, captured or run directly, and the size of the graph cache
@@ -6687,6 +6686,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+#endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

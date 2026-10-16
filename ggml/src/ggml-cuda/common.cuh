@@ -1488,21 +1488,6 @@ struct ggml_backend_cuda_context {
         const ggml_tensor * rows = nullptr; // the deferred GGML_OP_GET_ROWS
     } gdn_state_gather[GDN_STATE_GATHER_SLOTS];
 
-#ifdef USE_CUDA_GRAPH
-    // Map from graph key to cuda_graph - allows multiple graphs per context when the
-    // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same
-    // split is called with different tensor shapes (e.g. a speculative verify batch)
-    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
-
-    // a cuda graph instance is only valid for the shapes it captured, so a caller that
-    // alternates shapes needs one instance per shape to stay on the graph path
-    // halo-hybrid: a hybrid decode step submits ~76 card splits (plus the draft's), so the old 64-entry LRU evicted
-    // every key before its reuse (4% replays). Default 256; GGML_CUDA_MAX_GRAPHS=<n> overrides the per-device size.
-    static size_t max_cuda_graphs_n() {
-        static const size_t n = (size_t) std::max<int64_t>(1, ggml_env_int("GGML_CUDA_MAX_GRAPHS", 256));
-        return n;
-    }
-
     // q8_1 side copies of single-row f32 activations, written by the fused kernels in hc.cu in the
     // same launch that produces the f32 value, and consumed by mul_mat_vec_q instead of a separate
     // quantize launch. Keyed by data pointer, validated against the producing tensor; reset per
@@ -1530,6 +1515,21 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * mmq_side_prod = nullptr;   // producing tensor (the matmul reads a reshape of it)
     int64_t             mmq_side_ne0  = 0;          // K of the consumer (ne10, unpadded == padded)
     int64_t             mmq_side_ne1  = 0;          // tokens
+
+#ifdef USE_CUDA_GRAPH
+    // Map from graph key to cuda_graph - allows multiple graphs per context when the
+    // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same
+    // split is called with different tensor shapes (e.g. a speculative verify batch)
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    // a cuda graph instance is only valid for the shapes it captured, so a caller that
+    // alternates shapes needs one instance per shape to stay on the graph path
+    // halo-hybrid: a hybrid decode step submits ~76 card splits (plus the draft's), so the old 64-entry LRU evicted
+    // every key before its reuse (4% replays). Default 256; GGML_CUDA_MAX_GRAPHS=<n> overrides the per-device size.
+    static size_t max_cuda_graphs_n() {
+        static const size_t n = (size_t) std::max<int64_t>(1, ggml_env_int("GGML_CUDA_MAX_GRAPHS", 256));
+        return n;
+    }
 
     int64_t last_graph_eviction_sweep = 0;
 

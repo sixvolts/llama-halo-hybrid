@@ -1,8 +1,8 @@
 name: halo-ci
 
 # Checks for llama-halo-hybrid on GitHub-hosted runners: the CPU build with warnings as errors plus its tests, the
-# server tests of this tree's behaviour, and compile-only HIP, CUDA and Vulkan builds. Nothing here needs a GPU; the
-# GPU suites are tests/halo.
+# server tests of this tree's behaviour, compile-only HIP (also with CUDA graphs off; the other RDNA targets weekly),
+# CUDA and Vulkan builds, and a lint of this tree's own Python. Nothing here needs a GPU; the GPU suites are tests/halo.
 
 on:
   push:
@@ -11,6 +11,8 @@ on:
   pull_request:
     paths-ignore: ['**/*.md', 'halo-cookbook/**', 'docs/**', 'tests/halo/**']
   workflow_dispatch:
+  schedule:
+    - cron: '17 5 * * 1'   # weekly: everything, plus the HIP targets no push builds (hip-other)
 
 permissions:
   contents: read
@@ -67,6 +69,26 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON "-DGPU_TARGETS=gfx1151;gfx1201" \
             -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang -DGGML_RPC=ON -DGGML_NATIVE=OFF
           cmake --build build -j 4 --target ggml-hip llama-server ggml-rpc-server
+      - name: Build with CUDA graphs off (gfx1151)
+        run: |
+          cmake -S . -B build-nographs -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 \
+            -DGGML_HIP_GRAPHS=OFF -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang -DGGML_NATIVE=OFF
+          cmake --build build-nographs -j 4 --target ggml-hip
+
+  hip-other:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    container: rocm/dev-ubuntu-24.04:7.2.1-complete
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Dependencies
+        run: apt-get update && apt-get install -y ninja-build cmake git libssl-dev
+      - name: Build (gfx1100, gfx1101, gfx1030)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON "-DGPU_TARGETS=gfx1100;gfx1101;gfx1030" \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang -DGGML_RPC=ON -DGGML_NATIVE=OFF
+          cmake --build build -j 4 --target ggml-hip llama-server
 
   cuda:
     runs-on: ubuntu-24.04
@@ -93,3 +115,15 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_NATIVE=OFF
           cmake --build build -j 4 --target ggml-vulkan llama-server
+
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Dependencies
+        run: python3 -m venv venv && venv/bin/pip install flake8 pytest numpy pyyaml
+      - name: flake8 (this tree's own Python)
+        run: venv/bin/flake8 tests/halo scripts/halo-hybrid conversion/glm5next.py conversion/qwen4exp.py
+      - name: gguf-py tests
+        run: cd gguf-py && PYTHONPATH=. ../venv/bin/python -m pytest -q tests
