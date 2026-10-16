@@ -1689,7 +1689,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
         {"--prefill-lanes"}, "N",
-        "halo-hybrid: two-lane prefill: consecutive prompt ubatches run on two schedulers so a card and the APU (or two "
+        "two-lane prefill: consecutive prompt ubatches run on two schedulers so a card and the APU (or two "
         "devices) overlap; needs two GPU devices and -b at least twice -ub. 1 = off, 2 = two lanes; with an RPC device "
         "2 runs the rolling pipeline and 4 the paired one. Sets LLAMA_PREFILL_LANES for the library (default: off)",
         [](common_params &, int value) {
@@ -1701,7 +1701,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_PREFILL_LANES"));
     add_opt(common_arg(
         {"--qsa-chunk-mb"}, "N",
-        "halo-hybrid: build the QSA indexer's prefill scratch (Qwen3.8 and other qwen4exp models) in chunks of at most N "
+        "build the QSA indexer's prefill scratch (Qwen3.8 and other qwen4exp models) in chunks of at most N "
         "MiB per tensor, for ubatches that hold one sequence. Lower it for very long contexts on a small card "
         "(256 for 256K on 32 GB). 0 = no chunking. Sets LLAMA_QSA_CHUNK_MB for the library (default: 2048)",
         [](common_params &, int value) {
@@ -1746,7 +1746,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--checkpoint-min-new"}, "N",
-        string_format("halo-hybrid: skip the checkpoint (and the prompt split) at the last user message unless at least N new tokens follow it; a short chat turn then runs as one batch with one checkpoint (default: %d, 0 = always)", params.checkpoint_min_new),
+        string_format("for models that use context checkpoints (see -ctxcp): skip the checkpoint, and the prompt split, at the "
+                      "last user message unless at least N new tokens follow it, so a short chat turn runs as one batch "
+                      "with one checkpoint (default: %d, 0 = always)", params.checkpoint_min_new),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("checkpoint-min-new must be non-negative");
@@ -4198,7 +4200,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
         {"--spec-draft-n-max-sampled"}, "N",
-        string_format("halo-hybrid: sampled (T > 0) requests with an MTP draft draft at most N tokens; with rejection "
+        string_format("sampled (T > 0) requests with an MTP draft draft at most N tokens; with rejection "
                       "sampling the third draft token costs more verify time than it saves (default: %d, 0 = no cap)",
                       params.speculative.draft.n_max_sampled),
         [](common_params & params, int value) {
@@ -4210,7 +4212,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_SPEC_NMAX_SAMPLED"));
     add_opt(common_arg(
         {"--spec-draft-ubatch-size"}, "N",
-        string_format("halo-hybrid: physical batch size of the draft context; the draft otherwise inherits -ub and sizes "
+        string_format("physical batch size of the draft context; the draft otherwise inherits -ub and sizes "
                       "its compute buffer for it although it runs one layer. Not for block drafts (DFlash, DSpark) "
                       "(default: %d = the target's -ub)", params.speculative.draft.n_ubatch),
         [](common_params & params, int value) {
