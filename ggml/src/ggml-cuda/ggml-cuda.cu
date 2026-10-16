@@ -5566,7 +5566,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // both rows in the same wave and applies the GLU on the way out. Anything else next to a GLU is
                 // left to the dedicated fused path.
                 static const bool no_pair = ggml_env_flag("GGML_CUDA_NO_GEMV_PAIR", false);
-                if (!no_pair && j + 2 < cgraph->n_nodes && cgraph->nodes[j + 2]->op == GGML_OP_GLU && eligible(cgraph->nodes[j + 1], false) &&
+                if (!no_pair && j + 2 < cgraph->n_nodes && cgraph->nodes[j + 2]->op == GGML_OP_GLU && eligible(cgraph->nodes[j + 1]) &&
                     cgraph->nodes[j + 2]->src[0] == t && cgraph->nodes[j + 2]->src[1] == cgraph->nodes[j + 1] &&
                     ggml_is_quantized(t->src[0]->type) && cgraph->nodes[j + 1]->src[0]->type == t->src[0]->type &&
                     ggml_get_op_params_i32(cgraph->nodes[j + 2], 1) == 0 &&
