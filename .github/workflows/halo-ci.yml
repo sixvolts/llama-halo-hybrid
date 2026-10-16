@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
       - name: Build (warnings as errors)
@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 240
     container: rocm/dev-ubuntu-24.04:7.2.1-complete
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Dependencies
         run: apt-get update && apt-get install -y ninja-build cmake git libssl-dev
       - name: Build (gfx1151, gfx1201)
@@ -53,7 +53,7 @@ jobs:
     timeout-minutes: 240
     container: nvidia/cuda:12.8.1-devel-ubuntu24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Dependencies
         run: apt-get update && apt-get install -y ninja-build cmake git libssl-dev
       - name: Build (compile only)
@@ -66,7 +66,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev libvulkan-dev glslc spirv-headers
       - name: Build (compile only)
