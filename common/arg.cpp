@@ -1691,10 +1691,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--prefill-lanes"}, "N",
         "two-lane prefill: consecutive prompt ubatches run on two schedulers so a card and the APU (or two "
         "devices) overlap; needs two GPU devices and -b at least twice -ub. 1 = off, 2 = two lanes; with an RPC device "
-        "2 runs the rolling pipeline and 4 the paired one. Sets LLAMA_PREFILL_LANES for the library (default: off)",
+        "2 runs the rolling pipeline and 4 the paired one (0 or 1 = off). Sets LLAMA_PREFILL_LANES for the library "
+        "(default: off)",
         [](common_params &, int value) {
-            if (value < 1) {
-                throw std::invalid_argument("prefill-lanes must be at least 1");
+            if (value < 0) {
+                throw std::invalid_argument("prefill-lanes must be non-negative");
             }
             common_set_env("LLAMA_PREFILL_LANES", std::to_string(value));
         }

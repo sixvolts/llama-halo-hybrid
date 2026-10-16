@@ -5568,7 +5568,8 @@ struct test_rwkv_wkv6 : public test_case {
 // halo-hybrid: the HIP bf16 chunked GDN prefill (on by default) runs the cases with a scalar gate, head size 128 and at
 // least a chunk-path width; its NMSE against the CPU is ~1e-5 (a cross-sequence scratch overlap showed up as
 // 1e-4..1e-3). Those cases get 3e-5 on ROCm devices whatever GGML_CUDA_GDN_BF16 says, so the tolerance follows the
-// backend under test, not the environment; TBO_GDN_NMSE overrides it for every case.
+// backend under test, not the environment (a run with GGML_CUDA_GDN_BF16=0 checks the fp32 path at 3e-5 too: set
+// TBO_GDN_NMSE=1e-7 for the tight bound); TBO_GDN_NMSE overrides it for every case.
 static double gdn_max_nmse(ggml_backend_t backend, int64_t head_size, bool kda, int64_t n_seq_tokens, double def) {
     if (const char * e = getenv("TBO_GDN_NMSE")) {
         return atof(e);

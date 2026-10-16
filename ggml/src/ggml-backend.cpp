@@ -2594,7 +2594,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 // it that way, and every read of a must precede b's writes the same way. Per whole cache tensor (conservative). Returns
 // the number of violations, logging the first n_log.
 // The pair guard's per-pair lines are debug output unless GGML_SCHED_PAIR_DEBUG is set (then warnings, as the
-// tests/halo scheduler checks parse them: keep their text); a serialised pair logs one INFO line per process.
+// tests/halo scheduler checks parse them: keep their text); the first serialised pair logs one warning per process
+// (llama-server hides library INFO lines by default, and a lost overlap costs prefill speed).
 static enum ggml_log_level ggml_backend_sched_pair_log_level(void) {
     static const bool pair_debug = ggml_env_flag("GGML_SCHED_PAIR_DEBUG", false);
     return pair_debug ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_DEBUG;
@@ -2766,7 +2767,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
             static bool told = false;
             if (!told) {
                 told = true;
-                GGML_LOG_INFO("%s: a prefill lane pair ran one lane after the other (%s), so its devices did not overlap; "
+                GGML_LOG_WARN("%s: a prefill lane pair ran one lane after the other (%s), so its devices did not overlap; "
                     "GGML_SCHED_PAIR_DEBUG=1 logs every pair\n", __func__, refused ? "cross-backend cache hazards" : "the split structures differ");  // (not the parsed texts)
             }
             static int n_logged = 0;

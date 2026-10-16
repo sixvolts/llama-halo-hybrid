@@ -127,8 +127,9 @@ def check_group(name, results, problems):
 
 
 def mode_base(a):
-    # plain rpc-server and a composite one (GGML_RPC_COMPOSITE=1 on both sides: the server schedules its part of the
-    # graph itself), each on the APU behind a loopback port; the composite cases also run the paired four-lane pipeline
+    # plain rpc-server and a composite one (GGML_RPC_COMPOSITE=1 on the client: the server schedules its part of the
+    # graph itself; the server's environment gets it too, harmlessly), each on the APU behind a loopback port; the
+    # composite cases also run the paired four-lane pipeline
     problems = []
     composite = {'GGML_RPC_COMPOSITE': '1'}
     srv, port = start_server(a, 'ROCm0', 'plain')

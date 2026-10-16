@@ -6,7 +6,9 @@ numbers were measured with: a normal run sets nothing from this page except the 
 
 **Values.** A switch (on/off) is off for `0`, `false`, `off`, `no` or an empty value, and on for anything else; unset
 means its default. A number must be a whole integer (or a float where noted); anything else is ignored with a
-warning and the default is used. Each process reads a switch once, at first use.
+warning and the default is used. Each process reads a switch once, at first use. The environment names of the
+flags below are read by the argument parser of the llama.cpp tools instead, like the flags: there a bad value stops
+the program with an error.
 
 **Startup line.** `llama-server` prints every `GGML_*` and `LLAMA_*` variable set in its environment
 (`environment: ...`), so a bug report carries them and a typo shows up as an unknown name. `LLAMA_ARG_*` variables
@@ -27,12 +29,14 @@ the host whose device runs the kernel.
 | `--spec-draft-n-max-sampled N` | `LLAMA_SPEC_NMAX_SAMPLED` | 2 | Sampled (T > 0) requests with an MTP draft draft at most N tokens; greedy requests use `--spec-draft-n-max`. 0 = no cap. |
 | `--checkpoint-min-new N` | `LLAMA_ARG_CHECKPOINT_MIN_NEW` | see `--help` | Skip the checkpoint (and the prompt split) at the last user message unless at least N new tokens follow it, so a short chat turn runs as one batch with one checkpoint. Models that use context checkpoints only. |
 
-The flags set the environment variable of the same row, so either form works and the startup line shows it.
+Either form works. `--prefill-lanes` and `--qsa-chunk-mb` set their environment variable for the library, so the
+startup line shows them; the two draft settings and `--checkpoint-min-new` are parameters of the server and are not
+on that line.
 
 | Environment | Default | What |
 |---|---|---|
 | `LLAMA_ASYNC_INPUTS=1` | off | Stream-ordered host input copies without the second lane (GLM-5.3 over RPC: its sparse-attention pool inputs are read by dozens of splits per token). |
-| `GGML_RPC_COMPOSITE=1` | off | A multi-device `rpc-server` schedules its half of the graph itself ([multi-machine.md](multi-machine.md)). Set on the client and the server. |
+| `GGML_RPC_COMPOSITE=1` | off | A multi-device `rpc-server` schedules its half of the graph itself ([multi-machine.md](multi-machine.md)). Set on the client (the server needs nothing). |
 | `LLAMA_UBATCH_TAPER=N` | 0 | Shape the first and last ubatches of a prompt so a pipeline fills sooner: 1 = half a ubatch first and an equal final pair, 2 = equal final pair only, 3 = partial first ubatch. |
 | `LLAMA_MTP_EARLY_MIN=N` | 256 | The MTP draft ingests a prompt per target ubatch, inside the target's prefill, for prompts of at least N tokens. 0 = after the prefill, as upstream. |
 | `GGML_CUDA_ALLOW_MIXED_GENERATIONS=1` | off | Run with discrete GPUs of different generations visible (refused by default: untested). |
@@ -155,7 +159,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 
 | Switch | What it turns off |
 |---|---|
-| `LLAMA_SPEC_RS=0` | lossless rejection sampling for sampled MTP requests (back to comparing tokens) |
+| `LLAMA_SPEC_RS=0` | lossless rejection sampling of drafts for sampled (T > 0) requests (back to comparing tokens) |
 | `LLAMA_MTP_INGEST_FULL=1` | the K/V-only draft ingest (back to full attention for ingest batches) |
 | `LLAMA_SERVER_SLOT_CONTIG=0` | choosing idle slots that keep the busy ones contiguous (back to similarity / LRU) |
 | `LLAMA_DFLASH_SWA_BIDIR=1` | causal sliding-window layers in the DFlash drafter (back to all-bidirectional) |

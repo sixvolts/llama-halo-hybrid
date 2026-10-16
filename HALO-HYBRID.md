@@ -119,7 +119,7 @@ leaves it on.
 
 | What | Off switch |
 |---|---|
-| Sampled requests (T > 0) verify MTP drafts with lossless rejection sampling, so sampled output follows the target's distribution. Greedy requests compare tokens. | `LLAMA_SPEC_RS=0` |
+| Sampled requests (T > 0) verify drafts (MTP or a draft model) with lossless rejection sampling, so sampled output follows the target's distribution. Greedy requests compare tokens. | `LLAMA_SPEC_RS=0` |
 | Sampled MTP requests draft at most 2 tokens; greedy ones use `--spec-draft-n-max`. | `--spec-draft-n-max-sampled 0` (no cap) |
 | The draft ingests a long prompt per target ubatch, inside the target's prefill, instead of once after it. | `LLAMA_MTP_EARLY_MIN=0`, `LLAMA_MTP_INGEST_DEFER=0` |
 
