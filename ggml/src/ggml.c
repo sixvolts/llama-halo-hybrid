@@ -1100,10 +1100,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
 
+    // halo-hybrid ops: begin
     "DSV4_HC_MIX",
     "KQ_MASK_BUILD",
     "QSA_TOP_K",
     "QSA_HEAD_SUM",
+    // halo-hybrid ops: end
 };
 
 static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
@@ -1220,10 +1222,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
 
+    // halo-hybrid ops: begin
     "dsv4_hc_mix(x, hc_fn, scale, base)",
     "kq_mask_build(pos_kv, pos_q, pool_of, tail_start, bo_vis)",
     "qsa_top_k(score, q_pos, n_bid)",
     "qsa_head_sum(x, bias)",
+    // halo-hybrid ops: end
 };
 
 static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");

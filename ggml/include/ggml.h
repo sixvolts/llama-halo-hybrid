@@ -601,10 +601,13 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        GGML_OP_DSV4_HC_MIX,   // halo-hybrid: appended last so the ids above stay wire-stable
-        GGML_OP_KQ_MASK_BUILD, // halo-hybrid (2026-09-23): masks built on the device from per-cell/per-query ints
-        GGML_OP_QSA_TOP_K,     // halo-hybrid (2026-09-28): block-level top-k of the qwen4exp QSA indexer
-        GGML_OP_QSA_HEAD_SUM,  // halo-hybrid (2026-09-30): the QSA indexer's rectified head sum (+ bias) in one pass
+        // halo-hybrid ops: begin. Appended after upstream's so their ids stay as upstream has them; a new upstream op
+        // goes above this block (and changes these ids: bump the RPC protocol, see UPSTREAM.md)
+        GGML_OP_DSV4_HC_MIX,   // the hyper-connection prologue of a sublayer in one op
+        GGML_OP_KQ_MASK_BUILD, // attention masks built on the device from per-cell / per-query ints
+        GGML_OP_QSA_TOP_K,     // block-level top-k of the qwen4exp QSA indexer
+        GGML_OP_QSA_HEAD_SUM,  // the QSA indexer's rectified head sum (+ bias) in one pass
+        // halo-hybrid ops: end
 
         GGML_OP_COUNT,
     };

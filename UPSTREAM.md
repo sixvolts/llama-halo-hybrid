@@ -61,11 +61,19 @@ and summarised in a row below. Upstream pull requests are not opened from this t
 10. Update `UPSTREAM_BASE` in `tests/halo/lib/env_check.py` and the base row above; run `tests/halo` base full and the
     GPU suites before the merge lands on `main`.
 
+## Markers
+
+In upstream's files a fork hunk carries a `// halo-hybrid: why` comment, and fork entries in upstream's enums and
+tables sit between `// halo-hybrid ...: begin` and `// halo-hybrid ...: end` lines (the op enum and its name tables,
+the scheduler declarations in `ggml-backend.h`). Files only this tree has need no markers. Markers help reading; the
+diff against the base is what counts.
+
 ## Adding a fork op
 
-A new `GGML_OP_*`: add it at the end of the enum's `halo-hybrid` block, give it a CPU implementation (the reference
-for test-backend-ops), a `supports_op` answer on every backend that can see it (RPC included: the server answers),
-test-backend-ops cases, and bump the RPC protocol (the handshake compares `GGML_OP_COUNT`).
+A new `GGML_OP_*`: add it at the end of the enum's `halo-hybrid ops` block and of the two name tables in `ggml.c`,
+give it a CPU implementation (the reference for test-backend-ops), a `supports_op` answer on every backend that can
+see it (RPC included: the server answers), test-backend-ops cases, and bump the RPC protocol (the handshake compares
+`GGML_OP_COUNT`).
 
 ## Version strings
 
