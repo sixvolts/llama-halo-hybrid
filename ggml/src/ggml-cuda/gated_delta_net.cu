@@ -968,7 +968,7 @@ static void gdn_perturb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static const float eps = [] {
         const float e = (float) ggml_env_float("GGML_CUDA_GDN_PERTURB", 0.0f);
         if (e != 0.0f) {
-            GGML_LOG_WARN("GGML_CUDA_GDN_PERTURB=%g scales the GDN value input to probe sensitivity; output is wrong on purpose\n", e);
+            GGML_LOG_WARN("GGML_CUDA_GDN_PERTURB=%g scales every GDN output by 1 + %g to probe sensitivity; output is wrong on purpose\n", e, e);
         }
         return e;
     }();
