@@ -2230,6 +2230,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
 // MoE GEMV; gone with serialized kernels or GGML_SCHED_IGPU_EVENTS=0; root cause open, 2026-09-28). The server step
 // measured the same without them (90-92 ms). An explicit GGML_SCHED_IGPU_EVENTS in the environment still wins.
 static void rpc_server_sched_defaults() {
+    if (getenv("GGML_SCHED_IGPU_EVENTS") != nullptr) {
+        ggml_env_flag_unsafe("GGML_SCHED_IGPU_EVENTS", false,
+            "turns on the APU split events that faulted the rpc-server's scheduler (GLM-5.3 two-host, 2026-09-28)");
+    }
 #ifdef _WIN32
     if (getenv("GGML_SCHED_IGPU_EVENTS") == nullptr) {
         _putenv_s("GGML_SCHED_IGPU_EVENTS", "0");
@@ -2859,7 +2863,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 // than 4 x 4096, 2026-10-09) is placed elsewhere instead of aborting the server. Answers are cached by the op's shape and
 // its sources' shapes and buffers. GGML_RPC_NO_SUPPORTS_OP=1 assumes every op is supported (unsafe, for A/B).
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    static const bool disabled = ggml_env_flag("GGML_RPC_NO_SUPPORTS_OP", false);
+    static const bool disabled = ggml_env_flag_unsafe("GGML_RPC_NO_SUPPORTS_OP", false,
+        "assumes the rpc-server supports every op, so an op its kernels cannot run aborts the server");
     if (disabled) {
         return true;
     }

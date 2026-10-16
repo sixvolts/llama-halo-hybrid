@@ -24,6 +24,10 @@
 #include <string>
 #include <unordered_map>
 
+// halo-hybrid: what GGML_SCHED_NO_OUTPUT_EVENTS=1 re-opens (read in decode and encode)
+static const char * unsafe_no_out_ev =
+    "lets the next graph overwrite output tensors whose reads are still in flight (MTP drafts with several sequences)";
+
 //
 // llama_context
 //
@@ -2010,7 +2014,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // halo-hybrid: as in decode's extract_outputs - the reads above were queued after the split events were recorded
     {
-        static const bool no_out_ev = ggml_env_flag("GGML_SCHED_NO_OUTPUT_EVENTS", false);
+        static const bool no_out_ev = ggml_env_flag_unsafe("GGML_SCHED_NO_OUTPUT_EVENTS", false, unsafe_no_out_ev);
         if (!no_out_ev) {
             ggml_backend_sched_record_output_events(sched.get());
         }
@@ -2429,7 +2433,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // their reads were still in flight (MTP drafts with several sequences read hidden-state floats as token ids).
         // Re-record the events behind the reads. GGML_SCHED_NO_OUTPUT_EVENTS=1 restores the old behaviour.
         {
-            static const bool no_out_ev = ggml_env_flag("GGML_SCHED_NO_OUTPUT_EVENTS", false);
+            static const bool no_out_ev = ggml_env_flag_unsafe("GGML_SCHED_NO_OUTPUT_EVENTS", false, unsafe_no_out_ev);
             if (!no_out_ev) {
                 ggml_backend_sched_record_output_events(sch);
             }

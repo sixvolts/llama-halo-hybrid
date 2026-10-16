@@ -19,6 +19,10 @@ extern "C" {
 
 GGML_API bool    ggml_env_flag (const char * name, bool    def);
 GGML_API int64_t ggml_env_int  (const char * name, int64_t def);
+
+// as ggml_env_flag, for a diagnostic switch whose non-default value re-opens a fixed bug: warns once, naming the risk
+// ("restores ...") when the value differs from def
+GGML_API bool    ggml_env_flag_unsafe(const char * name, bool def, const char * risk);
 GGML_API double  ggml_env_float(const char * name, double  def);
 
 // every GGML_* and LLAMA_* variable set in the environment, as " NAME=value ..." (empty when none): LLAMA_ARG_* is left

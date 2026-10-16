@@ -18,7 +18,7 @@ extern char ** environ;
 #endif
 
 static std::mutex            g_env_mutex;
-static std::set<std::string> g_env_warned;   // names whose value could not be parsed
+static std::set<std::string> g_env_warned;   // names already warned about (unparsable value, unsafe switch)
 
 static const char * env_get(const char * name) {
     return getenv(name);
@@ -51,6 +51,17 @@ bool ggml_env_flag(const char * name, bool def) {
         }
     }
     return true;
+}
+
+bool ggml_env_flag_unsafe(const char * name, bool def, const char * risk) {
+    const bool v = ggml_env_flag(name, def);
+    if (v != def) {
+        std::lock_guard<std::mutex> lock(g_env_mutex);
+        if (g_env_warned.insert(std::string(name) + "#unsafe").second) {
+            GGML_LOG_WARN("%s=%s is a diagnostic switch that %s; do not use it for normal runs\n", name, env_get(name), risk);
+        }
+    }
+    return v;
 }
 
 int64_t ggml_env_int(const char * name, int64_t def) {

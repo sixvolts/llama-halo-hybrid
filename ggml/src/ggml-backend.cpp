@@ -2419,7 +2419,8 @@ static enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sc
                 // reads still use (a differently allocated next graph): wait on the destination's output-read event once.
                 // Integrated-GPU destinations only, as in the copy path above: a discrete destination's reads are
                 // ordered by its own stream ahead of this graph's first split there, which every eager source depends on
-                static const bool no_eager_fence = ggml_env_flag("GGML_SCHED_NO_EAGER_FENCE", false);
+                static const bool no_eager_fence = ggml_env_flag_unsafe("GGML_SCHED_NO_EAGER_FENCE", false,
+                        "lets eager copies onto an integrated GPU overwrite memory its pending output reads still use");
                 ggml_backend_event_t out_ev = sched->out_ev[cs->backend_id][sched->out_ev_last[cs->backend_id]];
                 if (!no_eager_fence && sched->out_ev_pending[cs->backend_id] && out_ev != NULL &&
                         dst_backend->device != NULL && ggml_backend_dev_type(dst_backend->device) == GGML_BACKEND_DEVICE_TYPE_IGPU &&
