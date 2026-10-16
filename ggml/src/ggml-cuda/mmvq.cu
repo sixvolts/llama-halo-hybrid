@@ -1,4 +1,3 @@
-#define GGML_CUDA_MMVQ_RDNA35 0
 #include "mmvq.cuh"
 #include "hc.cuh"
 #include "quantize.cuh"
@@ -103,8 +102,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
     MMVQ_PARAMETERS_GB10,
-    // halo-hybrid: real RDNA2 (gfx103x). gfx1151 also uses the RDNA2 table above by default (GGML_CUDA_MMVQ_RDNA35),
-    // so the Navi21 tuning (llama-navi21-furnace 0aa20a02b, b5f65d215, 05512bb1d) gets its own id
+    // halo-hybrid: real RDNA2 (gfx103x). gfx1151 also uses the RDNA2 table above (measured against the RDNA3_0 one
+    // on the real model), so the Navi21 tuning (llama-navi21-furnace 0aa20a02b, b5f65d215, 05512bb1d) gets its own id
     MMVQ_PARAMETERS_NAVI21
 };
 
@@ -114,13 +113,7 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #elif defined(RDNA3_0)
     return MMVQ_PARAMETERS_RDNA3_0;
 #elif defined(RDNA3_5)
-    // halo-hybrid: gfx1151 fell through the RDNA2 table to nwarps = 1 (one wave per row). GGML_CUDA_MMVQ_RDNA35
-    // picks the table at build time so the choice can be measured on the real model: 0 = RDNA2 (upstream), 1 = RDNA3_0.
-#if defined(GGML_CUDA_MMVQ_RDNA35) && GGML_CUDA_MMVQ_RDNA35 == 1
-    return MMVQ_PARAMETERS_RDNA3_0;
-#else
     return MMVQ_PARAMETERS_RDNA2;
-#endif
 #elif defined(RDNA2)
     return MMVQ_PARAMETERS_NAVI21;
 #elif defined(GCN) || defined(CDNA)
@@ -142,11 +135,7 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
         return MMVQ_PARAMETERS_RDNA3_0;
     }
     if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
-#if defined(GGML_CUDA_MMVQ_RDNA35) && GGML_CUDA_MMVQ_RDNA35 == 1
-        return MMVQ_PARAMETERS_RDNA3_0;
-#else
         return MMVQ_PARAMETERS_RDNA2;
-#endif
     }
     if (GGML_CUDA_CC_IS_RDNA2(cc)) {
         return MMVQ_PARAMETERS_NAVI21;

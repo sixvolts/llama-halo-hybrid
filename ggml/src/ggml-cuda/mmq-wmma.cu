@@ -435,7 +435,7 @@ static void launch_mul_mat_q8_0_wmma(const void * W, const void * X, float * dst
     CUDA_CHECK(cudaGetLastError());
 }
 template <ggml_type WT>
-static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const int mode) {
+static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
@@ -457,29 +457,13 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     //  2048 tokens on gfx1151. The f16 rounding of the activations is the same either way.)
     static const int64_t prepass_min = ggml_env_int("GGML_CUDA_Q8_WMMA_PREPASS_MIN", (int64_t) 8 * 1024 * 1024);
     const bool prepass = M * K > prepass_min;
-    if ((mode >= 2 && mode <= 10) || (mode <= 1 && prepass)) {
+    if (prepass) {
         ggml_cuda_pool_alloc<half> x16(ctx.pool(), (size_t) N * K);
         mmqw_f32_to_f16_sat<<<(N * K + 255) / 256, 256, 0, stream>>>((const float *) src1->data, x16.get(), N * K);
-        switch (mode) {
-            case 2:  MMQW_LAUNCH16( 64, 128, 64, 2, 2, 1, 1); break;
-            case 3:  MMQW_LAUNCH16( 64,  64, 32, 2, 2, 2, 1); break;
-            case 4:  MMQW_LAUNCH16(128, 128, 32, 2, 4, 2, 1); break;
-            case 5:  MMQW_LAUNCH16( 96, 128, 64, 2, 4, 1, 1); break;
-            case 6:  MMQW_LAUNCH16(128, 128, 32, 2, 4, 2, 2); break;
-            case 7:  MMQW_LAUNCH16(128, 128, 64, 2, 4, 1, 1); break;
-            case 8:  MMQW_LAUNCH16(128, 128, 64, 2, 4, 1, 2); break;
-            case 9:  MMQW_LAUNCH16( 64, 128, 32, 2, 2, 2, 2); break;
-            case 10: MMQW_LAUNCH16( 64, 128, 64, 2, 2, 1, 1); break;
-            default: if (big) { MMQW_LAUNCH16(128, 128, 64, 2, 4, 1, 1); } else { MMQW_LAUNCH16(64, 128, 64, 2, 2, 1, 1); } break;
-        }
+        if (big) { MMQW_LAUNCH16(128, 128, 64, 2, 4, 1, 1); } else { MMQW_LAUNCH16(64, 128, 64, 2, 2, 1, 1); }
         return true;
     }
-    switch (mode) {
-        case 11: MMQW_LAUNCH32(128, 128, 64, 2, 4, 1, 1); break;
-        case 12: MMQW_LAUNCH32( 64, 128, 64, 2, 2, 1, 1); break;
-        case 13: MMQW_LAUNCH32( 64,  64, 64, 2, 2, 1, 1); break;
-        default: if (big) { MMQW_LAUNCH32(128, 128, 64, 2, 4, 1, 1); } else { MMQW_LAUNCH32(64, 128, 64, 2, 2, 1, 1); } break;
-    }
+    if (big) { MMQW_LAUNCH32(128, 128, 64, 2, 4, 1, 1); } else { MMQW_LAUNCH32(64, 128, 64, 2, 2, 1, 1); }
 #undef MMQW_LAUNCH16
 #undef MMQW_LAUNCH32
     return true;
@@ -492,8 +476,8 @@ bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_ten
     GGML_UNUSED_VARS(ctx, src0, src1, dst);
     return false;
 #else
-    // GGML_CUDA_Q8_WMMA: 0 = off (MMQ), 1 = auto (default on RDNA3; RDNA4's int8 WMMA rate keeps MMQ ahead there, so
-    // off unless asked), 2-10 fixed configs on an f16 pre-pass, 11-13 fixed configs reading f32 (tuning knobs)
+    // GGML_CUDA_Q8_WMMA: 0 = off (MMQ), any other value = on; unset: on for RDNA3, off for RDNA4 (its int8 WMMA rate
+    // keeps MMQ ahead there)
     static const int mode = (int) ggml_env_int("GGML_CUDA_Q8_WMMA", -1);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!(GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
@@ -527,10 +511,10 @@ bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_ten
         return false;
     }
     switch (src0->type) {
-        case GGML_TYPE_Q4_K: return mmqw_launch<GGML_TYPE_Q4_K>(ctx, src0, src1, dst, mode);
-        case GGML_TYPE_Q5_K: return mmqw_launch<GGML_TYPE_Q5_K>(ctx, src0, src1, dst, mode);
-        case GGML_TYPE_Q6_K: return mmqw_launch<GGML_TYPE_Q6_K>(ctx, src0, src1, dst, mode);
-        default:             return mmqw_launch<GGML_TYPE_Q8_0>(ctx, src0, src1, dst, mode);
+        case GGML_TYPE_Q4_K: return mmqw_launch<GGML_TYPE_Q4_K>(ctx, src0, src1, dst);
+        case GGML_TYPE_Q5_K: return mmqw_launch<GGML_TYPE_Q5_K>(ctx, src0, src1, dst);
+        case GGML_TYPE_Q6_K: return mmqw_launch<GGML_TYPE_Q6_K>(ctx, src0, src1, dst);
+        default:             return mmqw_launch<GGML_TYPE_Q8_0>(ctx, src0, src1, dst);
     }
 #endif
 }

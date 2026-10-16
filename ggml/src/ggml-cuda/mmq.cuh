@@ -140,14 +140,7 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0:
             return 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0 + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1:
-#if defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78)
-            // halo-hybrid experiment: a row pitch of 78 ints (== 14 mod 32) puts 16 consecutive rows on 16 distinct
-            //     bank groups for 8-byte loads; every 16-byte-aligned pitch repeats banks every 8 rows (2-way
-            //     conflicts, 15.5% of GPU time on the q4_K expert GEMM at n=1024)
-            return 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_1 + 6;
-#else
             return 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_1 + 4;
-#endif
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K         + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K:
@@ -155,11 +148,7 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI6_K   + MMQ_TILE_NE_K/8 + 7;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_FP4:
-#if defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78)
-            return 2*MMQ_TILE_NE_K + 8                     + 6;   // must equal the Q8_1 pitch (static_assert below)
-#else
             return 2*MMQ_TILE_NE_K + 8                     + 4;
-#endif
         case GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2       + 4;
         default:
@@ -168,15 +157,11 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
 }
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)  % 8 == 4, "Wrong padding.");
-#if !(defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78))
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)  % 8 == 4, "Wrong padding.");
-#endif
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K)  % 8 == 4, "Wrong padding.");
-#if !(defined(RDNA3_5) && defined(MMQ_RDNA35_STRIDE_78))
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4)   % 8 == 4, "Wrong padding.");
-#endif
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4) % 8 == 4, "Wrong padding.");
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4) == ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1), "Wrong tile size for MXFP4");
@@ -471,13 +456,6 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
 static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config & config, const int cc) {
     if (config.use_mma_data_layout(cc)) {
         int stride = ggml_cuda_mmq_get_sram_stride(config.sram_layout);
-#if defined(MMQ_RDNA35_STRIDE_78)
-        // the device pitch for these layouts is 2 ints wider on RDNA3.5 (see ggml_cuda_mmq_get_sram_stride); the
-        // host compiles without the arch macro, so size the dynamic LDS from cc
-        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && (config.sram_layout == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1 || config.sram_layout == GGML_CUDA_MMQ_SRAM_LAYOUT_FP4)) {
-            stride += 2;
-        }
-#endif
         return config.I * stride * 4;
     }
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(config.type, config.I);
@@ -956,21 +934,6 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
 #endif // defined(RDNA3_5) && defined(AMD_WMMA_AVAILABLE)
 }
 
-// halo-hybrid experiment (off): on RDNA3.5 the prefetching kernels can keep both activation halves of a K iteration
-//     in LDS (two y tiles), so the K loop needs two barriers per 256-wide iteration instead of four (the second pair
-//     only exists so the single y tile can be rewritten between the two vec_dot halves). Q4_K I=64 J=32 grows
-//     24.2 -> 28.8 KiB, still two blocks per CU. Measured on gfx1151 (288 experts x 2048x4096, correctness-gated):
-//     q4_K n=1024 8.68 vs 8.46 ms, n=2048 14.76 vs 14.51, n=512 6.73 vs 6.78 - the barriers are not what the kernel
-//     waits on. Build with -DGGML_CUDA_MMQ_Y2 to enable; the host sizes the dynamic LDS from cc through this predicate.
-static constexpr __host__ __device__ bool ggml_cuda_mmq_y_double(ggml_type type, int J, int fallback) {
-#if defined(GGML_CUDA_MMQ_Y2)
-    return ggml_cuda_mmq_prefetch_whitelist(type, J, fallback) && J <= 64;
-#else
-    GGML_UNUSED(type); GGML_UNUSED(J); GGML_UNUSED(fallback);
-    return false;
-#endif
-}
-
 template <ggml_type type, int J, int fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
@@ -988,11 +951,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
 
     extern __shared__ int data_mul_mat_q[];
-    constexpr bool y_double = ggml_cuda_mmq_use_prefetch<type, J, fallback>() && ggml_cuda_mmq_y_double(type, J, fallback);
-    constexpr int  tile_y_n = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
-    int * tile_y  = data_mul_mat_q + J;
-    int * tile_y1 = y_double ? tile_y + tile_y_n : tile_y;      // second activation half (== tile_y when single-buffered)
-    int * tile_x  = tile_y + (y_double ? 2 : 1)*tile_y_n;
+    int * tile_y = data_mul_mat_q + J;
+    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -1030,18 +990,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         int yr1[y_regs_n];
         ggml_cuda_mmq_x_regs<type, J, fallback> xr;
         GGML_UNUSED(xr);
-        // halo-hybrid experiment (off): two-deep weight prefetch (build with -DGGML_CUDA_MMQ_X_DEPTH2). The weight
-        //     stream of the q4_K expert GEMM on gfx1151 runs at ~190 GB/s at n >= 512 against 232 GB/s at n=128 with
-        //     one iteration in flight per block; a second register slot (+20 VGPRs) doubles the bytes in flight but
-        //     measured neutral (q4_K n=1024 8.52 vs 8.46 ms, n=2048 14.57 vs 14.55, correctness-gated), so the
-        //     stream is not latency-bound at that depth. The activation tile comes from L2 and stays one deep.
-#if defined(GGML_CUDA_MMQ_X_DEPTH2)
-        constexpr bool x_depth2 = x_regs_ok;
-#else
-        constexpr bool x_depth2 = false;
-#endif
-        ggml_cuda_mmq_x_regs<type, J, fallback> xr2;
-        GGML_UNUSED(xr2);
 
         auto load_y_regs = [&](int (&yr)[y_regs_n], const int kb0, const int half) {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + half*sz);
@@ -1061,11 +1009,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             if constexpr (x_regs_ok) {
                 xr.load(x, offset_x + kb0_start, tile_x_max_i, stride_row_x);
             }
-            if constexpr (x_depth2) {
-                if (kb0_start + blocks_per_iter < kb0_stop) {
-                    xr2.load(x, offset_x + kb0_start + blocks_per_iter, tile_x_max_i, stride_row_x);
-                }
-            }
             load_y_regs(yr0, kb0_start, 0);
             load_y_regs(yr1, kb0_start, 1);
         }
@@ -1080,9 +1023,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
             }
             store_y_regs(tile_y, yr0);
-            if constexpr (y_double) {
-                store_y_regs(tile_y1, yr1);
-            }
 
             __syncthreads();
 
@@ -1093,43 +1033,29 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             }
             if (has_next) {
                 load_y_regs(yr0, kb0 + blocks_per_iter, 0);
-                if constexpr (y_double) {
-                    load_y_regs(yr1, kb0 + blocks_per_iter, 1);
-                }
             }
 
             vec_dot(tile_x, tile_y, sum, 0, j_skip);
 
             if (has_half2(kb0)) {
-                if constexpr (!y_double) {
-                    __syncthreads();
+                __syncthreads();
 
-                    store_y_regs(tile_y1, yr1);
+                store_y_regs(tile_y, yr1);
 
-                    __syncthreads();
+                __syncthreads();
 
-                    if (has_next) {
-                        load_y_regs(yr1, kb0 + blocks_per_iter, 1);
-                    }
+                if (has_next) {
+                    load_y_regs(yr1, kb0 + blocks_per_iter, 1);
                 }
 
-                vec_dot(tile_x, tile_y1, sum, MMQ_TILE_NE_K, j_skip);
+                vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K, j_skip);
             }
 
             __syncthreads();
         };
 
-        if constexpr (x_depth2) {
-            for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += 2*blocks_per_iter) {
-                step(kb0, xr, kb0 + 2*blocks_per_iter);
-                if (kb0 + blocks_per_iter < kb0_stop) {
-                    step(kb0 + blocks_per_iter, xr2, kb0 + 3*blocks_per_iter);
-                }
-            }
-        } else {
-            for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-                step(kb0, xr, kb0 + blocks_per_iter);
-            }
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            step(kb0, xr, kb0 + blocks_per_iter);
         }
 
         if (fixup) {
@@ -1640,9 +1566,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
-    // halo-hybrid: the RDNA3.5 prefetching kernels hold both activation halves (ggml_cuda_mmq_y_double)
-    const size_t n_y = GGML_CUDA_CC_IS_RDNA3_5(cc) && ggml_cuda_mmq_y_double(config.type, config.J, config.fallback) ? 2 : 1;
-    return nbs_ids + nbs_x + n_y*GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
 // MoE: per expert e the tiling grid has ntx column tiles but only ceil(tokens_e/J) of them hold tokens;
