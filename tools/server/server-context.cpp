@@ -906,6 +906,9 @@ private:
 
     common_speculative_ptr spec;
 
+    // halo-hybrid: the earlier of the two prompt-tail checkpoints, tokens before the end (load_model)
+    int tail_ckpt_offset = 4;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1275,6 +1278,19 @@ private:
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
+        // halo-hybrid: with two-lane prefill (LLAMA_PREFILL_LANES=2) the ubatches of one llama_decode overlap across the
+        // devices (a rolling pipeline with a remote device), and every extra llama_decode boundary drains that pipeline:
+        // 1-2 s per boundary at 13K on the two-host layout. The checkpoint 4 + n_ubatch tokens before the end only bounds
+        // how much a restore re-processes, and the user-message-start checkpoints already cover an edited last message,
+        // so the lanes keep just the one 4 tokens before the end (a 13K prompt: 2 drains -> 1, a 3K prompt likewise).
+        // LLAMA_TAIL_CKPT=2 restores the second checkpoint with the lanes (A/B: with it the draft's acceptance measured
+        // 0.84 / 0.86 vs 0.81 / 0.83 without, decode 20.5 vs 20.0, prefill 430 vs 457 tok/s at 13K; the ubatch
+        // boundaries move with it and so do the hidden states at the noise level)
+        {
+            const int lanes = std::max(1, (int) llama_n_prefill_lanes(ctx_tgt));
+            tail_ckpt_offset = lanes >= 2 && ggml_env_int("LLAMA_TAIL_CKPT", 0) != 2 ? 4 : 4 + lanes * (int) llama_n_ubatch(ctx_tgt);
+        }
+
         // halo-hybrid: how drafts are rolled back, for a speculative setup only
         const bool spec_configured = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                 [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
@@ -3702,20 +3718,8 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            // halo-hybrid: with two-lane prefill (LLAMA_PREFILL_LANES=2) the ubatches of one
-                            // llama_decode overlap across the devices (a rolling pipeline with a remote device),
-                            // and every extra llama_decode boundary drains that pipeline: 1-2 s per boundary at 13K
-                            // on the two-host layout. The checkpoint 4 + n_ubatch tokens before the end only
-                            // bounds how much a restore re-processes, and the user-message-start checkpoints
-                            // already cover an edited last message, so the lanes keep just the one 4 tokens
-                            // before the end (a 13K prompt: 2 drains -> 1, a 3K prompt likewise).
-                            // LLAMA_TAIL_CKPT=2 restores the second checkpoint with the lanes (A/B: with it the
-                            // draft's acceptance measured 0.84 / 0.86 vs 0.81 / 0.83 without, decode 20.5 vs 20.0,
-                            // prefill 430 vs 457 tok/s at 13K; the ubatch boundaries move with it and so do the
-                            // hidden states at the noise level)
-                            static const int tail_ckpt = (int) ggml_env_int("LLAMA_TAIL_CKPT", 0);
-                            const int prefill_lanes = std::max(1, (int) llama_n_prefill_lanes(ctx_tgt));
-                            const int checkpoint_offsets[] = {prefill_lanes >= 2 && tail_ckpt != 2 ? 4 : 4 + prefill_lanes * n_ubatch, 4};
+                            // halo-hybrid: tail_ckpt_offset is 4 + n_ubatch, or 4 with two-lane prefill (load_model)
+                            const int checkpoint_offsets[] = {tail_ckpt_offset, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
@@ -3739,8 +3743,7 @@ private:
                     // halo-hybrid: only the batches that START at a checkpoint offset before the end count as
                     // "near the end" (the original `task < prompt + n_ubatch` was true for every batch of a short
                     // prompt, so a 30-token turn saved two 145 MiB checkpoints)
-                    const int  tail_span       = 4 + ((llama_n_prefill_lanes(ctx_tgt) >= 2 && !(ggml_env_int("LLAMA_TAIL_CKPT", 0) == 2)) ? 0 : (int) llama_n_prefill_lanes(ctx_tgt) * n_ubatch);
-                    const bool near_prompt_end = slot.task->n_tokens() - n_tokens_start <= tail_span;
+                    const bool near_prompt_end = slot.task->n_tokens() - n_tokens_start <= tail_ckpt_offset;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos &&
