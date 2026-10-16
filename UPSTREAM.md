@@ -58,7 +58,8 @@ and summarised in a row below. Upstream pull requests are not opened from this t
 7. `generate_cu_files.py` must still emit the three DKQ=512 sparse instances (regenerate: zero diff).
 8. Per-file triage of upstream commits to the "ours" files (above).
 9. Wire changes: rebuild both RPC hosts; bump the fork's protocol minor (or major) on any wire change.
-10. Update `UPSTREAM_BASE` in `tests/halo/lib/env_check.py` and the base row above; run `tests/halo` base full and the
+10. Update `UPSTREAM_BASE` in `tests/halo/lib/env_check.py`, the prebuilt UI version in `tools/ui/CMakeLists.txt`
+    (`b` + upstream's `git rev-list --count <base>`) and the base row above; run `tests/halo` base full and the
     GPU suites before the merge lands on `main`.
 
 ## Markers

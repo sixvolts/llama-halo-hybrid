@@ -24,7 +24,9 @@ if(DEFINED ENV{HF_WEBUI_VERSION})
 elseif(DEFINED ENV{HF_UI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
 elseif(DEFINED LLAMA_BUILD_NUMBER)
-    set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
+    # halo-hybrid: this tree's build number counts its own commits and names no upstream release (the fetch fell back
+    # to "latest", a newer UI than this server); take the UI of the upstream base instead. Update at every merge.
+    set(HF_UI_VERSION "b11344")
 else()
     set(HF_UI_VERSION "")
 endif()
