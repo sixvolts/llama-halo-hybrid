@@ -1,7 +1,8 @@
 name: halo-ci
 
-# Compile checks for llama-halo-hybrid on GitHub-hosted runners: the CPU build with warnings as errors plus its
-# tests, and compile-only HIP, CUDA and Vulkan builds. Nothing here needs a GPU; the GPU suites are tests/halo.
+# Checks for llama-halo-hybrid on GitHub-hosted runners: the CPU build with warnings as errors plus its tests, the
+# server tests of this tree's behaviour, and compile-only HIP, CUDA and Vulkan builds. Nothing here needs a GPU; the
+# GPU suites are tests/halo.
 
 on:
   push:
@@ -33,6 +34,25 @@ jobs:
           cmake --build build -j 4
       - name: Tests
         run: ctest --test-dir build -L main --output-on-failure -j 4
+
+  server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev python3-venv
+          python3 -m venv venv && venv/bin/pip install -r tools/server/tests/requirements.txt
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+          cmake --build build -j 4 --target llama-server
+      - name: Server tests (this tree's behaviour, speculative decoding)
+        run: |
+          cd tools/server/tests && mkdir -p tmp
+          LLAMA_SERVER_BIN_PATH=../../../build/bin/llama-server ../../../venv/bin/python -m pytest -q \
+            unit/test_halo.py unit/test_speculative.py
 
   hip:
     runs-on: ubuntu-24.04

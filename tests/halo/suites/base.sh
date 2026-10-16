@@ -50,6 +50,24 @@ unit_cpu() {   # upstream's ctest "main" label on the CPU build. The state tests
     return $rc
 }
 
+server_cpu() {   # the server tests of this tree's behaviour (tools/server/tests/unit/test_halo.py) and upstream's
+    # speculative ones, on the CPU build. Needs pytest and the packages of tools/server/tests/requirements.txt (point
+    # HALO_PYTHON at a venv's python); downloads two tiny models on first use. A free port: never a running server's.
+    local py=${HALO_PYTHON:-python3}
+    "$py" -c 'import pytest, requests, openai' 2> /dev/null || {
+        echo "detail: $py lacks pytest/requests/openai (set HALO_PYTHON to a venv with tools/server/tests/requirements.txt)"
+        return 77
+    }
+    local port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    local out="$RUN_DIR/server-cpu.out"
+    (cd "$REPO/tools/server/tests" && mkdir -p tmp && PORT=$port LLAMA_SERVER_BIN_PATH="$CPU_BUILD/bin/llama-server" \
+        "$py" -m pytest -q unit/test_halo.py unit/test_speculative.py) > "$out" 2>&1
+    local rc=$?
+    tail -40 "$out"
+    echo "detail: $(grep -E '[0-9]+ (passed|failed)' "$out" | tail -1)"
+    return $rc
+}
+
 gen_models() {   # tiny random-weight models of every architecture (seeded, so every run uses the same weights)
     mkdir -p "$RUN_DIR/models"
     "$CPU_BUILD/bin/test-llama-archs" -s 42 -o "$RUN_DIR/models/" || return 1
@@ -77,6 +95,7 @@ suite_base() {
     fi
     step unit-cpu unit_cpu
     step env-doc python3 "$HALO_DIR/lib/env_check.py" "$REPO"
+    step server-cpu server_cpu
     step models gen_models
     step state-cpu state_check "$CPU_BUILD/bin" cpu
     step fuse-cpu  python3 "$HALO_DIR/lib/sched_check.py" fuse --bin "$CPU_BUILD/bin" --models "$RUN_DIR/models" \

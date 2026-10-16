@@ -18,7 +18,7 @@ and one log per step, plus one line in `ledger.jsonl`. The exit code is 0 only o
 
 | Suite | Steps |
 |---|---|
-| base smoke | HIP build (gfx1151, gfx1201, gfx1100, gfx1101, gfx1030), CPU-only build, ctest `main` on the CPU build, every environment switch the code reads listed in [configuration.md](../../halo-cookbook/configuration.md) and none it no longer reads (`lib/env_check.py`), test-backend-ops on the APU (`ops.txt` + Qwen3.8 / GLM model shapes) |
+| base smoke | HIP build (gfx1151, gfx1201, gfx1100, gfx1101, gfx1030), CPU-only build, ctest `main` on the CPU build, every environment switch the code reads listed in [configuration.md](../../halo-cookbook/configuration.md) and none it no longer reads (`lib/env_check.py`), the server tests of this tree's behaviour on the CPU build (`HALO_PYTHON`: a python with `tools/server/tests/requirements.txt`; SKIP without), test-backend-ops on the APU (`ops.txt` + Qwen3.8 / GLM model shapes) |
 | base full | + random-weight architectures vs CPU on the APU, recurrent-state rollback and save/load, scheduler exactness through an RPC loopback (local vs RPC vs split, 1 vs 2 lanes, and a composite rpc-server with the four-lane pipeline) |
 | gpu &lt;gen&gt; | pre-flight (host state, GEMV probe, peer copies; a failure stops the run with `HOST-STATE`), test-backend-ops and architectures on the card, batched peer copies, scheduler exactness over card + APU (production layout and layer split, 1 vs 2 lanes, lane-pair hazard model and its self-test, the production layout behind a composite rpc-server that owns both devices) |
 | gpu rdna3 | + `gpu/rdna3.sh`: the matmul, MoE and attention cases again with RDNA3's default fast paths off (q8_0 and k-quant WMMA, D=256 sparse attention), so the MMQ and dense fallbacks are checked on the card too |
@@ -53,6 +53,7 @@ suites use the base suite's build (`--build <dir>` to name another, `--no-build`
 | `HALO_GPU_TARGETS` | `gfx1151;gfx1201;gfx1100;gfx1101;gfx1030` | GPU_TARGETS of a new `build-halo` (keep gfx1151) |
 | `CPU_BUILD` | `<repo>/build-halo-cpu` | the CPU-only build |
 | `ROCM_PATH` | `/opt/rocm` | ROCm install |
+| `HALO_PYTHON` | `python3` | python for the server tests (pytest, requests, openai) |
 
 Production handling is opt-in: only with `PROD_PIDFILE`, `PROD_LAUNCHER` and `PROD_HEALTH` all set in `<host>.env` is
 a server stopped and restarted; with `PROD_PIDFILE` alone the run stops with `SETUP` rather than stop something it
