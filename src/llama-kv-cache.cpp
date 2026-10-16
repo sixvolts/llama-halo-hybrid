@@ -846,7 +846,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             const int64_t t0 = ggml_time_us();
             move_rows(m);
             v_cells[0].mv(m.src, m.dst, m.n);
-            LLAMA_LOG_WARN("%s: moved cells [%u, %u) to %u in %.1f ms\n", __func__, m.src, m.src + m.n, m.dst, (ggml_time_us() - t0)/1000.0);
+            // routine with -kvu and several sequences (INFO, not a warning)
+            LLAMA_LOG_INFO("%s: moved cells [%u, %u) to %u in %.1f ms\n", __func__, m.src, m.src + m.n, m.dst, (ggml_time_us() - t0)/1000.0);
         }
 
         moves_done = true;
@@ -3418,8 +3419,10 @@ llama_kv_cache_context::llama_kv_cache_context(
 llama_kv_cache_context::~llama_kv_cache_context() = default;
 
 bool llama_kv_cache_context::needs_reserve() const {
-    // cell moves copy rows outside the scheduler
-    return do_shift || !sc_info.empty() || moves.empty();
+    // only an update that does nothing but move cells skips the reserve: the moves copy rows outside the scheduler.
+    // A K-shift computes a graph, and stream copies and every other update keep the default (reserve).
+    const bool only_moves = !moves.empty() && !do_shift && sc_info.empty();
+    return !only_moves;
 }
 
 bool llama_kv_cache_context::next() {

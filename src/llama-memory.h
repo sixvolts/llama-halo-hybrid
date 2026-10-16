@@ -65,8 +65,8 @@ struct llama_memory_context_i {
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
 
-    // halo-hybrid: for an update context, whether apply() computes a graph on the scheduler, so the worst-case graph
-    // must be reserved again afterwards (a K-shift does; plain buffer copies do not)
+    // halo-hybrid: for an update context, whether the worst-case graph must be reserved again after apply(). True by
+    // default; the KV cache returns false only for an update that just moves cells (rows copied outside the scheduler)
     virtual bool needs_reserve() const { return true; }
 
     // halo-hybrid: the ubatch `ahead` places after the current one, before it is applied (nullptr if there is none or

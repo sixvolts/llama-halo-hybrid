@@ -541,6 +541,7 @@ llama_context::llama_context(
                     cparams.prefill_lanes = 2;
                     LLAMA_LOG_INFO("%s: two-lane prefill enabled (LLAMA_PREFILL_LANES)\n", __func__);
                 } else {
+                    // (parsed by tests/halo/lib/sched_check.py: keep the text)
                     LLAMA_LOG_WARN("%s: LLAMA_PREFILL_LANES ignored (n_gpu = %d, pipeline_parallel = %d)\n", __func__, n_gpu, cparams.pipeline_parallel);
                 }
             }
@@ -2208,6 +2209,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
+                    // halo-hybrid: also returned when llama_kv_cache::plan_moves queued cell moves (a -kvu shared pool):
+                    // memory_update applies them and the retry places the batch (plan_moves skips planning once,
+                    // moves_done), so "failed to find a memory slot" below means no slot even after the moves
                     if (!did_optimize) {
                         did_optimize = true;
 

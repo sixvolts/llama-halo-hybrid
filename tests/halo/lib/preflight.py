@@ -145,9 +145,9 @@ def gemv(gen, mpath, bindir, bless):
                 vals['%s:%s' % (mm.group(1), mm.group(2))] = float(mm.group(3))
         us.append(vals)
     best = {k: min(u.get(k, 1e9) for u in us) for k in us[0]}
-    if len(best) != 6:
+    if len(best) != 6:   # the probe did not run (or its output changed): a setup problem, not the machine's state
         print('detail: probe printed %d of 6 shapes' % len(best))
-        return 1
+        return 2
     data = load(mpath)
     ref = data.get(gen, {}).get('gemv_us')
     if bless or not ref:
@@ -166,7 +166,7 @@ def p2p(gen, mpath, exe, bless):
     print(r.stdout)
     if r.returncode != 0:
         print('detail: p2p probe failed: ' + r.stderr[-200:])
-        return 1
+        return 2
     can = re.search(r'canAccessPeer 0->1 (\d), 1->0 (\d)', r.stdout)
     got = {}
     for mm in re.finditer(r'(card->APU|APU->card)\s+(\d+) B:\s+[\d.]+ us\s+([\d.]+) GB/s', r.stdout):

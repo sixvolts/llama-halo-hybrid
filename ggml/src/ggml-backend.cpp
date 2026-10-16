@@ -1542,10 +1542,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (ps >= 0 && ps != i_split && ps < i_split &&
                             ggml_backend_sched_backend_is_remote(sched->backends[sched->splits[ps].backend_id]) &&
                             !(root->flags & GGML_TENSOR_FLAG_BOUNDARY)) {
+                        // (a debug line, and only for a reader without a copy: a copied input is fetched anyway)
+                        const bool copied = src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
                         static int n_logged = 0;
-                        if (n_logged < 16) {
+                        if (!copied && n_logged < 16) {
                             n_logged++;
-                            GGML_LOG_WARN("%s: %s (from remote split %d) read by split %d on %s without a copy: flagged BOUNDARY\n",
+                            GGML_LOG_DEBUG("%s: %s (from remote split %d) read by split %d on %s without a copy: flagged BOUNDARY\n",
                                 __func__, root->name, ps, i_split, ggml_backend_name(sched->backends[cur_backend_id]));
                         }
                         root->flags |= GGML_TENSOR_FLAG_BOUNDARY;
@@ -2560,6 +2562,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 // run on the same backend stream and j <= i, so every write of a to a cache tensor must reach b's reads and writes of
 // it that way, and every read of a must precede b's writes the same way. Per whole cache tensor (conservative). Returns
 // the number of violations, logging the first n_log.
+// The pair guard's per-pair lines are debug output unless GGML_SCHED_PAIR_DEBUG is set (then warnings, as the
+// tests/halo scheduler checks parse them: keep their text); a serialised pair logs one INFO line per process.
+static enum ggml_log_level ggml_backend_sched_pair_log_level(void) {
+    static const bool pair_debug = ggml_env_flag("GGML_SCHED_PAIR_DEBUG", false);
+    return pair_debug ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_DEBUG;
+}
+
 static int ggml_backend_sched_pair_hazards(ggml_backend_sched_t sa, ggml_backend_sched_t sb, int n_log, int * n_shared = nullptr, int a_shift = 0, int * n_cross = nullptr) {
     struct acc { int split; int backend; bool write; };
     std::unordered_map<const ggml_tensor *, std::vector<acc>> use[2];
@@ -2628,7 +2637,7 @@ static int ggml_backend_sched_pair_hazards(ggml_backend_sched_t sa, ggml_backend
                     (*n_cross)++;
                 }
                 if (n_bad++ < n_log) {
-                    GGML_LOG_WARN("  pair hazard on %s: a %s at split %d (%s) | b %s at split %d (%s)\n", r->name,
+                    ggml_log_internal(ggml_backend_sched_pair_log_level(), "  pair hazard on %s: a %s at split %d (%s) | b %s at split %d (%s)\n", r->name,
                         x.write ? "writes" : "reads", x.split, ggml_backend_name(sa->backends[x.backend]),
                         y.write ? "writes" : "reads", y.split, ggml_backend_name(sb->backends[y.backend]));
                 }
@@ -2699,10 +2708,10 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
             const int n_bad = ggml_backend_sched_pair_hazards(sched_a, sched_b, (log_hz || (same && log_refusal)) ? 8 : 0, &n_shared, 0, &n_cross);
             if (log_hz) {
                 n_hz_logged++;
-                GGML_LOG_WARN("%s: names %s, %d vs %d splits, %d cache tensors shared, %d cache hazards\n", __func__,
+                ggml_log_internal(ggml_backend_sched_pair_log_level(), "%s: names %s, %d vs %d splits, %d cache tensors shared, %d cache hazards\n", __func__,
                     same ? "match" : "differ", sched_a->n_splits, sched_b->n_splits, n_shared, n_bad);
                 if (ggml_env_int("GGML_SCHED_PAIR_DEBUG", 0) >= 2) {
-                    GGML_LOG_WARN("%s: self-test, a delayed one split: %d cache hazards\n", __func__,
+                    ggml_log_internal(ggml_backend_sched_pair_log_level(), "%s: self-test, a delayed one split: %d cache hazards\n", __func__,
                         ggml_backend_sched_pair_hazards(sched_a, sched_b, 2, nullptr, 1));
                 }
             }
@@ -2714,18 +2723,24 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
                 refused = true;
                 if (log_refusal) {
                     n_refused_logged++;
-                    GGML_LOG_WARN("%s: the lanes match but leave %d cache hazards (%d across backends): running them one after the other\n",
+                    ggml_log_internal(ggml_backend_sched_pair_log_level(), "%s: the lanes match but leave %d cache hazards (%d across backends): running them one after the other\n",
                         __func__, n_bad, n_cross);
                 }
             } else if (pair_hazard && same && n_bad > 0 && (pair_debug || n_reorder_logged++ < 4)) {
-                GGML_LOG_WARN("%s: the lanes match with %d same-stream reorders and no cross-backend hazard: interleaving (name guard)\n",
+                ggml_log_internal(ggml_backend_sched_pair_log_level(), "%s: the lanes match with %d same-stream reorders and no cross-backend hazard: interleaving (name guard)\n",
                     __func__, n_bad);
             }
         }
         if (!same) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                GGML_LOG_INFO("%s: a prefill lane pair ran one lane after the other (%s), so its devices did not overlap; "
+                    "GGML_SCHED_PAIR_DEBUG=1 logs every pair\n", __func__, refused ? "cross-backend cache hazards" : "the split structures differ");  // (not the parsed texts)
+            }
             static int n_logged = 0;
             if (!refused && n_logged++ < 4) {
-                GGML_LOG_WARN("%s: the two lanes have different split structures (%d vs %d splits): running them one after the other\n",
+                ggml_log_internal(ggml_backend_sched_pair_log_level(), "%s: the two lanes have different split structures (%d vs %d splits): running them one after the other\n",
                     __func__, sched_a->n_splits, sched_b->n_splits);
                 const int n = std::max(sched_a->n_splits, sched_b->n_splits);
                 for (int i = 0; i < n; i++) {
@@ -2735,7 +2750,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
                         (xa->graph.n_nodes && xb->graph.n_nodes && (strcmp(xa->graph.nodes[0]->name, xb->graph.nodes[0]->name) != 0 ||
                          strcmp(xa->graph.nodes[xa->graph.n_nodes-1]->name, xb->graph.nodes[xb->graph.n_nodes-1]->name) != 0));
                     if (diff) {
-                        GGML_LOG_WARN("  split %d: a %s %d nodes (%s .. %s) | b %s %d nodes (%s .. %s)\n", i,
+                        ggml_log_internal(ggml_backend_sched_pair_log_level(), "  split %d: a %s %d nodes (%s .. %s) | b %s %d nodes (%s .. %s)\n", i,
                             xa ? ggml_backend_name(sched_a->backends[xa->backend_id]) : "-", xa ? xa->i_end - xa->i_start : 0,
                             xa && xa->graph.n_nodes ? xa->graph.nodes[0]->name : "-", xa && xa->graph.n_nodes ? xa->graph.nodes[xa->graph.n_nodes-1]->name : "-",
                             xb ? ggml_backend_name(sched_b->backends[xb->backend_id]) : "-", xb ? xb->i_end - xb->i_start : 0,
