@@ -294,6 +294,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
     total_vram = 0;
 
     std::vector<std::pair<int, std::string>> turing_devices_without_mma;
+#if defined(GGML_USE_HIP)
+    std::vector<std::pair<int, std::string>> discrete_amd_devices; // halo-hybrid: mixed-generation check below
+#endif // defined(GGML_USE_HIP)
     for (int id = 0; id < info.device_count; ++id) {
         const int physical_id = info.devices[id].physical_device;
 
@@ -353,6 +356,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
                       device_vmm ? "yes" : "no", prop.warpSize,
                       device_vram_mib);
+        if (!prop.integrated && GGML_CUDA_CC_IS_AMD(info.devices[id].cc)) {
+            discrete_amd_devices.push_back({ id, std::string(prop.name) + " (" + prop.gcnArchName + ")" });
+        }
 #elif defined(GGML_USE_MUSA)
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
         info.devices[id].cc = GGML_CUDA_CC_OFFSET_MTHREADS + prop.major * 0x100;
@@ -386,6 +392,40 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
 #endif  // defined(GGML_USE_HIP)
     }
+
+#if defined(GGML_USE_HIP)
+    // halo-hybrid: this tree supports one discrete card (plus the APU) per process, or several cards of one
+    // generation. Cards of different generations in one process are untested here (kernel choices, split
+    // planning and the lane scheduler assume one card family), so refuse them up front with the remedy.
+    {
+        auto family = [](int cc) -> const char * {
+            if (GGML_CUDA_CC_IS_RDNA4(cc))   { return "RDNA4"; }
+            if (GGML_CUDA_CC_IS_RDNA3_5(cc)) { return "RDNA3.5"; }
+            if (GGML_CUDA_CC_IS_RDNA3_0(cc)) { return "RDNA3"; }
+            if (GGML_CUDA_CC_IS_RDNA2(cc))   { return "RDNA2"; }
+            if (GGML_CUDA_CC_IS_RDNA1(cc))   { return "RDNA1"; }
+            if (GGML_CUDA_CC_IS_CDNA(cc))    { return "CDNA"; }
+            return "GCN";
+        };
+        std::string devices;
+        bool mixed = false;
+        for (const auto & dev : discrete_amd_devices) {
+            const char * fam = family(info.devices[dev.first].cc);
+            mixed = mixed || strcmp(fam, family(info.devices[discrete_amd_devices[0].first].cc)) != 0;
+            devices += "  Device " + std::to_string(dev.first) + ": " + dev.second + ", " + fam + "\n";
+        }
+        if (mixed) {
+            if (!ggml_env_flag("GGML_CUDA_ALLOW_MIXED_GENERATIONS", false)) {
+                GGML_LOG_ERROR("%s: discrete GPUs of different generations are visible to this process:\n%s", __func__, devices.c_str());
+                GGML_ABORT("mixing GPU generations in one process is not supported by llama-halo-hybrid: keep one card "
+                           "(or cards of one generation) visible with ROCR_VISIBLE_DEVICES (agent indices or card UUIDs from "
+                           "rocminfo), or set GGML_CUDA_ALLOW_MIXED_GENERATIONS=1 to run untested");
+            }
+            GGML_LOG_WARN("%s: GGML_CUDA_ALLOW_MIXED_GENERATIONS=1: running with discrete GPUs of different generations "
+                          "(untested):\n%s", __func__, devices.c_str());
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
         GGML_LOG_INFO("The following devices will have suboptimal performance due to a lack of tensor cores:\n");
