@@ -89,8 +89,10 @@ Run `sudo update-grub` and reboot after changing these.
 * **Draft length:** the measured lines on these pages use `--spec-draft-n-max 2`. With 3, greedy requests (T=0) draft
   three tokens, and that raised the median on short answers by ~8%. Sampled requests (T > 0) are capped at 2 drafts
   anyway, because acceptance drops when sampling and a third draft no longer pays for its verify. The cap is
-  `LLAMA_SPEC_NMAX_SAMPLED` (default 2, 0 = no cap). The production line on [rdna4.md](rdna4.md) runs n-max 3.
-* **`LLAMA_PREFILL_LANES=2`** runs consecutive ubatches on two schedulers so the iGPU's expert GEMMs overlap the
+  `--spec-draft-n-max-sampled` / `LLAMA_SPEC_NMAX_SAMPLED` (default 2, 0 = no cap). The production line on
+  [rdna4.md](rdna4.md) runs n-max 3.
+* **`LLAMA_PREFILL_LANES=2`** (or `--prefill-lanes 2`; every environment setting on these pages is listed with its
+  flag, if it has one, in [configuration.md](configuration.md)) runs consecutive ubatches on two schedulers so the iGPU's expert GEMMs overlap the
   card's attention (`-b` at least twice `-ub`). It needs two GPU devices; on the iGPU alone it is ignored. It is the
   whole hybrid prefill win (one lane: ~1,450 tok/s at 16K instead of ~2,200 on the R9700). Unset or 1 is off; any
   value of 2 or more gives two local lanes. With a remote RPC device, 2 runs the rolling pipeline and 4 the paired one

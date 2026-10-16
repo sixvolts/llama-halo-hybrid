@@ -76,6 +76,7 @@ suite_base() {
         step build-cpu build_cpu || { halo_finish; return 1; }
     fi
     step unit-cpu unit_cpu
+    step env-doc python3 "$HALO_DIR/lib/env_check.py" "$REPO"
     step models gen_models
     step state-cpu state_check "$CPU_BUILD/bin" cpu
     step fuse-cpu  python3 "$HALO_DIR/lib/sched_check.py" fuse --bin "$CPU_BUILD/bin" --models "$RUN_DIR/models" \

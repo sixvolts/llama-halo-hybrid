@@ -18,7 +18,7 @@ and one log per step, plus one line in `ledger.jsonl`. The exit code is 0 only o
 
 | Suite | Steps |
 |---|---|
-| base smoke | HIP build (gfx1151, gfx1201, gfx1100, gfx1101, gfx1030), CPU-only build, ctest `main` on the CPU build, test-backend-ops on the APU (`ops.txt` + Qwen3.8 / GLM model shapes) |
+| base smoke | HIP build (gfx1151, gfx1201, gfx1100, gfx1101, gfx1030), CPU-only build, ctest `main` on the CPU build, every environment switch the code reads listed in [configuration.md](../../halo-cookbook/configuration.md) and none it no longer reads (`lib/env_check.py`), test-backend-ops on the APU (`ops.txt` + Qwen3.8 / GLM model shapes) |
 | base full | + random-weight architectures vs CPU on the APU, recurrent-state rollback and save/load, scheduler exactness through an RPC loopback (local vs RPC vs split, 1 vs 2 lanes) |
 | gpu &lt;gen&gt; | pre-flight (host state, GEMV probe, peer copies; a failure stops the run with `HOST-STATE`), test-backend-ops and architectures on the card, batched peer copies, scheduler exactness over card + APU (production layout and layer split, 1 vs 2 lanes, lane-pair hazard model and its self-test) |
 | gpu rdna3 | + `gpu/rdna3.sh`: the matmul, MoE and attention cases again with RDNA3's default fast paths off (q8_0 and k-quant WMMA, D=256 sparse attention), so the MMQ and dense fallbacks are checked on the card too |

@@ -4,8 +4,9 @@ This tree is upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp
 2026-10-01) plus the changes made to run large mixture-of-experts models on an AMD Strix Halo APU (gfx1151, 128 GB
 unified memory), alone, with one Radeon card next to it, or across two machines over RPC. Setup, kernel parameters,
 model files and launch lines are in the [cookbook](halo-cookbook/README.md). This page lists what the tree changes,
-what is on by default and how to switch each piece off. The measurements behind each change are in its commit
-message (`git log -S<switch name>` finds it).
+what is on by default and how to switch each piece off; [configuration.md](halo-cookbook/configuration.md) lists
+every flag and environment switch. The measurements behind each change are in its commit message
+(`git log -S<switch name>` finds it).
 
 Everything here is developed and tested with the HIP (ROCm) backend on gfx1151 plus gfx1201, gfx1101 or gfx1030.
 The CUDA and Vulkan backends compile but are not tested by this fork, and some upstream NVIDIA changes were not
@@ -119,16 +120,17 @@ leaves it on.
 | What | Off switch |
 |---|---|
 | Sampled requests (T > 0) verify MTP drafts with lossless rejection sampling, so sampled output follows the target's distribution. Greedy requests compare tokens. | `LLAMA_SPEC_RS=0` |
-| Sampled MTP requests draft at most 2 tokens; greedy ones use `--spec-draft-n-max`. | `LLAMA_SPEC_NMAX_SAMPLED=0` (no cap) |
+| Sampled MTP requests draft at most 2 tokens; greedy ones use `--spec-draft-n-max`. | `--spec-draft-n-max-sampled 0` (no cap) |
 | The draft ingests a long prompt per target ubatch, inside the target's prefill, instead of once after it. | `LLAMA_MTP_EARLY_MIN=0`, `LLAMA_MTP_INGEST_DEFER=0` |
 
 ## Opt-in settings
 
 | Setting | What |
 |---|---|
-| `LLAMA_PREFILL_LANES=2` | Two-lane prefill (below). Needs two GPU devices and `-b` at least twice `-ub`. Unset or 1 is off; 2 or more gives two local lanes; with a remote RPC device 2 runs the rolling pipeline and 4 the paired one. |
-| `LLAMA_QSA_CHUNK_MB=N` | Build the QSA indexer's prefill scratch in chunks of N MiB (default 2048; single KV stream only). Needed for 256K context on a 32 GB card. |
-| `LLAMA_SPEC_DRAFT_UB=N` | Cap the draft's ubatch (0 = the target's `-ub`). |
+| `--prefill-lanes 2` (`LLAMA_PREFILL_LANES=2`) | Two-lane prefill (below). Needs two GPU devices and `-b` at least twice `-ub`. Unset or 1 is off; 2 or more gives two local lanes; with a remote RPC device 2 runs the rolling pipeline and 4 the paired one. |
+| `--qsa-chunk-mb N` (`LLAMA_QSA_CHUNK_MB=N`) | Build the QSA indexer's prefill scratch in chunks of N MiB (default 2048; ubatches of one sequence). Needed for 256K context on a 32 GB card. |
+| `--spec-draft-ubatch-size N` (`LLAMA_SPEC_DRAFT_UB=N`) | Cap the draft's ubatch (0 = the target's `-ub`). |
+| `--spec-draft-n-max-sampled N` (`LLAMA_SPEC_NMAX_SAMPLED=N`) | Sampled MTP requests draft at most N tokens (default 2, 0 = no cap). |
 | `LLAMA_ASYNC_INPUTS=1` | Stream-ordered host input copies without the second lane (helps GLM-5.3 over RPC). |
 | `GGML_RPC_COMPOSITE=1` | Let a multi-device rpc-server schedule its half of the graph itself ([multi-machine.md](halo-cookbook/multi-machine.md)). |
 | `LLAMA_UBATCH_TAPER=N` | Make the first ubatch of a prompt partial so a pipeline fills sooner. |
@@ -169,6 +171,9 @@ builds included. Layouts and launch lines:
 [multi-machine.md](halo-cookbook/multi-machine.md).
 
 ## Diagnostics
+
+The full list, with the unsafe switches that re-open fixed bugs, is in
+[configuration.md](halo-cookbook/configuration.md#diagnostics).
 
 | Switch | What |
 |---|---|
