@@ -262,7 +262,10 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     // with two blocks per WGP for the 16-column tile and 32 heads per tile (fattn-mma-f16.cuh): 19-21 ms (gfx1201)
     // / 76-78 ms (gfx1151) per 1024 queries against a dense walk of 2.8 / 7.7 ms per 1K of context, break-even
     // ~6.7K (ratio 3.3) on gfx1201 and ~10K (ratio 4.9) on gfx1151
-    static const int64_t amd_pp_ratio = ggml_env_int("GGML_CUDA_FA_SPARSE_MIN_RATIO", (GGML_CUDA_CC_IS_RDNA4(cc) ? 3 : 5));
+    // (the env value is read once; the per-architecture default is resolved per call, so a card and the APU in one
+    //  process each get their own)
+    static const int64_t amd_pp_ratio_env = ggml_env_int("GGML_CUDA_FA_SPARSE_MIN_RATIO", -1);
+    const int64_t amd_pp_ratio = amd_pp_ratio_env >= 0 ? amd_pp_ratio_env : (GGML_CUDA_CC_IS_RDNA4(cc) ? 3 : 5);
     const int64_t min_ratio = amd && Q->ne[1] > 8 ? amd_pp_ratio : 2;
     // halo-hybrid: Qwen3.8's QSA layers (D = 256, GQA 12, 2051 cells of top-k per query): only prefill-width
     // batches, whose 16-query tiles walk the union of their selections (fattn-mma-f16.cuh, (256, 256, 16, 4));
