@@ -7,16 +7,19 @@
 HALO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REPO=$(cd "$HALO_DIR/../.." && pwd)
 HOST=$(hostname -s)
-HALO_RESULTS=${HALO_RESULTS:-${XDG_STATE_HOME:-$HOME/.local/state}/halo-test}   # <host>.env may set it
-HALO_LOCK=${HALO_LOCK:-/run/lock/llamabench.lock}
-ROCM_PATH=${ROCM_PATH:-/opt/rocm}
-export PATH=$ROCM_PATH/bin:$PATH
 
 # per-machine settings and pre-flight references live outside the tree (see machines/README.md):
-# $HALO_MACHINE_DIR/<host>.env (production launcher, pidfile, health URL) and <host>.json (link, VRAM, GEMV, p2p)
+# $HALO_MACHINE_DIR/<host>.env (production launcher, pidfile, health URL) and <host>.json (link, VRAM, GEMV, p2p).
+# The file is read before the defaults below, so it can set them (a value given on the command line still wins when
+# the file uses ${VAR:-...})
 HALO_MACHINE_DIR=${HALO_MACHINE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/halo-test}
 PROD_LAUNCHER=; PROD_PIDFILE=; PROD_HEALTH=
 [ -f "$HALO_MACHINE_DIR/$HOST.env" ] && . "$HALO_MACHINE_DIR/$HOST.env"
+
+HALO_RESULTS=${HALO_RESULTS:-${XDG_STATE_HOME:-$HOME/.local/state}/halo-test}
+HALO_LOCK=${HALO_LOCK:-/run/lock/llamabench.lock}
+ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+export PATH=$ROCM_PATH/bin:$PATH
 
 halo_init() {   # halo_init <suite> <level>
     SUITE=$1; LEVEL=$2
