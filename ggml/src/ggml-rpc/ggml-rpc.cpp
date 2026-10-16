@@ -2302,6 +2302,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
             }
             if (readback && t->buffer != nullptr) {
                 sg.outs.push_back({ t, t->buffer, t->data });
+                // the copy-back runs after the whole graph: keep the tensor (and the tensor a view reads) out of the
+                // allocator's reuse, or a later node of this graph overwrites it first (GLM's hc_mixes, read by
+                // the client's next graph, arrived as garbage with every layer behind a composite server)
+                for (ggml_tensor * k = t; k != nullptr; k = k->view_src) {
+                    k->flags |= GGML_TENSOR_FLAG_OUTPUT;
+                }
             }
             t->buffer = nullptr;
             t->data   = nullptr;
