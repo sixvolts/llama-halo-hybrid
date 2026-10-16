@@ -810,6 +810,23 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// halo-hybrid: what this tree adds to the scheduler, in one place (details at each function).
+//   Terms: a lane is one of two schedulers sharing the same backends and streams (llama-context's two-lane prefill);
+//     a remote backend is an RPC device (ggml_backend_sched_backend_is_rpc); an eager copy is a cross-backend copy
+//     issued right behind its producer split instead of when its consumer is submitted.
+//   Mechanisms, each with its kill switch (halo-cookbook/configuration.md): split events for local GPUs and the APU
+//     (GGML_SCHED_NO_EVENTS, GGML_SCHED_IGPU_EVENTS), eager copies batched per consumer (GGML_SCHED_NO_COPY_BATCH) and
+//     allocated at the producer (GGML_SCHED_NO_EAGER_PRODUCER_ALLOC), the overlap cut (GGML_SCHED_OVERLAP_CUT), one
+//     copy per crossing root instead of per view (GGML_SCHED_NO_VIEW_ROUTE), remote input order
+//     (GGML_SCHED_NO_INPUT_ORDER), remote fetch and the head/tail pipeline (llama-context), the lane pair with its
+//     hazard model (GGML_SCHED_PAIR_HAZARD), output events re-recorded after async reads (record_output_events).
+//   State owners: the per-split input events, stages and view copies belong to split_graph's allocation; the copy
+//     event pool and out_ev are per backend and live as long as the scheduler; pipe_state exists between head and tail.
+//   Lifecycle per graph: split_graph -> alloc_graph -> compute (single, pair, or head ... tail) -> the caller's async
+//     output reads -> record_output_events -> synchronize (or synchronize_local) before inputs change.
+//   Coverage: tests/halo sched_check.py (rpc loopback, card + APU, lanes on/off, hazard self-test), test-peer-copy-batch.
+//   Parsed log lines: the pair guard's (see ggml_backend_sched_pair_log_level) and llama-context's "LLAMA_PREFILL_LANES
+//     ignored" are read by tests/halo/lib/sched_check.py; keep their text.
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -859,7 +876,7 @@ struct ggml_backend_sched {
     // split loop state between ggml_backend_sched_graph_compute_async_head and _tail
     struct ggml_backend_sched_compute_state * pipe_state;
     bool trace_split_sends = false; // halo-hybrid: GGML_SCHED_TRACE_SPLITS, one graph
-    int pipe_first_remote;
+    int pipe_cut_split; // the split ggml_backend_sched_graph_compute_async_head stops after (the last remote split)
     ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPY_EVENTS];
     int copy_event_next[GGML_SCHED_MAX_BACKENDS];
     int copy_event_used[GGML_SCHED_MAX_BACKENDS]; // taken since the last sched synchronize (ring wrap guard)
@@ -3226,7 +3243,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_head(ggml_backend_sched_
     const int r = ggml_backend_sched_last_remote_split(sched);
     GGML_ASSERT(r >= 0 && "no remote split");
     sched->pipe_state = new ggml_backend_sched_compute_state;
-    sched->pipe_first_remote = r;
+    sched->pipe_cut_split = r;
     if (ggml_backend_sched_trace_waits()) {
         // one-time picture of the split structure the pipeline is cutting
         static int n_logged = 0;
@@ -3274,9 +3291,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async_head_pair(ggml_backend_s
     }
 
     sa->pipe_state = new ggml_backend_sched_compute_state;
-    sa->pipe_first_remote = ra;
+    sa->pipe_cut_split = ra;
     sb->pipe_state = new ggml_backend_sched_compute_state;
-    sb->pipe_first_remote = rb;
+    sb->pipe_cut_split = rb;
     auto fail = [&](enum ggml_status ec) {
         delete sa->pipe_state; sa->pipe_state = NULL;
         delete sb->pipe_state; sb->pipe_state = NULL;
@@ -3310,7 +3327,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_head_pair(ggml_backend_s
 enum ggml_status ggml_backend_sched_graph_compute_async_tail(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched && sched->pipe_state != NULL && "tail without head");
     enum ggml_status ec = GGML_STATUS_SUCCESS;
-    for (int split_id = sched->pipe_first_remote + 1; split_id < sched->n_splits; split_id++) {
+    for (int split_id = sched->pipe_cut_split + 1; split_id < sched->n_splits; split_id++) {
         ec = ggml_backend_sched_compute_split(sched, split_id, *sched->pipe_state);
         if (ec != GGML_STATUS_SUCCESS) {
             break;

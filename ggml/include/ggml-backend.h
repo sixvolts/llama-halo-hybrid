@@ -343,6 +343,23 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+
+    // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
+    // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
+    // The correct way to use this API is to discard the deallocated tensors and create new ones.
+    GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
+
+    // Set a callback to be called for each resulting node during graph compute
+    GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // halo-hybrid: begin - the fork's scheduler API (fork-local and unstable: not in upstream ggml, may change at any sync).
+    // Contract for all of it: the graphs are allocated (ggml_backend_sched_alloc_graph) before a compute call; the
+    // caller synchronizes (ggml_backend_sched_synchronize, or _synchronize_local with local sync on) before it rewrites
+    // graph inputs or re-allocates; record_output_events goes after the caller's async output reads; head/tail and
+    // the pair calls take no eval callback; every head is followed by its tail before the next head; the remote-split
+    // queries are valid after alloc and before the next reset.
+
     // Compute two already-allocated graphs (see ggml_backend_sched_alloc_graph) on two schedulers that share the same
     // backends, submitting their splits alternately so that work of one graph on one device can overlap work of the
     // other graph on another device. Neither scheduler may have an eval callback set.
@@ -374,7 +391,7 @@ extern "C" {
     // index of the first split on a remote backend, or -1
     GGML_API int                  ggml_backend_sched_first_remote_split(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_last_remote_split(ggml_backend_sched_t sched);
-    // split the submission of an allocated graph at its first remote split: head submits the splits up to and
+    // split the submission of an allocated graph at its LAST remote split: head submits the splits up to and
     // including it (the remote work then runs asynchronously), tail submits the rest. Between the two the caller
     // may prepare and submit the head of another scheduler's graph.
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_head(ggml_backend_sched_t sched);
@@ -387,15 +404,7 @@ extern "C" {
     // halo-hybrid: a backend whose queue lives on another host (an RPC device): synchronizing it drains that host's whole
     // command queue
     GGML_API bool                 ggml_backend_is_remote(ggml_backend_t backend);
-    GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
-
-    // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
-    // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
-    // The correct way to use this API is to discard the deallocated tensors and create new ones.
-    GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
-
-    // Set a callback to be called for each resulting node during graph compute
-    GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    // halo-hybrid: end
 
     //
     // Meta backend

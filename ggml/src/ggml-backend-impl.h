@@ -301,6 +301,10 @@ extern "C" {
 #    define GGML_BACKEND_DL_SCORE_IMPL(score_fn)
 #endif
 
+    // halo-hybrid (internal, ggml-base only): fill the allocator's compute buffers with value, skipping RPC buffers
+    // when skip_remote (the scheduler's GGML_SCHED_ZERO_BUFFERS diagnostic)
+    void ggml_gallocr_fill_buffers(ggml_gallocr_t galloc, uint8_t value, bool skip_remote);
+
 #ifdef  __cplusplus
 }
 #endif
