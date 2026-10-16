@@ -509,9 +509,39 @@ private:
     };
     rpc_msg_queue    queue;
     socket_ptr       sock;
+    std::string      server_endpoint;  // for error messages
     std::atomic_bool running;
     std::thread      thread;
 };
+
+static const char * rpc_cmd_name(rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_ALLOC_BUFFER:        return "ALLOC_BUFFER";
+        case RPC_CMD_GET_ALIGNMENT:       return "GET_ALIGNMENT";
+        case RPC_CMD_GET_MAX_SIZE:        return "GET_MAX_SIZE";
+        case RPC_CMD_BUFFER_GET_BASE:     return "BUFFER_GET_BASE";
+        case RPC_CMD_FREE_BUFFER:         return "FREE_BUFFER";
+        case RPC_CMD_BUFFER_CLEAR:        return "BUFFER_CLEAR";
+        case RPC_CMD_SET_TENSOR:          return "SET_TENSOR";
+        case RPC_CMD_SET_TENSOR_HASH:     return "SET_TENSOR_HASH";
+        case RPC_CMD_GET_TENSOR:          return "GET_TENSOR";
+        case RPC_CMD_COPY_TENSOR:         return "COPY_TENSOR";
+        case RPC_CMD_GRAPH_COMPUTE:       return "GRAPH_COMPUTE";
+        case RPC_CMD_GET_DEVICE_MEMORY:   return "GET_DEVICE_MEMORY";
+        case RPC_CMD_INIT_TENSOR:         return "INIT_TENSOR";
+        case RPC_CMD_GET_ALLOC_SIZE:      return "GET_ALLOC_SIZE";
+        case RPC_CMD_HELLO:               return "HELLO";
+        case RPC_CMD_DEVICE_COUNT:        return "DEVICE_COUNT";
+        case RPC_CMD_GRAPH_RECOMPUTE:     return "GRAPH_RECOMPUTE";
+        case RPC_CMD_MEMSET_TENSOR:       return "MEMSET_TENSOR";
+        case RPC_CMD_COPY_TENSOR_ASYNC:   return "COPY_TENSOR_ASYNC";
+        case RPC_CMD_GRAPH_COMPUTE_SCHED: return "GRAPH_COMPUTE_SCHED";
+        case RPC_CMD_SUPPORTS_OP:         return "SUPPORTS_OP";
+        case RPC_CMD_NONE:
+        case RPC_CMD_COUNT:               break;
+    }
+    return "?";
+}
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
 {
@@ -617,6 +647,7 @@ void rpc_dispatcher::synchronize() {
 }
 
 void rpc_dispatcher::start(const std::string & endpoint) {
+    server_endpoint = endpoint;
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
@@ -645,12 +676,12 @@ void rpc_dispatcher::work() {
             break;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
-            if (msg_ptr->output) {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
-                RPC_STATUS_ASSERT(status);
-            } else {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
-                RPC_STATUS_ASSERT(status);
+            const bool status = msg_ptr->output ?
+                send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size) :
+                send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+            if (!status) {
+                GGML_ABORT("rpc-server %s closed the connection or sent a malformed reply during %s; see its log on that host",
+                    server_endpoint.c_str(), rpc_cmd_name(msg_ptr->cmd));
             }
         }
         msg_ptr->completion.set_value();
