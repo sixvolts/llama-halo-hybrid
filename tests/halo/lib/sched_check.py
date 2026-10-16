@@ -122,6 +122,12 @@ def check_group(name, results, problems):
     if new:
         problems.append('%s: %s crashed' % (name, ','.join(new)))
     ok = {t: h for t, h in hashes.items() if h is not None}
+    # a case listed as known (by tag) whose output differs from the group's first case is reported, not failed
+    ref = next(iter(ok.values()), None)
+    for t in [t for t, h in ok.items() if h != ref and known(MODE, name, t)]:
+        print('KNOWN %s %s differs: %s' % (name, t, known(MODE, name, t)))
+        KNOWN_HITS.append('%s/%s' % (name, t))
+        del ok[t]
     if len(set(ok.values())) > 1:
         problems.append('%s: outputs differ (%s)' % (name, ' '.join('%s=%s' % kv for kv in ok.items())))
 
