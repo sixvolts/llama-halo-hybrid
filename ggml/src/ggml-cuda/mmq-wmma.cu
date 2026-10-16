@@ -118,7 +118,7 @@ template <> struct mmqw_wtraits<GGML_TYPE_Q5_K> { static constexpr int QK = 256;
 template <> struct mmqw_wtraits<GGML_TYPE_Q6_K> { static constexpr int QK = 256; static constexpr int BYTES = 210; };
 
 template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32>
-static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
+static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
         const void * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ dst,
         const int M, const int N, const int K, const int64_t ldx, const int64_t ldd) {
     static_assert(KT % 32 == 0, "K tile must cover whole q8_0 blocks");
@@ -427,11 +427,11 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q8_0_wmma(
 }
 
 template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32>
-static void launch_mul_mat_q8_0_wmma(const void * W, const void * X, float * dst, int M, int N, int K, int64_t ldx, int64_t ldd, cudaStream_t stream) {
+static void launch_mul_mat_q_wmma(const void * W, const void * X, float * dst, int M, int N, int K, int64_t ldx, int64_t ldd, cudaStream_t stream) {
     constexpr int PITCH = KT + 8;
     constexpr size_t smem = (size_t) NBUF * (BN + BM) * PITCH * sizeof(half);
     const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
-    mul_mat_q8_0_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd);
+    mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd);
     CUDA_CHECK(cudaGetLastError());
 }
 template <ggml_type WT>
@@ -447,8 +447,8 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     // in-kernel unless the re-read volume is large (every m-tile re-reads its n-tile; at M*K > 16M the 2 MB f32
     // tile thrashes gfx1151's L2 and the kernel drops to 22 TFLOPS), then a f16 pre-pass (0.1 ms at 1024x4096).
     // 2-way split-K for the sub-4-wave grids was tried: the memset + atomics cost more than the tail it recovers.
-#define MMQW_LAUNCH16(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q8_0_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, false>(src0->data, x16.get(), (float *) dst->data, M, N, K, K, ldd, stream)
-#define MMQW_LAUNCH32(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q8_0_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, true>(src0->data, x32, (float *) dst->data, M, N, K, K, ldd, stream)
+#define MMQW_LAUNCH16(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, false>(src0->data, x16.get(), (float *) dst->data, M, N, K, K, ldd, stream)
+#define MMQW_LAUNCH32(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, true>(src0->data, x32, (float *) dst->data, M, N, K, K, ldd, stream)
     const int64_t blocks128 = ((M + 127) / 128) * ((N + 127) / 128);
     const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
     const bool big     = blocks128 >= 2 * nsm;
@@ -471,7 +471,7 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
 
 #endif // MMQ_WMMA_ENABLED
 
-bool ggml_cuda_mul_mat_q8_0_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+bool ggml_cuda_mul_mat_q_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #ifndef MMQ_WMMA_ENABLED
     GGML_UNUSED_VARS(ctx, src0, src1, dst);
     return false;

@@ -902,7 +902,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
         // halo-hybrid: issue the copy with the SOURCE device current. On an APU + dGPU host a card -> APU copy issued
         // with the APU current (hipMemcpyPeer, D2D memcpy, or a kernel pull alike) returns zeros with no error; the same
-        // copy issued from the card is correct (bench/results/q38rev-0926/code-review/peerbw/ptscheck.out)
+        // copy issued from the card is correct (measured 2026-09-26)
         ggml_cuda_set_device(src_ctx->device);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
@@ -2026,7 +2026,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     // halo-hybrid: dense q8_0 at prefill widths on RDNA: dequantize-once f16 WMMA GEMM (mmq-wmma.cu)
-    if (GGML_CUDA_CC_IS_AMD(cc) && ggml_cuda_mul_mat_q8_0_wmma(ctx, src0, src1, dst)) {
+    if (GGML_CUDA_CC_IS_AMD(cc) && ggml_cuda_mul_mat_q_wmma(ctx, src0, src1, dst)) {
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
@@ -2097,7 +2097,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        // halo-hybrid: F16-WMMA routed expert GEMM on RDNA3/3.5 at prefill widths (mmid-f16.cu, GGML_CUDA_MMID_F16=1)
+        // halo-hybrid: F16-WMMA routed expert GEMM on RDNA3/3.5 at prefill widths (mmid-f16.cu: by default where it
+        // measured faster; GGML_CUDA_MMID_F16=0 off, =1 always)
         if (ggml_cuda_mmid_f16(ctx, src0, src1, ids, dst)) {
             return;
         }
@@ -5276,7 +5277,6 @@ static int ggml_cuda_try_fuse_moe_tail(ggml_backend_cuda_context * cuda_ctx, ggm
     return m.last - i;
 }
 
-// try and fuse nodes and return the number of nodes to skip
 // halo-hybrid: qwen4exp's decode block scoring MUL_MAT(block keys, queries) -> RESHAPE -> QSA_HEAD_SUM as one kernel
 // (qsa-topk.cu ggml_cuda_qsa_score_fused), only where the unfused MUL_MAT runs mul_mat_vec_f, whose arithmetic it
 // replays: the result is bit-identical. GGML_CUDA_NO_QSA_SCORE=1 disables it.
@@ -5327,6 +5327,7 @@ static int ggml_cuda_try_fuse_qsa_score(ggml_backend_cuda_context * cuda_ctx, gg
     return j - i;
 }
 
+// try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5569,7 +5570,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
         const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
         const ggml_tensor * src1 = node->src[1];
-        auto eligible = [&](const ggml_tensor * t, bool leader) {
+        auto eligible = [&](const ggml_tensor * t) {
             const ggml_tensor * w = t->src[0];
             if (t->op != GGML_OP_MUL_MAT || t->src[1] != src1 || t->type != GGML_TYPE_F32) {
                 return false;
@@ -5580,26 +5581,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (!w->buffer || !ggml_backend_buft_is_cuda(w->buffer->buft)) {
                 return false;
             }
-            // An f32 matrix (the hyper-connection inject, the DeltaNet alpha/beta) can ride along in the grouped
-            // kernel, which dots it against the unquantized activation, but that is OFF by default: a row there is
-            // one wave where mul_mat_vec_f gives it 8 warps, and no f32 matrix in these models has the rows to make
-            // that back (the inject, 4 rows of K=10240, cost 7.6 ms per token). The member must be excluded HERE and
-            // not in the launcher: a group the launcher refuses falls back to one launch per matrix and loses the
-            // quantized merges too.
+            // An f32 matrix (the hyper-connection inject, the DeltaNet alpha/beta, the MoE router) rides along in the
+            // grouped kernel, which dots it against the unquantized activation with a whole block per row, and may
+            // lead the group; GGML_CUDA_GEMV_GROUP_F32ROWS=<n> admits only f32 members with at least n rows (set it
+            // huge to exclude them). The launcher still needs a quantized member somewhere in the group. Exclude a
+            // member HERE, not in the launcher: a group the launcher refuses falls back to one launch per matrix and
+            // loses the quantized merges too.
             if (w->type == GGML_TYPE_F32) {
-                // on by default now that an f32 member gets a whole block per row (GGML_CUDA_GEMV_GROUP_F32ROWS=<n>
-                // admits only members with at least n rows; set it huge to exclude them). An f32 matrix may also
-                // lead (the MoE router precedes the shared expert's gate/up); the launcher still needs a quantized
-                // member somewhere in the group, and falls back to the plain paths otherwise.
                 static const int64_t f32_rows = ggml_env_int("GGML_CUDA_GEMV_GROUP_F32ROWS", 0);
-                GGML_UNUSED(leader);
                 return w->ne[0] == src1->ne[0] && w->ne[1] >= f32_rows;
             }
             return ggml_is_quantized(w->type) &&
                    ggml_cuda_should_use_mmvq(w->type, cc, src1->ne[1]) &&
                    !ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb, src1->ne[1], false);
         };
-        if (eligible(node, true)) {
+        if (eligible(node)) {
             int idx[8];
             int n = 1;
             idx[0] = i;
@@ -5608,7 +5604,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE) {
                     continue; // reshapes between the matmuls are free
                 }
-                if (!eligible(t, false)) {
+                if (!eligible(t)) {
                     break;
                 }
                 // a (gate, up, GLU) triple joins as ONE pair member, represented by its GLU node: the kernel dots
@@ -6904,7 +6900,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
     // halo-hybrid: hoist GEMVs that read the same activation next to each other so the grouped GEMV (see the
-    // MUL_MAT group in ggml_cuda_compute_forward_group) sees them as one run. Qwen3.8 puts a sigmoid between the
+    // MUL_MAT group in ggml_cuda_try_fuse) sees them as one run. Qwen3.8 puts a sigmoid between the
     // DeltaNet beta and alpha projections, and the shared expert's gate/up/GLU (plus its 1-row gate) 37 nodes after
     // the router that reads the same vector. Moving a node EARLIER is always dependency-safe when its inputs are a
     // weight and the anchor's own activation; this runs before allocation, so lifetimes follow the new order.
