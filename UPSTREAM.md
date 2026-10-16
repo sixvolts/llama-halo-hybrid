@@ -54,8 +54,9 @@ and summarised in a row below. Upstream pull requests are not opened from this t
    architectures.
 3. Backend registry names in the strided-mask allowlist, converter routes in `conversion/__init__.py`.
 4. `.github`: `git rm` every modify/delete conflict and read newly added upstream workflows before keeping any.
-5. Lane-aware scopes (`prepare_ubatch`, `extract_outputs`, `graph_reserve`, `graph_get_cb`) must not regain
-   `sched.get()`.
+5. Lane-aware scopes (`prepare_ubatch`, `extract_outputs`, `extract_layer_inputs`, `graph_reserve`, `graph_get_cb`,
+   the lane loop in `decode`) name their scheduler `sched`, shadowing the member, so a merged-in `sched.get()` fails to
+   compile there: resolve each such line to the local, never to `this->sched`.
 6. Speculative decoding: `batch.set_embd` in the early ingest becomes `set_embd_state` when upstream 781dbc5ac lands;
    trim the draft queue next to `result.resize(dp.n_max)`.
 7. `generate_cu_files.py` must still emit the three DKQ=512 sparse instances (regenerate: zero diff).
