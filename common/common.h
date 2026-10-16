@@ -333,6 +333,10 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // halo-hybrid
+    int32_t n_max_sampled = 2; // sampled (T > 0) requests with an MTP draft draft at most this many tokens (0 = no cap)
+    int32_t n_ubatch      = 0; // the draft context's n_ubatch (0 = the target's); not for block drafts (DFlash, DSpark)
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

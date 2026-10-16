@@ -473,7 +473,8 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
-        // halo-hybrid: sampled requests with an MTP draft draft at most LLAMA_SPEC_NMAX_SAMPLED tokens (default 2; 0 = no cap). With
+        // halo-hybrid: sampled requests with an MTP draft draft at most --spec-draft-n-max-sampled (LLAMA_SPEC_NMAX_SAMPLED)
+        //     tokens (default 2; 0 = no cap). With
         //     rejection sampling at T > 0 the acceptance drops (Qwen3.8 hybrid, real content at T = 0.7: 0.64 per
         //     token vs 0.81 greedy), so the third draft token no longer pays for its ~6.5 ms of verify: n-max 2 gives
         //     59.3 / 56.4 tok/s against 55.5 / 54.6 at n-max 3, while greedy gains 64.5 -> 74.4 on the Spark bench
@@ -482,14 +483,14 @@ struct server_slot {
         const bool spec_mtp = task && std::find(task->params.speculative.types.begin(), task->params.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != task->params.speculative.types.end();
         if (task && spec_mtp && task->params.sampling.temp > 0.0f) {
-            static const int nmax_sampled = (int) ggml_env_int("LLAMA_SPEC_NMAX_SAMPLED", 2);
+            const int nmax_sampled = task->params.speculative.draft.n_max_sampled;
             if (nmax_sampled > 0) {
                 // never below the draft's n_min: a shorter draft would be discarded entirely
                 const int cap = std::max(nmax_sampled, (int) task->params.speculative.draft.n_min);
                 static bool logged = false;
                 if (!logged && cap < n_draft_max) {
                     logged = true;
-                    SLT_INF(*this, "sampled requests draft at most %d tokens (LLAMA_SPEC_NMAX_SAMPLED, 0 = no cap)\n", cap);
+                    SLT_INF(*this, "sampled requests draft at most %d tokens (--spec-draft-n-max-sampled, 0 = no cap)\n", cap);
                 }
                 n_draft_max = std::min(n_draft_max, cap);
             }

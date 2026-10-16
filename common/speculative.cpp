@@ -2716,12 +2716,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
     }
 
     // halo-hybrid: the draft inherits the target's n_ubatch, so its compute buffer is sized for a 2048-4096 token
-    // ubatch although it runs one layer. LLAMA_SPEC_DRAFT_UB=<n> caps it (ingest is chunked by the draft's own
-    // n_ubatch). Not for block drafts, which decode a whole noise block in one pass.
-    if (!has_block_draft) {
-        static const int32_t draft_ub = (int) ggml_env_int("LLAMA_SPEC_DRAFT_UB", 0);
-        if (draft_ub > 0 && draft_ub < result.n_ubatch) {
-            result.n_ubatch = draft_ub;
+    // ubatch although it runs one layer. --spec-draft-ubatch-size (LLAMA_SPEC_DRAFT_UB) caps it (ingest is chunked by
+    // the draft's own n_ubatch). Not for block drafts, which decode a whole noise block in one pass.
+    if (params_spec.n_ubatch > 0) {
+        if (has_block_draft) {
+            LOG_WRN("%s: --spec-draft-ubatch-size %d ignored: block drafts (DFlash, DSpark) decode a whole block in one ubatch\n",
+                    __func__, params_spec.n_ubatch);
+        } else if (params_spec.n_ubatch < result.n_ubatch) {
+            LOG_INF("%s: draft n_ubatch = %d (--spec-draft-ubatch-size; target -ub %d)\n", __func__, params_spec.n_ubatch, result.n_ubatch);
+            result.n_ubatch = params_spec.n_ubatch;
         }
     }
 

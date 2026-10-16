@@ -1688,6 +1688,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--prefill-lanes"}, "N",
+        "halo-hybrid: two-lane prefill: consecutive prompt ubatches run on two schedulers so a card and the APU (or two "
+        "devices) overlap; needs two GPU devices and -b at least twice -ub. 1 = off, 2 = two lanes; with an RPC device "
+        "2 runs the rolling pipeline and 4 the paired one. Sets LLAMA_PREFILL_LANES for the library (default: off)",
+        [](common_params &, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("prefill-lanes must be at least 1");
+            }
+            common_set_env("LLAMA_PREFILL_LANES", std::to_string(value));
+        }
+    ).set_env("LLAMA_PREFILL_LANES"));
+    add_opt(common_arg(
+        {"--qsa-chunk-mb"}, "N",
+        "halo-hybrid: build the QSA indexer's prefill scratch (Qwen3.8 and other qwen4exp models) in chunks of at most N "
+        "MiB per tensor, for ubatches that hold one sequence. Lower it for very long contexts on a small card "
+        "(256 for 256K on 32 GB). 0 = no chunking. Sets LLAMA_QSA_CHUNK_MB for the library (default: 2048)",
+        [](common_params &, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("qsa-chunk-mb must be non-negative");
+            }
+            common_set_env("LLAMA_QSA_CHUNK_MB", std::to_string(value));
+        }
+    ).set_env("LLAMA_QSA_CHUNK_MB"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
@@ -4156,7 +4180,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        string_format("number of tokens to draft for speculative decoding (default: %d; sampled requests with an MTP draft "
+                      "are capped by --spec-draft-n-max-sampled)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -4171,6 +4196,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-n-max-sampled"}, "N",
+        string_format("halo-hybrid: sampled (T > 0) requests with an MTP draft draft at most N tokens; with rejection "
+                      "sampling the third draft token costs more verify time than it saves (default: %d, 0 = no cap)",
+                      params.speculative.draft.n_max_sampled),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("spec-draft-n-max-sampled must be non-negative");
+            }
+            params.speculative.draft.n_max_sampled = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_SPEC_NMAX_SAMPLED"));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch-size"}, "N",
+        string_format("halo-hybrid: physical batch size of the draft context; the draft otherwise inherits -ub and sizes "
+                      "its compute buffer for it although it runs one layer. Not for block drafts (DFlash, DSpark) "
+                      "(default: %d = the target's -ub)", params.speculative.draft.n_ubatch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("spec-draft-ubatch-size must be non-negative");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_SPEC_DRAFT_UB"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",

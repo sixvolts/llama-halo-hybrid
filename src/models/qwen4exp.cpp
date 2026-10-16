@@ -1303,8 +1303,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // build the same graph). Chunks only split along the query tokens, so every row is the same computation. One stream
     // only; LLAMA_QSA_CHUNK_MB=0 disables it.
     int64_t n_chunk = n_tps;
+    static const int64_t budget = (ggml_env_int("LLAMA_QSA_CHUNK_MB", 2048)) * 1024 * 1024;
+    if (n_stream > 1) {
+        static bool logged = false;
+        if (!logged && getenv("LLAMA_QSA_CHUNK_MB") != nullptr) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: LLAMA_QSA_CHUNK_MB applies to ubatches of one sequence; a ubatch of %d sequences builds "
+                    "the QSA scratch unchunked (logged once)\n", __func__, (int) n_stream);
+        }
+    }
     if (n_stream == 1) {
-        static const int64_t budget = (ggml_env_int("LLAMA_QSA_CHUNK_MB", 2048)) * 1024 * 1024;
         if (budget > 0) {
             const int64_t n_kv_max  = std::max<int64_t>(n_kv, n_ctx);
             const int64_t per_token = std::max<int64_t>(n_kv_max, ((n_kv_max + r - 1)/r)*n_idx_h) * (int64_t) sizeof(float);
