@@ -1444,6 +1444,21 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+// halo-hybrid: rocBLAS loads Tensile modules lazily, and on gfx1201 a first-choice load can return
+// hipErrorNoBinaryForGpu ("Cannot Find Global Var Sizes / Cannot create kernels" in an AMD_LOG_LEVEL=3 trace).
+// rocBLAS HANDLES that by falling back to another solution, which launches and returns success - but HIP's sticky
+// per-thread error survives, and the cudaGetLastError() at the end of ggml_cuda_compute_forward would attribute it
+// to the op and abort a matmul that computed correctly. Call this right after a CUBLAS_CHECKed GEMM (which has
+// already validated the real outcome) to discard the handled error. Clearing at the START of compute_forward does
+// NOT work (measured): the load happens during the GEMM call. gfx1201 hits this and gfx1151 does not because
+// gfx1201's rocBLAS ships far fewer tuned Tensile kernels (56 files against 96). On CUDA this is a no-op, so
+// upstream's error reporting is unchanged there.
+static inline void ggml_cuda_clear_handled_blas_error() {
+#if defined(GGML_USE_HIP)
+    (void) cudaGetLastError();
+#endif // defined(GGML_USE_HIP)
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1586,16 +1601,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                     (const float *) alpha, (const float *) src0_ptr, s01,
                                            (const float *) src1_ptr, s11,
                     (const float *) beta,  (float       *)  dst_ptr, ne0));
-        // halo-hybrid: rocBLAS loads Tensile modules lazily, and on gfx1201 a first-choice load can return
-        // hipErrorNoBinaryForGpu ("Cannot Find Global Var Sizes / Cannot create kernels" in an AMD_LOG_LEVEL=3
-        // trace). rocBLAS HANDLES that by falling back to another solution, which launches and returns success -
-        // but HIP's sticky per-thread error survives, and the cudaGetLastError() at the end of
-        // ggml_cuda_compute_forward would attribute it to this op and abort a matmul that computed correctly.
-        // CUBLAS_CHECK above has already validated the real outcome, so discard the handled error here.
-        // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
-        // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
-        // (56 files against 96), so first-choice loads miss and fall back far more often.
-        (void) cudaGetLastError();
+        ggml_cuda_clear_handled_blas_error();
     } else if (ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1605,16 +1611,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                     beta,   dst_ptr, cu_data_type,   ne0,
                     cu_compute_type,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        // halo-hybrid: rocBLAS loads Tensile modules lazily, and on gfx1201 a first-choice load can return
-        // hipErrorNoBinaryForGpu ("Cannot Find Global Var Sizes / Cannot create kernels" in an AMD_LOG_LEVEL=3
-        // trace). rocBLAS HANDLES that by falling back to another solution, which launches and returns success -
-        // but HIP's sticky per-thread error survives, and the cudaGetLastError() at the end of
-        // ggml_cuda_compute_forward would attribute it to this op and abort a matmul that computed correctly.
-        // CUBLAS_CHECK above has already validated the real outcome, so discard the handled error here.
-        // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
-        // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
-        // (56 files against 96), so first-choice loads miss and fall back far more often.
-        (void) cudaGetLastError();
+        ggml_cuda_clear_handled_blas_error();
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
@@ -1631,16 +1628,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 ne12*ne13,
                 cu_compute_type,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        // halo-hybrid: rocBLAS loads Tensile modules lazily, and on gfx1201 a first-choice load can return
-        // hipErrorNoBinaryForGpu ("Cannot Find Global Var Sizes / Cannot create kernels" in an AMD_LOG_LEVEL=3
-        // trace). rocBLAS HANDLES that by falling back to another solution, which launches and returns success -
-        // but HIP's sticky per-thread error survives, and the cudaGetLastError() at the end of
-        // ggml_cuda_compute_forward would attribute it to this op and abort a matmul that computed correctly.
-        // CUBLAS_CHECK above has already validated the real outcome, so discard the handled error here.
-        // Clearing at the START of compute_forward does NOT work (measured): the load happens during this call.
-        // gfx1201 hits this and gfx1151 does not because gfx1201's rocBLAS ships far fewer tuned Tensile kernels
-        // (56 files against 96), so first-choice loads miss and fall back far more often.
-        (void) cudaGetLastError();
+        ggml_cuda_clear_handled_blas_error();
     } else {
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
@@ -1679,11 +1667,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 ne23,
                 cu_compute_type,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        // halo-hybrid: same handled-rocBLAS-error clear as the other three GEMM entry points above. This is the
-        // pointer-array path, taken when the batch is not uniformly strided; it has the same lazy Tensile load
-        // underneath and would fail the same way. Note the CUDA_CHECK above is a check, not a clear, so a handled
-        // error left by THIS call would surface at the end of ggml_cuda_compute_forward, which is the original bug.
-        (void) cudaGetLastError();
+        ggml_cuda_clear_handled_blas_error();
     }
 
     // Convert output back to F32 if needed
