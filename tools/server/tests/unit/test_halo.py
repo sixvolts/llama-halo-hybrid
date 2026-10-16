@@ -67,6 +67,8 @@ def test_env_aliases_of_the_halo_flags(monkeypatch):
     monkeypatch.setenv("LLAMA_SPEC_NMAX_SAMPLED", "1")
     monkeypatch.setenv("LLAMA_PREFILL_LANES", "2")
     monkeypatch.setenv("LLAMA_QSA_CHUNK_MB", "256")
+    server.n_ubatch = 512
+    server.log_path = "./tmp/test_halo_env_aliases.log"
     server.start()
     res = server.make_request("POST", "/completion", data={
         "prompt": "I believe the meaning of life is",
@@ -75,6 +77,9 @@ def test_env_aliases_of_the_halo_flags(monkeypatch):
     })
     assert res.status_code == 200, res.body
     assert res.body["tokens_predicted"] == 16
+    log = open(server.log_path).read()
+    assert "draft n_ubatch = 64" in log   # the LLAMA_SPEC_DRAFT_UB alias reached the draft context
+    assert "LLAMA_PREFILL_LANES=2" in log and "LLAMA_QSA_CHUNK_MB=256" in log   # the startup environment line
 
 
 def test_env_alias_rejects_a_bad_value(monkeypatch):
@@ -83,3 +88,12 @@ def test_env_alias_rejects_a_bad_value(monkeypatch):
     monkeypatch.setenv("LLAMA_SPEC_DRAFT_UB", "-5")
     with pytest.raises(Exception):
         server.start(timeout_seconds=30)
+
+
+def test_prefill_lanes_zero_is_off(monkeypatch):
+    # LLAMA_PREFILL_LANES=0 has always meant "off"; the alias must keep accepting it
+    global server
+    monkeypatch.setenv("LLAMA_PREFILL_LANES", "0")
+    server.start()
+    res = server.make_request("POST", "/completion", data={"prompt": "Hello", "temperature": 0.0, "n_predict": 4})
+    assert res.status_code == 200, res.body
