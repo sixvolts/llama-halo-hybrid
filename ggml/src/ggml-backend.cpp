@@ -3272,6 +3272,11 @@ enum ggml_status ggml_backend_sched_graph_compute_async_head(ggml_backend_sched_
     return GGML_STATUS_SUCCESS;
 }
 
+// halo-hybrid: the paired head of the four-lane remote pipeline. Its admission is NOT compute_async_pair's: it
+// interleaves the local splits before the first remote split whenever both lanes place them on the same backends,
+// without the lane-name guard or the cache-hazard check, and relies on the shared in-order stream per backend for the
+// KV and recurrent-state order. Only a two-host layout reaches it; the RPC loopback cases in tests/halo
+// (split-composite-lanes, LLAMA_PREFILL_LANES=4) check its output.
 enum ggml_status ggml_backend_sched_graph_compute_async_head_pair(ggml_backend_sched_t sa, ggml_backend_sched_t sb) {
     GGML_ASSERT(sa && sb && sa != sb && sa->is_alloc && sb->is_alloc && !sa->callback_eval && !sb->callback_eval);
     GGML_ASSERT(sa->pipe_state == NULL && sb->pipe_state == NULL && "head called twice without tail");

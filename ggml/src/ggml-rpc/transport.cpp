@@ -426,6 +426,8 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
     return true;
 }
 
+// halo-hybrid: RDMA is off on the hosts this tree is tested on (since 2026-09-23), so this path is unmaintained;
+// upstream's completion-channel wait (#29440) was not taken (UPSTREAM.md).
 // Wait for one completion. Spin for RDMA_SPIN_US (the latency-critical case: the peer answers within a
 // few microseconds), then poll with short sleeps so an idle rpc-server, or a client waiting for a remote
 // graph_compute, does not pin a core at 100% (that idle spin looks exactly like a hang from outside).

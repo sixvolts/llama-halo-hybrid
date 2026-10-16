@@ -42,6 +42,9 @@ and summarised in a row below. Upstream pull requests are not opened from this t
 | #30103 | fixed differently (`fattn-mma-f16.cuh`) |
 | #27694 probabilistic draft sampling (after the base) | this tree has its own rejection sampling; decide at the next merge |
 | RPC protocol | fork-local major 107 and command ids from 128; upstream's RPC changes are ported, never merged as-is |
+| `llama_model_params::model_shared` | added in the middle of the struct (the MTP draft shares the target's tensors): this libllama's ABI differs from upstream's, so a program must be built against this tree's `llama.h` |
+| `clip.vision.swiglu_limit` (glm5next vision) | carried beside upstream's `clip.vision.swiglu_clamp` (GLM5V): the same clamp of the gate and up branches under two keys; keep both until one converter writes one |
+| MoE expert sum: fusion pattern (D), `k_weighted_sum` (`hc.cu`) | duplicates upstream's MoE weighted reduction (#25952), which matches first and stops at 15 experts per token, so (D) only runs above that; no model on the test hosts goes above (Qwen3.8 10, GLM-5.3 8; DSV4, bailingmoe3, dots3 not checked): kept, covered by test-backend-ops |
 
 ## Checklist for the next merge
 

@@ -1,3 +1,4 @@
+// GLM-5.3-Flash vision tower (projector "glm5next"): from upstream PR #27754 (unsloth), with halo-hybrid changes.
 #include "models.h"
 
 // the GLM-OCR ViT plus a clamp on the SwiGLU gate and up projections, which the per-block MLP

@@ -113,7 +113,9 @@ Run `sudo update-grub` and reboot after changing these.
   ```
 
 * **GLM-5.3-Flash:** unsloth UD-Q4_K_XL (200 GB, two machines) or UD-Q2_K_XL (108.7 GB, one machine). The draft head
-  is exported from the model's own shards ([rdna4.md](rdna4.md#glm-53-flash-at-ud-q2_k_xl)).
+  is exported from the model's own shards ([rdna4.md](rdna4.md#glm-53-flash-at-ud-q2_k_xl)). Images: the vision tower
+  loads with a `glm5next` mmproj (`--mmproj`, converted by this tree's `convert_hf_to_gguf.py --mmproj`), but no test
+  here covers it.
 * **Python tools** (the converter and `scripts/halo-hybrid/`): `python3 -m pip install -r
   requirements/requirements-convert_hf_to_gguf.txt`, in a virtual environment.
 * **API:** use `/v1/chat/completions` (a bare prompt on `/completion` stops after one token with Qwen3.8). Qwen3.8

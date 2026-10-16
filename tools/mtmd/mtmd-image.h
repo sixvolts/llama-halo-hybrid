@@ -273,7 +273,6 @@ struct mtmd_image_preprocessor_glm5next : mtmd_image_preprocessor {
         clip_image_size content; // resized image, placed at the top-left of the canvas
     };
 
-    // static so tests can reach it without a clip_ctx
     static clip_image_size smart_resize(const clip_hparams & hparams, const clip_image_size & size);
     static geometry        get_geometry(const clip_hparams & hparams, const clip_image_size & size);
 };

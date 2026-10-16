@@ -1,3 +1,5 @@
+# GLM-5.3-Flash for llama-halo-hybrid (arch "glm5next"): from upstream PR #27754 (unsloth), with halo-hybrid changes.
+# Upstream carries its own port as "glm5-next" (conversion/glm.py); UPSTREAM.md has the split.
 from __future__ import annotations
 
 import re
@@ -14,6 +16,7 @@ from .qwen3vl import Glm4VVisionModel
 
 
 @ModelBase.register("Glm5NextForConditionalGeneration", "Glm5NextForCausalLM")
+@ModelBase.example("zai-org/GLM-5.3-Flash")
 class Glm5NextModel(TextModel):
     """GLM-5.3-Flash text tower: hybrid KDA + DSA attention, nope-only MLA, mHC
     hyper-connections, and a NextN block with its own DSA attention and indexer.
@@ -227,7 +230,7 @@ class Glm5NextModel(TextModel):
 
 
 @ModelBase.register("Glm5NextForConditionalGeneration")
-# [TAG_HF_EXAMPLE_MISSING]
+@ModelBase.example("zai-org/GLM-5.3-Flash")
 class Glm5NextVisionModel(Glm4VVisionModel):
     """The vision tower is the GLM-OCR ViT under a `model.visual.` prefix.
 

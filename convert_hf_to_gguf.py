@@ -127,7 +127,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mtp-shared-embd", action="store_true",
-        help="With --mtp, leave the token embeddings, output norm and LM head out of the draft and take them from the target model at load time. Much smaller draft, but it needs a llama.cpp new enough to read it.",
+        help="With --mtp, leave the token embeddings, output norm and LM head out of the draft and take them from the target model at load time. Much smaller draft; only llama-halo-hybrid reads such drafts (upstream llama.cpp rejects them).",
     )
     parser.add_argument(
         "--dspark", action="store_true",

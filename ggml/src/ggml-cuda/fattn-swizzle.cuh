@@ -1,5 +1,8 @@
 #pragma once
 
+// halo-hybrid: carried with this tree's fattn-mma-f16.cuh; upstream reworked its FA tiles since (#28536, #29152, #28770,
+// #29298, not taken: UPSTREAM.md). NVIDIA (Turing+) only: HIP keeps the +4 row padding.
+
 #include "common.cuh"
 #include "mma.cuh"
 
