@@ -1767,10 +1767,12 @@ private:
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     // halo-hybrid: a full shared pool (-kvu) has no room for the cached prompt until an idle slot leaves
                     // it; only decode freed one, after this load had failed, so a purged conversation coming back was
-                    // prefilled again
+                    // prefilled again. The failed restore already removed this slot's cells (its prompt was saved above):
+                    // clear it first, so its token list matches its empty cache and another idle slot is the one to go
                     bool loaded = false;
                     if (params_base.kv_unified) {
                         SLT_INF(*ret, "%s", "no room in the shared pool for the cached prompt: freeing an idle slot and loading again\n");
+                        ret->prompt_clear();
                         loaded = try_clear_idle_slots() && ret->prompt_load(*prompt_cache, task.tokens);
                     }
                     if (!loaded) {

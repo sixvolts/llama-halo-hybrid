@@ -7,9 +7,9 @@ name: halo-ci
 on:
   push:
     branches: [main]
-    paths-ignore: ['**/*.md', 'halo-cookbook/**', 'docs/**', 'tests/halo/**']
+    paths-ignore: ['**/*.md', 'halo-cookbook/**', 'docs/**']
   pull_request:
-    paths-ignore: ['**/*.md', 'halo-cookbook/**', 'docs/**', 'tests/halo/**']
+    paths-ignore: ['**/*.md', 'halo-cookbook/**', 'docs/**']
   workflow_dispatch:
   schedule:
     - cron: '17 5 * * 1'   # weekly: everything, plus the HIP targets no push builds (hip-other)

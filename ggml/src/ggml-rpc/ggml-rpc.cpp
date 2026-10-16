@@ -2150,7 +2150,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
         // view nodes, so a split's node range can hold a view of another split's result that no node here reads
         // (its consumers read the scheduler's input copy); a backend skips it, but this scheduler would have to
         // place its source, which is in no server buffer (qwen4exp's "model.input_embed (reshaped)" with every
-        // layer behind the server). Walk backwards so chains of such views go too.
+        // layer behind the server). A BOUNDARY/OUTPUT flag on such a view does not keep it: the client reads that
+        // data from its own memory, where the root lives. Walk backwards so chains of such views go too.
         {
             auto foreign_root = [&](ggml_tensor * t) {
                 ggml_tensor * root = t->view_src;
@@ -2167,7 +2168,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
                     continue;
                 }
                 const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
-                if (view && read.find(t) == read.end() && !(t->flags & (GGML_TENSOR_FLAG_BOUNDARY | GGML_TENSOR_FLAG_OUTPUT)) && foreign_root(t)) {
+                if (view && read.find(t) == read.end() && foreign_root(t)) {
                     keep[i] = false;
                     continue;
                 }

@@ -127,3 +127,36 @@ def test_kvu_full_pool_purges_the_lru_idle_slot():
     assert a2["timings"]["cache_n"] > 0   # restored from the prompt cache, not prefilled again
     log = open(server.log_path).read()
     assert "purging slot" in log
+
+
+def test_kvu_returning_conversation_with_both_slots_resident():
+    # the same return path when both slots hold a conversation: the slot picked for it (least recently used) is too
+    # small to take the cached prompt even after its own cells are freed, so the other idle slot must leave the pool,
+    # not the picked one again
+    global server
+    server = ServerPreset.stories15m_moe()
+    server.kv_unified = True
+    server.n_slots = 2
+    server.n_ctx = 256
+    server.no_cache_idle_slots = True
+    server.cache_ram = 64
+    server.log_path = "./tmp/test_halo_kvu_resident.log"
+    server.start()
+    r = "The quick brown fox jumps over the lazy dog. " * 12
+    y = "A little girl went to the park and played with her red ball. " * 10
+    x = "Hello there."
+
+    def complete(prompt):
+        res = server.make_request("POST", "/completion", data={"prompt": prompt, "temperature": 0.0, "n_predict": 16})
+        assert res.status_code == 200, res.body
+        return res.body
+
+    r1 = complete(r)   # slot A
+    complete(y)        # slot B; r does not fit beside it and goes to the prompt cache
+    complete(x)        # slot A: small, both slots resident now
+    complete(y)        # slot B again: x is the least recently used
+    r2 = complete(r)   # slot A is picked; freeing x is not enough, y must leave
+    assert r2["content"] == r1["content"]
+    assert r2["timings"]["cache_n"] > 0
+    log = open(server.log_path).read()
+    assert "freeing an idle slot and loading again" in log
