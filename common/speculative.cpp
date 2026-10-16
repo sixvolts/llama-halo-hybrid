@@ -1592,6 +1592,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (int32_t k = i0; k < i0 + n; ++k) {
             const int32_t idx = batch.add(src.tokens[k].id, src.tokens[k].pos[0], early.seq, false);
             const float * h_row = k == 0 ? pending_h[early.seq].data() : h + (size_t) (k - 1) * n_embd;
+            // FIXME(halo-hybrid, next sync): becomes set_embd_state when upstream 781dbc5ac lands (UPSTREAM.md, item 6)
             batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
         }
 
@@ -3084,6 +3085,11 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+                        // halo-hybrid: the draft distributions go with their tokens (the server uses rejection sampling
+                        // only when there is one per draft token; upstream asserts on the mismatch)
+                        if (dp.result_q != nullptr && dp.result_q->size() > result.size()) {
+                            dp.result_q->resize(result.size());
+                        }
                     }
                 }
 
