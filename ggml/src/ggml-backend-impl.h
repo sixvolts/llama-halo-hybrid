@@ -8,7 +8,11 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    // halo-hybrid: upstream's version (2) + 1000. This tree appends cpy_tensor_async_nowait and
+    // cpy_tensors_async_nowait to struct ggml_backend_i, so a dynamically loaded backend built from upstream (or
+    // an older fork build) must be refused rather than called through a short iface table. Bump together with
+    // upstream's number, and again whenever this tree changes an iface struct.
+    #define GGML_BACKEND_API_VERSION 1002
 
     //
     // Backend buffer type
