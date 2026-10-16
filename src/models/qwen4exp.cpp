@@ -87,16 +87,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
-    // halo-hybrid: the MTP block carries its own indexer, but the converter writes ratio 0 for it (dense, see
-    // graph_mtp). LLAMA_MTP_QSA=1 gives it the trunk's ratio so the draft attends through QSA (opt-in: measured worse).
-    {
-        static const bool mtp_qsa = ggml_env_flag("LLAMA_MTP_QSA", false);
-        if (mtp_qsa && hparams.n_layer_nextn > 0) {
-            uint32_t r_trunk = 0;
-            for (uint32_t il = 0; il < hparams.n_layer() && r_trunk == 0; ++il) { r_trunk = hparams.dsv4_compress_ratios[il]; }
-            for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
-                if (hparams.dsv4_compress_ratios[il] == 0) { hparams.dsv4_compress_ratios[il] = r_trunk; }
-            }
+    // halo-hybrid: the MTP block carries its own indexer, but this tree's converter writes ratio 0 for it, so the draft
+    // attends densely (see graph_mtp). Upstream's converter (since #29761, 2026-10-01) writes the trunk's ratio, and
+    // such a head takes the QSA draft path, which measured lower acceptance here: say so once at load.
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        if (hparams.dsv4_compress_ratios[il] > 0) {
+            LLAMA_LOG_WARN("%s: MTP block %u has compress ratio %u, so the draft attends through QSA; this tree's converter "
+                    "writes 0 (dense), which measured better acceptance (0.76 vs 0.73 on Swift 1.5)\n",
+                    __func__, il, hparams.dsv4_compress_ratios[il]);
         }
     }
 
@@ -328,17 +326,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // qwen4exp sets mtp_use_dedicated_embeddings=false, so these are absent and the
         // head falls back to the trunk's embedding table and LM head
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
-        // halo-hybrid: a reduced-vocabulary draft head. A draft file may carry its own nextn.shared_head_head over a
-        // subset of the vocabulary plus `d2t` (I64, the target token id of each head row), as EAGLE-3 does: drafting
-        // then reads ~n_draft rows instead of the full LM head, and verification still uses the full one.
-        int64_t n_head_rows = n_vocab;
-        if (const ggml_tensor * d2t_meta = ml.get_tensor_meta(tn(LLM_TENSOR_D2T).str().c_str())) {
-            n_head_rows = d2t_meta->ne[0];
-            d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_head_rows }, 0);
-            LLAMA_LOG_INFO("%s: MTP head over a reduced vocabulary: %lld of %lld tokens\n", __func__, (long long) n_head_rows, (long long) n_vocab);
-        }
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_head_rows },
-                flags | (n_head_rows == n_vocab ? TENSOR_NOT_REQUIRED : 0));
+        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
     }
 }
 
@@ -565,8 +553,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 // speculative driver can feed it straight back in for the next draft step.
 //
 // The block attends densely by default. The trunk's QSA only prunes context past a 2048-token budget, so dense is a
-// numerical superset; drafts are verified by the target either way. LLAMA_MTP_QSA=1 runs the block through the
-// trunk's QSA path instead (its own indexer, hybrid memory with an indexer cache for this layer). Measured
+// numerical superset; drafts are verified by the target either way. A head whose file gives the block a nonzero
+// compress ratio (upstream's converter) runs it through the trunk's QSA path instead (its own indexer, hybrid memory
+// with an indexer cache for this layer). Measured
 // 2026-09-27 on Swift 1.5 Q8T, APU + R9700, 19-23K-token contexts: acceptance 0.759 dense vs 0.732 QSA, 43.6 vs 45.3
 // ms/step, and the per-ubatch ingest is slower on the R9700 (dense FA is tuned there): so the head appears to have
 // been trained dense and QSA stays opt-in.
@@ -615,7 +604,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // QSA draft (LLAMA_MTP_QSA): the context then carries the hybrid memory with an indexer cache for this layer
+    // QSA draft (a file ratio > 0, see load_arch_hparams): the context then carries the hybrid memory with an indexer
+    // cache for this layer
     const bool mtp_qsa = hparams.dsv4_compress_ratios[il] > 0;
     llm_graph_input_attn_kv * inp_attn = nullptr;
     const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
@@ -809,19 +799,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
     cur = build_lora_mm(head_w, cur, head_s);
-    if (model.d2t) {
-        // reduced-vocabulary head: scatter its rows into a full-vocabulary row at -inf, as EAGLE-3 does, so the
-        // samplers and the verification see ordinary logits (tokens outside the subset are never drafted)
-        const int64_t n_rows    = cur->ne[0];
-        const int64_t n_outputs = cur->ne[1];
-        const int64_t n_vocab   = (int64_t) model.vocab.n_tokens();
-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == n_rows);
-        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,      n_rows, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_rows, 1,      1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
-    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

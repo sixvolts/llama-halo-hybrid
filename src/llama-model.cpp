@@ -2667,8 +2667,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
-                // (a qwen4exp MTP block with a nonzero compress ratio - LLAMA_MTP_QSA - attends through QSA and needs the
-                //  hybrid memory with an indexer cache for its layer, as glm5next's MTP does)
+                // (a qwen4exp MTP block with a nonzero compress ratio - upstream-converted heads - attends through QSA
+                //  and needs the hybrid memory with an indexer cache for its layer, as glm5next's MTP does)
                 const bool mtp_qsa_qwen4exp = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
                     hparams.n_layer_all > hparams.n_layer() && hparams.dsv4_compress_ratios[hparams.n_layer()] > 0;
                 const bool mtp_on_hybrid_qwen =
