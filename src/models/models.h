@@ -1323,11 +1323,6 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * sinks,
                 float kq_scale,
                 int il) const;
-
-        // halo-hybrid: static, glm5next.cpp (our GLM-5.3-Flash graph) calls it too
-        static ggml_tensor * build_hc_mean(
-                ggml_context * ctx,
-                ggml_tensor  * x);
     };
 
     struct graph_mtp : public graph {

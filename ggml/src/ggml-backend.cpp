@@ -868,14 +868,15 @@ struct ggml_backend_sched {
 
     // see ggml_backend_sched_set_eager_copies
     bool eager_copies;
-    bool overlap_cut_ok = false; // halo-hybrid: ggml_backend_sched_set_overlap_cut
+    // see ggml_backend_sched_set_overlap_cut
+    bool overlap_cut_ok;
     // see ggml_backend_sched_set_remote_fetch
     bool remote_fetch;
     // see ggml_backend_sched_set_local_sync
     bool local_sync;
     // split loop state between ggml_backend_sched_graph_compute_async_head and _tail
     struct ggml_backend_sched_compute_state * pipe_state;
-    bool trace_split_sends = false; // halo-hybrid: GGML_SCHED_TRACE_SPLITS, one graph
+    bool trace_split_sends; // GGML_SCHED_TRACE_SPLITS, one graph
     int pipe_cut_split; // the split ggml_backend_sched_graph_compute_async_head stops after (the last remote split)
     ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPY_EVENTS];
     int copy_event_next[GGML_SCHED_MAX_BACKENDS];
@@ -2823,16 +2824,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async_pair(ggml_backend_sched_
     // keeps that guarantee only with the remote split at the same index in both lanes (else b's splits between them
     // would run before a's): otherwise it alternates, the order the check validated.
     static const bool lockstep = ggml_env_flag("GGML_SCHED_PAIR_LOCKSTEP", false);
-    auto first_remote_split = [](ggml_backend_sched_t sched) -> int {
-        for (int i = 0; i < sched->n_splits; i++) {
-            if (ggml_backend_sched_backend_is_rpc(sched->backends[sched->splits[i].backend_id])) {
-                return i;
-            }
-        }
-        return -1;
-    };
-    const int ra = first_remote_split(sched_a);
-    const int rb = first_remote_split(sched_b);
+    const int ra = ggml_backend_sched_first_remote_split(sched_a);
+    const int rb = ggml_backend_sched_first_remote_split(sched_b);
     if (!lockstep && ra >= 0 && rb >= 0 && !(by_hazard && ra != rb)) {
         struct phase { ggml_backend_sched_t sched; int from; int to; ggml_backend_sched_compute_state * st; };
         const phase phases[4] = {

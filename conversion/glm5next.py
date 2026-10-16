@@ -240,7 +240,7 @@ class Glm5NextVisionModel(Glm4VVisionModel):
     rather than a flag on glm4v.
     """
 
-    clip_projector_type = gguf.VisionProjectorType.GLM5NEXT
+    projector_type = gguf.VisionProjectorType.GLM5NEXT
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
