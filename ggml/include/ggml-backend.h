@@ -384,8 +384,9 @@ extern "C" {
     // halo-hybrid: re-record the current copy's split events on every backend that has them, so they also cover work queued
     // after the graph (the caller's async output reads); the next graph's user-input copies wait on these events
     GGML_API void                 ggml_backend_sched_record_output_events(ggml_backend_sched_t sched);
-    // a backend whose queue lives on another host (RPC): synchronizing it drains that host's whole command queue
-    GGML_API bool                 ggml_backend_sched_backend_is_remote_ext(ggml_backend_t backend);
+    // halo-hybrid: a backend whose queue lives on another host (an RPC device): synchronizing it drains that host's whole
+    // command queue
+    GGML_API bool                 ggml_backend_is_remote(ggml_backend_t backend);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

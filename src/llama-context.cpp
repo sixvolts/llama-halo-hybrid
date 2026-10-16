@@ -520,11 +520,7 @@ llama_context::llama_context(
             // (2026-09-07, cause open), so they stay off unless LLAMA_PREFILL_LANES_RPC=1 forces them
             bool has_remote = false;
             for (auto & backend : backends) {
-                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-                        strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "RPC") == 0) {
-                    has_remote = true;
-                }
+                has_remote = has_remote || ggml_backend_is_remote(backend.get());
             }
             // with a remote device the lanes run as a rolling pipeline (prefill_pipeline: the remote computes
             // ubatch k while the local devices run k+1; see decode); LLAMA_PREFILL_LANES_RPC=1 keeps the older
@@ -2449,7 +2445,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (ubatch_done_cb && t_h_nextn && embd_nextn.data && !cparams.embeddings_nextn_masked &&
                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
             ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sch, t_h_nextn);
-            if (backend_h && !ggml_backend_sched_backend_is_remote_ext(backend_h)) {
+            if (backend_h && !ggml_backend_is_remote(backend_h)) {
                 // deferred (two local lanes): record an event behind the h rows' copy; the hook runs after the next
                 // pair is submitted, so the draft overlaps it instead of stalling both devices (LLAMA_MTP_INGEST_DEFER=0)
                 static const bool defer_env = ggml_env_flag("LLAMA_MTP_INGEST_DEFER", true);

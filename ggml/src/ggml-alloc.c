@@ -1116,6 +1116,7 @@ void ggml_gallocr_fill_buffers(ggml_gallocr_t galloc, uint8_t value, bool skip_r
             if (b == NULL) {
                 continue;
             }
+            // an RPC buffer (the buffer-side form of ggml_backend_is_remote: its buffer type names start with "RPC")
             if (skip_remote && strncmp(ggml_backend_buffer_name(b), "RPC", 3) == 0) {
                 continue;
             }
