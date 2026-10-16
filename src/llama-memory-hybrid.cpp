@@ -8,8 +8,6 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
-#include <algorithm>
-
 //
 // llama_memory_hybrid
 //

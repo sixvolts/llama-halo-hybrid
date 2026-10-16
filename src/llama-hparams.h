@@ -292,10 +292,10 @@ struct llama_hparams {
     uint32_t indexer_top_k     = 0;
     // glm5next: the indexer scores pools of this many keys instead of single keys
     uint32_t indexer_kpool     = 0;
-    bool     indexer_kpool_select_tail = true; // glm5-next (upstream)
-    // head-size slots per cached indexer row, the last one holds the pooled key (upstream)
+    bool     indexer_kpool_select_tail = true;
+    // head-size slots per cached indexer row, the last one holds the pooled key
     uint32_t indexer_kpool_row = 3;
-    // pools are consecutive cells in sequence order, not runs of consecutive positions (upstream)
+    // pools are consecutive cells in sequence order, not runs of consecutive positions
     bool     indexer_kpool_by_order = false;
     // MSA
     uint32_t indexer_block_size  = 0;

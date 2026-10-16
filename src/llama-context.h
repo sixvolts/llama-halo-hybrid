@@ -436,7 +436,8 @@ private:
     std::vector<ingest_pending_t>     ingest_pending;
     std::vector<ggml_backend_event_t> ingest_ev_free;
     std::vector<ggml_backend_event_t> ingest_ev_all;
-    void ingest_flush(bool run);    llm_graph_result_ptr gf_res_reserve;
+    void ingest_flush(bool run);
+    llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
