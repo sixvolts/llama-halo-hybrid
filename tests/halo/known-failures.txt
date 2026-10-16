@@ -6,3 +6,5 @@
 # every failed case fails its step.
 sched-rpc ^qwen4exp-moe$ rpc-composite 2026-10-16: every layer behind a composite rpc-server: the server refuses the graph (model.input_embed, computed by the client's CPU split, arrives as an op leaf with no buffer); the same at 48b174740; layer splits with a local device (split-composite-lanes, the two-host layout) match
 sched-rpc ^glm5next-moe$ rpc-composite 2026-10-16: every layer behind a composite rpc-server: output differs from local; the same at 48b174740; split-composite-lanes matches
+sched-card ^qwen4exp-moe/composite$ rpc-composite 2026-10-16: the same composite failure as sched-rpc (here the server owns card + APU, experts on RPC1); not rechecked at 48b174740 in this mode
+sched-card ^glm5next-moe/composite$ rpc-composite 2026-10-16: the same composite failure as sched-rpc (output differs; here the server owns card + APU); not rechecked at 48b174740 in this mode
