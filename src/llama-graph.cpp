@@ -3209,7 +3209,7 @@ void llm_graph_input_attn_k::select_device(ggml_context * ctx0, ggml_backend_sch
     // the pin (graph callback) assigns the op to the layer's device; an instance whose backend already has one is
     // simply left out of the forward graph
     ggml_tensor * m = ggml_kq_mask_build(ctx0, self_pos_kv, self_pos_q, nullptr, nullptr, nullptr, 0, self_kq_mask->type);
-    pin(m, "kq_mask_dev", il);
+    pin(m, LLM_PLACE_KQ_MASK_DEV, il);
     ggml_backend_t be = sched ? ggml_backend_sched_get_tensor_backend(sched, m) : nullptr;
     auto it = dev_masks.find(be);
     if (it == dev_masks.end()) {

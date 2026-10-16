@@ -588,12 +588,12 @@ void llm_graph_input_kpool::select_device(ggml_context * ctx0, ggml_backend_sche
     const int64_t n_kv = sel_mask->ne[0];
     const int64_t n_q  = sel_mask->ne[1];
     ggml_tensor * s = ggml_kq_mask_build(ctx0, dev_pos_at, dev_q, dev_pool_of, dev_tail_start, dev_bo_vis, 1, GGML_TYPE_F16);
-    pin(s, "kq_mask_dev_sel", il);
+    pin(s, LLM_PLACE_KQ_MASK_DEV "_sel", il);
     ggml_backend_t be = sched ? ggml_backend_sched_get_tensor_backend(sched, s) : nullptr;
     auto it = dev_masks.find(be);
     if (it == dev_masks.end()) {
         ggml_tensor * c = ggml_kq_mask_build(ctx0, dev_pos_at, dev_q, dev_pool_of, dev_tail_start, dev_bo_vis, 2, GGML_TYPE_F16);
-        pin(c, "kq_mask_dev_cand", il);
+        pin(c, LLM_PLACE_KQ_MASK_DEV "_cand", il);
         it = dev_masks.emplace(be, std::make_pair(ggml_reshape_4d(ctx0, s, n_kv, n_q, 1, 1), ggml_reshape_4d(ctx0, c, n_kv, n_q, 1, 1))).first;
     }
     sel_cur  = it->second.first;

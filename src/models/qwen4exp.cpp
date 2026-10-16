@@ -1725,9 +1725,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
             cb(logits, "ffn_moe_logits", il);
             ggml_tensor * x16 = ggml_cast(ctx0, cur, f16_rows ? GGML_TYPE_F16 : GGML_TYPE_F32);
-            cb(x16, "moe_in_f16", il);
+            cb(x16, LLM_PLACE_MOE_IN_F16, il);
             exp_in = ggml_cast(ctx0, x16, GGML_TYPE_F32);
-            cb(exp_in, "moe_in_f32", il);
+            cb(exp_in, LLM_PLACE_MOE_IN_F32, il);
         }
     }
 

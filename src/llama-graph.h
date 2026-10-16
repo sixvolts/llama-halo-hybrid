@@ -779,6 +779,12 @@ public:
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
 
+// halo-hybrid: names llama_context::graph_get_cb places tensors by; a producer must name its tensor with these
+#define LLM_PLACE_KQ_MASK_DEV  "kq_mask_dev"   // prefix: device-built masks (also _sel, _cand) go to the layer's device
+#define LLM_PLACE_HC_FLAT_NORM "hc_flat_norm"  // runs on the layer's device
+#define LLM_PLACE_MOE_IN_F16   "moe_in_f16"    // the f16 cast of the MoE input: on the layer's device
+#define LLM_PLACE_MOE_IN_F32   "moe_in_f32"    // its f32 cast back: on the experts' device
+
 class llm_graph_result;
 
 struct llm_graph_params {
