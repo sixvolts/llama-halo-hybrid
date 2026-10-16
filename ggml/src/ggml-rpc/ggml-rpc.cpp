@@ -2145,19 +2145,80 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
         sg.sched_mode = true;
         sg.slot = (int) slot;
         sg.outs.clear();
-        // leafs: every deserialised tensor that is not a node of this graph, WHATEVER its op. The client sends a
-        // split's nodes plus everything they read; a source that is not a node here was produced elsewhere (a
-        // weight, an input the client copied in, a view of the KV or recurrent-state cache, an intermediate of an
-        // earlier split) and arrives with its data already in place - the scheduler must see it as an assigned
-        // leaf or split_graph asserts on it (GLM's slice reaches KV and state through view ops; found on the
-        // first GLM-size graph after a small-model smoke test whose sources were all plain weights).
         std::unordered_set<ggml_tensor *> node_set(graph->nodes, graph->nodes + n_nodes);
+        // halo-hybrid: drop the dead views of tensors computed elsewhere. The client's scheduler does not split at
+        // view nodes, so a split's node range can hold a view of another split's result that no node here reads
+        // (its consumers read the scheduler's input copy); a backend skips it, but this scheduler would have to
+        // place its source, which is in no server buffer (qwen4exp's "model.input_embed (reshaped)" with every
+        // layer behind the server). Walk backwards so chains of such views go too.
+        {
+            auto foreign_root = [&](ggml_tensor * t) {
+                ggml_tensor * root = t->view_src;
+                while (root && root->view_src) {
+                    root = root->view_src;
+                }
+                return root && root->buffer == nullptr && root->op != GGML_OP_NONE && node_set.find(root) == node_set.end();
+            };
+            std::unordered_set<ggml_tensor *> read;
+            std::vector<bool> keep(graph->n_nodes, true);
+            for (int i = graph->n_nodes - 1; i >= 0; i--) {
+                ggml_tensor * t = graph->nodes[i];
+                if (t == nullptr) {
+                    continue;
+                }
+                const bool view = t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+                if (view && read.find(t) == read.end() && !(t->flags & (GGML_TENSOR_FLAG_BOUNDARY | GGML_TENSOR_FLAG_OUTPUT)) && foreign_root(t)) {
+                    keep[i] = false;
+                    continue;
+                }
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    if (t->src[j]) {
+                        read.insert(t->src[j]);
+                    }
+                }
+                if (t->view_src) {
+                    read.insert(t->view_src);
+                }
+            }
+            int n = 0;
+            for (int i = 0; i < graph->n_nodes; i++) {
+                if (keep[i]) {
+                    graph->nodes[n++] = graph->nodes[i];
+                } else {
+                    node_set.erase(graph->nodes[i]);
+                }
+            }
+            graph->n_nodes = n;
+        }
+        // leafs: every tensor the nodes reach through src and view_src that is not a node of this graph, WHATEVER
+        // its op. The client sends a split's nodes plus everything they read; a source that is not a node here was
+        // produced elsewhere (a weight, an input the client copied in, a view of the KV or recurrent-state cache, an
+        // intermediate of an earlier split) and arrives with its data already in place - the scheduler must see it
+        // as an assigned leaf or split_graph asserts on it (GLM's slice reaches KV and state through view ops; found
+        // on the first GLM-size graph after a small-model smoke test whose sources were all plain weights).
         graph->n_leafs = 0;
-        for (auto & kv : tensor_map) {
-            ggml_tensor * t = kv.second;
-            if (t && node_set.find(t) == node_set.end()) {
-                GGML_ASSERT(graph->n_leafs < graph->size);
-                graph->leafs[graph->n_leafs++] = t;
+        {
+            std::unordered_set<ggml_tensor *> seen;
+            std::vector<ggml_tensor *> stack;
+            auto visit = [&](ggml_tensor * t) {
+                if (t && seen.insert(t).second) {
+                    stack.push_back(t);
+                }
+            };
+            for (int i = 0; i < graph->n_nodes; i++) {
+                visit(graph->nodes[i]);
+            }
+            while (!stack.empty()) {
+                ggml_tensor * t = stack.back();
+                stack.pop_back();
+                if (node_set.find(t) == node_set.end()) {
+                    GGML_ASSERT(graph->n_leafs < graph->size);
+                    graph->leafs[graph->n_leafs++] = t;
+                }
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    visit(t->src[j]);
+                }
+                visit(t->view_src);
             }
         }
         // unpin the intermediates: the client allocated every node of this graph in its own scratch buffer on
@@ -2189,7 +2250,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
                 return false;
             }
         }
-        for (uint32_t i = 0; i < n_nodes; i++) {
+        for (int i = 0; i < graph->n_nodes; i++) {
             ggml_tensor * t = graph->nodes[i];
             if (t == nullptr || t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
                 continue;
@@ -2228,7 +2289,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
             }
         }
         std::unordered_set<ggml_tensor *> unpinned;
-        for (uint32_t i = 0; i < n_nodes; i++) {
+        for (int i = 0; i < graph->n_nodes; i++) {
             ggml_tensor * t = graph->nodes[i];
             if (t == nullptr || t->op == GGML_OP_NONE) {
                 continue;
