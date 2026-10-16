@@ -110,12 +110,12 @@ def host(gen, mpath, bless):
             problems.append('kernel cmdline has %s' % f)
 
     dm = subprocess.run(['sudo', '-n', 'dmesg'], capture_output=True, text=True).stdout
-    mine = [l for l in dm.splitlines() if pci in l or pci[5:] in l]
+    mine = [ln for ln in dm.splitlines() if pci in ln or pci[5:] in ln]
     for pat in (r'power state from D3', r'device inaccessible', r'device lost', r'GPU reset begin', r'reset failed', r'GPU recovery', r'SMU is in hanged state'):
-        hits = [l for l in mine if re.search(pat, l)]
+        hits = [ln for ln in mine if re.search(pat, ln)]
         if hits:
             problems.append('dmesg since boot: %s (%d lines; reboot to clear)' % (pat, len(hits)))
-    faults = [l for l in mine if 'page fault' in l.lower()]
+    faults = [ln for ln in mine if 'page fault' in ln.lower()]
     if faults:
         notes.append('%d page-fault lines in dmesg' % len(faults))
     if not dm:

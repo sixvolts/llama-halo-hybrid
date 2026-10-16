@@ -142,7 +142,7 @@ def admitted_hazards(err):
     the scheduler ran its lanes one after the other, or when every hazard is a reorder on one stream, which the name guard
     has always admitted (5a8325082); it logs either right after the pair's hazard line (uncapped under
     GGML_SCHED_PAIR_DEBUG). The 1-lane/2-lane exact-output comparison is what checks an admitted reorder."""
-    lines = [l for l in err.splitlines() if HZ.search(l) or REFUSED.search(l) or REORDER in l or DIFFERENT in l]
+    lines = [ln for ln in err.splitlines() if HZ.search(ln) or REFUSED.search(ln) or REORDER in ln or DIFFERENT in ln]
     n, bad, reorder = 0, 0, 0
     for i, l in enumerate(lines):
         m = HZ.search(l)
@@ -159,6 +159,8 @@ def admitted_hazards(err):
             else:
                 bad += 1
     return n, bad, reorder
+
+
 SELF = re.compile(r'self-test, a delayed one split: (\d+) cache hazards')
 
 

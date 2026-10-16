@@ -46,8 +46,8 @@ def run_one(binary, model_path, out):
 
 
 def parse(text, model):
-    head = [l for l in text.splitlines() if l.startswith('Model ')]
-    row = [l for l in text.splitlines() if l.startswith(model)]
+    head = [ln for ln in text.splitlines() if ln.startswith('Model ')]
+    row = [ln for ln in text.splitlines() if ln.startswith(model)]
     if not head or not row:
         return None
     cols = re.split(r'\s{2,}', head[-1].strip())[1:]   # column names can hold one space ("split replay")

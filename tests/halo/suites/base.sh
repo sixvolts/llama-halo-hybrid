@@ -4,7 +4,9 @@
 
 CPU_BUILD=${CPU_BUILD:-$REPO/build-halo-cpu}
 GPU_TARGETS_ALL=${HALO_GPU_TARGETS:-"gfx1151;gfx1201;gfx1100;gfx1101;gfx1030"}   # every cookbook target by default
-ARCHS='^(qwen4exp|qwen35|qwen35moe|glm5next|glm-dsa|deepseek4)$'
+# the architectures whose graphs or kernels this tree changes (glm5-next, bailingmoe3, dots3note: upstream's, through the
+# shared MoE and attention paths)
+ARCHS='^(qwen4exp|qwen35|qwen35moe|glm5next|glm5-next|glm-dsa|deepseek4|bailingmoe3|dots3note)$'
 
 build_jobs() {   # ~3 GiB per HIP compile job: production runs during builds and memguard kills it below 10 GiB
     local avail=$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)

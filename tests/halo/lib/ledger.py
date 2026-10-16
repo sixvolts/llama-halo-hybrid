@@ -29,7 +29,7 @@ def finish(run_dir, ledger, kv):
     with open(os.path.join(run_dir, 'summary.md'), 'w') as f:
         f.write('# %s %s on %s: %s\n\n' % (rec.get('suite'), rec.get('level'), rec.get('host'), rec.get('verdict')))
         f.write('commit %s%s, %s, %d min\n\n' % (rec.get('commit'), ' (dirty)' if rec['dirty'] else '', rec['ts'],
-                                                rec['seconds'] // 60))
+                                                 rec['seconds'] // 60))
         f.write('| Step | Verdict | Time | Detail |\n|---|---|---|---|\n')
         for s in steps:
             f.write('| %s | %s | %ds | %s |\n' % (s['name'], s['verdict'], s['seconds'], s['detail'].replace('|', '/')))
@@ -44,7 +44,7 @@ def last(ledger, n):
         r = json.loads(line)
         bad = [s['name'] for s in r['steps'] if s['verdict'] not in ('PASS', 'SKIP')]
         print('%s  %-6s %-6s %-9s %-10s %s%s' % (r['ts'][:16], r['host'], r['suite'], r['level'], r['verdict'],
-                                                r['commit'], ('  failing: ' + ', '.join(bad)) if bad else ''))
+                                                 r['commit'], ('  failing: ' + ', '.join(bad)) if bad else ''))
 
 
 if __name__ == '__main__':

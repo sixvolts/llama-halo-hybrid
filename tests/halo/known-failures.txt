@@ -1,3 +1,6 @@
 # Failures the suites report as KNOWN instead of FAIL. Every line needs a date and a reason, and comes out when it is
 # fixed. Anything not listed here fails its step.
 # <test> <model regex> <subtest | abort | *> <date: reason>
+# <test> is one of: test-save-load-state, test-recurrent-state-rollback (lib/state_check.py, the state-* steps) or
+# sched-rpc, sched-card, sched-fuse (lib/sched_check.py). test-backend-ops cases (lib/tbo_check.py) cannot be listed:
+# every failed case fails its step.
