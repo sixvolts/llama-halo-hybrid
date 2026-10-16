@@ -10837,6 +10837,82 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// halo-hybrid: the case sets that environment variables select (test-backend-ops --help lists them). An exclusive set
+// replaces the case list from its position on: the cases built before it stay in (they always have; with -o the
+// unrelated ones drop out). An additive set adds its cases to the full list.
+struct halo_case_set {
+    const char * name;
+    const char * mode;      // "eval" (test, grad, support) or "perf"
+    bool         exclusive;
+    const char * what;
+};
+
+static const halo_case_set halo_case_sets[] = {
+    { "TBO_Q38_EVAL",          "eval", false, "Qwen3.8 QSA prefill attention (D=256, top-k 2051, sparse union walk)" },
+    { "TBO_GLM_EVAL",          "eval", false, "GLM-5.3-Flash expert / trunk GEMMs, MTP indexer, GDN, concat, D=512 (sparse) attention" },
+    { "TBO_Q38_MOE_EVAL",      "eval", true,  "Qwen3.8 expert GEMMs and MoE blocks at prefill widths" },
+    { "TBO_THIN_W",            "both", true,  "thin bf16 / f16 / f32 weights (4 x 10240) at prefill widths" },
+    { "TBO_MMV_SHAPES",        "both", true,  "\"m:k[:n[:type]],...\" dense GEMV / GEMM shapes (n 3, type q8_0 by default)" },
+    { "TBO_GLM_SHAPES",        "eval", true,  "GLM-5.3-Flash GEMM shapes (bisect set)" },
+    { "TBO_KDA_CONV_L2",       "perf", true,  "\"d_inner:nt[:reps],...\" KDA conv tail" },
+    { "TBO_MMV_FUSION_SHAPES", "perf", true,  "\"m:k[:n[:g|b]],...\" fused gate/up + SwiGLU (g) or bias (b) GEMV" },
+    { "TBO_KDA_CONV",          "perf", true,  "\"C:nt:K[:leaf|mm|alias],...\" KDA conv-input assembly" },
+    { "TBO_CONCAT_T",          "perf", true,  "\"a0:C[:ntok],...\" conv-state concat" },
+    { "TBO_MMV_ROT",           "perf", true,  "\"m:k[:n[:type[:p|b|g]]],...\" GEMV over rotating weights (DRAM-streamed)" },
+    { "TBO_Q38_FA",            "perf", true,  "Qwen3.8 attention shapes" },
+    { "TBO_Q38",               "perf", true,  "Qwen3.8 decode shapes" },
+    { "TBO_GLM_MWR",           "perf", false, "GLM-5.3 MoE weighted reduction" },
+    { "TBO_GLM_DECODE",        "perf", false, "GLM-5.3 decode extras" },
+    { "TBO_GLM",               "perf", true,  "GLM-5.3-Flash shapes" },
+    { "TBO_Q38_SHAPES",        "perf", true,  "Qwen3.8 GEMM shapes" },
+    { "TBO_Q38_F32",           "perf", true,  "Qwen3.8 f32 GEMM shapes" },
+    { "TBO_Q38_MOE",           "perf", true,  "Qwen3.8 expert GEMMs and gate+up+SwiGLU" },
+};
+
+// one line on stderr naming the active case sets of this mode and the number of cases they produced
+static void halo_case_sets_report(bool perf, size_t n_cases) {
+    std::string names;
+    for (const halo_case_set & cs : halo_case_sets) {
+        const bool mode_ok = strcmp(cs.mode, "both") == 0 || strcmp(cs.mode, perf ? "perf" : "eval") == 0;
+        if (mode_ok && getenv(cs.name) != nullptr) {
+            names += std::string(names.empty() ? "" : ", ") + cs.name + (cs.exclusive ? "" : " (added)");
+        }
+    }
+    if (!names.empty()) {
+        fprintf(stderr, "halo-hybrid case set %s: %zu cases\n", names.c_str(), n_cases);
+    }
+}
+
+// the comma-separated entries of a TBO_* shape string; parse returns false for an entry it cannot read, which ends
+// the program with the set's name (a typo used to drop the shape silently)
+template <typename F>
+static void halo_for_each_shape_spec(const char * set, const char * spec, F && parse) {
+    const std::string s(spec);
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t end = s.find(',', pos);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        const std::string one = s.substr(pos, end - pos);
+        pos = end + 1;
+        if (!one.empty() && !parse(one.c_str())) {
+            fprintf(stderr, "%s: cannot use '%s'\n", set, one.c_str());
+            exit(1);
+        }
+    }
+}
+
+// a ggml type by name (q8_0, q4_K, ...), GGML_TYPE_COUNT if there is none
+static ggml_type halo_type_by_name(const char * name) {
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        if (ggml_type_name((ggml_type) i) && strcmp(ggml_type_name((ggml_type) i), name) == 0) {
+            return (ggml_type) i;
+        }
+    }
+    return GGML_TYPE_COUNT;
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
@@ -12100,18 +12176,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // halo-hybrid: arbitrary dense q8_0 GEMV/GEMM shapes for kernel work, TBO_MMV_SHAPES="m:k[:n],m:k[:n],..." (n defaults to 3)
     if (const char * env = getenv("TBO_MMV_SHAPES")) {
-        std::string spec(env);
-        size_t pos = 0;
-        while (pos < spec.size()) {
-            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
-            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+        halo_for_each_shape_spec("TBO_MMV_SHAPES", env, [&](const char * one) {
             int64_t m = 0, k = 0, n = 3; char tname[16] = "q8_0";
-            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15s", &m, &k, &n, tname) >= 2 && m > 0 && k > 0) {
-                ggml_type t = GGML_TYPE_Q8_0;
-                for (int i = 0; i < GGML_TYPE_COUNT; i++) { if (ggml_type_name((ggml_type) i) && strcmp(ggml_type_name((ggml_type) i), tname) == 0) { t = (ggml_type) i; } }
-                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            if (sscanf(one, "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15s", &m, &k, &n, tname) < 2 || m <= 0 || k <= 0 || n <= 0) {
+                return false;
             }
-        }
+            const ggml_type t = halo_type_by_name(tname);
+            if (t == GGML_TYPE_COUNT) {
+                return false;
+            }
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            return true;
+        });
         return test_cases;
     }
     // GLM-5.3-Flash shapes (halo-hybrid bisect): 288 experts / 8 used, q4_K / q5_K / q6_K experts, q8_0 trunk
@@ -13521,16 +13597,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // halo-hybrid: KDA conv tail, TBO_KDA_CONV_L2="d_inner:nt[:reps],..." (d_conv 4); reps copies per graph, one per layer
     if (const char * env = getenv("TBO_KDA_CONV_L2")) {
-        std::string spec(env);
-        size_t pos = 0;
-        while (pos < spec.size()) {
-            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
-            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+        halo_for_each_shape_spec("TBO_KDA_CONV_L2", env, [&](const char * one) {
             int64_t di = 0, nt = 3, reps = 1;
-            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &di, &nt, &reps) >= 2 && di > 0 && nt > 0 && reps > 0) {
-                test_cases.emplace_back(new test_kda_conv_l2(di, 4, nt, 1, reps));
+            if (sscanf(one, "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &di, &nt, &reps) < 2 || di <= 0 || nt <= 0 || reps <= 0) {
+                return false;
             }
-        }
+            test_cases.emplace_back(new test_kda_conv_l2(di, 4, nt, 1, reps));
+            return true;
+        });
         return test_cases;
     }
     // halo-hybrid: 8 chained hyper-connection boundaries in one graph (us/run is the whole graph); compare
@@ -13540,50 +13614,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // halo-hybrid: fused gate/up + SwiGLU GEMV shapes, TBO_MMV_FUSION_SHAPES="m:k[:n],..." (q8_0 x f32, n defaults to 3)
     if (const char * env = getenv("TBO_MMV_FUSION_SHAPES")) {
-        std::string spec(env);
-        size_t pos = 0;
-        while (pos < spec.size()) {
-            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
-            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+        halo_for_each_shape_spec("TBO_MMV_FUSION_SHAPES", env, [&](const char * one) {
             int64_t m = 0, k = 0, n = 3; char mode[8] = "g";
             // mode g (default): gate/up + SwiGLU; b: bias only (the attn_qkv / hc_down fusions of a decode step)
-            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%7s", &m, &k, &n, mode) >= 2 && m > 0 && k > 0) {
-                const bool gate = mode[0] != 'b';
-                // ctor order is (n_tokens, rows, k)
-                test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n, m, k,
-                    false, 1, 1, false, !gate, gate, false, {1, 1}));
+            if (sscanf(one, "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%7s", &m, &k, &n, mode) < 2 || m <= 0 || k <= 0 || n <= 0 ||
+                    (mode[0] != 'g' && mode[0] != 'b')) {
+                return false;
             }
-        }
+            const bool gate = mode[0] != 'b';
+            // ctor order is (n_tokens, rows, k)
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n, m, k,
+                false, 1, 1, false, !gate, gate, false, {1, 1}));
+            return true;
+        });
         return test_cases;
     }
     // halo-hybrid: KDA conv-input assembly, whole graph per run, TBO_KDA_CONV="C:nt:K[:mode],..." (mode leaf|mm|alias)
     //     A/B the fused launch against the unfused chain with GGML_CUDA_NO_KDA_CONV_ROWS=1
     if (const char * env = getenv("TBO_KDA_CONV")) {
-        std::string spec(env);
-        size_t pos = 0;
-        while (pos < spec.size()) {
-            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
-            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+        halo_for_each_shape_spec("TBO_KDA_CONV", env, [&](const char * one) {
             int64_t c = 0, nt = 3, k = 3;
             char mode[16] = "leaf";
-            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15s", &c, &nt, &k, mode) >= 1 && c > 0 && c % 3 == 0) {
-                test_cases.emplace_back(new test_kda_conv_state(c, nt, k, mode, true));
+            if (sscanf(one, "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15s", &c, &nt, &k, mode) < 1 || c <= 0 || c % 3 != 0) {
+                return false;
             }
-        }
+            test_cases.emplace_back(new test_kda_conv_state(c, nt, k, mode, true));
+            return true;
+        });
         return test_cases;
     }
     // halo-hybrid: conv-state concat shapes, TBO_CONCAT_T="a0:C:ntok,..." (f32)
     if (const char * env = getenv("TBO_CONCAT_T")) {
-        std::string spec(env);
-        size_t pos = 0;
-        while (pos < spec.size()) {
-            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
-            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+        halo_for_each_shape_spec("TBO_CONCAT_T", env, [&](const char * one) {
             int64_t a0 = 0, c = 0, nt = 3;
-            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &a0, &c, &nt) >= 2 && a0 > 0 && c > 0) {
-                test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F32, {a0, c, 1, 1}, nt));
+            if (sscanf(one, "%" SCNd64 ":%" SCNd64 ":%" SCNd64, &a0, &c, &nt) < 2 || a0 <= 0 || c <= 0) {
+                return false;
             }
-        }
+            test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F32, {a0, c, 1, 1}, nt));
+            return true;
+        });
         return test_cases;
     }
     for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -13594,38 +13663,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // halo-hybrid: arbitrary dense q8_0 GEMV/GEMM shapes for kernel work, TBO_MMV_SHAPES="m:k[:n],m:k[:n],..." (n defaults to 3)
     if (const char * env = getenv("TBO_MMV_SHAPES")) {
-        std::string spec(env);
-        size_t pos = 0;
-        while (pos < spec.size()) {
-            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
-            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+        halo_for_each_shape_spec("TBO_MMV_SHAPES", env, [&](const char * one) {
             int64_t m = 0, k = 0, n = 3; char tname[16] = "q8_0";
-            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15s", &m, &k, &n, tname) >= 2 && m > 0 && k > 0) {
-                ggml_type t = GGML_TYPE_Q8_0;
-                for (int i = 0; i < GGML_TYPE_COUNT; i++) { if (ggml_type_name((ggml_type) i) && strcmp(ggml_type_name((ggml_type) i), tname) == 0) { t = (ggml_type) i; } }
-                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            if (sscanf(one, "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15s", &m, &k, &n, tname) < 2 || m <= 0 || k <= 0 || n <= 0) {
+                return false;
             }
-        }
+            const ggml_type t = halo_type_by_name(tname);
+            if (t == GGML_TYPE_COUNT) {
+                return false;
+            }
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            return true;
+        });
         return test_cases;
     }
 
     // halo-hybrid: DRAM-streamed GEMV shapes (see test_mul_mat_rot), TBO_MMV_ROT="m:k[:n[:type]],..."
     if (const char * env = getenv("TBO_MMV_ROT")) {
-        std::string spec(env);
-        size_t pos = 0;
-        while (pos < spec.size()) {
-            size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
-            std::string one = spec.substr(pos, end - pos); pos = end + 1;
+        halo_for_each_shape_spec("TBO_MMV_ROT", env, [&](const char * one) {
             int64_t m = 0, k = 0, n = 3; char tname[16] = "q8_0"; char mode[8] = "p";   // p plain, b bias, g gate
-            if (sscanf(one.c_str(), "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15[^:]:%7s", &m, &k, &n, tname, mode) >= 2 && m > 0 && k > 0) {
-                ggml_type t = GGML_TYPE_Q8_0;
-                for (int i = 0; i < GGML_TYPE_COUNT; i++) { if (ggml_type_name((ggml_type) i) && strcmp(ggml_type_name((ggml_type) i), tname) == 0) { t = (ggml_type) i; } }
-                const int fz = mode[0] == 'b' ? 1 : mode[0] == 'g' ? 2 : 0;
-                const int64_t bytes = ggml_row_size(t, k) * m * (fz == 2 ? 2 : 1);
-                const int rot = (int) std::min<int64_t>(fz == 2 ? 128 : 256, std::max<int64_t>(2, ((int64_t) 256 << 20) / bytes + 1));
-                test_cases.emplace_back(new test_mul_mat_rot(t, m, n, k, rot, fz));
+            if (sscanf(one, "%" SCNd64 ":%" SCNd64 ":%" SCNd64 ":%15[^:]:%7s", &m, &k, &n, tname, mode) < 2 || m <= 0 || k <= 0 ||
+                    n <= 0 || (mode[0] != 'p' && mode[0] != 'b' && mode[0] != 'g')) {
+                return false;
             }
-        }
+            const ggml_type t = halo_type_by_name(tname);
+            if (t == GGML_TYPE_COUNT) {
+                return false;
+            }
+            const int fz = mode[0] == 'b' ? 1 : mode[0] == 'g' ? 2 : 0;
+            const int64_t bytes = ggml_row_size(t, k) * m * (fz == 2 ? 2 : 1);
+            const int rot = (int) std::min<int64_t>(fz == 2 ? 128 : 256, std::max<int64_t>(2, ((int64_t) 256 << 20) / bytes + 1));
+            test_cases.emplace_back(new test_mul_mat_rot(t, m, n, k, rot, fz));
+            return true;
+        });
         return test_cases;
     }
     // Qwen3.8-Flash-Next attention on the R9700: 24 q heads over 2 kv heads, D=256, QSA selects ~8K cells per query
@@ -14487,6 +14557,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             test_cases = make_test_cases_perf();
             break;
         }
+        halo_case_sets_report(mode == MODE_PERF, test_cases.size());
     } else {
         test_cases = make_test_cases_from_file(test_file_path);
     }
@@ -14764,6 +14835,12 @@ static void usage(char ** argv) {
     printf("  %s -b MTL0 -o 'DSV4.*'\n", argv[0]);
     printf("  %s -b CUDA0 -o 'ADD(type=f16,ne=[1,1,1,1],nr=[32,1,1,1],nf=1,perm1=0,src_overlap=0)'\n", argv[0]);
     printf("  %s perf -o 'MUL_MAT.*'\n", argv[0]);
+    printf("\nhalo-hybrid case sets (set the variable to use one; exclusive sets replace the default list):\n");
+    for (const halo_case_set & cs : halo_case_sets) {
+        printf("  %-22s %-4s %-9s %s\n", cs.name, cs.mode, cs.exclusive ? "exclusive" : "added", cs.what);
+    }
+    printf("  TBO_GDN_NMSE=<x>       NMSE tolerance of the gated-delta-net cases\n");
+    printf("  TBO_MMID_SHARE=<n>     every token of a MUL_MAT_ID case also routes to token 0's first n experts\n");
 }
 
 int main(int argc, char ** argv) {
