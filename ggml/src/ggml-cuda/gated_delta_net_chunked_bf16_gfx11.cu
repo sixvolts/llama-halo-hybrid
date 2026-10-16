@@ -874,7 +874,7 @@ gdn_bf16_scan_cuda(
 
 #else // !defined(RDNA3)
 
-// No-op stub definitions: the first-gen wmma intrinsic needs the gfx11 target features
+// Stub definitions (they trap if ever launched): the first-gen wmma intrinsic needs the gfx11 target features
 // (wmma-256b-insts,wavefrontsize32) and does not compile on gfx12/older targets. The
 // runtime-cc dispatch never launches these on non-RDNA3 hardware; they exist only so the
 // host-pass launch stubs in the launchers below link on every arch.
@@ -882,14 +882,14 @@ template <int HG_RATIO>
 __global__ static void gdn_bf16_kkt_cuda(
         const float * __restrict__ k, const float * __restrict__ g, const float * __restrict__ beta,
         unsigned short * __restrict__ A_sc, int64_t H, int64_t H_k, int64_t n_tokens,
-        int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3) {}
+        int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3) { NO_DEVICE_CODE; }
 __global__ static void gdn_bf16_scan_cuda(
         const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
         const float * __restrict__ g, const float * __restrict__ beta, const float * __restrict__ state_in,
         float * __restrict__ attn_out, float * __restrict__ state_out,
         const unsigned short * __restrict__ A_sc, int64_t H, int64_t H_k, int64_t n_tokens,
         int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
-        const uint3 neqk1_magic, const uint3 rq3_magic, float scale, int64_t state_seq_stride) {}
+        const uint3 neqk1_magic, const uint3 rq3_magic, float scale, int64_t state_seq_stride) { NO_DEVICE_CODE; }
 
 #endif // defined(RDNA3)
 

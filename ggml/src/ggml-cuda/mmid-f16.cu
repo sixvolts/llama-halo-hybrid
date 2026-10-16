@@ -705,7 +705,7 @@ __launch_bounds__(256) __global__
     void RoutedF16GEMMKernel(const void* __restrict__, const __half* __restrict__, const std::int32_t* __restrict__,
                              const std::int32_t* __restrict__, const std::int32_t* __restrict__, const std::int32_t* __restrict__,
                              const float* __restrict__, float* __restrict__, __half* __restrict__, std::size_t, std::size_t,
-                             const void* __restrict__) {}
+                             const void* __restrict__) { NO_DEVICE_CODE; }
 #endif
 
 
