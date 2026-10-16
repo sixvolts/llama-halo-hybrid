@@ -97,3 +97,33 @@ def test_prefill_lanes_zero_is_off(monkeypatch):
     server.start()
     res = server.make_request("POST", "/completion", data={"prompt": "Hello", "temperature": 0.0, "n_predict": 4})
     assert res.status_code == 200, res.body
+
+
+def test_kvu_full_pool_purges_the_lru_idle_slot():
+    # -kvu -np 2 with idle slots kept resident (--no-cache-idle-slots): when the shared pool cannot take a new prompt,
+    # the least recently used idle slot leaves it for the RAM prompt cache, and its conversation comes back from there
+    global server
+    server = ServerPreset.stories15m_moe()
+    server.kv_unified = True
+    server.n_slots = 2
+    server.n_ctx = 256   # the pool; the model's own context is 256 too
+    server.no_cache_idle_slots = True
+    server.cache_ram = 64
+    server.log_path = "./tmp/test_halo_kvu_purge.log"
+    server.start()
+    a = "The quick brown fox jumps over the lazy dog. " * 12
+    b = "A little girl went to the park and played with her red ball. " * 10
+
+    def complete(prompt):
+        res = server.make_request("POST", "/completion", data={"prompt": prompt, "temperature": 0.0, "n_predict": 16})
+        assert res.status_code == 200, res.body
+        return res.body
+
+    a1 = complete(a)
+    b1 = complete(b)
+    assert a1["tokens_evaluated"] + b1["tokens_evaluated"] + 32 > 256   # the two do not fit the pool together
+    a2 = complete(a)
+    assert a2["content"] == a1["content"]
+    assert a2["timings"]["cache_n"] > 0   # restored from the prompt cache, not prefilled again
+    log = open(server.log_path).read()
+    assert "purging slot" in log
