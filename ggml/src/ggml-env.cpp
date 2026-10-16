@@ -89,10 +89,9 @@ double ggml_env_float(const char * name, double def) {
     return r;
 }
 
-void ggml_env_log_set(const char * who) {
-    static std::once_flag once;
-    std::call_once(once, [who] {
-        std::string set;
+const char * ggml_env_set_string(void) {
+    static const std::string set = [] {
+        std::string r;
         for (char ** e = GGML_ENVIRON; e && *e; ++e) {
             // LLAMA_ARG_* mirrors command-line options (--api-key among them); never log those
             if ((std::strncmp(*e, "GGML_", 5) != 0 && std::strncmp(*e, "LLAMA_", 6) != 0) || std::strncmp(*e, "LLAMA_ARG_", 10) == 0) {
@@ -104,10 +103,19 @@ void ggml_env_log_set(const char * who) {
                     name.find("SECRET") != std::string::npos || name.find("PASS") != std::string::npos) {
                 kv = name + "=<redacted>";
             }
-            set += " " + kv;
+            r += " " + kv;
         }
-        if (!set.empty()) {
-            GGML_LOG_INFO("%s: environment:%s\n", who, set.c_str());
+        return r;
+    }();
+    return set.c_str();
+}
+
+void ggml_env_log_set(const char * who) {
+    static std::once_flag once;
+    std::call_once(once, [who] {
+        const char * set = ggml_env_set_string();
+        if (set[0] != '\0') {
+            GGML_LOG_INFO("%s: environment:%s\n", who, set);
         }
     });
 }

@@ -1278,6 +1278,9 @@ private:
                 (int) ctx_tgt_seq_rm_type, llama_n_rs_seq(ctx_tgt));
 
         // setup slots
+        if (ggml_env_set_string()[0] != '\0') {
+            SRV_INF("environment:%s\n", ggml_env_set_string());   // halo-hybrid: the GGML_* / LLAMA_* switches this run uses
+        }
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
 
