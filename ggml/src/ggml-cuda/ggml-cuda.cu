@@ -231,7 +231,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
 #ifdef GGML_USE_HIP
-    // rocBLAS 7.x hands f32 GEMMs to hipBLASLt, whose gfx1201 sgemm solutions are 8x8 macro-tile fallbacks
+    // halo-hybrid: rocBLAS 7.x hands f32 GEMMs to hipBLASLt, whose gfx1201 sgemm solutions are 8x8 macro-tile fallbacks
     // (a [2560 -> 512] x 1024 sgemm runs at 2.5 TFLOPS; rocBLAS' own Tensile kernels reach 11).
     // Prefer rocBLAS unless the user chose explicitly.
     if (getenv("ROCBLAS_USE_HIPBLASLT") == nullptr) {
@@ -240,6 +240,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
 #else
         setenv("ROCBLAS_USE_HIPBLASLT", "0", 1);
 #endif
+        GGML_LOG_INFO("%s: ROCBLAS_USE_HIPBLASLT=0 (set by ggml-hip: rocBLAS' own f32 GEMMs; set it to choose)\n", __func__);
     }
 #endif // GGML_USE_HIP
 

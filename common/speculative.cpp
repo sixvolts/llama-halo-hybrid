@@ -1458,6 +1458,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        {   // halo-hybrid: whether prompt batches feed the draft from inside the target's decode (see early_ingest)
+            const int64_t early_min = ggml_env_int("LLAMA_MTP_EARLY_MIN", 256);
+            if (early_min > 0 && !is_mem_shared && !chain_heads) {
+                SPC_INF("MTP early ingest: prompt batches of %lld+ tokens (LLAMA_MTP_EARLY_MIN; 0 = off)\n", (long long) early_min);
+            }
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 

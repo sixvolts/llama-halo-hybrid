@@ -2323,14 +2323,20 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool sched_mo
 }
 
 // halo-hybrid: the server-side scheduler (card + APU behind ggml-rpc) keeps the pre-9375f16ec behaviour for the APU -
-// a host synchronize of its stream before its split inputs instead of scheduler events. With APU events this
-// scheduler faulted on the APU at the first decode graph of GLM-5.3 two-host (out-of-range expert reads by the grouped
-// MoE GEMV; gone with serialized kernels or GGML_SCHED_IGPU_EVENTS=0; root cause open, 2026-09-28). The server step
-// measured the same without them (90-92 ms). An explicit GGML_SCHED_IGPU_EVENTS in the environment still wins.
+// a host synchronize of its stream before its split inputs instead of scheduler events. The server step measured the
+// same without them (90-92 ms). An explicit GGML_SCHED_IGPU_EVENTS in the environment still wins.
+// TODO(halo): with GGML_SCHED_IGPU_EVENTS=1 this scheduler faulted on the APU at the first decode graph of GLM-5.3
+// two-host (out-of-range expert reads by the grouped MoE GEMV; gone with serialized kernels; 2026-09-28): cause not found.
 static void rpc_server_sched_defaults() {
     if (getenv("GGML_SCHED_IGPU_EVENTS") != nullptr) {
         ggml_env_flag_unsafe("GGML_SCHED_IGPU_EVENTS", false,
             "turns on the APU split events that faulted the rpc-server's scheduler (GLM-5.3 two-host, 2026-09-28)");
+    } else {
+        static bool announced = false;
+        if (!announced) {
+            GGML_LOG_INFO("%s: GGML_SCHED_IGPU_EVENTS=0 for the server's scheduler (APU splits synchronize instead)\n", __func__);
+            announced = true;
+        }
     }
 #ifdef _WIN32
     if (getenv("GGML_SCHED_IGPU_EVENTS") == nullptr) {

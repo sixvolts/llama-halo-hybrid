@@ -1574,6 +1574,10 @@ void llama_kv_cache::set_window(bool enable) {
     static const bool disabled = ggml_env_flag("LLAMA_KV_NO_WINDOW", false);
 
     window = enable && !disabled && n_stream == 1 && n_seq_max > 1;
+    if (enable) {
+        LLAMA_LOG_INFO("%s: kv window: %s\n", __func__, window ? "on" : disabled ? "off (LLAMA_KV_NO_WINDOW)" :
+                       n_stream != 1 ? "off (a stream per sequence: -kvu shares one)" : "off (one sequence)");
+    }
 }
 
 bool llama_kv_cache::get_window() const {

@@ -516,8 +516,6 @@ llama_context::llama_context(
                     n_gpu++;
                 }
             }
-            // a remote (RPC) device: the lanes gain ~8% prefill there but halve decode with a draft head
-            // (2026-09-07, cause open), so they stay off unless LLAMA_PREFILL_LANES_RPC=1 forces them
             bool has_remote = false;
             for (auto & backend : backends) {
                 has_remote = has_remote || ggml_backend_is_remote(backend.get());
@@ -536,6 +534,10 @@ llama_context::llama_context(
                 if (n_gpu >= 2 && !cparams.pipeline_parallel && !model.hparams.no_alloc) {
                     cparams.prefill_lanes = 2;
                     LLAMA_LOG_INFO("%s: two-lane prefill enabled (LLAMA_PREFILL_LANES)\n", __func__);
+                    if (cparams.n_batch < 2 * cparams.n_ubatch) {
+                        LLAMA_LOG_WARN("%s: two-lane prefill pairs the ubatches of one batch: with n_batch = %u < 2 * n_ubatch = %u "
+                                       "a batch has one and the lanes never overlap (raise -b)\n", __func__, cparams.n_batch, 2 * cparams.n_ubatch);
+                    }
                 } else {
                     // (parsed by tests/halo/lib/sched_check.py: keep the text)
                     LLAMA_LOG_WARN("%s: LLAMA_PREFILL_LANES ignored (n_gpu = %d, pipeline_parallel = %d)\n", __func__, n_gpu, cparams.pipeline_parallel);

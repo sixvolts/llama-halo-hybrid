@@ -1302,6 +1302,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
+                    const size_t i_ov = overrides - tensor_buft_overrides;   // halo-hybrid
+                    if (buft_override_hits.size() <= i_ov) {
+                        buft_override_hits.resize(i_ov + 1, 0);
+                    }
+                    buft_override_hits[i_ov]++;
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
@@ -1461,6 +1466,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
+    // halo-hybrid: a tensor override that placed nothing is usually a typo in an -ot pattern (one line: the per-layer
+    // patterns of --n-cpu-moe and the fit legitimately miss layers without such tensors)
+    {
+        size_t n_ov = 0, n_miss = 0;
+        const char * first_miss = nullptr;
+        for (; tensor_buft_overrides && tensor_buft_overrides[n_ov].pattern != nullptr; n_ov++) {
+            if (n_ov >= buft_override_hits.size() || buft_override_hits[n_ov] == 0) {
+                first_miss = n_miss++ == 0 ? tensor_buft_overrides[n_ov].pattern : first_miss;
+            }
+        }
+        if (n_miss > 0) {
+            LLAMA_LOG_WARN("%s: %zu of %zu tensor overrides matched no tensor of this model (first: '%s')\n", __func__, n_miss, n_ov, first_miss);
+        }
+    }
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }

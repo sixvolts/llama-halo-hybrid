@@ -1482,6 +1482,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    // halo-hybrid: GLM-5.3 converted by upstream's converter loads as upstream's graph, not this tree's
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        LLAMA_LOG_WARN("%s: arch 'glm5-next' (upstream's GLM-5.3 port): this tree's tuned path and the cookbook numbers are for "
+                       "'glm5next', from this tree's convert_hf_to_gguf.py\n", __func__);
+    }
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();

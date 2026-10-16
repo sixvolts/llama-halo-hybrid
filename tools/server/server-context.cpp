@@ -1275,8 +1275,13 @@ private:
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
-        SRV_INF("speculative seq_rm type = %d (0 none, full checkpoints, partial, recurrent rollback), n_rs_seq = %u\n",
-                (int) ctx_tgt_seq_rm_type, llama_n_rs_seq(ctx_tgt));
+        // halo-hybrid: how drafts are rolled back, for a speculative setup only
+        const bool spec_configured = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (spec_configured) {
+            SRV_INF("speculative seq_rm type = %d (0 none, 1 partial, 2 full sequences only: checkpoints, 3 partial within n_rs_seq), n_rs_seq = %u\n",
+                    (int) ctx_tgt_seq_rm_type, llama_n_rs_seq(ctx_tgt));
+        }
 
         // setup slots
         if (ggml_env_set_string()[0] != '\0') {
@@ -1309,6 +1314,10 @@ private:
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
         } else {
+            if (spec_configured && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                // halo-hybrid: common_speculative_init drops a draft-* type with no draft context without a word
+                SRV_WRN("%s", "--spec-type was given but no speculative decoding runs: a draft-* type found no draft (-md, or MTP layers in the model)\n");
+            }
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
@@ -1653,6 +1662,13 @@ private:
 
                 if (task.id_slot == -1 && !contig[slot.id]) {
                     SLT_TRC(slot, "%s", " - skipping, would split the busy slots\n");
+                    // halo-hybrid: say so when the skipped slot held a matching prompt
+                    if (!tokens.empty()) {
+                        const float f_sim_skip = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+                        if (f_sim_skip > slot_prompt_similarity) {
+                            SLT_INF(slot, "not reused (sim %.3f): it would split the busy slots (LLAMA_SERVER_SLOT_CONTIG=0 turns this off)\n", f_sim_skip);
+                        }
+                    }
                     continue;
                 }
 
@@ -3132,7 +3148,7 @@ private:
                             /* .result   = */ &slot.spec_draft,
                         };
 
-                        // halo-hybrid: lossless speculative sampling when the task samples (LLAMA_SPEC_RS=1)
+                        // halo-hybrid: lossless speculative sampling when the task samples (on by default; LLAMA_SPEC_RS=0 turns it off)
                         slot.spec_draft_q.clear();
                         {
                             static const bool spec_rs = ggml_env_flag("LLAMA_SPEC_RS", true);
