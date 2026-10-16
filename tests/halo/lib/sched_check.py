@@ -5,8 +5,10 @@ Greedy output must not depend on where the layers run, as long as every device r
 one device vs layers split over two, one prefill lane vs two, local vs RPC loopback. Random weights make every
 logit matter, so a stale read or a reordered write shows up as a different token stream.
 
-  sched_check.py base  --bin <dir> --models <dir> --out <dir>    APU + RPC loopback (ROCR_VISIBLE_DEVICES = the APU)
-  sched_check.py card  --bin <dir> --models <dir> --out <dir>    card + APU (ROCm0 = card, ROCm1 = APU)
+  sched_check.py base  --bin <dir> --models <dir> --out <dir>    APU + RPC loopback, plain and composite
+                                                                 (ROCR_VISIBLE_DEVICES = the APU)
+  sched_check.py card  --bin <dir> --models <dir> --out <dir>    card + APU (ROCm0 = card, ROCm1 = APU), locally and
+                                                                 behind a composite rpc-server that owns both
   sched_check.py fuse  --bin <dir> --models <dir> --out <dir>    CPU, every model: graph fast paths on vs off
                                                                  (LLAMA_NO_GRAPH_FUSE=1)
 
@@ -63,6 +65,39 @@ def free_port():
     return p
 
 
+def start_server(a, devices, tag, env_extra=None):
+    """an rpc-server on a free loopback port; returns (process, port), the port accepting connections"""
+    port = free_port()
+    log = open(os.path.join(a.out, 'rpc-server-%s.log' % tag), 'w')
+    srv = subprocess.Popen([os.path.join(a.bin, 'ggml-rpc-server'), '-H', '127.0.0.1', '-p', str(port), '-d', devices],
+                           stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ, **(env_extra or {})))
+    for _ in range(60):
+        try:
+            socket.create_connection(('127.0.0.1', port), timeout=1).close()
+            break
+        except OSError:
+            time.sleep(0.5)
+    return srv, port
+
+
+def stop_server(srv):
+    srv.terminate()
+    try:
+        srv.wait(10)
+    except subprocess.TimeoutExpired:
+        srv.kill()
+
+
+def rpc_device(a, rpc, env_extra=None):
+    """the client's name for the server's (first) device, e.g. RPC0[127.0.0.1:port], or None"""
+    lst = subprocess.run([os.path.join(a.bin, 'llama-completion')] + rpc + ['--list-devices'], capture_output=True,
+                         text=True, timeout=120, env=dict(os.environ, **(env_extra or {})))
+    m = re.search(r'^\s*(RPC\S*?):', lst.stdout + lst.stderr, re.M)
+    if not m:
+        print(lst.stdout + lst.stderr)
+    return m.group(1) if m else None
+
+
 KNOWN_HITS = []
 KNOWN = []   # (test, model regex, case, reason) from known-failures.txt, test = sched-<mode>
 
@@ -92,27 +127,19 @@ def check_group(name, results, problems):
 
 
 def mode_base(a):
+    # plain rpc-server and a composite one (GGML_RPC_COMPOSITE=1 on both sides: the server schedules its part of the
+    # graph itself), each on the APU behind a loopback port; the composite cases also run the paired four-lane pipeline
     problems = []
-    port = free_port()
-    srv_log = open(os.path.join(a.out, 'rpc-server.log'), 'w')
-    srv = subprocess.Popen([os.path.join(a.bin, 'ggml-rpc-server'), '-H', '127.0.0.1', '-p', str(port), '-d', 'ROCm0'],
-                           stdout=srv_log, stderr=subprocess.STDOUT)
+    composite = {'GGML_RPC_COMPOSITE': '1'}
+    srv, port = start_server(a, 'ROCm0', 'plain')
+    srv_c, port_c = start_server(a, 'ROCm0', 'composite', composite)
     try:
-        for _ in range(60):
-            try:
-                socket.create_connection(('127.0.0.1', port), timeout=1).close()
-                break
-            except OSError:
-                time.sleep(0.5)
         rpc = ['--rpc', '127.0.0.1:%d' % port]
-        lst = subprocess.run([os.path.join(a.bin, 'llama-completion')] + rpc + ['--list-devices'],
-                             capture_output=True, text=True, timeout=120)
-        m = re.search(r'^\s*(RPC\S*?):', lst.stdout + lst.stderr, re.M)
-        if not m:
+        rpc_c = ['--rpc', '127.0.0.1:%d' % port_c]
+        rdev, rdev_c = rpc_device(a, rpc), rpc_device(a, rpc_c, composite)
+        if not rdev or not rdev_c:
             print('detail: rpc device not listed')
-            print(lst.stdout + lst.stderr)
             return 1
-        rdev = m.group(1)
         for model in MODELS:
             res = {
                 'local':       run(a, 'local', model, ['-dev', 'ROCm0']),
@@ -120,15 +147,16 @@ def mode_base(a):
                 'split':       run(a, 'split', model, rpc + ['-dev', 'ROCm0,' + rdev, '-ts', '1,1']),
                 'split-lanes': run(a, 'split-lanes', model, rpc + ['-dev', 'ROCm0,' + rdev, '-ts', '1,1'],
                                    {'LLAMA_PREFILL_LANES': '2'}),
+                'rpc-composite': run(a, 'rpc-composite', model, rpc_c + ['-dev', rdev_c], composite),
+                'split-composite-lanes': run(a, 'split-composite-lanes', model,
+                                             rpc_c + ['-dev', 'ROCm0,' + rdev_c, '-ts', '1,1'],
+                                             dict(composite, LLAMA_PREFILL_LANES='4')),
             }
             check_group(model, res, problems)
     finally:
-        srv.terminate()
-        try:
-            srv.wait(10)
-        except subprocess.TimeoutExpired:
-            srv.kill()
-    return report(problems, len(MODELS) * 4)
+        stop_server(srv)
+        stop_server(srv_c)
+    return report(problems, len(MODELS) * 6)
 
 
 HZ = re.compile(r'names (match|differ), (\d+) vs (\d+) splits, (\d+) cache tensors shared, (\d+) cache hazards')
@@ -167,6 +195,19 @@ SELF = re.compile(r'self-test, a delayed one split: (\d+) cache hazards')
 def mode_card(a):
     problems = []
     n_pairs = n_self = 0
+    composite = {'GGML_RPC_COMPOSITE': '1'}
+    srv_c, port_c = start_server(a, 'ROCm0,ROCm1', 'composite', composite)
+    rpc_c = ['--rpc', '127.0.0.1:%d' % port_c]
+    rdev_c = rpc_device(a, rpc_c, composite)
+    if not rdev_c:
+        problems.append('composite rpc-server device not listed')
+    try:
+        return mode_card_models(a, problems, n_pairs, n_self, composite, port_c, rpc_c, rdev_c)
+    finally:
+        stop_server(srv_c)
+
+
+def mode_card_models(a, problems, n_pairs, n_self, composite, port_c, rpc_c, rdev_c):
     for model in MODELS:
         # an override that matches no tensor turns pipeline parallelism off, so the lanes run (a dense model's
         # production layout and the layer split); layer-pp is the layer split with pipeline parallelism
@@ -208,10 +249,17 @@ def mode_card(a):
                 problems.append('%s/%s: hazard self-test found nothing' % (model, tag))
         res_c = {'card': run(a, 'card', model, ['-dev', 'ROCm0'])}
         check_group(model + '/card', res_c, problems)
+        if rdev_c:
+            # the production layout behind a composite rpc-server that owns both devices: its own scheduler splits
+            # the graph between them (the experts go to its second device, RPC1)
+            exps_c = ['-ot', r'ffn_(gate|up|down)_exps=RPC1[127.0.0.1:%d]' % port_c] if 'moe' in model else noop
+            res_r = {'prod-1lane': res_p['prod-1lane'],
+                     'rpc-composite': run(a, 'rpc-composite', model, rpc_c + ['-dev', rdev_c] + exps_c, composite)}
+            check_group(model + '/composite', res_r, problems)
     if n_pairs == 0:
         problems.append('no lane pairs were checked (hazard log missing)')
     print('lane pairs checked: %d, self-tests that found hazards: %d' % (n_pairs, n_self))
-    return report(problems, len(MODELS) * 6)
+    return report(problems, len(MODELS) * 7)
 
 
 def mode_fuse(a):
