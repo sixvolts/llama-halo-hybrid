@@ -353,5 +353,11 @@ if (TARGET gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
 
-# batched eager copies at a split boundary (needs two GPUs; skips otherwise)
-llama_build(test-peer-copy-batch.cpp)
+# halo-hybrid: batched eager copies at a split boundary (needs two GPUs; exits 77 = skipped otherwise). Label "halo",
+# so ctest -L main leaves it out; the tests/halo gpu suites run it on a card + APU.
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    # Needs non-public ggml-backend-impl.h
+    llama_build(test-peer-copy-batch.cpp)
+    llama_test(test-peer-copy-batch LABEL halo)
+    set_property(TEST test-peer-copy-batch PROPERTY SKIP_RETURN_CODE 77)
+endif()

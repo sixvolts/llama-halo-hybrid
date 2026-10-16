@@ -242,7 +242,7 @@ int main(int argc, char ** argv) {
     std::vector<ggml_backend_dev_t> gpus = gpu_devices();
     if (gpus.size() < 2) {
         printf("test-peer-copy-batch: needs two GPU devices, found %zu: skipped\n", gpus.size());
-        return 0;
+        return 77;
     }
     ggml_backend_t g0  = ggml_backend_dev_init(gpus[0], NULL);
     ggml_backend_t g1  = ggml_backend_dev_init(gpus[1], NULL);
