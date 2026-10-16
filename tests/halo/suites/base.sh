@@ -3,7 +3,7 @@
 #   full:  + random-weight architectures vs CPU, state rollback / save-load, scheduler + RPC loopback exactness
 
 CPU_BUILD=${CPU_BUILD:-$REPO/build-halo-cpu}
-GPU_TARGETS_ALL="gfx1151;gfx1201;gfx1100;gfx1101;gfx1030"
+GPU_TARGETS_ALL=${HALO_GPU_TARGETS:-"gfx1151;gfx1201;gfx1100;gfx1101;gfx1030"}   # every cookbook target by default
 ARCHS='^(qwen4exp|qwen35|qwen35moe|glm5next|glm-dsa|deepseek4)$'
 
 build_jobs() {   # ~3 GiB per HIP compile job: production runs during builds and memguard kills it below 10 GiB
@@ -17,8 +17,10 @@ build_jobs() {   # ~3 GiB per HIP compile job: production runs during builds and
 build_hip() {
     if [ ! -f "$BUILD/CMakeCache.txt" ]; then
         cmake -S "$REPO" -B "$BUILD" -DGGML_HIP=ON "-DGPU_TARGETS=$GPU_TARGETS_ALL" \
-            -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang -DGGML_RPC=ON -DGGML_RPC_RDMA=ON \
+            -DCMAKE_HIP_COMPILER="$ROCM_PATH/lib/llvm/bin/clang" -DGGML_RPC=ON \
             -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON || return 1
+    else
+        cmake "$BUILD" > /dev/null || return 1   # re-glob: new .cu files are picked up only at configure time
     fi
     grep -q "GPU_TARGETS.*=$GPU_TARGETS_ALL" "$BUILD/CMakeCache.txt" || { echo "detail: $BUILD lacks GPU_TARGETS=$GPU_TARGETS_ALL"; return 1; }
     nice -n 10 cmake --build "$BUILD" -j "$(build_jobs)" || return 1
@@ -26,8 +28,11 @@ build_hip() {
 }
 
 build_cpu() {
-    [ -f "$CPU_BUILD/CMakeCache.txt" ] || cmake -S "$REPO" -B "$CPU_BUILD" -DGGML_HIP=OFF -DGGML_RPC=ON \
-        -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON || return 1
+    if [ ! -f "$CPU_BUILD/CMakeCache.txt" ]; then
+        cmake -S "$REPO" -B "$CPU_BUILD" -DGGML_HIP=OFF -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON || return 1
+    else
+        cmake "$CPU_BUILD" > /dev/null || return 1
+    fi
     nice -n 10 cmake --build "$CPU_BUILD" -j "$(build_jobs)" || return 1
     echo "detail: CPU-only build ok"
 }
@@ -63,6 +68,7 @@ state_check() {   # state_check <bin dir> <tag>: rollback + save/load per genera
 
 suite_base() {
     unset ROCR_VISIBLE_DEVICES
+    step_gate apu SETUP python3 "$HALO_DIR/lib/devices.py" visible apu
     if [ "$NO_BUILD" != 1 ]; then
         step build-hip build_hip || { halo_finish; return 1; }
         step build-cpu build_cpu || { halo_finish; return 1; }
@@ -73,9 +79,9 @@ suite_base() {
     step fuse-cpu  python3 "$HALO_DIR/lib/sched_check.py" fuse --bin "$CPU_BUILD/bin" --models "$RUN_DIR/models" \
         --out "$RUN_DIR/fuse-cpu" --known "$HALO_DIR/known-failures.txt"
 
-    prod_stop
+    step_gate prod-stop SETUP prod_stop
+    step_gate devices SETUP python3 "$HALO_DIR/lib/devices.py" check apu --build "$BUILD"
     export ROCR_VISIBLE_DEVICES=$(python3 "$HALO_DIR/lib/devices.py" visible apu)
-    step_gate devices SETUP python3 "$HALO_DIR/lib/devices.py" check apu
     step ops-apu      run_ops ROCm0 "$HALO_DIR/ops.txt" TBO_Q38_EVAL=1 TBO_GLM_EVAL=1
     step shapes-apu   run_shapes ROCm0
     if [ "$LEVEL" = full ]; then

@@ -7,6 +7,7 @@ number measured after it would be read as a code regression by mistake (2026-09-
   preflight.py p2p  <gen> <machine.json> <p2p-bin> [--bless]  card <-> APU peer copies vs references
 
 References live in machine.json under the generation's key; --bless records the current values there.
+Exit codes: 0 ok, 1 the machine is not in its reference state, 2 an error of this tool (missing file, tool or argument).
 """
 import json
 import os
@@ -20,8 +21,10 @@ import devices  # noqa: E402
 GEMV_SHAPES = '24:16384:3,2048:4096:3,4096:2048:3,2048:1024:3,12288:4096:3,32:32768:3'
 GEMV_SLACK = 1.15     # a shape more than 15% slower than its reference fails
 P2P_SLACK = 0.85      # bandwidth below 85% of the reference fails
-# kernel flags each generation needs (rdna2: the V620 re-enables GECC without ras_enable=0 and RAS slows peer copies)
-NEED_FLAGS = {'rdna2': ['amdgpu.ras_enable=0'], 'rdna3': ['amdgpu.runpm=0'], 'rdna4': []}
+# kernel flags each generation needs, and the ones particular cards need (by marketing name: the Radeon Pro V620
+# re-enables GECC without ras_enable=0, and RAS slows peer copies; consumer RDNA2 cards have no ECC)
+NEED_FLAGS = {'rdna3': ['amdgpu.runpm=0']}
+CARD_FLAGS = {'V620': ['amdgpu.ras_enable=0']}
 BAD_FLAGS = ['amdgpu.pcie_gen_cap']
 
 
@@ -98,7 +101,8 @@ def host(gen, mpath, bless):
 
     cmd = open('/proc/cmdline').read()
     # a dock card keeps the BIOS-built tunnel and its full BAR only without the thunderbolt host reset
-    for f in NEED_FLAGS.get(gen, []) + (['thunderbolt.host_reset=false'] if dock else []):
+    need = NEED_FLAGS.get(gen, []) + [f for name, fl in CARD_FLAGS.items() if name in c['name'] for f in fl]
+    for f in need + (['thunderbolt.host_reset=false'] if dock else []):
         if f not in cmd:
             problems.append('kernel cmdline lacks %s' % f)
     for f in BAD_FLAGS:
@@ -187,6 +191,9 @@ def p2p(gen, mpath, exe, bless):
 
 
 def main():
+    if len(sys.argv) < 4:
+        print(__doc__)
+        sys.exit(2)
     what, gen, mpath = sys.argv[1], sys.argv[2], sys.argv[3]
     bless = '--bless' in sys.argv
     if what == 'host':
@@ -195,8 +202,13 @@ def main():
         sys.exit(gemv(gen, mpath, sys.argv[4], bless))
     if what == 'p2p':
         sys.exit(p2p(gen, mpath, sys.argv[4], bless))
-    raise SystemExit(__doc__)
+    print(__doc__)
+    sys.exit(2)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (OSError, IndexError, KeyError, ValueError, subprocess.CalledProcessError) as e:
+        print('detail: preflight.py: %s: %s' % (type(e).__name__, e))   # a checker error: SETUP, not HOST-STATE
+        sys.exit(2)

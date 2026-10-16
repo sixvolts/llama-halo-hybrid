@@ -8,7 +8,11 @@ which is what ROCR_VISIBLE_DEVICES takes (the APU has no UUID, so indices are us
   devices.py list                  JSON list of GPUs
   devices.py visible <setup>       ROCR_VISIBLE_DEVICES for apu | rdna2 | rdna3 | rdna4
                                    (card first, then the APU: ROCm0 = card, ROCm1 = APU)
-  devices.py check <setup>         verify the mapping under that ROCR_VISIBLE_DEVICES
+  devices.py check <setup> [--build <dir>]
+                                   verify the mapping under that ROCR_VISIBLE_DEVICES and, with --build, that the
+                                   build's GPU_TARGETS (from its CMakeCache.txt) include every device of the setup
+
+Exit codes: 0 ok, 1 the devices are not as expected, 2 an error of this tool (rocminfo missing, bad arguments).
 """
 import json
 import os
@@ -65,6 +69,16 @@ def visible(setup, devs):
     return '%d,%d' % (cards[0]['index'], apu[0]['index'])
 
 
+def build_targets(build):
+    """GPU_TARGETS of a HIP build, from its CMakeCache.txt"""
+    path = os.path.join(build, 'CMakeCache.txt')
+    for line in open(path):
+        m = re.match(r'^(?:GPU_TARGETS|AMDGPU_TARGETS):[A-Z]*=(.*)$', line.strip())
+        if m and m.group(1):
+            return m.group(1).split(';')
+    raise SystemExit('detail: %s names no GPU_TARGETS' % path)
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else 'list'
     devs = gpus()
@@ -78,11 +92,25 @@ def main():
         seen = [d['gen'] for d in gpus(env)]
         want = ['apu'] if setup == 'apu' else [setup, 'apu']
         if seen != want:
-            raise SystemExit('ROCR_VISIBLE_DEVICES=%s shows %s, expected %s' % (env['ROCR_VISIBLE_DEVICES'], seen, want))
-        print('ok %s: ROCR_VISIBLE_DEVICES=%s -> %s' % (setup, env['ROCR_VISIBLE_DEVICES'], ' '.join(seen)))
+            raise SystemExit('detail: ROCR_VISIBLE_DEVICES=%s shows %s, expected %s' % (env['ROCR_VISIBLE_DEVICES'], seen, want))
+        msg = 'ok %s: ROCR_VISIBLE_DEVICES=%s -> %s' % (setup, env['ROCR_VISIBLE_DEVICES'], ' '.join(seen))
+        if '--build' in sys.argv:
+            build = sys.argv[sys.argv.index('--build') + 1]
+            targets = build_targets(build)
+            missing = sorted({d['gfx'] for d in gpus(env)} - set(targets))
+            if missing:
+                raise SystemExit('detail: %s is not built for %s (GPU_TARGETS=%s)' % (build, ' '.join(missing), ';'.join(targets)))
+            msg += ', built for %s' % ';'.join(targets)
+        print(msg)
+        print('detail: ' + msg)
     else:
-        raise SystemExit(__doc__)
+        print(__doc__)
+        sys.exit(2)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (OSError, IndexError, ValueError, subprocess.CalledProcessError) as e:
+        print('detail: devices.py: %s' % e)
+        sys.exit(2)

@@ -15,12 +15,17 @@ build_p2p() {   # the peer-copy probe (host code only, so one binary for every c
     fi
 }
 
+build_present() {   # the gpu suites use the base suite's build
+    [ -x "$BUILD/bin/test-backend-ops" ] || { echo "detail: no build in $BUILD: run the base suite first"; return 1; }
+    echo "detail: $BUILD"
+}
+
 suite_gpu() {
-    [ -x "$BUILD/bin/test-backend-ops" ] || { echo "no build in $BUILD: run the base suite first"; return 1; }
+    step_gate build SETUP build_present
     local bless=; [ "$BLESS" = 1 ] && bless=--bless
-    prod_stop
-    export ROCR_VISIBLE_DEVICES=$(python3 "$HALO_DIR/lib/devices.py" visible "$GEN") || { halo_finish; return 1; }
-    step_gate devices      SETUP      python3 "$HALO_DIR/lib/devices.py" check "$GEN"
+    step_gate prod-stop    SETUP      prod_stop
+    step_gate devices      SETUP      python3 "$HALO_DIR/lib/devices.py" check "$GEN" --build "$BUILD"
+    export ROCR_VISIBLE_DEVICES=$(python3 "$HALO_DIR/lib/devices.py" visible "$GEN")
     step_gate p2p-build    SETUP      build_p2p
     step_gate host-state   HOST-STATE python3 "$HALO_DIR/lib/preflight.py" host "$GEN" "$MACHINE_JSON" $bless
     step_gate gemv-probe   HOST-STATE python3 "$HALO_DIR/lib/preflight.py" gemv "$GEN" "$MACHINE_JSON" "$BUILD/bin" $bless

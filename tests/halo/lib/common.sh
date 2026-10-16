@@ -9,7 +9,8 @@ REPO=$(cd "$HALO_DIR/../.." && pwd)
 HOST=$(hostname -s)
 HALO_RESULTS=${HALO_RESULTS:-${XDG_STATE_HOME:-$HOME/.local/state}/halo-test}   # <host>.env may set it
 HALO_LOCK=${HALO_LOCK:-/run/lock/llamabench.lock}
-export PATH=/opt/rocm/bin:$PATH
+ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+export PATH=$ROCM_PATH/bin:$PATH
 
 # per-machine settings and pre-flight references live outside the tree (see machines/README.md):
 # $HALO_MACHINE_DIR/<host>.env (production launcher, pidfile, health URL) and <host>.json (link, VRAM, GEMV, p2p)
@@ -36,11 +37,15 @@ _record() {   # _record <name> <verdict> <seconds> <detail>
 }
 
 # step <name> <command...>: exit 0 = PASS, 77 = SKIP, anything else = FAIL. The command's last line of output that
-# starts with "detail:" becomes the step's detail column.
+# starts with "detail:" becomes the step's detail column. The log is opened for appending, so a command that tees
+# into /dev/stderr (tee -a) adds to it instead of truncating it.
+STEP_RC=0
 step() {
     local name=$1; shift
     local t=$(date +%s) rc=0
-    "$@" > "$RUN_DIR/$name.log" 2>&1 || rc=$?
+    : > "$RUN_DIR/$name.log"
+    "$@" >> "$RUN_DIR/$name.log" 2>&1 || rc=$?
+    STEP_RC=$rc
     local detail=$(grep '^detail:' "$RUN_DIR/$name.log" | tail -1 | cut -c9-)
     local v=PASS
     [ $rc = 77 ] && v=SKIP
@@ -50,10 +55,12 @@ step() {
 }
 
 # step_gate <name> <verdict-on-failure> <command...>: like step, but a failure ends the run with that verdict
-# (HOST-STATE for pre-flight, SETUP for a missing device or tool)
+# (HOST-STATE for pre-flight, SETUP for a missing device or tool). Exit code 2 (a checker's own error, e.g. a
+# missing file or tool) always ends it with SETUP.
 step_gate() {
     local name=$1 fail_v=$2; shift 2
     if ! step "$name" "$@"; then
+        [ "$STEP_RC" = 2 ] && fail_v=SETUP
         sed -i '$ s/\tFAIL\t/\t'"$fail_v"'\t/' "$RUN_DIR/steps.tsv"
         halo_log "$name failed: stopping with $fail_v"
         halo_finish
@@ -64,6 +71,10 @@ step_gate() {
 # --- production: down for every GPU run, restored on exit (user decision 2026-10-09) ---
 PROD_WAS_UP=0
 prod_stop() {
+    if [ -n "$PROD_PIDFILE" ] && { [ -z "$PROD_LAUNCHER" ] || [ -z "$PROD_HEALTH" ]; }; then
+        echo "detail: $HALO_MACHINE_DIR/$HOST.env sets PROD_PIDFILE but not PROD_LAUNCHER and PROD_HEALTH: refusing to stop what cannot be restored"
+        return 1
+    fi
     if [ -n "$PROD_PIDFILE" ] && [ -f "$PROD_PIDFILE" ]; then
         local p=$(cat "$PROD_PIDFILE")
         if kill -0 "$p" 2>/dev/null && [ "$(ps -o comm= -p "$p")" = llama-server ]; then
@@ -75,11 +86,12 @@ prod_stop() {
             sleep 5
         fi
     fi
-    halo_log "waiting for the bench lock"
-    exec 9>"$HALO_LOCK"
-    flock 9
-    halo_log "bench lock held"
     trap prod_restore EXIT
+    halo_log "waiting for the bench lock"
+    exec 9>"$HALO_LOCK" || { echo "detail: cannot open $HALO_LOCK"; return 1; }
+    flock 9 || { echo "detail: flock on $HALO_LOCK failed"; return 1; }
+    halo_log "bench lock held"
+    echo "detail: lock held$( [ $PROD_WAS_UP = 1 ] && echo ', production stopped')"
 }
 
 prod_restore() {
@@ -116,17 +128,17 @@ run_ops() {
     [ -f "$ops" ] && ops=$(grep -v '^#' "$ops" | tr -s ' \n' ',' | sed 's/^,//; s/,$//')
     local filter=(); [ "$ops" != - ] && filter=(-o "$ops")
     # one worker: with -j N a worker's hipMemset on the legacy stream breaks another's HIP graph capture (2026-10-09)
-    env "$@" "$BUILD/bin/test-backend-ops" test -b "$backend" "${filter[@]}" 2>&1 | tee /dev/stderr \
+    env "$@" "$BUILD/bin/test-backend-ops" test -b "$backend" "${filter[@]}" 2>&1 | tee -a /dev/stderr \
         | python3 "$HALO_DIR/lib/tbo_check.py"
 }
 
 # run_shapes <backend>: the real-model shape sets that replace the case list (Qwen3.8 expert GEMMs + MoE blocks,
 # Swift's thin bf16 weights)
 run_shapes() {
-    local a b rc=0
-    a=$(run_ops "$1" - TBO_Q38_MOE_EVAL=1) || rc=1
-    b=$(run_ops "$1" - TBO_THIN_W=1) || rc=1
-    printf '%s\n%s\n' "$a" "$b" | grep -v '^detail:'
-    echo "detail: q38 moe $(echo "$a" | grep '^detail:' | cut -c9-); thin w $(echo "$b" | grep '^detail:' | cut -c9-)"
+    local a="$RUN_DIR/shapes-$1-q38moe.out" b="$RUN_DIR/shapes-$1-thinw.out" rc=0
+    run_ops "$1" - TBO_Q38_MOE_EVAL=1 > "$a" || rc=1
+    run_ops "$1" - TBO_THIN_W=1 > "$b" || rc=1
+    grep -hv '^detail:' "$a" "$b"
+    echo "detail: q38 moe $(grep '^detail:' "$a" | cut -c9-); thin w $(grep '^detail:' "$b" | cut -c9-)"
     return $rc
 }
