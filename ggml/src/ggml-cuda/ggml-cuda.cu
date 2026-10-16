@@ -6374,6 +6374,8 @@ struct ggml_cuda_optimer {
             std::vector<std::pair<std::string, acc>> v(by_key.begin(), by_key.end());
             std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
             double tot = 0; uint64_t n = 0; for (auto & e : v) { tot += e.second.us; n += e.second.n; }
+            // straight to stderr, not GGML_LOG: the table must show at every log verbosity (llama-server hides
+            // library INFO lines by default) and without a log prefix (scripts parse the OPTIMER lines)
             fprintf(stderr, "\n=== OPTIMER dev %d after %llu graphs: %llu launches, %.1f ms total (%.3f ms/graph)\n",
                     device, (unsigned long long) graphs, (unsigned long long) n, tot / 1000.0, tot / 1000.0 / graphs);
             static const size_t top = (size_t) ggml_env_int("GGML_CUDA_TIME_OPS_TOP", 40);

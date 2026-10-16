@@ -215,6 +215,9 @@ Measured, kept for comparison, off by default. They may be removed.
 
 ## Diagnostics
 
+They log at the library's INFO level, which `llama-server` and `llama-cli` show with `-lv 4`; the op timer
+(`GGML_CUDA_TIME_OPS`) and the GEMV planner trace print to stderr directly.
+
 | Switch | What |
 |---|---|
 | `GGML_CUDA_TIME_OPS=1` | per-op GPU time table; needs `GGML_CUDA_DISABLE_GRAPHS=1` |
