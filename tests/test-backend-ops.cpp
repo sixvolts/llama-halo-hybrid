@@ -5565,10 +5565,17 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
-// halo-hybrid: the cases the HIP bf16 chunked GDN prefill runs (scalar gate, head size 128, at least a chunk-path width)
-static bool gdn_bf16_case(int64_t head_size, bool kda, int64_t n_seq_tokens) {
-    const char * e = getenv("GGML_CUDA_GDN_BF16");
-    return head_size == 128 && !kda && n_seq_tokens >= 64 && (e == nullptr || atoi(e) != 0);
+// halo-hybrid: the HIP bf16 chunked GDN prefill (on by default) runs the cases with a scalar gate, head size 128 and at
+// least a chunk-path width; its NMSE against the CPU is ~1e-5 (a cross-sequence scratch overlap showed up as
+// 1e-4..1e-3). Those cases get 3e-5 on ROCm devices whatever GGML_CUDA_GDN_BF16 says, so the tolerance follows the
+// backend under test, not the environment; TBO_GDN_NMSE overrides it for every case.
+static double gdn_max_nmse(ggml_backend_t backend, int64_t head_size, bool kda, int64_t n_seq_tokens, double def) {
+    if (const char * e = getenv("TBO_GDN_NMSE")) {
+        return atof(e);
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    const bool rocm = strcmp(ggml_backend_reg_name(reg), "ROCm") == 0;
+    return rocm && head_size == 128 && !kda && n_seq_tokens >= 64 ? std::max(def, 3e-5) : def;
 }
 
 struct test_gated_delta_net : public test_case {
@@ -5592,12 +5599,8 @@ struct test_gated_delta_net : public test_case {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
-    double max_nmse_err() override {
-        if (getenv("TBO_GDN_NMSE")) {
-            return atof(getenv("TBO_GDN_NMSE"));
-        }
-        // the HIP bf16 chunked prefill (default, GGML_CUDA_GDN_BF16=0 off) takes these: NMSE ~1e-5 (a cross-sequence scratch overlap showed up as 1e-4..1e-3)
-        return gdn_bf16_case(head_size, kda, n_seq_tokens) ? 3e-5 : 1e-7;
+    double max_nmse_err(ggml_backend_t backend) override {
+        return gdn_max_nmse(backend, head_size, kda, n_seq_tokens, test_case::max_nmse_err(backend));
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
@@ -5675,8 +5678,8 @@ struct test_kda_state_gather : public test_case {
     std::string vars() override {
         return VARS_TO_STR9(head_count, head_size, n_seq_tokens, K, mem_size, head, plane, kda, reps);
     }
-    double max_nmse_err() override {
-        return gdn_bf16_case(head_size, kda, n_seq_tokens) ? 3e-5 : test_case::max_nmse_err();
+    double max_nmse_err(ggml_backend_t backend) override {
+        return gdn_max_nmse(backend, head_size, kda, n_seq_tokens, test_case::max_nmse_err(backend));
     }
 
     test_kda_state_gather(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 1, int64_t K = 3,
@@ -5792,8 +5795,8 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
     }
 
-    double max_nmse_err() override {
-        return gdn_bf16_case(head_size, false, n_seq_tokens) ? 3e-5 : 1e-7;
+    double max_nmse_err(ggml_backend_t backend) override {
+        return gdn_max_nmse(backend, head_size, false, n_seq_tokens, test_case::max_nmse_err(backend));
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
