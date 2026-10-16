@@ -2229,6 +2229,11 @@ extern DECL_FATTN_MMA_F16_CASE(512, 512,  2,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  8);
 
+// halo-hybrid: GLM-5.3-Flash's sparse DSA layers (see ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse):
+extern DECL_FATTN_MMA_F16_CASE(512, 512,  1, 16);
+extern DECL_FATTN_MMA_F16_CASE(512, 512,  2, 16);
+extern DECL_FATTN_MMA_F16_CASE(512, 512,  1, 32);
+
 // The number of viable configurations for Deepseek is very limited:
 extern DECL_FATTN_MMA_F16_CASE(576, 512, 1, 16);
 extern DECL_FATTN_MMA_F16_CASE(576, 512, 2, 16);
