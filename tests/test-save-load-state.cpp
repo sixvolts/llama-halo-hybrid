@@ -814,11 +814,55 @@ struct test_suite {
 };
 
 // column headers for the --models table, one per test, in the order they are run
+// Test 10: partial state size
+// a checkpoint saves the partial state: what seq_rm cannot roll back (recurrent states, SWA windows). It must not be
+// larger than the full state, and without SWA it must not grow with the tokens (a plain KV cache, e.g. an MTP draft
+// context, used to write all of its cells into every checkpoint)
+static bool test_state_partial_size(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 10: partial state size ===\n");
+
+    const size_t n_half = tokens.size() / 2;
+    const llama_tokens first (tokens.begin(), tokens.begin() + n_half);
+    const llama_tokens second(tokens.begin() + n_half, tokens.end());
+
+    size_t partial[2];
+    size_t full[2];
+
+    const llama_tokens * parts[2] = { &first, &second };
+    for (int i = 0; i < 2; i++) {
+        common_batch batch = common_batch_get_one(ctx.get(), *parts[i]);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            LOG_ERR("\n%s: failed to decode part %d\n", __func__, i);
+            return false;
+        }
+        partial[i] = llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        full[i]    = llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    }
+
+    LOGV(LOG_LEVEL_INFO, "partial %zu -> %zu, full %zu -> %zu\n", partial[0], partial[1], full[0], full[1]);
+
+    if (partial[0] > full[0] || partial[1] > full[1]) {
+        LOG_ERR("\n%s: the partial state is larger than the full state\n", __func__);
+        return false;
+    }
+
+    if (llama_model_n_swa(model) == 0 && partial[0] != partial[1]) {
+        LOG_ERR("\n%s: the partial state grows with the tokens: %zu -> %zu bytes\n", __func__, partial[0], partial[1]);
+        return false;
+    }
+
+    LOGV(LOG_LEVEL_INFO, "\nPASS\n");
+    return true;
+}
+
 static const std::vector<const char *> test_names = {
-    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf",
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "ps",
 };
 
-// Run the full save/load test suite (tests 1-9) for a single model.
+// Run the full save/load test suite (tests 1-10) for a single model.
 // Returns the per-test results.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
@@ -896,6 +940,9 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
 
     // Test 9: state restore failure
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+
+    // Test 10: partial state size
+    suite.results.push_back(test_state_partial_size(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
     return suite;
 }
