@@ -1,5 +1,6 @@
 #include "hc.cuh"
 #include "mmq.cuh"
+#include "norm.cuh"
 
 #include <cstdlib>
 
@@ -263,9 +264,8 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_tensor 
 }
 
 // halo-hybrid: the qwen4exp hc boundary. One block per stream row (c, t) builds res = x + b * w(c, t) exactly as
-// k_hc_combine does, then normalises the row exactly as rms_norm_f32<block_size, true> does (same per-thread
-// column stride, same block_reduce, same expressions), so every output is bit-identical to the three launches it
-// replaces. The block reads only its own row of x and writes only its own rows of res and xn: res and xn may
+// k_hc_combine does, then normalises the row exactly as rms_norm_f32 does (its summation order, norm.cuh, the same
+// block_reduce and expressions), so every output is bit-identical to the three launches it replaces. The block reads only its own row of x and writes only its own rows of res and xn: res and xn may
 // alias x at the same base; b and inj must be disjoint from both (checked by the matcher).
 template <int block_size>
 static __global__ void k_hc_combine_norm(const float * x, const float * b, const float * inj, const float * gamma,
@@ -284,11 +284,19 @@ static __global__ void k_hc_combine_norm(const float * x, const float * b, const
 
     const float w = s2 * hc_sigmoid(s1 * inj[(int64_t) t*hc + c] + b1) + b2;
 
+    // the sum of squares in rms_norm_f32's order (norm.cuh): the float4 order reads the finished row back
+    const bool vec = rms_norm_vec_order(n_embd);
     float tmp = 0.0f;
     for (int col = tid; col < n_embd; col += block_size) {
         const float xi = __fadd_rn(x[col], __fmul_rn(b[col], w));
         res[col] = xi;
-        tmp += xi * xi;
+        if (!vec) {
+            tmp += xi * xi;
+        }
+    }
+    if (vec) {
+        __syncthreads();
+        tmp = rms_norm_vec_partial(res, n_embd, tid);
     }
 
     __shared__ float s_sum[32];

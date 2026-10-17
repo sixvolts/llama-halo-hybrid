@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
 #include "hc.cuh"
+#include "norm.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -328,7 +329,7 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 //     POST: the preceding dsv4_hc_post is computed in the load stage: this thread's 16 elements of the new residual
 //           are post*x + sum_src comb*res, in dsv4_hc_post_f32's order, written to the hc_post dst (it has a second
 //           consumer, the next hc_post's residual) and used as the prologue's input without a reload
-//     NORM: the following RMS_NORM + MUL(w) runs on the finished pre-mix row in LDS in rms_norm_f32<1024>'s order and
+//     NORM: the following RMS_NORM + MUL(w) runs on the finished pre-mix row in LDS in rms_norm_f32's order and
 //           also writes the q8_1 copy of the result for the GEMVs that consume it
 struct dsv4_hc_mix_ext {
     const float * px;   int64_t spx1;                   // hc_post x [n_embd, nt]
@@ -497,11 +498,15 @@ static __global__ void __launch_bounds__(DSV4_HC_MIX_THREADS) dsv4_hc_mix_f32(
         __syncthreads();
     }
     if constexpr (NORM) {
-        // 6. RMS_NORM + MUL(w) on the finished row, rms_norm_f32<1024, true>'s loop and reduction order
+        // 6. RMS_NORM + MUL(w) on the finished row, in rms_norm_f32's summation order (norm.cuh) and reduction
         float tmp = 0.0f;
-        for (int col = tid; col < n_embd; col += DSV4_HC_MIX_THREADS) {
-            const float xi = acc[col];
-            tmp += xi * xi;
+        if (rms_norm_vec_order(n_embd)) {
+            tmp = rms_norm_vec_partial(acc, n_embd, tid);
+        } else {
+            for (int col = tid; col < n_embd; col += DSV4_HC_MIX_THREADS) {
+                const float xi = acc[col];
+                tmp += xi * xi;
+            }
         }
         tmp = block_reduce<block_reduce_method::SUM, DSV4_HC_MIX_THREADS>(tmp, redss);
         const float mean  = tmp / n_embd;

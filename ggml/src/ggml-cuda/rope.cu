@@ -2,6 +2,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include "norm.cuh"
 
 struct rope_corr_dims {
     float v[2];
@@ -739,9 +740,15 @@ static __global__ void rms_norm_mul_rope_f32(
     float tmp = 0.0f;
 
     ggml_cuda_pdl_sync();
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        tmp += xi * xi;
+    // halo-hybrid: the sum of squares in rms_norm_f32's order (norm.cuh), so this row matches the unfused launches bit
+    // for bit (block_size >= rms_norm_vec_block(ncols) always holds here)
+    if (rms_norm_vec_order(ncols)) {
+        tmp = rms_norm_vec_partial(x, ncols, tid);
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col];
+            tmp += xi * xi;
+        }
     }
 
     extern __shared__ float s_sum[];

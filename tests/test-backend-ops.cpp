@@ -14353,6 +14353,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // halo-hybrid: RMS_NORM at hidden-size rows (decode, verify, prefill widths) and per-head q/k norms, plain and with the
+    // weight multiply (rms_norm_mul_add without add); for the float4 path (upstream 623c16393)
+    for (int64_t T : {1, 4, 512, 4096}) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {4096, T, 1, 1}));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 32, T, 1}));
+        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4096, T, 1, 1}, 1e-6f, false));
+    }
     // halo-hybrid: Qwen3.8 (16 k-heads x 128, 48 v-heads, K = 4 rollback slots) at decode, MTP verify and prefill widths,
     // Qwen3.5 / 3.6 (32 v-heads); GLM-5.3 KDA (64 heads) decode and prefill
     for (int64_t T : {1, 2, 4, 512, 2048, 2052, 4100, 8196}) {
