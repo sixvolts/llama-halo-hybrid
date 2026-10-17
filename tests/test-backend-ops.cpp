@@ -13465,6 +13465,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 96, 2, 1, false, false, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 200, 1, 2));
 
+    // MMA-eligible GDN shapes (upstream 62df1815b): whole heads, value slices, tails, and the HIP prefill threshold.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 3, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  257, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 2, 2, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2051, 1, 3, false, false, 4)); // the MMA part + a K = 4 tail
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -14341,6 +14353,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // halo-hybrid: Qwen3.8 (16 k-heads x 128, 48 v-heads, K = 4 rollback slots) at decode, MTP verify and prefill widths,
+    // Qwen3.5 / 3.6 (32 v-heads); GLM-5.3 KDA (64 heads) decode and prefill
+    for (int64_t T : {1, 2, 4, 512, 2048, 2052, 4100, 8196}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 3, false, false, 4));
+    }
+    for (int64_t T : {1, 4, 2048, 4096}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 2, false, false, 1));
+    }
+    for (int64_t T : {1, 4, 1024}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, T, 1, 1, false, true, 3));
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
