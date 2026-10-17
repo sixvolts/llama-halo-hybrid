@@ -6357,6 +6357,9 @@ static std::string ggml_cuda_optimer_key(const ggml_tensor * node, int n_fused) 
         }
     } else if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_CONCAT || node->op == GGML_OP_CPY) {
         char b[64]; snprintf(b, sizeof(b), " %lldx%lld", (long long) node->ne[0], (long long) node->ne[1]); k += b;
+    } else if (node->op == GGML_OP_GATED_DELTA_NET) {   // v heads, tokens per sequence, sequences
+        const ggml_tensor * v = node->src[2];
+        char b[64]; snprintf(b, sizeof(b), " h%lld t%lld s%lld", (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3]); k += b;
     }
     if (n_fused > 0) { k += " +fused" + std::to_string(n_fused); }
     return k;
