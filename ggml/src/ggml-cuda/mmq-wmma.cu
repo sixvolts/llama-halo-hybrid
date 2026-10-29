@@ -463,6 +463,17 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
         if (big) { MMQW_LAUNCH16(128, 128, 64, 2, 4, 1, 1); } else { MMQW_LAUNCH16(64, 128, 64, 2, 2, 1, 1); }
         return true;
     }
+    // halo-hybrid: a narrow weight matrix (Qwen3.8's hc down projection 10240 -> 320, the 640-row shared expert) gives the
+    // 128x128 tile 3-5 m-tiles, i.e. 96-160 long-K blocks on 40 CUs: the hc down ran at ~7 TFLOPS. 32-token tiles with
+    // 1x4 warps quadruple the blocks and keep each block's activation tile in cache: 1.07 -> 0.70 s of hc down per 11K
+    // prompt on gfx1151 (16x128 ties, 64x64 / 128x64 / whole-M 320 tiles are slower). Every tile shape accumulates each
+    // output over the same 16-wide K slices in the same order, so this is bit-identical. RDNA3 only (not measured on RDNA4).
+    // GGML_CUDA_Q8_WMMA_NARROW=0 = off
+    static const bool narrow = ggml_env_flag("GGML_CUDA_Q8_WMMA_NARROW", true);
+    if (narrow && M <= 640 && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ctx.device].cc)) {
+        MMQW_LAUNCH32(32, 128, 64, 1, 4, 1, 1);
+        return true;
+    }
     if (big) { MMQW_LAUNCH32(128, 128, 64, 2, 4, 1, 1); } else { MMQW_LAUNCH32(64, 128, 64, 2, 2, 1, 1); }
 #undef MMQW_LAUNCH16
 #undef MMQW_LAUNCH32
