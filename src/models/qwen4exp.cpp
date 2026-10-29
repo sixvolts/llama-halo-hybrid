@@ -1967,8 +1967,11 @@ std::shared_ptr<std::vector<float>> ple_prefetch_take(const llama_model * model,
         std::lock_guard<std::mutex> lock(ple_pf_mu);
         for (auto it = ple_pf.begin(); it != ple_pf.end(); ++it) {
             // a gather whose rows start with these (a hinted n_batch chunk that checkpoints cut shorter) serves them as is:
-            // the caller uploads only the leading n_tok rows of its output
-            if (it->model == model && it->idx.size() >= idx.size() && std::equal(idx.begin(), idx.end(), it->idx.begin())) {
+            // the caller uploads only the leading n_tok rows of its output. Prefill widths only: a decode step's few rows
+            // can equal the first tokens of a queued hint, and taking it would wait on that gather and lose the hint
+            const bool prefix_ok = prefill && it->idx.size() < 2*idx.size();
+            if (it->model == model && (it->idx == idx || (prefix_ok && it->idx.size() > idx.size() &&
+                    std::equal(idx.begin(), idx.end(), it->idx.begin())))) {
                 hit = std::move(*it);
                 ple_pf.erase(it);
                 break;

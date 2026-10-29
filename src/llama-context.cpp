@@ -4533,12 +4533,11 @@ void llama_context::opt_epoch_iter(
         }
 
         // TODO: use llama_batch_ext here
-        {
-            llama_batch_compat compat(this, batch);
-            if (!balloc->init(*compat.batch_ext, model.vocab, true)) {
-                LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-                return;
-            }
+        // (halo-hybrid: compat lives as long as balloc is used below - balloc borrows its embeddings)
+        llama_batch_compat compat(this, batch);
+        if (!balloc->init(*compat.batch_ext, model.vocab, true)) {
+            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+            return;
         }
 
         const uint32_t n_tokens_all = balloc->get_n_tokens();
