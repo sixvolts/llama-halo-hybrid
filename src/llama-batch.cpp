@@ -84,9 +84,10 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (has_embd) {
-        embd_vec = batch_inp.embd;
-    }
+    // halo-hybrid: the embeddings are borrowed, not copied - batch_inp outlives every ubatch split from it (all are
+    // consumed inside the decode/encode call that passed it), and nothing writes through batch.embd. The copy cost
+    // ~8 ms per 4096-row MTP ingest batch at n_embd 2560
+    embd_src = has_embd ? const_cast<float *>(batch_inp.embd.data()) : nullptr;
 
     //
     // build flat pos array
@@ -174,7 +175,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = embd_src;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -758,7 +759,7 @@ void llama_batch_allocr::clear() {
     batch = {};
 
     token_vec   .clear();
-    embd_vec    .clear();
+    embd_src = nullptr;
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -788,8 +789,16 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
-    const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
+    // halo-hybrid: rows taken in batch order (one sequence, or split_simple) are a view into the batch's embeddings
+    // instead of a fresh copy - for a 4096-row MTP ingest ubatch the zero-filled allocation, its page faults and the
+    // munmap on release cost ~30 ms
+    bool embd_view = batch.embd != nullptr && n_tokens > 0;
+    for (uint32_t i = 1; embd_view && i < n_tokens; ++i) {
+        embd_view = idxs[i] == idxs[0] + (int32_t) i;
+    }
+
+    const int64_t n_embd_all = batch.embd && !embd_view ? (int64_t) n_tokens*n_embd : 0;
+    const int64_t n_pos_all  =                            (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
     udata->embd      .resize(n_embd_all);
@@ -810,7 +819,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (batch.embd) {
+        if (batch.embd && !embd_view) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -860,7 +869,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
-        /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.embd         =*/ !batch.embd ? nullptr : embd_view ? batch.embd + (int64_t) idxs[0]*n_embd : udata->embd.data(),
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),

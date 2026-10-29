@@ -1382,6 +1382,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // leading verify rows kept per batch: a verify batch is the sampled token plus at most n_max drafts
+    int32_t verify_h_lead() const { return std::max<int32_t>(64, this->params.n_max + 1); }
+
     std::vector<int>                i_last;
     std::vector<uint32_t>           rs_rng;  // halo-hybrid: xorshift32 state per seq for sampled drafts
     std::vector<std::vector<float>> chain_h;
@@ -1720,15 +1723,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+            // halo-hybrid: accept() reads row min(n_accepted, n_rows - 1) and n_accepted never exceeds a draft's length,
+            // so a prompt batch (thousands of rows) needs only its leading rows and its last one. Copying all of them
+            // cost 10-45 ms per 4096-token prompt ubatch
+            const int32_t n_lead = std::min(n_rows, verify_h_lead());
+            const int32_t n_keep = n_lead + (n_rows > n_lead ? 1 : 0);
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
+
+            for (int32_t i = 0; i < n_keep; ++i) {
+                const int32_t r = i < n_lead ? i : n_rows - 1;
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + r);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    verify_h[seq_id].data() + (size_t) (n_keep - 1) * n_embd, row_bytes);
             verify_pos0[seq_id] = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
             pending_pos[seq_id] = batch_in.tokens[i_batch_end[seq_id]].pos[0];
         }
@@ -1966,8 +1976,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        // stored rows: the first min(n_rows, verify_h_lead()), then the last row if it was not among them
+        const int32_t n_lead = std::min(n_rows, verify_h_lead());
+        int32_t r = i_h;
+        if (i_h >= n_lead) {
+            if (i_h != n_rows - 1) {
+                SPC_WRN("accept: %d accepted after a %d-row batch; using its last row\n", (int) n_accepted, (int) n_rows);
+            }
+            r = (int32_t) (verify_h[seq_id].size() / n_embd) - 1;
+        }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) r * n_embd, row_bytes);
         pending_pos[seq_id] = verify_pos0[seq_id] >= 0 ? verify_pos0[seq_id] + i_h : -1;
     }
 };

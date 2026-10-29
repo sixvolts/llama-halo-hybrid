@@ -1966,7 +1966,9 @@ std::shared_ptr<std::vector<float>> ple_prefetch_take(const llama_model * model,
     {
         std::lock_guard<std::mutex> lock(ple_pf_mu);
         for (auto it = ple_pf.begin(); it != ple_pf.end(); ++it) {
-            if (it->model == model && it->idx == idx) {
+            // a gather whose rows start with these (a hinted n_batch chunk that checkpoints cut shorter) serves them as is:
+            // the caller uploads only the leading n_tok rows of its output
+            if (it->model == model && it->idx.size() >= idx.size() && std::equal(idx.begin(), idx.end(), it->idx.begin())) {
                 hit = std::move(*it);
                 ple_pf.erase(it);
                 break;
@@ -2030,7 +2032,7 @@ std::shared_ptr<std::vector<float>> ple_prefetch_take(const llama_model * model,
     }
     if (hit.out) {
         hit.done.wait();
-        return hit.out->size() == idx.size()*hd ? hit.out : nullptr;
+        return hit.out->size() == hit.idx.size()*hd ? hit.out : nullptr;   // may be longer than idx (a prefix hit)
     }
     if (!best.out) {
         return nullptr;
@@ -2144,10 +2146,12 @@ void llama_model_qwen4exp::ple_prefetch_start(const llama_ubatch & ubatch, const
     e.model = this;
     ple_rows(hparams, ubatch, prev, e.idx);
     {
-        // lane 1's ubatch is prefetched twice, by lane 0 (pending) and by its own prepare: keep the first
+        // lane 1's ubatch is prefetched twice, by lane 0 (pending) and by its own prepare: keep the first. A queued gather
+        // whose rows start with these also covers them: the server hints n_batch tokens, but checkpoints can cut the
+        // chunk shorter (4092 of 4096), and a fresh gather here made set_input wait 20-30 ms for it instead
         std::lock_guard<std::mutex> lock(ple_pf_mu);
         for (const auto & q : ple_pf) {
-            if (q.model == this && q.idx == e.idx) {
+            if (q.model == this && q.idx.size() >= e.idx.size() && std::equal(e.idx.begin(), e.idx.end(), q.idx.begin())) {
                 return;
             }
         }
@@ -2227,7 +2231,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     std::copy(got.begin() + (int64_t) k*g, got.begin() + (int64_t) (k + 1)*g, pf->begin() + (int64_t) missing[k]*g);
                 }
             }
-            ggml_backend_tensor_set(emb, pf->data(), 0, pf->size()*sizeof(float));
+            // pf may hold more rows than this ubatch (see ple_prefetch_take): upload the leading ones
+            ggml_backend_tensor_set(emb, pf->data(), 0, (size_t) n_tokens*hp.ple_n_heads*hp.ple_head_dim*sizeof(float));
             return;
         }
         std::vector<float> out;

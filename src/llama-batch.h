@@ -193,7 +193,7 @@ private:
     uint32_t n_outputs;
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
-    std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
+    float *                     embd_src = nullptr; // borrowed from the llama_batch_ext passed to init()
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;
