@@ -3969,6 +3969,106 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
         return sidx - i;
     }
 
+    // (E) MUL_MAT(q8_0 hc up, lo) -> (B)'s chain                                  => the up GEMM with the mix as its epilogue
+    //     (prefill widths on RDNA3, mmq-wmma.cu): the 4x wider gate g is never stored or read back
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_Q8_0 && node->ne[1] > 8 && ggml_cuda_fuse_uses1(cgraph, i)) {
+        static const bool mix_dbg = ggml_env_flag("GGML_CUDA_HC_MIX_GEMM_DEBUG", false);
+#define HCMIX_NO(why) do { if (mix_dbg) { GGML_LOG_WARN("hc-mix-gemm: no fuse at %s: %s\n", node->name, why); } return 0; } while (0)
+        const int is = ggml_cuda_fuse_next(cgraph, i + 1);
+        if (is >= n || !ggml_cuda_fuse_unary(cgraph->nodes[is], GGML_UNARY_OP_SIGMOID) || cgraph->nodes[is]->src[0] != node ||
+                !ggml_cuda_fuse_uses1(cgraph, is)) { HCMIX_NO("check 1"); }
+        const ggml_tensor * sig = cgraph->nodes[is];
+        const int j = ggml_cuda_fuse_next(cgraph, is + 1);
+        if (j >= n || cgraph->nodes[j]->op != GGML_OP_MUL || !ggml_cuda_fuse_uses1(cgraph, j)) { HCMIX_NO("check 2"); }
+        const ggml_tensor * mul = cgraph->nodes[j];
+        const ggml_tensor * xn  = mul->src[0] == sig ? mul->src[1] : (mul->src[1] == sig ? mul->src[0] : nullptr);
+        if (!xn || xn->type != GGML_TYPE_F32 || !ggml_is_contiguous(xn) || !ggml_are_same_shape(xn, mul) ||
+                !ggml_are_same_shape(xn, node) || !ggml_is_contiguous(mul) || !ggml_cuda_fuse_views_belong(cgraph, i, j, { node, sig })) { HCMIX_NO("check 3"); }
+        const int k = ggml_cuda_fuse_next(cgraph, j + 1);
+        if (k >= n || cgraph->nodes[k]->op != GGML_OP_ADD) { HCMIX_NO("check 4"); }
+        const ggml_tensor * add = cgraph->nodes[k];
+        const ggml_tensor * v0 = add->src[0];
+        const ggml_tensor * v1 = add->src[1];
+        if (v0->op != GGML_OP_VIEW || v1->op != GGML_OP_VIEW || ggml_cuda_fuse_root(v0) != mul || ggml_cuda_fuse_root(v1) != mul) { HCMIX_NO("check 5"); }
+        const int64_t n_embd = v0->ne[0];
+        const int64_t nt     = v0->ne[1];
+        if (n_embd <= 0 || mul->ne[0] % n_embd != 0 || mul->ne[1] != nt || mul->ne[2] != 1 || mul->ne[3] != 1) { HCMIX_NO("check 6"); }
+        const int64_t hc = mul->ne[0] / n_embd;
+        const size_t ts = sizeof(float);
+        auto view_ok = [&](const ggml_tensor * v, int64_t c) {
+            return v->op == GGML_OP_VIEW && ggml_cuda_fuse_root(v) == mul && v->type == GGML_TYPE_F32 &&
+                   v->ne[0] == n_embd && v->ne[1] == nt && v->ne[2] == 1 && v->ne[3] == 1 &&
+                   v->nb[0] == ts && v->nb[1] == (size_t) hc * n_embd * ts && v->view_offs == (size_t) c * n_embd * ts;
+        };
+        if (hc != 4 || !view_ok(v0, 0) || !view_ok(v1, 1)) { HCMIX_NO("check 7"); }
+        int last_idx = k;
+        for (int64_t c = 2; c < hc; ++c) {
+            if (!ggml_cuda_fuse_uses1(cgraph, last_idx)) { HCMIX_NO("check 8"); }
+            const int m = ggml_cuda_fuse_next(cgraph, last_idx + 1);
+            if (m >= n || cgraph->nodes[m]->op != GGML_OP_ADD || cgraph->nodes[m]->src[0] != cgraph->nodes[last_idx] ||
+                    !view_ok(cgraph->nodes[m]->src[1], c)) { HCMIX_NO("check 9"); }
+            last_idx = m;
+        }
+        if (!ggml_cuda_fuse_uses1(cgraph, last_idx)) { HCMIX_NO("check 10"); }
+        const int sidx = ggml_cuda_fuse_next(cgraph, last_idx + 1);
+        if (sidx >= n || cgraph->nodes[sidx]->op != GGML_OP_SCALE || cgraph->nodes[sidx]->src[0] != cgraph->nodes[last_idx]) { HCMIX_NO("check 11"); }
+        ggml_tensor * scale_node = cgraph->nodes[sidx];
+        if (!ggml_is_contiguous(scale_node) || scale_node->ne[0] != n_embd || scale_node->ne[1] != nt ||
+                !ggml_cuda_fuse_views_belong(cgraph, i, sidx, { node, sig, mul })) { HCMIX_NO("check 12"); }
+        // every block reads xn and the GEMM input while others write the output: both must be disjoint from it
+        if (!ggml_cuda_fuse_disjoint(scale_node, xn) || !ggml_cuda_fuse_disjoint(scale_node, node->src[1])) { HCMIX_NO("check 13"); }
+        static const int check = (int) ggml_env_int("GGML_CUDA_HC_MIX_GEMM_CHECK", 0);
+        if (check > 0) {   // debug: reference (plain GEMM + k_hc_mix) into scale_node, fused into scratch, compare on the host
+            static int n_checked = 0;
+            const float sc = ggml_cuda_fuse_param_f32(scale_node, 0), bi = ggml_cuda_fuse_param_f32(scale_node, 1);
+            ggml_cuda_pool_alloc<float> gbuf(cuda_ctx->pool(), ggml_nelements(node));
+            ggml_cuda_pool_alloc<float> obuf(cuda_ctx->pool(), ggml_nelements(scale_node));
+            ggml_cuda_pool_alloc<float> g2buf(cuda_ctx->pool(), ggml_nelements(node));
+            ggml_tensor gt = *node;       gt.data = gbuf.get();
+            ggml_tensor ot = *scale_node; ot.data = obuf.get();
+            if (!ggml_cuda_mul_mat_q_wmma_hc_mix(*cuda_ctx, node->src[0], node->src[1], xn, n_embd, hc, sc, bi, &ot, g2buf.get())) { HCMIX_NO("check 14"); }
+            if (!ggml_cuda_mul_mat_q_wmma(*cuda_ctx, node->src[0], node->src[1], &gt)) { HCMIX_NO("check 15"); }
+            ggml_cuda_op_hc_mix(*cuda_ctx, xn, &gt, n_embd, hc, nt, sc, bi, scale_node);
+            std::vector<float> a(ggml_nelements(scale_node)), b(a.size());
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            CUDA_CHECK(cudaMemcpy(a.data(), scale_node->data, a.size()*4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(b.data(), ot.data, b.size()*4, cudaMemcpyDeviceToHost));
+            {
+                std::vector<float> ga(ggml_nelements(node)), gb(ga.size());
+                CUDA_CHECK(cudaMemcpy(ga.data(), gt.data, ga.size()*4, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(gb.data(), g2buf.get(), gb.size()*4, cudaMemcpyDeviceToHost));
+                size_t gbad = 0, gfirst = SIZE_MAX;
+                for (size_t q = 0; q < ga.size(); ++q) { if (memcmp(&ga[q], &gb[q], 4) != 0) { gbad++; if (gfirst == SIZE_MAX) gfirst = q; } }
+                if (n_checked < check) {
+                    GGML_LOG_WARN("hc-mix-gemm check g: %zu/%zu differ, first %zu: %.9g vs %.9g; scale %g bias %g\n", gbad, ga.size(), gfirst,
+                        gfirst == SIZE_MAX ? 0.0 : ga[gfirst], gfirst == SIZE_MAX ? 0.0 : gb[gfirst], sc, bi);
+                }
+            }
+            size_t nbad = 0, first = SIZE_MAX;
+            for (size_t q = 0; q < a.size(); ++q) { if (memcmp(&a[q], &b[q], 4) != 0) { nbad++; if (first == SIZE_MAX) first = q; } }
+            if (n_checked++ < check) {
+                GGML_LOG_WARN("hc-mix-gemm check %s nt=%lld: %zu/%zu differ%s", scale_node->name, (long long) nt, nbad, a.size(), nbad ? "" : "\n");
+                if (nbad) {
+                    GGML_LOG_WARN(" first at t=%zu i=%zu: ref %.9g fused %.9g\n", first / n_embd, first % n_embd, a[first], b[first]);
+                    const size_t t0 = first / n_embd, i0 = first % n_embd;
+                    std::vector<float> xh(ggml_nelements(xn)), gh(ggml_nelements(node));
+                    CUDA_CHECK(cudaMemcpy(xh.data(), xn->data, xh.size()*4, cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(gh.data(), gt.data, gh.size()*4, cudaMemcpyDeviceToHost));
+                    for (int64_t c = 0; c < hc; ++c) {
+                        const size_t q = (t0*hc + c)*n_embd + i0;
+                        GGML_LOG_WARN("  c=%lld xn %a g %a\n", (long long) c, xh[q], gh[q]);
+                    }
+                    GGML_LOG_WARN("  ref %a fused %a\n", a[first], b[first]);
+                }
+            }
+            return sidx - i;
+        }
+        if (!ggml_cuda_mul_mat_q_wmma_hc_mix(*cuda_ctx, node->src[0], node->src[1], xn, n_embd, hc,
+                ggml_cuda_fuse_param_f32(scale_node, 0), ggml_cuda_fuse_param_f32(scale_node, 1), scale_node)) { HCMIX_NO("check 16"); }
+        return sidx - i;
+#undef HCMIX_NO
+    }
+
     // (D) MUL(e [ne0, m, nt], w [1, m, nt]) -> ADD over the m expert views      => weighted_sum
     if (node->op == GGML_OP_MUL) {
         const ggml_tensor * e = node->src[0];
@@ -6753,6 +6853,34 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     };
+
+    // halo-hybrid: the fused hc up GEMM + mix (try_fuse_hc (E)) reads the GEMM input and xn while it writes the mix output,
+    // so the allocator must not place that output over either: keep both alive until the SCALE that ends the chain
+    if (!disable_fusion && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+            ggml_tensor * mm = cgraph->nodes[i];
+            if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_Q8_0 || mm->ne[1] <= 8) {
+                continue;
+            }
+            int k = i + 1;
+            while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) { k++; }
+            if (k >= cgraph->n_nodes || !ggml_cuda_fuse_unary(cgraph->nodes[k], GGML_UNARY_OP_SIGMOID) || cgraph->nodes[k]->src[0] != mm) {
+                continue;
+            }
+            const ggml_tensor * sig = cgraph->nodes[k];
+            ggml_tensor * mul = nullptr;
+            ggml_tensor * scale = nullptr;
+            for (int q = k + 1; q < cgraph->n_nodes && q < k + 24; ++q) {
+                ggml_tensor * t = cgraph->nodes[q];
+                if (!mul && t->op == GGML_OP_MUL && (t->src[0] == sig || t->src[1] == sig)) { mul = t; }
+                if (mul && t->op == GGML_OP_SCALE) { scale = t; break; }
+            }
+            if (mul && scale) {
+                params->add_alloc_dep(params->user_data, mm->src[1], scale);
+                params->add_alloc_dep(params->user_data, mul->src[0] == sig ? mul->src[1] : mul->src[0], scale);
+            }
+        }
+    }
 
     if (!disable_fusion) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.

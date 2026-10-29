@@ -117,12 +117,32 @@ template <> struct mmqw_wtraits<GGML_TYPE_Q4_K> { static constexpr int QK = 256;
 template <> struct mmqw_wtraits<GGML_TYPE_Q5_K> { static constexpr int QK = 256; static constexpr int BYTES = 176; };
 template <> struct mmqw_wtraits<GGML_TYPE_Q6_K> { static constexpr int QK = 256; static constexpr int BYTES = 210; };
 
-template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32>
+// halo-hybrid: the hyper-connection mix epilogue (HC > 0). The GEMM is qwen4exp's hc up projection g = W x (M = HC*n_embd
+// rows, row c*n_embd + i = stream c of channel i), and instead of storing g the block computes what k_hc_mix (hc.cu) reads
+// it for: out[n][i] = scale * sum_c xn[n][c][i] * sigmoid(g[n][c*n_embd + i]) + bias, with the c-sum in k_hc_mix's order.
+// The weight rows are read through a remap that gives each warp's HC consecutive 16-row fragments the HC streams of the same
+// 16 channels (logical m: group of 16*HC rows -> 16 channels, fragment c = stream c, lane = channel), so every lane holds
+// all streams of its channel: no shuffles, and the xn reads and out writes are 64-byte runs. Each g is the same
+// accumulator value the plain GEMM stores, so out is bit-identical.
+struct mmqw_mix_args {
+    const float * xn;     // [n][HC][n_embd]
+    float *       out;    // [n][n_embd]
+    float         scale;
+    float         bias;
+    int           n_embd;
+};
+
+static __device__ __forceinline__ float mmqw_hc_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));   // identical to hc.cu's hc_sigmoid
+}
+
+template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0>
 static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
         const void * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ dst,
-        const int M, const int N, const int K, const int64_t ldx, const int64_t ldd) {
+        const int M, const int N, const int K, const int64_t ldx, const int64_t ldd, const mmqw_mix_args mix) {
     static_assert(KT % 32 == 0, "K tile must cover whole q8_0 blocks");
     constexpr bool KQ = WT != GGML_TYPE_Q8_0;
+    static_assert(HC == 0 || (!KQ && (BM / (16 * WM)) % HC == 0), "the mix epilogue covers q8_0 with a multiple of HC fragments per warp");
     static_assert(!KQ || 256 % KT == 0, "a K tile must not straddle k-quant superblocks");
     static_assert(BN % (16 * WN) == 0 && BM % (16 * WM) == 0, "warp grid must tile the block");
     static_assert(PF == 1 || PF == 2, "register prefetch depth");
@@ -205,7 +225,11 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
             const int hf  = idx % 2;
             const int row = blk / KB;
             const int kb  = blk % KB;
-            const int m   = min(m0 + row, M - 1);
+            int m = min(m0 + row, M - 1);
+            if constexpr (HC > 0) {
+                // logical row m: group g = m / (16*HC), stream c = (m / 16) % HC, channel 16*g + m % 16 -> weight row c*n_embd + ch
+                m = ((m / 16) % HC) * (M / HC) + (m / (16 * HC)) * 16 + m % 16;
+            }
             if constexpr (!KQ) {
             const block_q8_0 * b = Wq + (int64_t) m * nbk + k0 / 32 + kb;
             rd[st][x] = b->d;
@@ -406,6 +430,44 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
     }
 
     // epilogue: element e of lane l holds C[n = 2e + l/16 (gfx11) | 8*(l/16) + e (gfx12)][m = l % 16]
+    if constexpr (HC > 0) {
+#pragma unroll
+        for (int i = 0; i < TN; ++i) {
+#pragma unroll
+            for (int jg = 0; jg < TM; jg += HC) {
+                const int mg = m0 + wm * TM * 16 + jg * 16;                 // first logical row of this channel group
+                const int ie = (mg / (16 * HC)) * 16 + lane % 16;           // the lane's channel
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+#if defined(RDNA4)
+                    const int n = n0 + wn * TN * 16 + i * 16 + 8 * (lane / 16) + e;
+#else
+                    const int n = n0 + wn * TN * 16 + i * 16 + 2 * e + lane / 16;
+#endif
+                    if (n >= N || mg >= M) {
+                        continue;
+                    }
+                    const float * xr = mix.xn + (int64_t) n * HC * mix.n_embd + ie;
+                    if (dst != nullptr) {   // debug (GGML_CUDA_HC_MIX_GEMM_CHECK): the raw g at its original rows
+#pragma unroll
+                        for (int c = 0; c < HC; ++c) {
+                            dst[(int64_t) n * ldd + c * mix.n_embd + ie] = acc[i][jg + c][e];
+                        }
+                    }
+                    // k_hc_mix's loop as compiled: acc = x0*s0, then acc = fma(x_c, s_c, acc) - the compiler contracts its
+                    // __fadd_rn(acc, __fmul_rn(x, s)) (HIP's __fmul_rn does not block that), so the explicit fmaf matches it
+                    float sum = __fmul_rn(xr[0], mmqw_hc_sigmoid(acc[i][jg][e]));
+#pragma unroll
+                    for (int c = 1; c < HC; ++c) {
+                        sum = fmaf(xr[c * mix.n_embd], mmqw_hc_sigmoid(acc[i][jg + c][e]), sum);
+                    }
+                    const float r = mix.scale * sum + mix.bias;
+                    mix.out[(int64_t) n * mix.n_embd + ie] = r;
+                }
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < TN; ++i) {
 #pragma unroll
@@ -426,12 +488,13 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
     }
 }
 
-template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32>
-static void launch_mul_mat_q_wmma(const void * W, const void * X, float * dst, int M, int N, int K, int64_t ldx, int64_t ldd, cudaStream_t stream) {
+template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0>
+static void launch_mul_mat_q_wmma(const void * W, const void * X, float * dst, int M, int N, int K, int64_t ldx, int64_t ldd, cudaStream_t stream,
+        const mmqw_mix_args mix = {}) {
     constexpr int PITCH = KT + 8;
     constexpr size_t smem = (size_t) NBUF * (BN + BM) * PITCH * sizeof(half);
     const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
-    mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd);
+    mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32, HC><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd, mix);
     CUDA_CHECK(cudaGetLastError());
 }
 template <ggml_type WT>
@@ -481,6 +544,38 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
 }
 
 #endif // MMQ_WMMA_ENABLED
+
+bool ggml_cuda_mul_mat_q_wmma_hc_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
+        const ggml_tensor * xn, int64_t n_embd, int64_t hc, float scale, float bias, ggml_tensor * out, float * g_debug) {
+#ifndef MMQ_WMMA_ENABLED
+    GGML_UNUSED_VARS(ctx, w, x, xn, n_embd, hc, scale, bias, out, g_debug);
+    return false;
+#else
+    static const bool off = ggml_env_flag("GGML_CUDA_NO_HC_MIX_GEMM", false);
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (off || !GGML_CUDA_CC_IS_RDNA3(cc) || w->type != GGML_TYPE_Q8_0 || hc != 4 || x->type != GGML_TYPE_F32 ||
+            xn->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(xn) || !ggml_is_contiguous(out) ||
+            w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1) {
+        return false;
+    }
+    const int64_t K = w->ne[0];
+    const int64_t M = w->ne[1];
+    const int64_t N = x->ne[1];
+    // the same path the plain GEMM would take for this shape (f32 activations read in-kernel), see mmqw_launch
+    static const int64_t prepass_min = ggml_env_int("GGML_CUDA_Q8_WMMA_PREPASS_MIN", (int64_t) 8 * 1024 * 1024);
+    if (K % 64 != 0 || M != hc * n_embd || M % 128 != 0 || n_embd % 16 != 0 || N < 64 || x->ne[0] != K || M * K > prepass_min ||
+            xn->ne[0] != M || xn->ne[1] != N || out->ne[0] != n_embd || out->ne[1] != N) {
+        return false;
+    }
+    const mmqw_mix_args mix = { (const float *) xn->data, (float *) out->data, scale, bias, (int) n_embd };
+    launch_mul_mat_q_wmma<GGML_TYPE_Q8_0, 128, 128, 64, 4, 2, 1, 1, true, 4>(w->data, x->data, g_debug, (int) M, (int) N, (int) K, K, M,
+            ctx.stream(), mix);
+    return true;
+#endif
+}
 
 bool ggml_cuda_mul_mat_q_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #ifndef MMQ_WMMA_ENABLED
