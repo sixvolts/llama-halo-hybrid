@@ -3719,7 +3719,12 @@ private:
                             // message must keep its system/user boundary checkpoint, or an edit or retry of that
                             // message reprocesses the whole system prompt)
                             const bool enough_new = checkpoints.empty() || slot.task->n_tokens() - pos >= params_base.checkpoint_min_new;
-                            if (enough_new && (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step)) {
+                            // halo-hybrid: nor after a prefix this short (a chat template's few header tokens): its own batch
+                            // costs a weight-bound pass of the MoE (~110 ms for 16 tokens on the APU) plus a checkpoint, while
+                            // reprocessing it inside a later batch costs about 1 ms per token (LLAMA_CKPT_MIN_PREFIX, 0 = off)
+                            static const int64_t min_prefix = ggml_env_int("LLAMA_CKPT_MIN_PREFIX", 128);
+                            const bool enough_old = (int64_t) pos >= min_prefix;
+                            if (enough_new && enough_old && (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step)) {
                                 break;
                             }
                         }
