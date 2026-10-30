@@ -6490,6 +6490,12 @@ static std::string ggml_cuda_optimer_key(const ggml_tensor * node, int n_fused) 
         const ggml_tensor * v = node->src[2];
         char b[64]; snprintf(b, sizeof(b), " h%lld t%lld s%lld", (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3]); k += b;
     }
+    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && ggml_env_flag("GGML_CUDA_TIME_OPS_NAMES", false)) {
+        // the node name with its "-<layer>" suffix stripped, so the classes still merge across layers
+        std::string nm = node->name; const size_t p = nm.rfind('-');
+        if (p != std::string::npos && p + 1 < nm.size() && nm.find_first_not_of("0123456789", p + 1) == std::string::npos) { nm.resize(p); }
+        k += " [" + nm + "]";
+    }
     if (n_fused > 0) { k += " +fused" + std::to_string(n_fused); }
     return k;
 }
@@ -7070,10 +7076,47 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
+    // halo-hybrid: hc boundary (ggml_cuda_try_fuse_hc (C) + the next mix's RMS_NORM -> MUL). The fused kernel reads the
+    //     block output b while it writes xn, but in the unfused graph b dies at the combine, so ggml-alloc may put xn
+    //     over it (2 of 3 Qwen3.8 boundaries at prefill fell back to three launches for that): keep b alive until xn
+    //     is allocated. (Not tied to GGML_CUDA_NO_HC_BOUNDARY=2, which then turns off only the kernels: the baseline
+    //     with the same allocation for an exactness check.)
+    if (!disable_fusion && !ggml_cuda_hc_boundary_disabled(1)) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * rep = cgraph->nodes[i];
+            if (rep->op != GGML_OP_REPEAT || rep->type != GGML_TYPE_F32) {
+                continue;
+            }
+            int j = i;
+            int k_rms = -1;
+            bool ok = true;
+            for (const ggml_op op : { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }) {
+                j = ggml_cuda_fuse_next(cgraph, j + 1);
+                if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != op) {
+                    ok = false;
+                    break;
+                }
+                k_rms = op == GGML_OP_RMS_NORM ? j : k_rms;
+            }
+            if (!ok) {
+                continue;
+            }
+            ggml_tensor * xn  = cgraph->nodes[j];
+            ggml_tensor * rms = cgraph->nodes[k_rms];
+            const ggml_tensor * add = rms->src[0];
+            if (rms->op != GGML_OP_RMS_NORM || xn->src[0] != rms || add->op != GGML_OP_ADD ||
+                    (add->src[0]->op != GGML_OP_MUL && add->src[1]->op != GGML_OP_MUL)) {
+                continue;
+            }
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ggml_cuda_fuse_root(rep->src[0])), xn);
+            i = j;
+        }
+    }
+
     // halo-hybrid: hc inject reorder (RDNA3, prefill widths). qwen4exp builds each mix's down projection, then its thin
     //     f32 inject projection, both of xn; put the inject first so it directly follows the hc boundary that produces
     //     xn, which then computes it (k_hc_combine_norm_inject, hc.cu). Both read only xn and a weight.
-    if (!disable_fusion && !ggml_cuda_hc_boundary_disabled(2) && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+    if (!disable_fusion && !ggml_cuda_hc_boundary_disabled(1) && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
             ggml_tensor * a = cgraph->nodes[i];
             ggml_tensor * q = cgraph->nodes[i + 1];
