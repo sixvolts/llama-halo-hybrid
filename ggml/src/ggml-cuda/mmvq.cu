@@ -2623,7 +2623,7 @@ static __global__ void mul_mat_vec_q_moe_tail(const mmvq_moe_tail_args a) {
     float sum = (part[0][i] * s0) * w[0];
     for (int e = 1; e < a.n_used; ++e) {
         const float sc = es != nullptr ? es[e*a.es_slot] : 1.0f;
-        sum += (part[e][i] * sc) * w[e*a.w_slot];
+        sum = ggml_cuda_add_mul_rn(sum, part[e][i] * sc, w[e*a.w_slot]);
     }
     // k_mul_sigmoid with the trailing ADD(moe_out, shexp*sigmoid(g)): a rounded product, then the add (no FMA; HIP's
     // __fmul_rn/__fadd_rn are plain operators and would contract here, where the unfused kernel's branch keeps them apart)

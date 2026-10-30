@@ -7,8 +7,9 @@
 
 #define HC_BLOCK 256
 
-// The separate kernels these replace round every intermediate to f32; __fmul_rn/__fadd_rn keep the
-// compiler from contracting products and sums into fma, so the fused results are bit-identical.
+// The separate kernels these replace round every intermediate to f32; ggml_cuda_add_mul_rn keeps the compiler from
+// contracting a product and the sum it feeds into one fma (HIP's __fmul_rn/__fadd_rn do not), so the fused results are
+// bit-identical.
 
 static __device__ __forceinline__ float hc_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
@@ -189,7 +190,7 @@ static __global__ void k_hc_mix(const float * xn, const float * g, float * dst, 
         const float * gr = g  + t * hc * n_embd + i;
         float acc = __fmul_rn(xr[0], hc_sigmoid(gr[0]));
         for (int64_t c = 1; c < hc; ++c) {
-            acc = __fadd_rn(acc, __fmul_rn(xr[c * n_embd], hc_sigmoid(gr[c * n_embd])));
+            acc = ggml_cuda_add_mul_rn(acc, xr[c * n_embd], hc_sigmoid(gr[c * n_embd]));
         }
         const float r = scale * acc + bias;
         dst[idx] = r;
@@ -218,7 +219,7 @@ static __global__ void k_hc_combine(const float * x, const float * b, const floa
         const int64_t c  = r / n_embd;
         const int64_t i  = r - c * n_embd;
         const float w    = s2 * hc_sigmoid(s1 * inj[t * hc + c] + b1) + b2;
-        dst[idx] = __fadd_rn(x[idx], __fmul_rn(b[t * n_embd + i], w));
+        dst[idx] = ggml_cuda_add_mul_rn(x[idx], b[t * n_embd + i], w);
     }
 }
 
@@ -289,7 +290,7 @@ static __global__ void k_hc_combine_norm(const float * x, const float * b, const
     const bool vec = rms_norm_vec_order(n_embd);
     float tmp = 0.0f;
     for (int col = tid; col < n_embd; col += block_size) {
-        const float xi = __fadd_rn(x[col], __fmul_rn(b[col], w));
+        const float xi = ggml_cuda_add_mul_rn(x[col], b[col], w);
         res[col] = xi;
         if (!vec) {
             tmp += xi * xi;
@@ -393,7 +394,7 @@ static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const fl
     for (int c = 0; c < HC; ++c) {
         const float w = s2 * hc_sigmoid(s1 * inj[(int64_t) t*HC + c] + b1) + b2;
         for (int col = tid; col < n_embd; col += BS) {
-            const float xi = __fadd_rn(x[c*n_embd + col], __fmul_rn(b[col], w));
+            const float xi = ggml_cuda_add_mul_rn(x[c*n_embd + col], b[col], w);
             res[c*n_embd + col]   = xi;
             s_row[c*n_embd + col] = xi;
         }
@@ -493,8 +494,9 @@ static __global__ void k_mul_sigmoid(const float * x, const float * g, const flo
     const int64_t stride = (int64_t) blockDim.x * gridDim.x;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
         const float gv = g_per_col ? g[i / ne0] : g[i];
-        float r  = __fmul_rn(x[i], hc_sigmoid(gv));
-        if (y) { r = __fadd_rn(y[i], r); }   // ADD(y, mul): same operand order as the separate kernel
+        const float sg = hc_sigmoid(gv);
+        // ADD(y, mul): same operand order as the separate kernel, and the product rounded before the add
+        const float r  = y ? ggml_cuda_add_mul_rn(y[i], x[i], sg) : x[i] * sg;
         dst[i] = r;
         if (q8) { q8_side_store(q8, i, r); }
     }
@@ -510,7 +512,7 @@ static __global__ void k_weighted_sum(const float * e, const float * w, float * 
         const float * wr = w + t * m;
         float acc = __fmul_rn(er[0], wr[0]);
         for (int64_t c = 1; c < m; ++c) {
-            acc = __fadd_rn(acc, __fmul_rn(er[c * ne0], wr[c]));
+            acc = ggml_cuda_add_mul_rn(acc, er[c * ne0], wr[c]);
         }
         dst[idx] = acc;
     }

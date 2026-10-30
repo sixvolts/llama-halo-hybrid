@@ -19,7 +19,7 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
     for (int expert = 1; expert < n_expert_used; ++expert) {
         const uint64_t row   = first_row + expert;
         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
-        sum += (experts[row * n_embd + col] * scale) * weights[row];
+        sum = ggml_cuda_add_mul_rn(sum, experts[row * n_embd + col] * scale, weights[row]);
     }
     dst[token * n_embd + col] = sum;
 }
@@ -28,7 +28,8 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
 //     grid above has the blocks that run together (consecutive tokens, one 1 KB chunk each) touch 8 rows 32 KB apart
 //     per token, which on gfx1151 GTT memory ran at ~60 GB/s in situ (2.5 ms per 1024-token GLM layer) while the same
 //     launch ran at cache speed in isolation. Same arithmetic per element and the same expert order, so the result is
-//     bit-identical. GGML_CUDA_MOE_WR_COLS=1 restores the column-chunk kernel.
+//     bit-identical. (Both kernels add each weighted row with ggml_cuda_add_mul_rn: rounded product, then the add, as
+//     the unfused MUL and ADD kernels; the contracted fma made the fused sum differ from them.) GGML_CUDA_MOE_WR_COLS=1 restores the column-chunk kernel.
 static __global__ void moe_weighted_reduction_f32_rows(const float * __restrict__ experts,
                                                        const float * __restrict__ expert_scale,
                                                        const float * __restrict__ weights,
@@ -50,10 +51,10 @@ static __global__ void moe_weighted_reduction_f32_rows(const float * __restrict_
             const float    sc  = expert_scale != nullptr ? expert_scale[row] : 1.0f;
             const float    w   = weights[row];
             const float4   v   = reinterpret_cast<const float4 *>(experts + row * n_embd)[c4];
-            sum.x += (v.x * sc) * w;
-            sum.y += (v.y * sc) * w;
-            sum.z += (v.z * sc) * w;
-            sum.w += (v.w * sc) * w;
+            sum.x = ggml_cuda_add_mul_rn(sum.x, v.x * sc, w);
+            sum.y = ggml_cuda_add_mul_rn(sum.y, v.y * sc, w);
+            sum.z = ggml_cuda_add_mul_rn(sum.z, v.z * sc, w);
+            sum.w = ggml_cuda_add_mul_rn(sum.w, v.w * sc, w);
         }
         reinterpret_cast<float4 *>(dst + token * n_embd)[c4] = sum;
     }

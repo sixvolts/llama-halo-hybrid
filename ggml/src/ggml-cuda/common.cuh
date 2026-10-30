@@ -749,6 +749,17 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // defined(GGML_USE_HIP)
 }
 
+// halo-hybrid: a + b*c with two roundings, as a MUL kernel followed by an ADD kernel computes it. HIP's __fadd_rn /
+// __fmul_rn are plain operators (OCML_BASIC_ROUNDED_OPERATIONS is not defined), so hipcc's default contraction turned
+// __fadd_rn(a, __fmul_rn(b, c)) into one fma: fused kernels written that way were not bit-identical to the launches they
+// replace, and because a fusion's acceptance depends on aliasing, every allocation change shifted outputs by ulps
+static __device__ __forceinline__ float ggml_cuda_add_mul_rn(const float a, const float b, const float c) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    return a + b * c;
+}
+
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
     acc += v*u;
 }

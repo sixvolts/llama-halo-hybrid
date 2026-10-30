@@ -454,12 +454,11 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
                             dst[(int64_t) n * ldd + c * mix.n_embd + ie] = acc[i][jg + c][e];
                         }
                     }
-                    // k_hc_mix's loop as compiled: acc = x0*s0, then acc = fma(x_c, s_c, acc) - the compiler contracts its
-                    // __fadd_rn(acc, __fmul_rn(x, s)) (HIP's __fmul_rn does not block that), so the explicit fmaf matches it
-                    float sum = __fmul_rn(xr[0], mmqw_hc_sigmoid(acc[i][jg][e]));
+                    // k_hc_mix's loop: acc = x0*s0, then acc + x_c*s_c rounded twice, as the unfused MUL and ADD kernels
+                    float sum = xr[0] * mmqw_hc_sigmoid(acc[i][jg][e]);
 #pragma unroll
                     for (int c = 1; c < HC; ++c) {
-                        sum = fmaf(xr[c * mix.n_embd], mmqw_hc_sigmoid(acc[i][jg + c][e]), sum);
+                        sum = ggml_cuda_add_mul_rn(sum, xr[c * mix.n_embd], mmqw_hc_sigmoid(acc[i][jg + c][e]));
                     }
                     const float r = mix.scale * sum + mix.bias;
                     mix.out[(int64_t) n * mix.n_embd + ie] = r;
