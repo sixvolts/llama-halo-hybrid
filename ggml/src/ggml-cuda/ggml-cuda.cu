@@ -4718,8 +4718,9 @@ static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx
 //     and cover whole 128-wide heads (qwen4exp normalises Q and K, adjacent, in one node). conv_input is not written:
 //     the copies and the conv must be its only readers. The builder puts the other layer's state gather between the
 //     copies and the conv; graph_optimize moves the conv..l2 run up behind the copies (dependency-safe: its inputs are
-//     conv_input and a weight) and keeps x and the states alive until the l2 output is allocated. Decode/verify only
-//     (n_seqs == 1, nt <= 8), f32, a stored conv weight (glm5next's is a concat, so glm never matches).
+//     conv_input and a weight) and keeps x and the states alive until the l2 output is allocated. One sequence
+//     (n_seqs == 1), f32, a stored conv weight (glm5next's is a concat, so glm never matches); nt <= 8 is the decode
+//     kernel, wider batches the token-chunked prefill kernel (prefill: the concat's 2 x 134 MB per layer at 4096 tokens).
 //     GGML_CUDA_NO_GDN_CONV_FRONT=1 disables.
 struct ggml_cuda_gdn_conv_front_match {
     ggml_tensor * c3;
@@ -4878,6 +4879,12 @@ static int ggml_cuda_try_fuse_gdn_conv_front(ggml_backend_cuda_context * cuda_ct
     }
     ggml_cuda_gdn_conv_front_match m;
     if (!ggml_cuda_gdn_conv_front_find(cgraph, i, m, /*adjacent =*/ true)) {
+        return 0;
+    }
+    // GGML_CUDA_NO_GDN_CONV_FRONT_LONG=1: the unfused path at prefill widths, with graph_optimize's reordering and
+    // alloc deps left in place (the baseline for an exactness check of the prefill kernel)
+    static const bool no_long = ggml_env_flag("GGML_CUDA_NO_GDN_CONV_FRONT_LONG", false);
+    if (no_long && m.silu->ne[1] > GDN_CONV_FRONT_MAX_TOKENS) {
         return 0;
     }
     if (!ggml_cuda_gdn_conv_front_disjoint(m)) {

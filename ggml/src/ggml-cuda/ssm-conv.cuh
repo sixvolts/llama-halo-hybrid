@@ -8,11 +8,12 @@ void ggml_cuda_op_ssm_conv_kda_l2(ggml_backend_cuda_context & ctx, const ggml_te
         const ggml_tensor * w_q, const ggml_tensor * w_k, const ggml_tensor * w_v,
         ggml_tensor * silu_dst, ggml_tensor * q_out, ggml_tensor * k_out, float eps);
 
-// halo-hybrid: the GDN conv front at decode (qwen4exp build_conv_state_at + ssm_conv + silu + one l2_norm over the
+// halo-hybrid: the GDN conv front at decode and prefill (qwen4exp build_conv_state_at + ssm_conv + silu + one l2_norm over the
 // leading 128-wide heads of the SiLU output) as one launch. See ggml_cuda_try_fuse_gdn_conv_front in ggml-cuda.cu.
 #define GDN_CONV_FRONT_MAX_DST    8
 #define GDN_CONV_FRONT_MAX_TOKENS 8
 #define GDN_CONV_FRONT_HEAD       128
+#define GDN_CONV_FRONT_LONG_T     32   // tokens per block of the prefill kernel (nt > GDN_CONV_FRONT_MAX_TOKENS)
 
 struct ggml_cuda_gdn_conv_front_args {
     const ggml_tensor * states;   // [d_conv-1, C, 1] conv history, any element/row strides
