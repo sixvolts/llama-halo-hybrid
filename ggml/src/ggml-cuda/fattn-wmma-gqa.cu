@@ -83,7 +83,8 @@ static __global__ void flash_attn_wmma_gqa12(
         const half * __restrict__ mask, const int32_t * __restrict__ lists, float * __restrict__ dst,
         const float scale, const int n_q, const int list_stride,
         const int64_t nbq1, const int64_t nbq2, const int64_t nbk1, const int64_t nbk2,
-        const int64_t nbv1, const int64_t nbv2, const int64_t s31, const int64_t nbd1, const int64_t nbd2) {
+        const int64_t nbv1, const int64_t nbv2, const int64_t s31, const int64_t nbd1, const int64_t nbd2,
+        const float * __restrict__ gate, const int64_t gate_s, const int64_t gate_hs, half * __restrict__ d16) {
 #if defined(AMD_WMMA_AVAILABLE) && !defined(RDNA4)
     const int tid     = threadIdx.x;
     const int lane    = tid & 31;
@@ -409,24 +410,33 @@ static __global__ void flash_attn_wmma_gqa12(
                     continue;
                 }
                 const float den = row_sum[rb * 16 + row];
-                float * out = (float *) ((char *) dst + int64_t(qi) * nbd2 + int64_t(row_head(rb, row)) * nbd1);
-                out[dim_tile * 16 + sub] = den > 0.0f ? o_acc[rb][t][i] / den : 0.0f;
+                const int   h   = row_head(rb, row);
+                const int   d   = dim_tile * 16 + sub;
+                float v = den > 0.0f ? o_acc[rb][t][i] / den : 0.0f;
+                if (gate) {
+                    // the output gate (qwen4exp attn_gated, k_mul_sigmoid's x * sigmoid(g))
+                    v = v * (1.0f / (1.0f + expf(-gate[int64_t(qi) * gate_s + int64_t(h) * gate_hs + d])));
+                }
+                float * out = (float *) ((char *) dst + int64_t(qi) * nbd2 + int64_t(h) * nbd1);
+                out[d] = v;
+                if (d16) {
+                    // mmqw_f32_to_f16_sat's conversion, for the output projection's WMMA pre-pass
+                    d16[(int64_t(qi) * (kGqa * gridDim.y) + h) * kD + d] = __float2half(v != v ? v : fminf(fmaxf(v, -65504.0f), 65504.0f));
+                }
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, lists, dst, scale, n_q, list_stride, nbq1, nbq2, nbk1, nbk2, nbv1, nbv2, s31, nbd1, nbd2);
+    GGML_UNUSED_VARS(Q, K, V, mask, lists, dst, scale, n_q, list_stride, nbq1, nbq2, nbk1, nbk2, nbv1, nbv2, s31, nbd1, nbd2,
+        gate, gate_s, gate_hs, d16);
     NO_DEVICE_CODE;
 #endif // defined(AMD_WMMA_AVAILABLE) && !defined(RDNA4)
 }
 
 #endif // defined(GGML_USE_HIP)
 
-bool ggml_cuda_flash_attn_ext_wmma_gqa12(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#if !defined(GGML_USE_HIP)
-    GGML_UNUSED_VARS(ctx, dst);
-    return false;
-#else
+#if defined(GGML_USE_HIP)
+static bool fa_gqa12_fits(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     // GGML_CUDA_FA_GQA12=0 = off (the MMA kernel's 16 x 4 union walk)
     static const bool enabled = ggml_env_flag("GGML_CUDA_FA_GQA12", true);
     const ggml_tensor * Q     = dst->src[0];
@@ -438,8 +448,7 @@ bool ggml_cuda_flash_attn_ext_wmma_gqa12(ggml_backend_cuda_context & ctx, ggml_t
     if (!enabled || !GGML_CUDA_CC_IS_RDNA3(cc) || mask == nullptr || sinks != nullptr) {
         return false;
     }
-    float scale, max_bias, logit_softcap;
-    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    float max_bias, logit_softcap;
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
@@ -452,12 +461,22 @@ bool ggml_cuda_flash_attn_ext_wmma_gqa12(ggml_backend_cuda_context & ctx, ggml_t
         return false;
     }
     // 16-byte rows for the vector loads; dst is [D, heads, queries]
-    if (Q->nb[0] != sizeof(float) || Q->nb[1] % 16 || Q->nb[2] % 16 || K->nb[0] != sizeof(half) || K->nb[1] % 16 ||
+    return !(Q->nb[0] != sizeof(float) || Q->nb[1] % 16 || Q->nb[2] % 16 || K->nb[0] != sizeof(half) || K->nb[1] % 16 ||
             K->nb[2] % 16 || V->nb[0] != sizeof(half) || V->nb[1] % 16 || V->nb[2] % 16 || dst->nb[0] != sizeof(float) ||
             dst->ne[0] != 256 || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] ||
-            (uintptr_t) Q->data % 16 || (uintptr_t) K->data % 16 || (uintptr_t) V->data % 16) {
-        return false;
-    }
+            (uintptr_t) Q->data % 16 || (uintptr_t) K->data % 16 || (uintptr_t) V->data % 16);
+}
+
+// out: dst itself, or (gated) a contiguous [D*heads, queries] tensor with the same element order
+static void fa_gqa12_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, float * out, const int64_t nbo1,
+        const int64_t nbo2, const float * gate, const int64_t gate_s, const int64_t gate_hs, half * d16) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    float scale;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
     cudaStream_t stream = ctx.stream();
     const int n_q    = (int) Q->ne[1];
@@ -469,9 +488,51 @@ bool ggml_cuda_flash_attn_ext_wmma_gqa12(ggml_backend_cuda_context & ctx, ggml_t
     const dim3 grid((n_q + kQueries - 1) / kQueries, (unsigned) K->ne[2], 1);
     flash_attn_wmma_gqa12<<<grid, 256, 0, stream>>>(
         (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data, lists.get(),
-        (float *) dst->data, scale, n_q, cap + 1, Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-        mask->nb[1] / (int64_t) sizeof(half), dst->nb[1], dst->nb[2]);
+        out, scale, n_q, cap + 1, Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2],
+        mask->nb[1] / (int64_t) sizeof(half), nbo1, nbo2, gate, gate_s, gate_hs, d16);
     CUDA_CHECK(cudaGetLastError());
+}
+#endif // defined(GGML_USE_HIP)
+
+bool ggml_cuda_flash_attn_ext_wmma_gqa12(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP)
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+#else
+    if (!fa_gqa12_fits(ctx, dst)) {
+        return false;
+    }
+    fa_gqa12_launch(ctx, dst, (float *) dst->data, dst->nb[1], dst->nb[2], nullptr, 0, 0, nullptr);
+    return true;
+#endif // !defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_flash_attn_ext_wmma_gqa12_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * fa, const ggml_tensor * gate,
+        ggml_tensor * out, half * d16) {
+#if !defined(GGML_USE_HIP)
+    GGML_UNUSED_VARS(ctx, fa, gate, out, d16);
+    return false;
+#else
+    // gate: [D*heads, queries] contiguous rows, or the strided [D, heads, queries] view it is copied from
+    const int64_t width = fa->ne[0] * fa->ne[1];
+    if (!fa_gqa12_fits(ctx, fa) || !ggml_is_contiguous(fa) || gate->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(out) || ggml_nelements(out) != ggml_nelements(fa) || out->ne[0] != width ||
+            gate->nb[0] != sizeof(float) || gate->ne[3] != 1 || ggml_nelements(gate) != ggml_nelements(fa)) {
+        return false;
+    }
+    int64_t gs, ghs;
+    if (gate->ne[0] == width && gate->ne[1] == fa->ne[2] && gate->ne[2] == 1) {
+        gs = gate->nb[1]; ghs = fa->ne[0] * sizeof(float);
+    } else if (gate->ne[0] == fa->ne[0] && gate->ne[1] == fa->ne[1] && gate->ne[2] == fa->ne[2]) {
+        gs = gate->nb[2]; ghs = gate->nb[1];
+    } else {
+        return false;
+    }
+    if (gs % sizeof(float) || ghs % sizeof(float)) {
+        return false;
+    }
+    fa_gqa12_launch(ctx, fa, (float *) out->data, fa->ne[0] * sizeof(float), out->nb[1], (const float *) gate->data,
+            gs / sizeof(float), ghs / sizeof(float), d16);
     return true;
 #endif // !defined(GGML_USE_HIP)
 }

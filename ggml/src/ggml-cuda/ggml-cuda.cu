@@ -64,6 +64,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/hc.cuh"
+#include "ggml-cuda/fattn-wmma-gqa.cuh"
 #include "ggml-cuda/kpool-compress.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -772,6 +773,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (mmq_side_buf != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(mmq_side_buf));
+    }
+    if (f16_side_buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(f16_side_buf));
     }
     if (mmvq_grp != nullptr) {
         ggml_cuda_set_device(device);
@@ -3887,6 +3892,46 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
         return 0;
     }
 
+    // (F) RMS_NORM(x, 128-wide rows) -> MUL(w) ; SIGMOID(z) -> MUL(normed, sig)      => gdn_out_norm_gate
+    //     (qwen4exp build_norm_gated at prefill) with the f16 copy the next WMMA GEMM (ssm_out) would convert to.
+    //     GGML_CUDA_NO_GDN_OUT_FUSE=1 disables.
+    if (node->op == GGML_OP_RMS_NORM) {
+        static const bool off = ggml_env_flag("GGML_CUDA_NO_GDN_OUT_FUSE", false);
+        const ggml_tensor * x = node->src[0];
+        if (off || x->type != GGML_TYPE_F32 || x->ne[0] != 128 || x->nb[0] != sizeof(float) || x->nb[1] % 16 || x->nb[2] % 16 ||
+                x->nb[3] % 16 || (uintptr_t) x->data % 16 || !ggml_cuda_fuse_uses1(cgraph, i) ||
+                x->ne[1] > 65535 || x->ne[2] > 65535 || x->ne[3] > 65535 || ggml_nrows(x) < 64) { return 0; }
+        const int j = ggml_cuda_fuse_next(cgraph, i + 1);
+        if (j >= n || cgraph->nodes[j]->op != GGML_OP_MUL || cgraph->nodes[j]->src[0] != node || !ggml_cuda_fuse_uses1(cgraph, j)) { return 0; }
+        const ggml_tensor * w = cgraph->nodes[j]->src[1];
+        if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != 128 || ggml_nelements(w) != 128 || (uintptr_t) w->data % 16) { return 0; }
+        const int k = ggml_cuda_fuse_next(cgraph, j + 1);
+        if (k >= n || !ggml_cuda_fuse_unary(cgraph->nodes[k], GGML_UNARY_OP_SIGMOID) || !ggml_cuda_fuse_uses1(cgraph, k)) { return 0; }
+        const ggml_tensor * z = cgraph->nodes[k]->src[0];
+        if (z->type != GGML_TYPE_F32 || !ggml_are_same_shape(z, x) || z->nb[0] != sizeof(float) || z->nb[1] % 16 || z->nb[2] % 16 ||
+                z->nb[3] % 16 || (uintptr_t) z->data % 16) { return 0; }
+        const int l = ggml_cuda_fuse_next(cgraph, k + 1);
+        if (l >= n || cgraph->nodes[l]->op != GGML_OP_MUL) { return 0; }
+        ggml_tensor * out = cgraph->nodes[l];
+        if (!((out->src[0] == cgraph->nodes[j] && out->src[1] == cgraph->nodes[k]) || (out->src[1] == cgraph->nodes[j] && out->src[0] == cgraph->nodes[k])) ||
+                out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) || !ggml_are_same_shape(out, x) || (uintptr_t) out->data % 16 ||
+                !ggml_cuda_fuse_views_belong(cgraph, i, l, { node, cgraph->nodes[j], cgraph->nodes[k], ggml_cuda_fuse_root(z), ggml_cuda_fuse_root(x) }) ||
+                !ggml_cuda_fuse_disjoint(out, w)) { return 0; }
+        // x or z may be out's own memory (in place): each float4 is read, then written, by one thread at the same offset
+        auto same_or_disjoint = [&](const ggml_tensor * t) { return ggml_cuda_fuse_disjoint(out, t) || (out->data == t->data && ggml_is_contiguous(t)); };
+        if (!same_or_disjoint(x) || !same_or_disjoint(z)) { return 0; }
+        // the consumer: the next node, a WMMA GEMM over a reshape of out that converts it in its pre-pass
+        half * d16 = nullptr;
+        const int m = ggml_cuda_fuse_next(cgraph, l + 1);
+        if (m < n && cgraph->nodes[m]->op == GGML_OP_MUL_MAT && ggml_cuda_fuse_root(cgraph->nodes[m]->src[1]) == out &&
+                cgraph->nodes[m]->src[1]->data == out->data && ggml_cuda_fuse_uses1(cgraph, l) &&
+                ggml_cuda_mul_mat_q_wmma_prepass(*cuda_ctx, cgraph->nodes[m]->src[0], cgraph->nodes[m]->src[1])) {
+            d16 = ggml_cuda_f16_side_reserve(*cuda_ctx, out);
+        }
+        ggml_cuda_op_gdn_out_norm_gate(*cuda_ctx, x, w, z, ggml_get_op_params_f32(node, 0), out, d16);
+        return l - i;
+    }
+
     // (A) SCALE -> SILU
     if (node->op == GGML_OP_SCALE) {
         const int j = ggml_cuda_fuse_next(cgraph, i + 1);
@@ -5414,6 +5459,78 @@ static int ggml_cuda_try_fuse_qsa_score(ggml_backend_cuda_context * cuda_ctx, gg
     return j - i;
 }
 
+// halo-hybrid: qwen4exp's gated attention at prefill: FLASH_ATTN_EXT -> RESHAPE ; SIGMOID(gate) ; MUL(attn, sig) as the
+//     QSA attention kernel with the gate in its epilogue (fattn-wmma-gqa.cu), plus the f16 copy the output projection's
+//     WMMA pre-pass would make. The attention output is not written. GGML_CUDA_NO_FA_GATE_FUSE=1 disables.
+static int ggml_cuda_try_fuse_fa_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool off = ggml_env_flag("GGML_CUDA_NO_FA_GATE_FUSE", false);
+    const int n = cgraph->n_nodes;
+    ggml_tensor * fa = cgraph->nodes[i];
+    if (off || (fa->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_cuda_fuse_uses1(cgraph, i)) {
+        return 0;
+    }
+    int j = ggml_cuda_fuse_next(cgraph, i + 1);
+    // qwen4exp builds the gate's CONT (of a strided view of the Q projection) right here: read the view instead
+    const ggml_tensor * cont = nullptr;
+    if (j < n && cgraph->nodes[j]->op == GGML_OP_CONT && ggml_cuda_fuse_uses1(cgraph, j)) {
+        cont = cgraph->nodes[j];
+        j = ggml_cuda_fuse_next(cgraph, j + 1);
+    }
+    if (j >= n || !ggml_cuda_fuse_unary(cgraph->nodes[j], GGML_UNARY_OP_SIGMOID) || !ggml_cuda_fuse_uses1(cgraph, j) ||
+            (cont && cgraph->nodes[j]->src[0] != cont)) {
+        return 0;
+    }
+    const ggml_tensor * gate = cont ? cont->src[0] : cgraph->nodes[j]->src[0];
+    const int l = ggml_cuda_fuse_next(cgraph, j + 1);
+    if (l >= n || cgraph->nodes[l]->op != GGML_OP_MUL) {
+        return 0;
+    }
+    ggml_tensor * out = cgraph->nodes[l];
+    const ggml_tensor * a = out->src[0] == cgraph->nodes[j] ? out->src[1] : (out->src[1] == cgraph->nodes[j] ? out->src[0] : nullptr);
+    if (a == nullptr || ggml_cuda_fuse_root(a) != fa || a->data != fa->data || !ggml_is_contiguous(a)) {
+        return 0;
+    }
+    // the views in between: of the attention output, of the gate's source, or of a leaf (a weight reshape the builder
+    // expanded here for the next mix)
+    for (int q = i + 1; q < l; ++q) {
+        const ggml_tensor * t = cgraph->nodes[q];
+        if (ggml_cuda_fuse_is_view(t) && ggml_cuda_fuse_root(t) != fa && ggml_cuda_fuse_root(t) != ggml_cuda_fuse_root(gate) &&
+                ggml_cuda_fuse_root(t)->op != GGML_OP_NONE) {
+            return 0;
+        }
+    }
+    // the reshape of the attention output is read by the MUL alone
+    for (int q = i + 1; q < l; ++q) {
+        if (cgraph->nodes[q] == a && !ggml_cuda_fuse_uses1(cgraph, q)) {
+            return 0;
+        }
+    }
+    for (int s = 0; s < 4; ++s) {
+        if (!ggml_cuda_fuse_disjoint(out, fa->src[s])) {
+            return 0;
+        }
+    }
+    // the gate may be the MUL's own memory (in place through the SIGMOID): each element is read, then written, by one thread
+    if (!ggml_cuda_fuse_disjoint(out, gate) && !(out->data == gate->data && ggml_is_contiguous(gate) && gate->nb[1] == out->nb[1])) {
+        return 0;
+    }
+    half * d16 = nullptr;
+    const int m = ggml_cuda_fuse_next(cgraph, l + 1);
+    if (m < n && cgraph->nodes[m]->op == GGML_OP_MUL_MAT && ggml_cuda_fuse_root(cgraph->nodes[m]->src[1]) == out &&
+            cgraph->nodes[m]->src[1]->data == out->data && ggml_cuda_fuse_uses1(cgraph, l) &&
+            ggml_cuda_mul_mat_q_wmma_prepass(*cuda_ctx, cgraph->nodes[m]->src[0], cgraph->nodes[m]->src[1])) {
+        d16 = ggml_cuda_f16_side_reserve(*cuda_ctx, out);
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    if (!ggml_cuda_flash_attn_ext_wmma_gqa12_gated(*cuda_ctx, fa, gate, out, d16)) {
+        if (d16) {
+            cuda_ctx->f16_side_prod = nullptr;   // reserved for nothing
+        }
+        return 0;
+    }
+    return l - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5422,6 +5539,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const int skip = ggml_cuda_try_fuse_fa_gate(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID) {   // halo-hybrid: MoE tail at decode widths
         const int skip = ggml_cuda_try_fuse_moe_tail(cuda_ctx, cgraph, i);
@@ -7110,6 +7234,40 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
             params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ggml_cuda_fuse_root(rep->src[0])), xn);
             i = j;
+        }
+    }
+
+    // halo-hybrid: gated attention (ggml_cuda_try_fuse_fa_gate): the fused kernel reads Q, K, V, the mask and the gate's
+    //     source while it writes the MUL's output, which ggml-alloc may otherwise place over Q or the Q projection (both
+    //     dead by the MUL in the unfused graph): keep them alive until the output is allocated.
+    if (!disable_fusion) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * fa = cgraph->nodes[i];
+            if (fa->op != GGML_OP_FLASH_ATTN_EXT) {
+                continue;
+            }
+            int j = ggml_cuda_fuse_next(cgraph, i + 1);
+            const ggml_tensor * cont = nullptr;
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_CONT) {
+                cont = cgraph->nodes[j];
+                j = ggml_cuda_fuse_next(cgraph, j + 1);
+            }
+            if (j >= cgraph->n_nodes || !ggml_cuda_fuse_unary(cgraph->nodes[j], GGML_UNARY_OP_SIGMOID)) {
+                continue;
+            }
+            const int l = ggml_cuda_fuse_next(cgraph, j + 1);
+            if (l >= cgraph->n_nodes || cgraph->nodes[l]->op != GGML_OP_MUL) {
+                continue;
+            }
+            ggml_tensor * out = cgraph->nodes[l];
+            const ggml_tensor * gate = cont ? cont->src[0] : cgraph->nodes[j]->src[0];
+            for (int s = 0; s < 4; ++s) {
+                if (fa->src[s]) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ggml_cuda_fuse_root(fa->src[s])), out);
+                }
+            }
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ggml_cuda_fuse_root(gate)), out);
+            i = l;
         }
     }
 

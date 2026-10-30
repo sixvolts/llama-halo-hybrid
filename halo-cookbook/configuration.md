@@ -91,6 +91,9 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | Switch | What it turns off |
 |---|---|
 | `GGML_CUDA_Q8_WMMA=0` | dense q8_0 GEMMs on WMMA with weights dequantized once per K tile (on for RDNA3 by default; any other value turns it on for RDNA4 too) |
+| `GGML_CUDA_Q8_WMMA_NARROW=0` | 32x128 WMMA tiles for q8_0 weights of at most 640 rows on RDNA3 (Qwen3.8 hc down projection, the shared expert) |
+| `GGML_CUDA_NO_HC_MIX_GEMM=1` | the qwen4exp hc up projection with the hc mix as its WMMA epilogue (RDNA3) |
+| `GGML_CUDA_NO_F16_SIDE=1` | producer-written f16 copies that replace the WMMA GEMM's f16 pre-pass |
 | `GGML_CUDA_KQ_WMMA=0` | q4_K / q5_K / q6_K GEMMs on WMMA (RDNA3 and RDNA4) |
 | `GGML_CUDA_MMID_F16=0` | the f16 routed expert GEMM where it measured faster (`=1` uses it for every eligible shape) |
 | `GGML_CUDA_MMID_F16_PAIR=0` | gate and up of the f16 expert GEMM as one paired kernel with the GLU in its epilogue |
@@ -107,6 +110,8 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 |---|---|
 | `GGML_CUDA_FA_NO_SPARSE=1` | the sparse flash-attention walk on RDNA for top-k-selected attention (GLM-5.3 DSA, D=512) |
 | `GGML_CUDA_FA_SPARSE_D256=0` | the same for Qwen3.8's QSA layers (D=256) at prefill widths |
+| `GGML_CUDA_FA_GQA12=0` | the RDNA3 QSA prefill attention kernel with 4 queries x 12 heads per block (back to the MMA kernel's 16 x 4 union walk) |
+| `GGML_CUDA_NO_FA_GATE_FUSE=1` | the qwen4exp attention output gate in that kernel's epilogue |
 | `GGML_CUDA_FA_SPARSE_PAIRS=0` | two queries sharing one gathered tile at prefill |
 | `GGML_CUDA_FA_NCOLS16=0` | 16 heads of one query per tile for one-query-per-sequence batches (back to 8) |
 | `GGML_CUDA_FA_TILE_SPARSE=0` | the sparse walk in the tile kernel on RDNA2 |
@@ -131,6 +136,8 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `GGML_CUDA_GDN_BF16=0` | the bf16 WMMA chunked GDN prefill on RDNA3/RDNA4 (back to the fp32 chunked path) |
 | `GGML_CUDA_NO_GDN_CHUNKED=1` | the chunked GDN prefill altogether (back to the token loop) |
 | `GGML_CUDA_NO_GDN_CONV_FRONT=1` | the qwen4exp GDN conv front as one launch at decode |
+| `GGML_CUDA_NO_GDN_CONV_FRONT_LONG=1` | the same conv front at prefill widths (the graph reordering and allocation dependencies stay: the baseline for an exactness check) |
+| `GGML_CUDA_NO_GDN_OUT_FUSE=1` | the GDN output RMS norm, weight and sigmoid gate as one launch at prefill |
 | `GGML_CUDA_NO_KDA_CONV_L2=1` | conv + SiLU + Q/K l2 norms as one launch at decode |
 | `GGML_CUDA_NO_KDA_CONV_ROWS=1` | the KDA conv-input assembly (concats and state copies) as one launch at decode |
 | `GGML_CUDA_NO_KDA_GATE_PROLOGUE=1` | the gate GEMV with its sigmoid prologue as one launch |
@@ -148,6 +155,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `GGML_CUDA_NO_HC_NORM_FUSE=1` | hc_post + rms_norm as one launch |
 | `GGML_CUDA_NO_HC_POST_FUSE=1` | only the hc_post part of that fusion |
 | `GGML_CUDA_NO_HC_BOUNDARY=1` | the qwen4exp hc boundary (=1 both halves, =2 only the fused combine + norm kernel) |
+| `GGML_CUDA_NO_HC_INJECT_FUSE=1` | the next mix's inject projection inside the hc boundary kernel at prefill (RDNA3) |
 | `GGML_CUDA_NO_HC_MIX_SPLIT=1` | the multi-block hc mix kernel (back to one block per token) |
 | `GGML_CUDA_NO_EWCHAIN=1` | generic element-wise chain fusion |
 | `GGML_CUDA_NO_KPOOL_COMPRESS=1` | the GLM-5.3 indexer pool compressor as one launch |
@@ -165,6 +173,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `LLAMA_SERVER_SLOT_CONTIG=0` | choosing idle slots that keep the busy ones contiguous (back to similarity / LRU) |
 | `LLAMA_DFLASH_SWA_BIDIR=1` | causal sliding-window layers in the DFlash drafter (back to all-bidirectional) |
 | `LLAMA_TAIL_CKPT=2` | the single tail checkpoint under the prefill lanes (restores the second one) |
+| `LLAMA_CKPT_MIN_PREFIX=N` (default 128) | the user-message prompt split after a prefix of fewer than N tokens (0 = always split, as before) |
 
 ## Tunables
 
@@ -242,6 +251,8 @@ They log at the library's INFO level, which `llama-server` and `llama-cli` show 
 | `LLAMA_LANES_DEBUG=1` | per prefill pair: tokens, splits, wall time (2-4 add detail) |
 | `LLAMA_KQ_MASK_VERIFY=1` | fill every mask on one thread as well and abort if the threaded fill differs |
 | `LLAMA_QSA_LAYOUT_CHECK=1` | verify every cell of the shared-pool QSA layout |
+| `GGML_CUDA_HC_MIX_GEMM_CHECK=N` | compare the fused hc up projection + mix against the plain GEMM + k_hc_mix on the first N calls (host copies; disable graphs) |
+| `GGML_CUDA_HC_MIX_GEMM_DEBUG=1` | why a hc up projection did not take the fused WMMA mix |
 | `GGML_RPC_SEND_TRACE=1` | phase timing of bulk RPC sends (8 MiB and more) |
 
 ## Unsafe diagnostic switches

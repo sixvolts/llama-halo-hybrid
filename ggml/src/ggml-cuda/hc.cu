@@ -32,6 +32,7 @@ static bool q8_side_disabled() {
 void ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx) {
     ctx.q8_side.clear();
     ctx.mmq_side_prod = nullptr;
+    ctx.f16_side_prod = nullptr;
     ctx.q8_arena_used = 0;
     if (ctx.q8_arena == nullptr && !q8_side_disabled()) {
         ctx.q8_arena_size = 32u << 20;  // a 3-token verify step registers ~10 activations per layer at ~35 KB each
@@ -167,6 +168,59 @@ const char * ggml_cuda_mmq_side_find(ggml_backend_cuda_context & ctx, const ggml
     const bool same = src1 == e || (src1->data == e->data && (r0 == r1 || r0 == e) && ggml_is_contiguous(e) &&
             ggml_nelements(src1) == ggml_nelements(e));
     return same ? ctx.mmq_side_buf : nullptr;
+}
+
+// halo-hybrid: producer-side f16 copies for the WMMA GEMM pre-pass (ggml_backend_cuda_context::f16_side_*), the same
+// contract as the MMQ copy above. GGML_CUDA_NO_F16_SIDE=1 disables.
+static bool f16_side_disabled() {
+    static const bool d = ggml_env_flag("GGML_CUDA_NO_F16_SIDE", false);
+    return d;
+}
+
+half * ggml_cuda_f16_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * prod) {
+    if (f16_side_disabled()) {
+        return nullptr;
+    }
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(ctx.stream(), &cs) != hipSuccess || cs != hipStreamCaptureStatusNone) {
+#else
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(ctx.stream(), &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+#endif
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    const size_t need = (size_t) ggml_nelements(prod);
+    if (need > ctx.f16_side_cap) {
+        ggml_cuda_set_device(ctx.device);
+        if (ctx.f16_side_buf != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));   // the previous copy may still be read
+            CUDA_CHECK(cudaFree(ctx.f16_side_buf));
+            ctx.f16_side_buf = nullptr; ctx.f16_side_cap = 0;
+        }
+        void * p = nullptr;
+        if (cudaMalloc(&p, need * sizeof(half)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        ctx.f16_side_buf = (half *) p; ctx.f16_side_cap = need;
+    }
+    ctx.f16_side_prod = prod;
+    return ctx.f16_side_buf;
+}
+
+const half * ggml_cuda_f16_side_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+    const ggml_tensor * e = ctx.f16_side_prod;
+    if (e == nullptr || f16_side_disabled() || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || !ggml_is_contiguous(e) ||
+            ggml_nelements(src1) != ggml_nelements(e)) {
+        return nullptr;
+    }
+    // the same producer data: the tensor itself or a reshape/view of it at offset 0
+    const ggml_tensor * r0 = src1->view_src ? src1->view_src : src1;
+    const ggml_tensor * r1 = e->view_src    ? e->view_src    : e;
+    const bool same = src1 == e || (src1->data == e->data && (r0 == r1 || r0 == e));
+    return same ? ctx.f16_side_buf : nullptr;
 }
 
 static __global__ void k_scale_silu(const float * x, float * dst, block_q8_1 * q8, const float scale, const float bias, const int64_t n) {
@@ -488,6 +542,61 @@ bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const 
             (float *) xn->data, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2, eps);
     CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+// halo-hybrid: the GDN output gate at prefill (qwen4exp build_norm_gated): RMS_NORM over 128-wide head rows -> MUL(w)
+// -> MUL(., sigmoid(z)) as one launch, one warp per row, plus the f16 copy the next q8_0 / k-quant WMMA GEMM (ssm_out)
+// would convert it to. Arithmetic: rms_norm_f32<32, true, false, false, 1, true> (float4 order, block_reduce, rsqrtf(sum /
+// ncols + eps), (scale * x) * w), then k_mul_sigmoid's x * hc_sigmoid(z), then mmqw_f32_to_f16_sat's saturating
+// conversion: bit-identical to the three launches and the pre-pass it replaces. Saves the normed rows' write and re-read
+// and the pre-pass read and write (Qwen3.8: ~400 MB per DeltaNet layer at 4096 tokens).
+static __global__ void __launch_bounds__(32) k_gdn_out_norm_gate(const float * x, const float * w, const float * z, float * dst,
+        half * d16, const int nr1, const int nr2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        const int64_t sz1, const int64_t sz2, const int64_t sz3, const float eps) {
+    constexpr int ncols = 128;
+    __shared__ float s_sum[32];
+    const int r1  = blockIdx.x;
+    const int r2  = blockIdx.y;
+    const int r3  = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int64_t row = ((int64_t) r3*nr2 + r2)*nr1 + r1;
+
+    const float4 xs = ((const float4 *) (x + r3*sx3 + r2*sx2 + r1*sx1))[tid];
+    float tmp = rms_norm_sumsq4(xs);
+    tmp = block_reduce<block_reduce_method::SUM, 32>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+    const float4 m = ((const float4 *) w)[tid];
+    r.x *= m.x; r.y *= m.y; r.z *= m.z; r.w *= m.w;
+
+    const float4 zz = ((const float4 *) (z + r3*sz3 + r2*sz2 + r1*sz1))[tid];
+    float4 o;
+    o.x = r.x * hc_sigmoid(zz.x);
+    o.y = r.y * hc_sigmoid(zz.y);
+    o.z = r.z * hc_sigmoid(zz.z);
+    o.w = r.w * hc_sigmoid(zz.w);
+    ((float4 *) (dst + row*ncols))[tid] = o;
+    if (d16) {
+        const auto sat = [](const float v) { return v != v ? v : fminf(fmaxf(v, -65504.0f), 65504.0f); };
+        half * h = d16 + row*ncols + 4*tid;
+        h[0] = __float2half(sat(o.x));
+        h[1] = __float2half(sat(o.y));
+        h[2] = __float2half(sat(o.z));
+        h[3] = __float2half(sat(o.w));
+    }
+}
+
+void ggml_cuda_op_gdn_out_norm_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+        const ggml_tensor * z, float eps, ggml_tensor * dst, half * d16) {
+    GGML_ASSERT(x->ne[0] == 128 && ggml_are_same_shape(x, z) && ggml_are_same_shape(x, dst) && ggml_is_contiguous(dst));
+    GGML_ASSERT(x->ne[1] <= 65535 && x->ne[2] <= 65535 && x->ne[3] <= 65535);
+    const dim3 grid((unsigned) x->ne[1], (unsigned) x->ne[2], (unsigned) x->ne[3]);
+    k_gdn_out_norm_gate<<<grid, 32, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (const float *) z->data,
+            (float *) dst->data, d16, (int) x->ne[1], (int) x->ne[2],
+            x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
+            z->nb[1] / sizeof(float), z->nb[2] / sizeof(float), z->nb[3] / sizeof(float), eps);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static __global__ void k_mul_sigmoid(const float * x, const float * g, const float * y, float * dst, block_q8_1 * q8, const int64_t n, const int64_t ne0, const bool g_per_col) {

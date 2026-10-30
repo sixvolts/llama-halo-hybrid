@@ -1527,6 +1527,12 @@ struct ggml_backend_cuda_context {
     int64_t             mmq_side_ne0  = 0;          // K of the consumer (ne10, unpadded == padded)
     int64_t             mmq_side_ne1  = 0;          // tokens
 
+    // halo-hybrid: the same for the f16 copy a q8_0 / k-quant WMMA GEMM converts its f32 activations to (mmq-wmma.cu
+    // pre-pass), written by the producer (hc.cu, k_gdn_out_norm_gate). One slot, reset per graph.
+    half *              f16_side_buf  = nullptr;
+    size_t              f16_side_cap  = 0;          // elements
+    const ggml_tensor * f16_side_prod = nullptr;
+
 #ifdef USE_CUDA_GRAPH
     // Map from graph key to cuda_graph - allows multiple graphs per context when the
     // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same

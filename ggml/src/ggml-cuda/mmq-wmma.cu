@@ -1,5 +1,6 @@
 #include "mmq-wmma.cuh"
 #include "convert.cuh"
+#include "hc.cuh"
 
 // halo-hybrid: dense q8_0 GEMM for RDNA WMMA at prefill widths.
 //
@@ -509,7 +510,7 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     // in-kernel unless the re-read volume is large (every m-tile re-reads its n-tile; at M*K > 16M the 2 MB f32
     // tile thrashes gfx1151's L2 and the kernel drops to 22 TFLOPS), then a f16 pre-pass (0.1 ms at 1024x4096).
     // 2-way split-K for the sub-4-wave grids was tried: the memset + atomics cost more than the tail it recovers.
-#define MMQW_LAUNCH16(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, false>(src0->data, x16.get(), (float *) dst->data, M, N, K, K, ldd, stream)
+#define MMQW_LAUNCH16(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, false>(src0->data, x16, (float *) dst->data, M, N, K, K, ldd, stream)
 #define MMQW_LAUNCH32(BN, BM, KT, WN, WM, NBUF, PF) launch_mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, true>(src0->data, x32, (float *) dst->data, M, N, K, K, ldd, stream)
     const int64_t blocks128 = ((M + 127) / 128) * ((N + 127) / 128);
     const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
@@ -520,8 +521,14 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     static const int64_t prepass_min = ggml_env_int("GGML_CUDA_Q8_WMMA_PREPASS_MIN", (int64_t) 8 * 1024 * 1024);
     const bool prepass = M * K > prepass_min;
     if (prepass) {
-        ggml_cuda_pool_alloc<half> x16(ctx.pool(), (size_t) N * K);
-        mmqw_f32_to_f16_sat<<<(N * K + 255) / 256, 256, 0, stream>>>((const float *) src1->data, x16.get(), N * K);
+        // the producer may have written the f16 copy already (hc.cu, f16 side copies): the same conversion
+        const half * pre = ggml_cuda_f16_side_find(ctx, src1);
+        ggml_cuda_pool_alloc<half> x16_buf(ctx.pool());
+        if (pre == nullptr) {
+            x16_buf.alloc((size_t) N * K);
+            mmqw_f32_to_f16_sat<<<(N * K + 255) / 256, 256, 0, stream>>>((const float *) src1->data, x16_buf.get(), N * K);
+        }
+        const half * x16 = pre ? pre : x16_buf.get();
         if (big) { MMQW_LAUNCH16(128, 128, 64, 2, 4, 1, 1); } else { MMQW_LAUNCH16(64, 128, 64, 2, 2, 1, 1); }
         return true;
     }
@@ -576,11 +583,23 @@ bool ggml_cuda_mul_mat_q_wmma_hc_mix(ggml_backend_cuda_context & ctx, const ggml
 #endif
 }
 
-bool ggml_cuda_mul_mat_q_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+#ifdef MMQ_WMMA_ENABLED
+// the checks ggml_cuda_mul_mat_q_wmma takes a call on (dst aside): an f32 dst of the same contiguous shape is assumed
+static bool mmqw_accepts(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
+#endif
+
+bool ggml_cuda_mul_mat_q_wmma_prepass(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
 #ifndef MMQ_WMMA_ENABLED
-    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    GGML_UNUSED_VARS(ctx, src0, src1);
     return false;
 #else
+    static const int64_t prepass_min = ggml_env_int("GGML_CUDA_Q8_WMMA_PREPASS_MIN", (int64_t) 8 * 1024 * 1024);
+    return mmqw_accepts(ctx, src0, src1) && src0->ne[0] * src0->ne[1] > prepass_min;
+#endif
+}
+
+#ifdef MMQ_WMMA_ENABLED
+static bool mmqw_accepts(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
     // GGML_CUDA_Q8_WMMA: 0 = off (MMQ), any other value = on; unset: on for RDNA3, off for RDNA4 (its int8 WMMA rate
     // keeps MMQ ahead there)
     static const int mode = (int) ggml_env_int("GGML_CUDA_Q8_WMMA", -1);
@@ -600,13 +619,13 @@ bool ggml_cuda_mul_mat_q_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (src0->type != GGML_TYPE_Q8_0 || mode == 0 || (mode < 0 && !GGML_CUDA_CC_IS_RDNA3(cc))) {
         return false;
     }
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if (src1->type != GGML_TYPE_F32) {
         return false;
     }
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
         return false;
     }
-    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
         return false;
     }
     const int64_t K = src0->ne[0];
@@ -615,6 +634,19 @@ bool ggml_cuda_mul_mat_q_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (K % (kq ? 256 : 64) != 0 || N < 64 || M < 128 || M > (1 << 30) || N > (1 << 30)) {
         return false;
     }
+    return true;
+}
+#endif // MMQ_WMMA_ENABLED
+
+bool ggml_cuda_mul_mat_q_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+#ifndef MMQ_WMMA_ENABLED
+    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    return false;
+#else
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || !mmqw_accepts(ctx, src0, src1)) {
+        return false;
+    }
+
     switch (src0->type) {
         case GGML_TYPE_Q4_K: return mmqw_launch<GGML_TYPE_Q4_K>(ctx, src0, src1, dst);
         case GGML_TYPE_Q5_K: return mmqw_launch<GGML_TYPE_Q5_K>(ctx, src0, src1, dst);

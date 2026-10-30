@@ -30,6 +30,12 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_te
 bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
         const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd, int64_t hc, int64_t nt,
         float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out);
+// producer-side f16 copy of `prod` for the next q8_0 / k-quant WMMA GEMM's pre-pass; nullptr when not available
+half *       ggml_cuda_f16_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * prod);
+const half * ggml_cuda_f16_side_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1);
+// RMS_NORM(x, 128-wide rows) -> MUL(w) -> MUL(., sigmoid(z)) into dst, and its f16 copy into d16 when not null
+void ggml_cuda_op_gdn_out_norm_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+        const ggml_tensor * z, float eps, ggml_tensor * dst, half * d16);
 bool ggml_cuda_hc_boundary_disabled(int level);   // GGML_CUDA_NO_HC_BOUNDARY: 1 = all of it, 2 = the fused kernel only
 
 // dst = x * sigmoid(g) (+ y); g is either the same shape as x or a per-column scalar [1, ne1, ne2, ne3];

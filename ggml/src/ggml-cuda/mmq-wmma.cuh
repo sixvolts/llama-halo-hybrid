@@ -4,6 +4,8 @@
 // dense q8_0 / q4_K / q5_K / q6_K x f32 GEMM on RDNA WMMA with the weights dequantized to f16 once per K tile
 // (mmq-wmma.cu); returns false when the shape or device is not covered and the caller falls through to MMQ
 bool ggml_cuda_mul_mat_q_wmma(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+// the WMMA GEMM would take this call and convert src1 to f16 in a pre-pass (a producer may write that copy instead)
+bool ggml_cuda_mul_mat_q_wmma_prepass(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
 
 // qwen4exp's hc up projection fused with the hc mix (k_hc_mix) as the GEMM epilogue, bit-identical to the two launches:
 // out[n][i] = scale * sum_c xn[n][c][i] * sigmoid((w x)[n][c*n_embd + i]) + bias; false when not covered (RDNA3, q8_0, hc 4)
