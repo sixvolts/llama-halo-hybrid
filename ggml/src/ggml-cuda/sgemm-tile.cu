@@ -18,8 +18,10 @@ static __global__ void __launch_bounds__(SGT_THREADS) mul_mat_f32_tile(
     const int tid = threadIdx.x;
     const int tm  = tid % 4;   // 4 thread columns along m, 8 outputs each
     const int tn  = tid / 4;   // 16 thread rows along n, 8 outputs each
-    const int m0  = blockIdx.y * SGT_TM;
-    const int n0  = blockIdx.x * SGT_TN;
+    // m-tiles fastest: the blocks that share an activation tile run together and read it from L2 once (n-tiles
+    // fastest re-read each 128-token tile from memory once per m-tile: 16x at the 512-expert router)
+    const int m0  = blockIdx.x * SGT_TM;
+    const int n0  = blockIdx.y * SGT_TN;
 
     float acc[8][8] = {};
 
@@ -137,7 +139,7 @@ bool ggml_cuda_mul_mat_f32_tile(ggml_backend_cuda_context & ctx, const ggml_tens
     if (N <= 16 || M > 1024) {
         return false;
     }
-    const dim3 grid((N + SGT_TN - 1) / SGT_TN, (M + SGT_TM - 1) / SGT_TM, 1);
+    const dim3 grid((M + SGT_TM - 1) / SGT_TM, (N + SGT_TN - 1) / SGT_TN, 1);
     mul_mat_f32_tile<<<grid, SGT_THREADS, 0, ctx.stream()>>>(
         (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
         (int) M, (int) N, (int) K, src0->nb[1] / sizeof(float), src1->nb[1] / sizeof(float), dst->nb[1] / sizeof(float));
