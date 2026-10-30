@@ -25,6 +25,11 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_tensor 
 void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
         const ggml_tensor * inj, const ggml_tensor * gamma, int64_t n_embd, int64_t hc, int64_t nt,
         float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn);
+// the same with the next mix's inject projection (w_inj [hc*n_embd, hc] f32) folded in at prefill widths: inj_out =
+//   w_inj^T xn per token, bit-identical to the swapped MMVF GEMV; false when the call does not fit (nothing launched)
+bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
+        const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd, int64_t hc, int64_t nt,
+        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out);
 bool ggml_cuda_hc_boundary_disabled(int level);   // GGML_CUDA_NO_HC_BOUNDARY: 1 = all of it, 2 = the fused kernel only
 
 // dst = x * sigmoid(g) (+ y); g is either the same shape as x or a per-column scalar [1, ne1, ne2, ne3];

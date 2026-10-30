@@ -1,6 +1,7 @@
 #include "hc.cuh"
 #include "mmq.cuh"
 #include "norm.cuh"
+#include "mmvf.cuh"
 
 #include <cstdlib>
 
@@ -357,6 +358,135 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_te
                 (const float *) inj->data, (const float *) gamma->data, (float *) res->data, (float *) xn->data, q8,
                 mmq, (int) nt, (int) n_embd, (int) hc, gamma_rows, s1, b1, s2, b2, eps);
     }
+}
+
+// halo-hybrid: the hc boundary at prefill widths with the next mix's inject projection folded in (w_inj [hc*n_embd, hc]
+// f32: hc dot products of a token's whole normalised row). One block per token keeps the token's hc rows in LDS, so the
+// inject GEMV no longer re-reads xn from memory (Qwen3.8: 168 MB per boundary at 4096 tokens, plus the transpose copy
+// behind the swapped GEMV). res / xn: k_hc_combine_norm<1024>'s arithmetic per stream row (the element-wise combine,
+// rms_norm's vec-order partials, block_reduce). inject: mul_mat_vec_f<float, float, HC, 256> as the swapped MMVF path in
+// ggml_cuda_mul_mat runs it (the token row is its "weight" row): 256 threads, float2 trips four at a time then one,
+// ggml_cuda_mad per element, warp_reduce_sum, the zeroed 32-entry buffer and a second warp_reduce_sum. Bit-identical
+// to the launches it replaces; res and xn may alias x at the same base (each element is read before it is written by
+// the same thread), the rest must be disjoint (checked by the matcher).
+template <int HC>
+static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const float * x, const float * b, const float * inj,
+        const float * gamma, const float * w_inj, float * res, float * xn, float * inj_out, const int n_embd, const int gamma_rows,
+        const float s1, const float b1, const float s2, const float b2, const float eps) {
+    constexpr int BS = 1024;
+    constexpr int IB = 256;
+    constexpr int WS = 32;
+    extern __shared__ float s_row[];   // [HC*n_embd]: the token's res rows, then its xn rows
+    __shared__ float s_sum[HC][32];
+    __shared__ float s_buf[HC][WS];   // mul_mat_vec_f's zeroed 32-entry buffer, one per output
+
+    const int t   = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int ne  = HC*n_embd;
+
+    x   += (int64_t) t*ne;
+    res += (int64_t) t*ne;
+    xn  += (int64_t) t*ne;
+    b   += (int64_t) t*n_embd;
+
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const float w = s2 * hc_sigmoid(s1 * inj[(int64_t) t*HC + c] + b1) + b2;
+        for (int col = tid; col < n_embd; col += BS) {
+            const float xi = __fadd_rn(x[c*n_embd + col], __fmul_rn(b[col], w));
+            res[c*n_embd + col]   = xi;
+            s_row[c*n_embd + col] = xi;
+        }
+    }
+    __syncthreads();
+
+    float scale[HC];
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        float tmp = rms_norm_vec_partial(s_row + c*n_embd, n_embd, tid);
+        tmp = block_reduce<block_reduce_method::SUM, BS>(tmp, s_sum[c]);
+        const float mean = tmp / n_embd;
+        scale[c] = rsqrtf(mean + eps);
+    }
+
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const float * g = gamma + (int64_t) (c % gamma_rows)*n_embd;
+        for (int col = tid; col < n_embd; col += BS) {
+            const float v = scale[c] * s_row[c*n_embd + col] * g[col];
+            xn[c*n_embd + col]    = v;
+            s_row[c*n_embd + col] = v;
+        }
+    }
+    // the HC dot products run side by side, one per 256-thread group: group j is mul_mat_vec_f's block for output j
+    static_assert(HC*IB == BS, "one 256-thread group per inject output");
+    const int j = tid / IB;
+    const int v = tid % IB;
+    s_buf[j][v % WS] = 0.0f;
+    __syncthreads();
+
+    float sumf = 0.0f;
+    {
+        const float2 * x2 = (const float2 *) s_row;
+        const float2 * yj = (const float2 *) (w_inj + (int64_t) j*ne);
+        const int ncols2 = ne / 2;
+        int col2 = v;
+        for (; col2 + 3*IB < ncols2; col2 += 4*IB) {
+            const float2 tx0 = x2[col2];
+            const float2 tx1 = x2[col2 +   IB];
+            const float2 tx2 = x2[col2 + 2*IB];
+            const float2 tx3 = x2[col2 + 3*IB];
+            const float2 ty0 = yj[col2];
+            const float2 ty1 = yj[col2 +   IB];
+            const float2 ty2 = yj[col2 + 2*IB];
+            const float2 ty3 = yj[col2 + 3*IB];
+            ggml_cuda_mad(sumf, tx0.x, ty0.x); ggml_cuda_mad(sumf, tx0.y, ty0.y);
+            ggml_cuda_mad(sumf, tx1.x, ty1.x); ggml_cuda_mad(sumf, tx1.y, ty1.y);
+            ggml_cuda_mad(sumf, tx2.x, ty2.x); ggml_cuda_mad(sumf, tx2.y, ty2.y);
+            ggml_cuda_mad(sumf, tx3.x, ty3.x); ggml_cuda_mad(sumf, tx3.y, ty3.y);
+        }
+        for (; col2 < ncols2; col2 += IB) {
+            const float2 tmpx = x2[col2];
+            const float2 tmpy = yj[col2];
+            ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+        }
+    }
+    sumf = warp_reduce_sum<WS>(sumf);
+    if (v % WS == 0) {
+        s_buf[j][v / WS] = sumf;
+    }
+    __syncthreads();
+    if (v < WS) {
+        sumf = s_buf[j][v];
+        sumf = warp_reduce_sum<WS>(sumf);
+        if (v == 0) {
+            inj_out[(int64_t) t*HC + j] = sumf;
+        }
+    }
+}
+
+bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
+        const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd, int64_t hc, int64_t nt,
+        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out) {
+    // GGML_CUDA_NO_HC_INJECT_FUSE=1: the separate inject GEMV (graph_optimize's reordering stays)
+    static const bool off = ggml_env_flag("GGML_CUDA_NO_HC_INJECT_FUSE", false);
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    // prefill widths only: there the per-row kernel writes neither q8_1 side copy on RDNA3 (RDNA4 writes the MMQ one)
+    if (off || hc != 4 || nt <= 8 || nt > INT_MAX || GGML_CUDA_CC_IS_RDNA4(cc) || n_embd < 1024 || n_embd % 2 != 0 ||
+            !rms_norm_vec_order((int) n_embd) || hc*n_embd*sizeof(float) > 64*1024 ||
+            ggml_cuda_info().devices[ctx.device].warp_size != 32 ||
+            ggml_cuda_mmvf_block_size(ctx.device, hc*n_embd, nt) != 256) {
+        return false;
+    }
+    GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(res) && ggml_is_contiguous(gamma) && ggml_is_contiguous(w_inj) &&
+            ggml_is_contiguous(inj_out));
+    const size_t smem = hc*n_embd*sizeof(float);
+    k_hc_combine_norm_inject<4><<<(unsigned) nt, 1024, smem, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
+            (const float *) inj->data, (const float *) gamma->data, (const float *) w_inj->data, (float *) res->data,
+            (float *) xn->data, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2, eps);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 static __global__ void k_mul_sigmoid(const float * x, const float * g, const float * y, float * dst, block_q8_1 * q8, const int64_t n, const int64_t ne0, const bool g_per_col) {
