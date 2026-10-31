@@ -159,6 +159,11 @@ file once (pure Python, about a second):
 python3 scripts/halo-hybrid/export_mtp.py <dir with the four UD-Q2_K_XL shards> GLM-5.3-Flash-mtp-UD-Q2_K_XL.gguf   # 2.8 GB
 ```
 
+Downloads from after 2026-10-05 carry upstream's architecture name, `glm5-next` (the export prints `arch glm5-next`).
+This tree loads them, and the draft head exported from them, on the same path as `glm5next` files, with the same
+output token for token; older builds cannot load that draft head ([README](README.md#models-and-draft-heads)).
+`LLAMA_GLM5_NEXT_UPSTREAM=1` keeps such a file on upstream's port instead, which has no MTP.
+
 Launch at 128K context:
 
 ```

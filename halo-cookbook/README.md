@@ -113,7 +113,12 @@ Run `sudo update-grub` and reboot after changing these.
   ```
 
 * **GLM-5.3-Flash:** unsloth UD-Q4_K_XL (200 GB, two machines) or UD-Q2_K_XL (108.7 GB, one machine). The draft head
-  is exported from the model's own shards ([rdna4.md](rdna4.md#glm-53-flash-at-ud-q2_k_xl)). Images: the vision tower
+  is exported from the model's own shards ([rdna4.md](rdna4.md#glm-53-flash-at-ud-q2_k_xl)). On 2026-10-05 Unsloth
+  re-tagged the first shard of both quants from this tree's architecture name, `glm5next`, to upstream llama.cpp's,
+  `glm5-next`; the weights in the other shards did not change. This tree loads a `glm5-next` file on its own GLM path,
+  MTP included, and says so in the load log (`arch 'glm5-next' loads as this tree's 'glm5next'`; the line is at
+  library INFO level, so `-lv 4` on the server). Builds without that line run a download from after 10-05 on upstream's
+  port: slower decode, and the exported draft head fails with `tensor 'blk.0.attn_norm.weight' not found`. Images: the vision tower
   loads with a `glm5next` mmproj (`--mmproj`, converted by this tree's `convert_hf_to_gguf.py --mmproj`), but no test
   here covers it.
 * **Python tools** (the converter and `scripts/halo-hybrid/`): `python3 -m pip install -r
