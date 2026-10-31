@@ -118,9 +118,10 @@ Run `sudo update-grub` and reboot after changing these.
   `glm5-next`; the weights in the other shards did not change. This tree loads a `glm5-next` file on its own GLM path,
   MTP included, and says so in the load log (`arch 'glm5-next' loads as this tree's 'glm5next'`; the line is at
   library INFO level, so `-lv 4` on the server). Builds without that line run a download from after 10-05 on upstream's
-  port: slower decode, and the exported draft head fails with `tensor 'blk.0.attn_norm.weight' not found`. Images: the vision tower
-  loads with a `glm5next` mmproj (`--mmproj`, converted by this tree's `convert_hf_to_gguf.py --mmproj`), but no test
-  here covers it.
+  port: slower decode, and the exported draft head fails with `tensor 'blk.0.attn_norm.weight' not found`. Images
+  (`--mmproj`): Unsloth's mmproj was re-tagged on 10-05 too, from projector `glm5next` to upstream's `glm5v`, with the
+  same tensors. Both load, as does one from this tree's `convert_hf_to_gguf.py --mmproj` (`glm5next`), and the two
+  Unsloth versions give the same greedy answers; that was checked by hand, the suites do not cover vision.
 * **Python tools** (the converter and `scripts/halo-hybrid/`): `python3 -m pip install -r
   requirements/requirements-convert_hf_to_gguf.txt`, in a virtual environment.
 * **API:** use `/v1/chat/completions` (a bare prompt on `/completion` stops after one token with Qwen3.8). Qwen3.8
