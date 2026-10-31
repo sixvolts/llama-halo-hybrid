@@ -78,7 +78,11 @@ archs_dev() {   # random-weight architectures on one device vs the CPU backend (
     local out="$RUN_DIR/archs-$1.txt"
     "$BUILD/bin/test-llama-archs" -s 42 -a "$ARCHS" -b "$1" 2>&1 | tee "$out"
     local rc=${PIPESTATUS[0]}
-    echo "detail: $(grep -o 'Summary: .*' "$out" | tail -1 | cut -c10-)"
+    # a glm5-next file loads on glm5next; upstream's port is what a file the alias declines runs
+    LLAMA_GLM5_NEXT_UPSTREAM=1 "$BUILD/bin/test-llama-archs" -s 42 -a '^glm5-next$' -b "$1" 2>&1 | tee -a "$out"
+    local rc_up=${PIPESTATUS[0]}
+    echo "detail: $(grep -o 'Summary: .*' "$out" | cut -c10- | paste -sd ';' | sed 's/;/; upstream glm5-next: /')"
+    [ $rc = 0 ] && return $rc_up
     return $rc
 }
 

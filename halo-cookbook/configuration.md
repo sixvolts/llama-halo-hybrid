@@ -141,6 +141,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 
 | Switch | What it turns off |
 |---|---|
+| `LLAMA_GLM5_NEXT_UPSTREAM=1` | loading a `glm5-next` GLM-5.3 GGUF (upstream's converter, unsloth's files since 2026-10-05) as this tree's `glm5next`; upstream's graph has no MTP |
 | `LLAMA_NO_GRAPH_FUSE=1` | graph shortcuts in the model builders (the identity recurrent-state gather as a view, one l2_norm over q and k) |
 | `LLAMA_NO_HC_MIX=1` | the hyper-connection prologue as one op (DeepSeek-V4 style models) |
 | `GGML_CUDA_NO_HC_FUSE=1` | the qwen4exp hyper-connection mix/combine, gate chains and MoE weighted sum fused by pattern |

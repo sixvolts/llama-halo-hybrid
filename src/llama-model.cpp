@@ -368,10 +368,91 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
     return model;
 }
 
+// halo-hybrid: a 'glm5-next' GGUF (upstream's GLM-5.3 port) whose metadata this tree's 'glm5next' reads the same way.
+// Both converters write the same tensors; unsloth re-tagged its GLM-5.3-Flash GGUFs from glm5next to glm5-next on
+// 2026-10-05 (shard 1 only). Returns the first reason the file needs upstream's graph, or nullptr.
+static const char * glm5_next_as_glm5next_blocker(llama_model_loader & ml) {
+    uint32_t n_layer_all = 0;
+    uint32_t n_nextn     = 0;
+    ml.get_key(LLM_KV_BLOCK_COUNT, n_layer_all, false);
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn, false);
+    if (n_layer_all == 0 || n_nextn >= n_layer_all || n_layer_all > LLAMA_MAX_LAYERS) {
+        return "block_count";
+    }
+    const uint32_t n_layer = n_layer_all - n_nextn;
+
+    // keys glm5next requires (or asserts on) that upstream's port reads as optional
+    float    f = 0.0f;
+    uint32_t u = 0;
+    bool     b = false;
+    if (!ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, f, false)) { return "attention.layer_norm_epsilon"; }
+    if (!ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, f, false) || f >= 0.0f) { return "kda.gate_lower_bound"; }
+    if (!ml.get_key(LLM_KV_EXPERT_GATING_FUNC, u, false)) { return "expert_gating_func"; }
+    if (!ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE, f, false)) { return "expert_weights_scale"; }
+    if (!ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM, b, false)) { return "expert_weights_norm"; }
+    if (!ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, u, false)) { return "leading_dense_block_count"; }
+    if (!ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK, u, false) || u == 0) { return "attention.q_lora_rank"; }
+    if (!ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT, u, false) || u != 0) { return "rope.dimension_count"; }
+
+    // upstream's port reuses the routed experts' SwiGLU clamp for the shared expert when the file has none for it
+    std::array<float, LLAMA_MAX_LAYERS> clamp;
+    if (ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, clamp, n_layer_all, false) &&
+            !ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, clamp, n_layer_all, false)) {
+        return "swiglu_clamp_shexp";
+    }
+
+    // glm5next always selects the k-pool tail and gives every attention layer its own indexer
+    bool select_tail = true;
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, select_tail, false);
+    if (!select_tail) {
+        return "attention.indexer.kpool_select_tail = false";
+    }
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> indexer_full;
+    n_head_kv.fill(0);
+    indexer_full.fill(1);
+    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv, n_layer_all, false)) {
+        return "attention.head_count_kv";
+    }
+    ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_full, n_layer, false);
+    uint32_t n_recr = 0;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        n_recr += n_head_kv[il] == 0;
+        if (n_head_kv[il] != 0 && !indexer_full[il]) {
+            return "attention.indexer.types (a shared-indexer layer)";
+        }
+    }
+    if (n_recr == 0 || n_recr == n_layer) {
+        return "attention.head_count_kv (no mix of KDA and attention layers)";
+    }
+
+    // upstream's table has an unabsorbed kv_b; glm5next loads k_b/v_b only
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        if (ml.get_weight(("blk." + std::to_string(il) + ".attn_kv_b.weight").c_str())) {
+            return "attn_kv_b";
+        }
+    }
+
+    return nullptr;
+}
+
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params) {
     llm_arch arch = ml.get_arch();
     if (arch == LLM_ARCH_UNKNOWN) {
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
+    }
+
+    // halo-hybrid: the loader keeps reading the file's 'glm5-next.' keys; only the model (graph, tuned paths) changes
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        static const bool upstream = ggml_env_flag("LLAMA_GLM5_NEXT_UPSTREAM", false);
+        const char * blocker = upstream ? "LLAMA_GLM5_NEXT_UPSTREAM" : glm5_next_as_glm5next_blocker(ml);
+        if (blocker == nullptr) {
+            LLAMA_LOG_INFO("%s: arch 'glm5-next' loads as this tree's 'glm5next' (same tensors and metadata meaning; "
+                           "LLAMA_GLM5_NEXT_UPSTREAM=1 keeps upstream's graph)\n", __func__);
+            arch = LLM_ARCH_GLM5NEXT;
+        } else {
+            LLAMA_LOG_INFO("%s: arch 'glm5-next' stays on upstream's graph: %s\n", __func__, blocker);
+        }
     }
 
     return llama_model_create(arch, params);

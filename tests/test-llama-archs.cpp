@@ -409,6 +409,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         // glm5next reads these unconditionally; the if (moe) block below never sets them
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                 1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                  true);
+    } else if (arch == LLM_ARCH_GLM5_NEXT) {
+        // halo-hybrid: the keys a converter writes, so the model loads on glm5next like a real file and its save/load
+        // roundtrip stays on one graph; tests/halo covers upstream's port with LLAMA_GLM5_NEXT_UPSTREAM=1
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                 1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                  true);
     }
 
     if (arch == LLM_ARCH_HRM_TEXT) {
