@@ -424,10 +424,23 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_te
 // ggml_cuda_mad per element, warp_reduce_sum, the zeroed 32-entry buffer and a second warp_reduce_sum. Bit-identical
 // to the launches it replaces; res and xn may alias x at the same base (each element is read before it is written by
 // the same thread), the rest must be disjoint (checked by the matcher).
-template <int HC>
+// MOE: b is not read but built per column from the routed experts and the gated shared expert (hc_moe_args): the MoE
+// layer's moe_weighted_reduction_f32_rows sum, in expert order with its arithmetic, then k_mul_sigmoid's ADD(moe, shexp *
+// sigmoid(g)), so the block output never goes to memory (Qwen3.8: its write and re-read and those of the routed sum,
+// 168 MB per MoE layer at 4096 tokens, and two launches). float4 columns; the per-element arithmetic is unchanged.
+struct hc_moe_args {
+    const float * experts;   // [n_embd, n_used, nt]
+    const float * scale;     // [n_used, nt] or nullptr
+    const float * weights;   // [n_used, nt]
+    const float * shexp;     // [n_embd, nt]
+    const float * sgate;     // [nt], the shared expert's gate logit
+    int           n_used;
+};
+
+template <int HC, bool MOE>
 static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const float * x, const float * b, const float * inj,
         const float * gamma, const float * w_inj, float * res, float * xn, float * inj_out, const int n_embd, const int gamma_rows,
-        const float s1, const float b1, const float s2, const float b2, const float eps) {
+        const float s1, const float b1, const float s2, const float b2, const float eps, const hc_moe_args moe) {
     constexpr int BS = 1024;
     constexpr int IB = 256;
     constexpr int WS = 32;
@@ -442,15 +455,59 @@ static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const fl
     x   += (int64_t) t*ne;
     res += (int64_t) t*ne;
     xn  += (int64_t) t*ne;
-    b   += (int64_t) t*n_embd;
 
+    if constexpr (MOE) {
+        float w[HC];
 #pragma unroll
-    for (int c = 0; c < HC; ++c) {
-        const float w = s2 * hc_sigmoid(s1 * inj[(int64_t) t*HC + c] + b1) + b2;
-        for (int col = tid; col < n_embd; col += BS) {
-            const float xi = ggml_cuda_add_mul_rn(x[c*n_embd + col], b[col], w);
-            res[c*n_embd + col]   = xi;
-            s_row[c*n_embd + col] = xi;
+        for (int c = 0; c < HC; ++c) {
+            w[c] = s2 * hc_sigmoid(s1 * inj[(int64_t) t*HC + c] + b1) + b2;
+        }
+        const float     sg  = hc_sigmoid(moe.sgate[t]);
+        const int       n4  = n_embd / 4;
+        const int64_t   r0  = (int64_t) t*moe.n_used;
+        const float4 *  e4  = (const float4 *) (moe.experts + r0*n_embd);
+        const float4 *  sh4 = (const float4 *) (moe.shexp + (int64_t) t*n_embd);
+        const float4 *  x4  = (const float4 *) x;
+        float4 *        r4  = (float4 *) res;
+        float4 *        l4  = (float4 *) s_row;
+        for (int c4 = tid; c4 < n4; c4 += BS) {
+            // moe_weighted_reduction_f32_rows
+            const float  sc0 = moe.scale != nullptr ? moe.scale[r0] : 1.0f;
+            const float  w0  = moe.weights[r0];
+            const float4 v0  = e4[c4];
+            float4 sum = make_float4((v0.x * sc0) * w0, (v0.y * sc0) * w0, (v0.z * sc0) * w0, (v0.w * sc0) * w0);
+            for (int e = 1; e < moe.n_used; ++e) {
+                const float  sc = moe.scale != nullptr ? moe.scale[r0 + e] : 1.0f;
+                const float  we = moe.weights[r0 + e];
+                const float4 v  = e4[(int64_t) e*n4 + c4];
+                sum.x = ggml_cuda_add_mul_rn(sum.x, v.x * sc, we);
+                sum.y = ggml_cuda_add_mul_rn(sum.y, v.y * sc, we);
+                sum.z = ggml_cuda_add_mul_rn(sum.z, v.z * sc, we);
+                sum.w = ggml_cuda_add_mul_rn(sum.w, v.w * sc, we);
+            }
+            // k_mul_sigmoid with the trailing ADD(moe, shexp * sigmoid(g))
+            const float4 sh = sh4[c4];
+            const float4 bv = make_float4(ggml_cuda_add_mul_rn(sum.x, sh.x, sg), ggml_cuda_add_mul_rn(sum.y, sh.y, sg),
+                                          ggml_cuda_add_mul_rn(sum.z, sh.z, sg), ggml_cuda_add_mul_rn(sum.w, sh.w, sg));
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                const float4 xv = x4[c*n4 + c4];
+                const float4 xi = make_float4(ggml_cuda_add_mul_rn(xv.x, bv.x, w[c]), ggml_cuda_add_mul_rn(xv.y, bv.y, w[c]),
+                                              ggml_cuda_add_mul_rn(xv.z, bv.z, w[c]), ggml_cuda_add_mul_rn(xv.w, bv.w, w[c]));
+                r4[c*n4 + c4] = xi;
+                l4[c*n4 + c4] = xi;
+            }
+        }
+    } else {
+        b += (int64_t) t*n_embd;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            const float w = s2 * hc_sigmoid(s1 * inj[(int64_t) t*HC + c] + b1) + b2;
+            for (int col = tid; col < n_embd; col += BS) {
+                const float xi = ggml_cuda_add_mul_rn(x[c*n_embd + col], b[col], w);
+                res[c*n_embd + col]   = xi;
+                s_row[c*n_embd + col] = xi;
+            }
         }
     }
     __syncthreads();
@@ -521,25 +578,57 @@ static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const fl
     }
 }
 
-bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
-        const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd, int64_t hc, int64_t nt,
-        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out) {
+static bool hc_inject_fuse_ok(ggml_backend_cuda_context & ctx, int64_t n_embd, int64_t hc, int64_t nt) {
     // GGML_CUDA_NO_HC_INJECT_FUSE=1: the separate inject GEMV (graph_optimize's reordering stays)
     static const bool off = ggml_env_flag("GGML_CUDA_NO_HC_INJECT_FUSE", false);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     // prefill widths only: there the per-row kernel writes neither q8_1 side copy on RDNA3 (RDNA4 writes the MMQ one)
-    if (off || hc != 4 || nt <= 8 || nt > INT_MAX || GGML_CUDA_CC_IS_RDNA4(cc) || n_embd < 1024 || n_embd % 2 != 0 ||
+    return !(off || hc != 4 || nt <= 8 || nt > INT_MAX || GGML_CUDA_CC_IS_RDNA4(cc) || n_embd < 1024 || n_embd % 2 != 0 ||
             !rms_norm_vec_order((int) n_embd) || hc*n_embd*sizeof(float) > 64*1024 ||
             ggml_cuda_info().devices[ctx.device].warp_size != 32 ||
-            ggml_cuda_mmvf_block_size(ctx.device, hc*n_embd, nt) != 256) {
+            ggml_cuda_mmvf_block_size(ctx.device, hc*n_embd, nt) != 256);
+}
+
+bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
+        const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd, int64_t hc, int64_t nt,
+        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out) {
+    if (!hc_inject_fuse_ok(ctx, n_embd, hc, nt)) {
         return false;
     }
     GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(res) && ggml_is_contiguous(gamma) && ggml_is_contiguous(w_inj) &&
             ggml_is_contiguous(inj_out));
     const size_t smem = hc*n_embd*sizeof(float);
-    k_hc_combine_norm_inject<4><<<(unsigned) nt, 1024, smem, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
+    k_hc_combine_norm_inject<4, false><<<(unsigned) nt, 1024, smem, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
             (const float *) inj->data, (const float *) gamma->data, (const float *) w_inj->data, (float *) res->data,
-            (float *) xn->data, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2, eps);
+            (float *) xn->data, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2, eps, hc_moe_args {});
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_hc_moe_fuse_disabled(int level) {
+    static const int v = (int) ggml_env_int("GGML_CUDA_NO_HC_MOE_FUSE", 0);
+    return v != 0 && v <= level;
+}
+
+bool ggml_cuda_op_hc_moe_combine_norm_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * shexp, const ggml_tensor * sgate,
+        const ggml_tensor * x, const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd,
+        int64_t hc, int64_t nt, float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn,
+        ggml_tensor * inj_out) {
+    auto al16 = [](const void * p) { return ((uintptr_t) p) % 16 == 0; };
+    if (ggml_cuda_hc_moe_fuse_disabled(2) || !hc_inject_fuse_ok(ctx, n_embd, hc, nt) || n_embd % 4 != 0 ||
+            !al16(experts->data) || !al16(shexp->data) || !al16(x->data) || !al16(res->data)) {
+        return false;
+    }
+    GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(res) && ggml_is_contiguous(gamma) && ggml_is_contiguous(w_inj) &&
+            ggml_is_contiguous(inj_out) && ggml_is_contiguous(experts) && ggml_is_contiguous(weights) &&
+            ggml_is_contiguous(shexp) && ggml_is_contiguous(sgate) && (!expert_scale || ggml_is_contiguous(expert_scale)));
+    const hc_moe_args moe = { (const float *) experts->data, expert_scale ? (const float *) expert_scale->data : nullptr,
+            (const float *) weights->data, (const float *) shexp->data, (const float *) sgate->data, (int) experts->ne[1] };
+    const size_t smem = hc*n_embd*sizeof(float);
+    k_hc_combine_norm_inject<4, true><<<(unsigned) nt, 1024, smem, ctx.stream()>>>((const float *) x->data, nullptr,
+            (const float *) inj->data, (const float *) gamma->data, (const float *) w_inj->data, (float *) res->data,
+            (float *) xn->data, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2, eps, moe);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

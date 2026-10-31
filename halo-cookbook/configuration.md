@@ -156,6 +156,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `GGML_CUDA_NO_HC_POST_FUSE=1` | only the hc_post part of that fusion |
 | `GGML_CUDA_NO_HC_BOUNDARY=1` | the qwen4exp hc boundary (=1 both halves, =2 only the fused combine + norm kernel) |
 | `GGML_CUDA_NO_HC_INJECT_FUSE=1` | the next mix's inject projection inside the hc boundary kernel at prefill (RDNA3) |
+| `GGML_CUDA_NO_HC_MOE_FUSE=1` | the MoE layer's routed sum and gated shared expert inside the hc boundary kernel at prefill (RDNA3; =1 also the graph reorder, =2 only the kernel) |
 | `GGML_CUDA_NO_HC_MIX_SPLIT=1` | the multi-block hc mix kernel (back to one block per token) |
 | `GGML_CUDA_NO_EWCHAIN=1` | generic element-wise chain fusion |
 | `GGML_CUDA_NO_KPOOL_COMPRESS=1` | the GLM-5.3 indexer pool compressor as one launch |
