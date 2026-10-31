@@ -29,7 +29,8 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_te
 //   w_inj^T xn per token, bit-identical to the swapped MMVF GEMV; false when the call does not fit (nothing launched)
 bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
         const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd, int64_t hc, int64_t nt,
-        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out);
+        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out,
+        half * xn16 = nullptr, float * rstd = nullptr);
 // the same boundary on a MoE layer, with the block output built in the kernel: the routed experts' weighted sum
 // (experts [n_embd, n_used, nt] * weights [n_used, nt], optional expert_scale) plus shexp * sigmoid(sgate [nt]).
 // false when the shape is not supported (nothing launched). GGML_CUDA_NO_HC_MOE_FUSE: 1 = all of it, 2 = the kernel
@@ -38,8 +39,12 @@ bool ggml_cuda_op_hc_moe_combine_norm_inject(ggml_backend_cuda_context & ctx, co
         const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * shexp, const ggml_tensor * sgate,
         const ggml_tensor * x, const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd,
         int64_t hc, int64_t nt, float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn,
-        ggml_tensor * inj_out);
+        ggml_tensor * inj_out, half * xn16 = nullptr, float * rstd = nullptr);
+// (rstd != nullptr: xn is not written; the kernel stores the per-stream rms scales [nt, hc] instead)
 bool ggml_cuda_hc_moe_fuse_disabled(int level);
+// xn = (rstd * res) * gamma as the boundary kernel computes it, for a boundary that stored rstd in place of xn
+void ggml_cuda_op_hc_xn_materialize(ggml_backend_cuda_context & ctx, const float * res, const float * rstd, const float * gamma,
+        int gamma_rows, int64_t n_embd, int64_t hc, int64_t nt, float * xn);
 // producer-side f16 copy of `prod` for the next q8_0 / k-quant WMMA GEMM's pre-pass; nullptr when not available
 half *       ggml_cuda_f16_side_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * prod);
 const half * ggml_cuda_f16_side_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1);

@@ -33,6 +33,7 @@ void ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx) {
     ctx.q8_side.clear();
     ctx.mmq_side_prod = nullptr;
     ctx.f16_side_prod = nullptr;
+    ctx.hc_xn_lazy.xn = nullptr;
     ctx.q8_arena_used = 0;
     if (ctx.q8_arena == nullptr && !q8_side_disabled()) {
         ctx.q8_arena_size = 32u << 20;  // a 3-token verify step registers ~10 activations per layer at ~35 KB each
@@ -439,8 +440,9 @@ struct hc_moe_args {
 
 template <int HC, bool MOE>
 static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const float * x, const float * b, const float * inj,
-        const float * gamma, const float * w_inj, float * res, float * xn, float * inj_out, const int n_embd, const int gamma_rows,
-        const float s1, const float b1, const float s2, const float b2, const float eps, const hc_moe_args moe) {
+        const float * gamma, const float * w_inj, float * res, float * xn, half * xn16, float * rstd, float * inj_out,
+        const int n_embd, const int gamma_rows, const float s1, const float b1, const float s2, const float b2, const float eps,
+        const hc_moe_args moe) {
     constexpr int BS = 1024;
     constexpr int IB = 256;
     constexpr int WS = 32;
@@ -454,7 +456,6 @@ static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const fl
 
     x   += (int64_t) t*ne;
     res += (int64_t) t*ne;
-    xn  += (int64_t) t*ne;
 
     if constexpr (MOE) {
         float w[HC];
@@ -519,6 +520,9 @@ static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const fl
         tmp = block_reduce<block_reduce_method::SUM, BS>(tmp, s_sum[c]);
         const float mean = tmp / n_embd;
         scale[c] = rsqrtf(mean + eps);
+        if (rstd != nullptr && tid == 0) {
+            rstd[(int64_t) t*HC + c] = scale[c];
+        }
     }
 
 #pragma unroll
@@ -526,8 +530,13 @@ static __global__ void __launch_bounds__(1024) k_hc_combine_norm_inject(const fl
         const float * g = gamma + (int64_t) (c % gamma_rows)*n_embd;
         for (int col = tid; col < n_embd; col += BS) {
             const float v = scale[c] * s_row[c*n_embd + col] * g[col];
-            xn[c*n_embd + col]    = v;
+            if (xn != nullptr) {   // nullptr: the consumers rebuild it from res and rstd (ggml_cuda_hc_xn_lazy)
+                xn[(int64_t) t*ne + c*n_embd + col] = v;
+            }
             s_row[c*n_embd + col] = v;
+            if (xn16 != nullptr) {   // mmqw_f32_to_f16_sat's conversion, for the hc down GEMM
+                xn16[(int64_t) t*ne + c*n_embd + col] = __float2half(v != v ? v : fminf(fmaxf(v, -65504.0f), 65504.0f));
+            }
         }
     }
     // the HC dot products run side by side, one per 256-thread group: group j is mul_mat_vec_f's block for output j
@@ -591,7 +600,8 @@ static bool hc_inject_fuse_ok(ggml_backend_cuda_context & ctx, int64_t n_embd, i
 
 bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
         const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd, int64_t hc, int64_t nt,
-        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out) {
+        float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn, ggml_tensor * inj_out, half * xn16,
+        float * rstd) {
     if (!hc_inject_fuse_ok(ctx, n_embd, hc, nt)) {
         return false;
     }
@@ -600,7 +610,8 @@ bool ggml_cuda_op_hc_combine_norm_inject(ggml_backend_cuda_context & ctx, const 
     const size_t smem = hc*n_embd*sizeof(float);
     k_hc_combine_norm_inject<4, false><<<(unsigned) nt, 1024, smem, ctx.stream()>>>((const float *) x->data, (const float *) b->data,
             (const float *) inj->data, (const float *) gamma->data, (const float *) w_inj->data, (float *) res->data,
-            (float *) xn->data, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2, eps, hc_moe_args {});
+            rstd ? nullptr : (float *) xn->data, xn16, rstd, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2,
+            eps, hc_moe_args {});
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -614,7 +625,7 @@ bool ggml_cuda_op_hc_moe_combine_norm_inject(ggml_backend_cuda_context & ctx, co
         const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * shexp, const ggml_tensor * sgate,
         const ggml_tensor * x, const ggml_tensor * inj, const ggml_tensor * gamma, const ggml_tensor * w_inj, int64_t n_embd,
         int64_t hc, int64_t nt, float s1, float b1, float s2, float b2, float eps, ggml_tensor * res, ggml_tensor * xn,
-        ggml_tensor * inj_out) {
+        ggml_tensor * inj_out, half * xn16, float * rstd) {
     auto al16 = [](const void * p) { return ((uintptr_t) p) % 16 == 0; };
     if (ggml_cuda_hc_moe_fuse_disabled(2) || !hc_inject_fuse_ok(ctx, n_embd, hc, nt) || n_embd % 4 != 0 ||
             !al16(experts->data) || !al16(shexp->data) || !al16(x->data) || !al16(res->data)) {
@@ -628,9 +639,34 @@ bool ggml_cuda_op_hc_moe_combine_norm_inject(ggml_backend_cuda_context & ctx, co
     const size_t smem = hc*n_embd*sizeof(float);
     k_hc_combine_norm_inject<4, true><<<(unsigned) nt, 1024, smem, ctx.stream()>>>((const float *) x->data, nullptr,
             (const float *) inj->data, (const float *) gamma->data, (const float *) w_inj->data, (float *) res->data,
-            (float *) xn->data, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2, eps, moe);
+            rstd ? nullptr : (float *) xn->data, xn16, rstd, (float *) inj_out->data, (int) n_embd, (int) gamma->ne[1], s1, b1, s2, b2,
+            eps, moe);
     CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+// halo-hybrid: xn of a boundary that left it unwritten (rstd != nullptr above), for a reader other than the fused hc down
+// GEMM and mix epilogue: the boundary kernel's (scale * res) * gamma per element from the stored per-stream scales
+template <int HC>
+static __global__ void k_hc_xn_materialize(const float * res, const float * rstd, const float * gamma, float * xn,
+        const int n_embd, const int gamma_rows) {
+    const int t = blockIdx.x;
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const float   sc = rstd[(int64_t) t*HC + c];
+        const float * g  = gamma + (int64_t) (c % gamma_rows)*n_embd;
+        const int64_t o  = ((int64_t) t*HC + c)*n_embd;
+        for (int col = threadIdx.x; col < n_embd; col += blockDim.x) {
+            xn[o + col] = sc * res[o + col] * g[col];
+        }
+    }
+}
+
+void ggml_cuda_op_hc_xn_materialize(ggml_backend_cuda_context & ctx, const float * res, const float * rstd, const float * gamma,
+        int gamma_rows, int64_t n_embd, int64_t hc, int64_t nt, float * xn) {
+    GGML_ASSERT(hc == 4);
+    k_hc_xn_materialize<4><<<(unsigned) nt, 256, 0, ctx.stream()>>>(res, rstd, gamma, xn, (int) n_embd, gamma_rows);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // halo-hybrid: the GDN output gate at prefill (qwen4exp build_norm_gated): RMS_NORM over 128-wide head rows -> MUL(w)

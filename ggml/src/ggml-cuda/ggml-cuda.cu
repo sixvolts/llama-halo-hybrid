@@ -778,6 +778,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(f16_side_buf));
     }
+    if (hc_rstd_buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(hc_rstd_buf));
+    }
     if (mmvq_grp != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(mmvq_grp));
@@ -4043,6 +4047,126 @@ static bool ggml_cuda_hc_boundary_find(const ggml_cgraph * cgraph, int i, ggml_c
     return true;
 }
 
+// the f16 copy of a level-3 boundary's xn for the next mix's hc down GEMM (the MUL_MAT behind the inject projection, its
+// index in *k), written by the boundary kernel in place of the GEMM's own f32 -> f16 conversion; nullptr when that GEMM
+// would not read it. GGML_CUDA_NO_HC_XN16=1 disables (and with it the unwritten xn below)
+static half * ggml_cuda_hc_xn16_reserve(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+        const ggml_cuda_hc_boundary_match & m, int * k) {
+    static const bool off = ggml_env_flag("GGML_CUDA_NO_HC_XN16", false);
+    *k = m.level == 3 ? ggml_cuda_fuse_next(cgraph, m.j8 + 1) : cgraph->n_nodes;
+    if (off || *k >= cgraph->n_nodes) {
+        return nullptr;
+    }
+    const ggml_tensor * mm = cgraph->nodes[*k];
+    if (mm->op != GGML_OP_MUL_MAT || ggml_cuda_fuse_root(mm->src[1]) != m.xn || mm->src[1]->data != m.xn->data ||
+            !ggml_cuda_mul_mat_q_wmma_f16_input(*cuda_ctx, mm->src[0], mm->src[1])) {
+        return nullptr;
+    }
+    return ggml_cuda_f16_side_reserve(*cuda_ctx, m.xn);
+}
+
+// halo-hybrid: with the f16 copy in place, the boundary need not write xn at all (Qwen3.8: 168 MB per boundary at 4096
+// tokens): its readers are the inject projection (inside the boundary), the hc down GEMM (the f16 copy) and the mix
+// MUL, which the up GEMM's mix epilogue does (mmq-wmma.cu) and which rebuilds xn from res and the per-stream rms
+// scales the kernel stores instead. Planned only when xn's use counts show exactly those readers; the evaluator then
+// runs the down GEMM itself (ggml_cuda_hc_xn_lazy_node) and materialises xn first for anything else. Returns the scale
+// buffer the kernel writes, nullptr to write xn. GGML_CUDA_NO_HC_XN_LAZY=1 disables
+static float * ggml_cuda_hc_xn_lazy_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+        const ggml_cuda_hc_boundary_match & m, int k) {
+    static const bool off = ggml_env_flag("GGML_CUDA_NO_HC_XN_LAZY", false) || ggml_env_int("GGML_CUDA_HC_MIX_GEMM_CHECK", 0) > 0;
+    const int n = cgraph->n_nodes;
+    if (off || m.level != 3 || k >= n || !cuda_ctx->stream_context().concurrent_events.empty() || m.hc != 4) {
+        return nullptr;
+    }
+    const ggml_tensor * xs = cgraph->nodes[k]->src[1];
+    if (xs->op != GGML_OP_RESHAPE || xs->src[0] != m.xn || cgraph->nodes[m.j8]->src[1] != xs) {
+        return nullptr;
+    }
+    int i_xs = -1;
+    for (int q = m.j7 + 1; q < m.j8; ++q) {
+        if (cgraph->nodes[q] == xs) { i_xs = q; break; }
+    }
+    if (i_xs < 0 || ggml_node_get_use_count(cgraph, m.j7) != 1 || ggml_node_get_use_count(cgraph, i_xs) != 3) {
+        return nullptr;
+    }
+    int i_up = -1, i_mul = -1;
+    for (int q = k + 1; q < n && q <= k + 16; ++q) {
+        const ggml_tensor * t = cgraph->nodes[q];
+        if (i_up < 0 && t->op == GGML_OP_MUL_MAT) {
+            i_up = q;
+        } else if (i_up >= 0 && t->op == GGML_OP_MUL && (t->src[0] == xs || t->src[1] == xs)) {
+            i_mul = q;
+            break;
+        }
+    }
+    if (i_mul < 0) {
+        return nullptr;
+    }
+    const size_t need = (size_t) (m.nt * m.hc);
+    if (need > cuda_ctx->hc_rstd_cap) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        if (cuda_ctx->hc_rstd_buf != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));   // the previous scales may still be read
+            CUDA_CHECK(cudaFree(cuda_ctx->hc_rstd_buf));
+            cuda_ctx->hc_rstd_buf = nullptr; cuda_ctx->hc_rstd_cap = 0;
+        }
+        void * p = nullptr;
+        if (cudaMalloc(&p, need * sizeof(float)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        cuda_ctx->hc_rstd_buf = (float *) p; cuda_ctx->hc_rstd_cap = need;
+    }
+    auto & L = cuda_ctx->hc_xn_lazy;
+    L.xn = nullptr;   // armed by the caller once the boundary kernel has run
+    L.i_down = k; L.i_up = i_up;
+    L.res = m.add; L.gamma = (const float *) m.gamma->data; L.gamma_rows = (int) m.gamma->ne[1];
+    L.n_embd = m.n_embd; L.hc = m.hc; L.nt = m.nt;
+    return cuda_ctx->hc_rstd_buf;
+}
+
+static void ggml_cuda_hc_xn_materialize(ggml_backend_cuda_context * cuda_ctx) {
+    auto & L = cuda_ctx->hc_xn_lazy;
+    ggml_cuda_op_hc_xn_materialize(*cuda_ctx, (const float *) L.res->data, cuda_ctx->hc_rstd_buf, L.gamma, L.gamma_rows,
+            L.n_embd, L.hc, L.nt, (float *) L.xn->data);
+    L.xn = nullptr;
+}
+
+static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i);
+
+// the evaluator's step for node i while a boundary's xn is unwritten: -1 = not handled here (go on as usual), else
+// the nodes to skip after node i was computed here
+static int ggml_cuda_hc_xn_lazy_node(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    auto & L = cuda_ctx->hc_xn_lazy;
+    ggml_tensor * node = cgraph->nodes[i];
+    if (i == L.i_down) {
+        // the same WMMA GEMM the MUL_MAT dispatch reaches for this shape, on the f16 copy
+        if (ggml_cuda_f16_side_find(*cuda_ctx, node->src[1]) != nullptr &&
+                ggml_cuda_mul_mat_q_wmma(*cuda_ctx, node->src[0], node->src[1], node)) {
+            return 0;
+        }
+        ggml_cuda_hc_xn_materialize(cuda_ctx);
+        return -1;
+    }
+    if (i == L.i_up) {
+        const int skip = ggml_cuda_try_fuse_hc(cuda_ctx, cgraph, i);
+        if (L.xn == nullptr) {
+            return skip;   // the mix epilogue took it
+        }
+        ggml_cuda_hc_xn_materialize(cuda_ctx);
+        return skip > 0 ? skip : -1;
+    }
+    bool reads = i > L.i_up;
+    for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr && !reads; ++s) {
+        const ggml_tensor * t = node->src[s];
+        reads = t == L.xn || ggml_cuda_fuse_root(t) == ggml_cuda_fuse_root(L.xn) || !ggml_cuda_fuse_disjoint(L.xn, t);
+    }
+    if (reads) {
+        ggml_cuda_hc_xn_materialize(cuda_ctx);
+    }
+    return -1;
+}
+
 static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     const int n = cgraph->n_nodes;
     ggml_tensor * node = cgraph->nodes[i];
@@ -4266,8 +4390,20 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
             }
             return sidx - i;
         }
+        // xn left unwritten by its boundary (ggml_cuda_hc_xn_lazy_plan): the epilogue rebuilds it from res
+        auto & lazy = cuda_ctx->hc_xn_lazy;
+        ggml_cuda_hc_xn_src xsrc = {};
+        const bool use_lazy = lazy.xn != nullptr && xn == lazy.xn;
+        if (use_lazy) {
+            if (!ggml_cuda_fuse_disjoint(scale_node, lazy.res)) { HCMIX_NO("check 17"); }
+            xsrc = { (const float *) lazy.res->data, cuda_ctx->hc_rstd_buf, lazy.gamma, lazy.gamma_rows };
+        }
         if (!ggml_cuda_mul_mat_q_wmma_hc_mix(*cuda_ctx, node->src[0], node->src[1], xn, n_embd, hc,
-                ggml_cuda_fuse_param_f32(scale_node, 0), ggml_cuda_fuse_param_f32(scale_node, 1), scale_node)) { HCMIX_NO("check 16"); }
+                ggml_cuda_fuse_param_f32(scale_node, 0), ggml_cuda_fuse_param_f32(scale_node, 1), scale_node, nullptr,
+                use_lazy ? &xsrc : nullptr)) { HCMIX_NO("check 16"); }
+        if (use_lazy) {
+            lazy.xn = nullptr;
+        }
         return sidx - i;
 #undef HCMIX_NO
     }
@@ -4332,9 +4468,20 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
         if (!ggml_cuda_hc_boundary_find(cgraph, i, m)) { return 0; }
         const float s1 = ggml_cuda_fuse_param_f32(m.sc1, 0), b1 = ggml_cuda_fuse_param_f32(m.sc1, 1);
         const float s2 = ggml_cuda_fuse_param_f32(m.sc2, 0), b2 = ggml_cuda_fuse_param_f32(m.sc2, 1);
-        if (m.level == 3 && ggml_cuda_op_hc_combine_norm_inject(*cuda_ctx, m.x, m.b, m.inj, m.gamma, m.wi, m.n_embd, m.hc, m.nt,
-                    s1, b1, s2, b2, ggml_cuda_fuse_param_f32(m.rms, 0), m.add, m.xn, m.mm)) {
-            return m.j8 - i;
+        if (m.level == 3) {
+            int k = -1;
+            half *  xn16 = ggml_cuda_hc_xn16_reserve(cuda_ctx, cgraph, m, &k);
+            float * rstd = xn16 ? ggml_cuda_hc_xn_lazy_plan(cuda_ctx, cgraph, m, k) : nullptr;
+            if (ggml_cuda_op_hc_combine_norm_inject(*cuda_ctx, m.x, m.b, m.inj, m.gamma, m.wi, m.n_embd, m.hc, m.nt,
+                        s1, b1, s2, b2, ggml_cuda_fuse_param_f32(m.rms, 0), m.add, m.xn, m.mm, xn16, rstd)) {
+                if (rstd) {
+                    cuda_ctx->hc_xn_lazy.xn = cgraph->nodes[k]->src[1];
+                }
+                return m.j8 - i;
+            }
+            if (xn16) {
+                cuda_ctx->f16_side_prod = nullptr;   // reserved for nothing
+            }
         }
         if (m.level >= 2) {
             ggml_cuda_op_hc_combine_norm(*cuda_ctx, m.x, m.b, m.inj, m.gamma, m.n_embd, m.hc, m.nt,
@@ -4515,11 +4662,20 @@ static int ggml_cuda_try_fuse_hc_moe(ggml_backend_cuda_context * cuda_ctx, ggml_
             return 0;
         }
     }
+    int k = -1;
+    half *  xn16 = ggml_cuda_hc_xn16_reserve(cuda_ctx, cgraph, bm, &k);
+    float * rstd = xn16 ? ggml_cuda_hc_xn_lazy_plan(cuda_ctx, cgraph, bm, k) : nullptr;
     if (!ggml_cuda_op_hc_moe_combine_norm_inject(*cuda_ctx, m.red.experts, m.red.expert_scale, m.red.weights, m.shexp, m.g,
                 bm.x, bm.inj, bm.gamma, bm.wi, bm.n_embd, bm.hc, bm.nt,
                 ggml_cuda_fuse_param_f32(bm.sc1, 0), ggml_cuda_fuse_param_f32(bm.sc1, 1), ggml_cuda_fuse_param_f32(bm.sc2, 0),
-                ggml_cuda_fuse_param_f32(bm.sc2, 1), ggml_cuda_fuse_param_f32(bm.rms, 0), bm.add, bm.xn, bm.mm)) {
+                ggml_cuda_fuse_param_f32(bm.sc2, 1), ggml_cuda_fuse_param_f32(bm.rms, 0), bm.add, bm.xn, bm.mm, xn16, rstd)) {
+        if (xn16) {
+            cuda_ctx->f16_side_prod = nullptr;   // reserved for nothing
+        }
         return 0;
+    }
+    if (rstd) {
+        cuda_ctx->hc_xn_lazy.xn = cgraph->nodes[k]->src[1];
     }
     return bm.j8 - i;
 }
@@ -6901,6 +7057,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (node->op == GGML_OP_GET_ROWS && !ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() &&
                         ggml_cuda_try_defer_gdn_state_gather(cuda_ctx, cgraph, i)) {
                     continue;
+                }
+
+                // halo-hybrid: an hc boundary's unwritten xn (ggml_cuda_hc_xn_lazy_plan)
+                if (cuda_ctx->hc_xn_lazy.xn != nullptr) {
+                    const int skip = ggml_cuda_hc_xn_lazy_node(cuda_ctx, cgraph, i);
+                    if (skip >= 0) {
+                        i += skip;
+                        continue;
+                    }
                 }
 
                 const bool optimer_on = ggml_cuda_optimer::enabled() && !use_cuda_graph;

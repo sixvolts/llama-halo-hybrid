@@ -1533,6 +1533,21 @@ struct ggml_backend_cuda_context {
     size_t              f16_side_cap  = 0;          // elements
     const ggml_tensor * f16_side_prod = nullptr;
 
+    // halo-hybrid: a qwen4exp hc boundary that left its xn unwritten (ggml-cuda.cu, ggml_cuda_hc_xn_lazy): the hc down
+    // GEMM reads the f16 side copy and the mix epilogue rebuilds xn from res and the per-stream rms scales in hc_rstd;
+    // any other reader gets it materialised first. One at a time, reset per graph.
+    struct {
+        const ggml_tensor * xn = nullptr;     // the reshape of the boundary's xn that its three readers take
+        int                 i_down = -1;      // the hc down GEMM (reads the f16 copy)
+        int                 i_up   = -1;      // the hc up GEMM whose mix epilogue reads xn
+        const ggml_tensor * res    = nullptr;   // the boundary's res (add)
+        const float *       gamma  = nullptr;
+        int                 gamma_rows = 1;
+        int64_t             n_embd = 0, hc = 0, nt = 0;
+    } hc_xn_lazy;
+    float *             hc_rstd_buf = nullptr;
+    size_t              hc_rstd_cap = 0;   // floats
+
 #ifdef USE_CUDA_GRAPH
     // Map from graph key to cuda_graph - allows multiple graphs per context when the
     // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same
