@@ -5140,8 +5140,10 @@ struct test_kda_conv_l2 : public test_case {
 // concat(states, transpose(x), 0), K rollback-slot copies of its last d_conv-1 columns into the conv cache, then
 // ssm_conv -> silu and one l2_norm over the leading H 128-wide heads of the SiLU output (Q and K), plus a consumer of
 // the normed heads and the V part (like gated_delta_net). The CUDA backend runs it as one launch at nt <= 8
-// (ggml_cuda_try_fuse_gdn_conv_front); nt = 64 is gated off. mode "alias": K = 1 and the states are a view of slot 0
-// at the head, the memory the copy writes (build_rs's single-slot path).
+// (ggml_cuda_try_fuse_gdn_conv_front) and nt = 64 through the long-prompt kernel, which leaves the dead Q/K part of the
+// SiLU output unwritten. mode "alias": K = 1 and the states are a view of slot 0 at the head, the memory the copy writes
+// (build_rs's single-slot path); "y-out": the SiLU output is a graph output, so the backend must write all of it;
+// "gemm": x is a q8_0 GEMM output, which RDNA3 runs with the conv front as its epilogue (ggml_cuda_try_fuse_gdn_conv_gemm).
 struct test_gdn_conv_front : public test_case {
     const int64_t     C, H, d_conv, nt, K;
     const std::string mode;
@@ -5157,9 +5159,18 @@ struct test_gdn_conv_front : public test_case {
     std::string vars() override {
         return VARS_TO_STR6(C, H, d_conv, nt, K, mode);
     }
+    static constexpr int64_t gemm_k = 1024;   // "gemm": C*gemm_k past the q8_0 WMMA pre-pass bound, the 128x128 tile
     bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    double max_nmse_err() override {
+        return mode == "gemm" ? 5e-4 : 1e-7;   // the CPU reference quantizes the GEMM activations to q8_0
+    }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
-        std::vector<ggml_tensor *> v = { y_out, l2_out, sum };
+        // the Q/K part of the SiLU output is dead at prefill (only the fused l2 reads it) and the backend may skip it;
+        // its V part is checked through sum, and the whole tensor only when it is a graph output ("y-out")
+        std::vector<ggml_tensor *> v = { l2_out, sum };
+        if (mode == "y-out") {
+            v.push_back(y_out);
+        }
         v.insert(v.end(), cpys.begin(), cpys.end());
         return v;
     }
@@ -5171,7 +5182,16 @@ struct test_gdn_conv_front : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t ns = d_conv - 1;
         const int64_t hd = 128;
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, nt);
+        ggml_tensor * x;
+        if (mode == "gemm") {
+            ggml_tensor * wqkv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, gemm_k, C);
+            ggml_set_name(wqkv, "wqkv");
+            ggml_tensor * act = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gemm_k, nt);
+            ggml_set_name(act, "attn_norm");
+            x = ggml_mul_mat(ctx, wqkv, act);
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, nt);
+        }
         ggml_set_name(x, "qkv_mixed");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, C);
         ggml_set_name(w, "conv1d_w");
@@ -5210,6 +5230,9 @@ struct test_gdn_conv_front : public test_case {
 
         ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
         ggml_set_name(y, "conv_output_silu");
+        if (mode == "y-out") {
+            ggml_set_output(y);
+        }
         const size_t nb1 = ggml_row_size(y->type, C);
         ggml_tensor * qk = ggml_view_4d(ctx, y, hd, H, nt, 1, ggml_row_size(y->type, hd), nb1, nb1*nt, 0);
         qk = ggml_l2_norm(ctx, qk, 1e-6f);
@@ -10941,6 +10964,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 3));            // MTP rollback slots
         test_cases.emplace_back(new test_gdn_conv_front(512, 2, 3, nt, 2));
         test_cases.emplace_back(new test_gdn_conv_front(384, 3, 4, nt, 1));               // every head normed
+        test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1, "y-out"));   // SiLU output read outside
+        test_cases.emplace_back(new test_gdn_conv_front(384, 3, 4, nt, 1, "y-out"));
+    }
+    for (int64_t nt : {64, 200, 300}) {   // halo-hybrid: GDN conv front as the qkv GEMM epilogue (RDNA3, partial tiles)
+        test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1, "gemm"));
+        test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 3, "gemm"));   // rollback slots read raw x
     }
     // halo-hybrid: KDA conv-input assembly (one launch at decode on CUDA/HIP, nt <= 8; gated off at nt = 64)
     for (int64_t C : {24576, 300}) {
