@@ -5811,6 +5811,55 @@ static int ggml_cuda_try_fuse_fa_gate(ggml_backend_cuda_context * cuda_ctx, ggml
     return l - i;
 }
 
+// halo-hybrid: two thin f32 projections of the same activations at prefill widths (qwen4exp ssm_beta and ssm_alpha)
+// as one f32 tile launch: one pass over the activations, bit-identical outputs (sgemm-tile.cu). True when node i (and
+// the later one, now in ctx.f32_pair_done) was computed here.
+static bool ggml_cuda_try_f32_pair(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_MUL_MAT || node->src[0]->type != GGML_TYPE_F32 || node->src[1]->type != GGML_TYPE_F32 ||
+            node->ne[1] <= 16 || !GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        return false;
+    }
+    // the second may sit a few nodes later (qwen4exp: beta's reshape and sigmoid in between); it runs early, so the
+    // nodes between must not touch its inputs or its output, nor read it
+    int j = i;
+    for (int hop = 0; hop < 4; ++hop) {
+        j = ggml_cuda_fuse_next(cgraph, j + 1);
+        if (j >= cgraph->n_nodes) {
+            return false;
+        }
+        ggml_tensor * n2 = cgraph->nodes[j];
+        if (n2->op != GGML_OP_MUL_MAT || n2->src[1] != node->src[1]) {
+            continue;
+        }
+        if (n2->src[0]->type != GGML_TYPE_F32 || !ggml_cuda_fuse_disjoint(node, n2->src[0]) ||
+                !ggml_cuda_fuse_disjoint(node, node->src[1]) || !ggml_cuda_fuse_disjoint(n2, node->src[0]) ||
+                !ggml_cuda_fuse_disjoint(n2, node->src[1]) || !ggml_cuda_fuse_disjoint(n2, node)) {
+            return false;
+        }
+        for (int q = i + 1; q < j; ++q) {
+            const ggml_tensor * t = cgraph->nodes[q];
+            if (ggml_cuda_is_view_or_noop(t)) {
+                continue;
+            }
+            if (!ggml_cuda_fuse_disjoint(t, n2) || !ggml_cuda_fuse_disjoint(t, n2->src[0]) || !ggml_cuda_fuse_disjoint(t, node->src[1])) {
+                return false;
+            }
+            for (int sx = 0; sx < GGML_MAX_SRC && t->src[sx] != nullptr; ++sx) {
+                if (!ggml_cuda_fuse_disjoint(n2, t->src[sx])) {
+                    return false;
+                }
+            }
+        }
+        if (!ggml_cuda_mul_mat_f32_tile_pair(*cuda_ctx, node->src[0], n2->src[0], node->src[1], node, n2)) {
+            return false;
+        }
+        cuda_ctx->f32_pair_done = n2;   // the evaluator skips it when it gets there
+        return true;
+    }
+    return false;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -7056,6 +7105,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // halo-hybrid: a decode recurrent-state gather that the gated_delta_net reads through its index
                 if (node->op == GGML_OP_GET_ROWS && !ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() &&
                         ggml_cuda_try_defer_gdn_state_gather(cuda_ctx, cgraph, i)) {
+                    continue;
+                }
+
+                // halo-hybrid: the second of an f32 projection pair, computed with the first (ggml_cuda_try_f32_pair)
+                if (node == cuda_ctx->f32_pair_done) {
+                    cuda_ctx->f32_pair_done = nullptr;
+                    continue;
+                }
+                if (!ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() && ggml_cuda_try_f32_pair(cuda_ctx, cgraph, i)) {
                     continue;
                 }
 

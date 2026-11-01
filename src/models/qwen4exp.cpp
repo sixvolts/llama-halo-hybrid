@@ -1579,19 +1579,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "beta_sigmoid", il);
-
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
     // pin the four projections of `cur` -- qkv, z, beta, alpha -- adjacent in the graph so the
-    // CUDA backend quantises the shared input once (grouped mul_mat_vec_q)
+    // CUDA backend quantises the shared input once (grouped mul_mat_vec_q) and, at prefill, runs
+    // beta and alpha as one f32 tile launch (the sigmoid comes after both: in between it would let
+    // alpha's output take beta's slot)
     ggml_build_forward_expand(gf, qkv_mixed);
     ggml_build_forward_expand(gf, z);
     ggml_build_forward_expand(gf, beta);
     ggml_build_forward_expand(gf, alpha);
+
+    beta = ggml_sigmoid(ctx0, beta);
+    cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);

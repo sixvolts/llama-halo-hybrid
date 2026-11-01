@@ -34,6 +34,7 @@ void ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx) {
     ctx.mmq_side_prod = nullptr;
     ctx.f16_side_prod = nullptr;
     ctx.hc_xn_lazy.xn = nullptr;
+    ctx.f32_pair_done = nullptr;
     ctx.q8_arena_used = 0;
     if (ctx.q8_arena == nullptr && !q8_side_disabled()) {
         ctx.q8_arena_size = 32u << 20;  // a 3-token verify step registers ~10 activations per layer at ~35 KB each

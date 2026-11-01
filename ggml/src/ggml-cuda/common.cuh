@@ -1545,6 +1545,7 @@ struct ggml_backend_cuda_context {
         int                 gamma_rows = 1;
         int64_t             n_embd = 0, hc = 0, nt = 0;
     } hc_xn_lazy;
+    const ggml_tensor * f32_pair_done = nullptr;   // ggml-cuda.cu ggml_cuda_try_f32_pair: computed early, skip it
     float *             hc_rstd_buf = nullptr;
     size_t              hc_rstd_cap = 0;   // floats
 

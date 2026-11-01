@@ -159,6 +159,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `GGML_CUDA_NO_HC_MOE_FUSE=1` | the MoE layer's routed sum and gated shared expert inside the hc boundary kernel at prefill (RDNA3; =1 also the graph reorder, =2 only the kernel) |
 | `GGML_CUDA_NO_HC_XN16=1` | the hc boundary's f16 copy of the normed streams for the hc down GEMM, and with it the unwritten f32 copy below (RDNA3 prefill) |
 | `GGML_CUDA_NO_HC_XN_LAZY=1` | the hc boundary writes the normed streams in f32 again instead of leaving them to the mix epilogue to rebuild (RDNA3 prefill) |
+| `GGML_CUDA_NO_F32_TILE_PAIR=1` | two thin f32 projections of the same activations (qwen4exp ssm_beta + ssm_alpha) as one f32 tile launch at prefill (AMD) |
 | `GGML_CUDA_NO_HC_MIX_SPLIT=1` | the multi-block hc mix kernel (back to one block per token) |
 | `GGML_CUDA_NO_EWCHAIN=1` | generic element-wise chain fusion |
 | `GGML_CUDA_NO_KPOOL_COMPRESS=1` | the GLM-5.3 indexer pool compressor as one launch |
