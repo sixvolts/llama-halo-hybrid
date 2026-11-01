@@ -4210,7 +4210,18 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
                 ggml_cuda_mul_mat_q_wmma_prepass(*cuda_ctx, cgraph->nodes[m]->src[0], cgraph->nodes[m]->src[1])) {
             d16 = ggml_cuda_f16_side_reserve(*cuda_ctx, out);
         }
-        ggml_cuda_op_gdn_out_norm_gate(*cuda_ctx, x, w, z, ggml_get_op_params_f32(node, 0), out, d16);
+        // halo-hybrid: the GEMM reads only the f16 copy, so with it in this fusion out is never written in f32 (Qwen3.8:
+        // 100 MB per GDN layer at 4096 tokens). GGML_CUDA_NO_F16_ONLY=1: write out and leave the GEMM to its node
+        static const bool f16_only_off = ggml_env_flag("GGML_CUDA_NO_F16_ONLY", false);
+        ggml_tensor * mm = d16 ? cgraph->nodes[m] : nullptr;
+        const bool f16_only = mm && !f16_only_off && mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) &&
+                ggml_cuda_fuse_disjoint(mm, out) && ggml_cuda_fuse_views_belong(cgraph, i, m, { node, cgraph->nodes[j], cgraph->nodes[k], ggml_cuda_fuse_root(z), ggml_cuda_fuse_root(x), out });
+        ggml_cuda_op_gdn_out_norm_gate(*cuda_ctx, x, w, z, ggml_get_op_params_f32(node, 0), out, d16, f16_only);
+        if (f16_only) {
+            const bool ok = ggml_cuda_mul_mat_q_wmma(*cuda_ctx, mm->src[0], mm->src[1], mm);
+            GGML_ASSERT(ok && "the pre-pass predicate accepted this GEMM");
+            return m - i;
+        }
         return l - i;
     }
 

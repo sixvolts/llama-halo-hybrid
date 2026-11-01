@@ -702,7 +702,9 @@ static __global__ void __launch_bounds__(32) k_gdn_out_norm_gate(const float * x
     o.y = r.y * hc_sigmoid(zz.y);
     o.z = r.z * hc_sigmoid(zz.z);
     o.w = r.w * hc_sigmoid(zz.w);
-    ((float4 *) (dst + row*ncols))[tid] = o;
+    if (dst) {   // nullptr: the f16 copy is the only output (its GEMM runs in the same fusion)
+        ((float4 *) (dst + row*ncols))[tid] = o;
+    }
     if (d16) {
         const auto sat = [](const float v) { return v != v ? v : fminf(fmaxf(v, -65504.0f), 65504.0f); };
         half * h = d16 + row*ncols + 4*tid;
@@ -714,12 +716,13 @@ static __global__ void __launch_bounds__(32) k_gdn_out_norm_gate(const float * x
 }
 
 void ggml_cuda_op_gdn_out_norm_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
-        const ggml_tensor * z, float eps, ggml_tensor * dst, half * d16) {
+        const ggml_tensor * z, float eps, ggml_tensor * dst, half * d16, bool f16_only) {
+    GGML_ASSERT(!f16_only || d16);
     GGML_ASSERT(x->ne[0] == 128 && ggml_are_same_shape(x, z) && ggml_are_same_shape(x, dst) && ggml_is_contiguous(dst));
     GGML_ASSERT(x->ne[1] <= 65535 && x->ne[2] <= 65535 && x->ne[3] <= 65535);
     const dim3 grid((unsigned) x->ne[1], (unsigned) x->ne[2], (unsigned) x->ne[3]);
     k_gdn_out_norm_gate<<<grid, 32, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (const float *) z->data,
-            (float *) dst->data, d16, (int) x->ne[1], (int) x->ne[2],
+            f16_only ? nullptr : (float *) dst->data, d16, (int) x->ne[1], (int) x->ne[2],
             x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
             z->nb[1] / sizeof(float), z->nb[2] / sizeof(float), z->nb[3] / sizeof(float), eps);
     CUDA_CHECK(cudaGetLastError());
