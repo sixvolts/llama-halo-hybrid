@@ -449,6 +449,10 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
                 for (int c = 0; c < HC; ++c) {
                     gv[c] = LZ && mg < M ? mix.gamma[(c % mix.gamma_rows) * mix.n_embd + ie] : 0.0f;
                 }
+                if (mg >= M) {
+                    continue;
+                }
+                float rv[8];
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
 #if defined(RDNA4)
@@ -456,7 +460,8 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
 #else
                     const int n = n0 + wn * TN * 16 + i * 16 + 2 * e + lane / 16;
 #endif
-                    if (n >= N || mg >= M) {
+                    rv[e] = 0.0f;
+                    if (n >= N) {
                         continue;
                     }
                     const int64_t xo = (int64_t) n * HC * mix.n_embd + ie;
@@ -482,10 +487,30 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
                     for (int c = 1; c < HC; ++c) {
                         sum = ggml_cuda_add_mul_rn(sum, xv[c], mmqw_hc_sigmoid(acc[i][jg + c][e]));
                     }
-                    const float r = mix.scale * sum + mix.bias;
-                    mix.out[(int64_t) n * mix.n_embd + ie] = r;
+                    rv[e] = mix.scale * sum + mix.bias;
+                }
+                // stores: lanes l and l^1 hold adjacent channels of the same rows; swapping the odd rows' values gives the
+                // even lane channels (ie, ie+1) of row 2p and the odd lane those of row 2p+1, so each half-wave writes
+                // 128-byte f32 / 64-byte f16 runs instead of 64 / 32 (the values are the ones computed above)
+                const bool odd = lane & 1;
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    const float other = __shfl_xor(odd ? rv[2*p] : rv[2*p + 1], 1, 32);
+                    const int   e     = 2*p + (odd ? 1 : 0);
+#if defined(RDNA4)
+                    const int n = n0 + wn * TN * 16 + i * 16 + 8 * (lane / 16) + e;
+#else
+                    const int n = n0 + wn * TN * 16 + i * 16 + 2 * e + lane / 16;
+#endif
+                    if (n >= N) {
+                        continue;
+                    }
+                    const float  lo = odd ? other : rv[2*p];
+                    const float  hi = odd ? rv[2*p + 1] : other;
+                    const int64_t o = (int64_t) n * mix.n_embd + (ie & ~1);
+                    *(float2 *) (mix.out + o) = make_float2(lo, hi);
                     if constexpr (O16) {
-                        mix.out16[(int64_t) n * mix.n_embd + ie] = __float2half(f16_sat(r));
+                        *(half2 *) (mix.out16 + o) = __halves2half2(__float2half(f16_sat(lo)), __float2half(f16_sat(hi)));
                     }
                 }
             }
