@@ -358,7 +358,7 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_f32
         const char * __restrict__ x, const int64_t nbx_t,
         const float * __restrict__ w, const int64_t stride_w,
         float * __restrict__ y, const int64_t stride_y,
-        float * __restrict__ l2, const int64_t l2_stride_t, const int n_heads,
+        float * __restrict__ l2, const int64_t l2_stride_t, const int n_heads, const bool y_skip_l2,
         const int nt, const float eps, const int n_dst, const gdn_conv_front_dst out) {
     static_assert(GDN_CONV_FRONT_HEAD == 4*WARP_SIZE, "one head = four warps");
     constexpr int ns   = d_conv - 1;
@@ -403,14 +403,10 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_f32
 #pragma unroll
     for (int i = 0; i < MAXT; ++i) {
         if (i < nt) {
-            float sumf = 0.0f;
-#pragma unroll
-            for (int j = 0; j < d_conv; ++j) {
-                sumf += win[i + j] * wr[j];
+            const float v = gdn_conv_silu<d_conv>(win + i, wr);
+            if (!norm || !y_skip_l2) {
+                y[i*stride_y + c] = v;
             }
-            sumf += 0.0f;   // the unfused kernel's (zero) bias term
-            const float v = ggml_cuda_op_silu_single(sumf);
-            y[i*stride_y + c] = v;
             if (norm) {
                 s_y[i][tid] = v;
             }
@@ -426,14 +422,7 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_f32
     const int lane = tid % WARP_SIZE;
     float * o = l2 + (int64_t) head*GDN_CONV_FRONT_HEAD;
     for (int i = warp; i < nt; i += GDN_CONV_FRONT_HEAD / WARP_SIZE) {
-        float tmp = s_y[i][lane] * s_y[i][lane];
-#pragma unroll
-        for (int col = lane + WARP_SIZE; col < GDN_CONV_FRONT_HEAD; col += WARP_SIZE) {
-            const float xi = s_y[i][col];
-            tmp = fmaf(xi, xi, tmp);
-        }
-        tmp = warp_reduce_sum(tmp);
-        const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+        const float scale = gdn_conv_l2_scale(s_y[i], lane, eps);
 #pragma unroll
         for (int col = lane; col < GDN_CONV_FRONT_HEAD; col += WARP_SIZE) {
             o[(int64_t) i*l2_stride_t + col] = scale * s_y[i][col];
@@ -447,23 +436,23 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_f32
 // (Qwen3.8 at 4096 tokens: 2 x 134 MB per DeltaNet layer). The l2 norm runs per chunk from LDS as in the decode
 // kernel. Only chunk 0 reads the history and writes the slots, each thread after its own history reads, so a slot that
 // is the history's memory stays safe. Same arithmetic as gdn_conv_front_f32.
-template <int d_conv>
+// TT tokens per block, blocks `cstride` tokens apart (TT: the whole batch; tiles mode: the first d_conv-1 of every GEMM tile)
+template <int d_conv, int TT>
 static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_long_f32(
         const char * st, const int64_t nbs0, const int64_t nbs1,
         const char * __restrict__ x, const int64_t nbx_t,
         const float * __restrict__ w, const int64_t stride_w,
         float * __restrict__ y, const int64_t stride_y,
-        float * __restrict__ l2, const int64_t l2_stride_t, const int n_heads,
-        const int nt, const float eps, const int n_dst, const gdn_conv_front_dst out) {
+        float * __restrict__ l2, const int64_t l2_stride_t, const int n_heads, const bool y_skip_l2,
+        const int nt, const int cstride, const float eps, const int n_dst, const gdn_conv_front_dst out) {
     static_assert(GDN_CONV_FRONT_HEAD == 4*WARP_SIZE, "one head = four warps");
     constexpr int ns = d_conv - 1;
-    constexpr int TT = GDN_CONV_FRONT_LONG_T;
     __shared__ float s_y[TT][GDN_CONV_FRONT_HEAD];
 
     const int tid   = threadIdx.x;
     const int head  = blockIdx.x;
     const int chunk = blockIdx.y;
-    const int t0    = chunk*TT;
+    const int t0    = chunk*cstride;
     const int n     = min(TT, nt - t0);
     const int64_t c = (int64_t) head*GDN_CONV_FRONT_HEAD + tid;
 
@@ -487,14 +476,10 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_lon
 #pragma unroll 4
     for (int i = 0; i < n; ++i) {
         win[ns] = xv(t0 + i);
-        float sumf = 0.0f;
-#pragma unroll
-        for (int j = 0; j < d_conv; ++j) {
-            sumf += win[j] * wr[j];
+        const float v = gdn_conv_silu<d_conv>(win, wr);
+        if (!norm || !y_skip_l2) {
+            y[(int64_t) (t0 + i)*stride_y + c] = v;
         }
-        sumf += 0.0f;   // the unfused kernel's (zero) bias term
-        const float v = ggml_cuda_op_silu_single(sumf);
-        y[(int64_t) (t0 + i)*stride_y + c] = v;
         if (norm) {
             s_y[i][tid] = v;
         }
@@ -530,14 +515,7 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_lon
     const int lane = tid % WARP_SIZE;
     float * o = l2 + (int64_t) head*GDN_CONV_FRONT_HEAD;
     for (int i = warp; i < n; i += GDN_CONV_FRONT_HEAD / WARP_SIZE) {
-        float tmp = s_y[i][lane] * s_y[i][lane];
-#pragma unroll
-        for (int col = lane + WARP_SIZE; col < GDN_CONV_FRONT_HEAD; col += WARP_SIZE) {
-            const float xi = s_y[i][col];
-            tmp = fmaf(xi, xi, tmp);
-        }
-        tmp = warp_reduce_sum(tmp);
-        const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+        const float scale = gdn_conv_l2_scale(s_y[i], lane, eps);
 #pragma unroll
         for (int col = lane; col < GDN_CONV_FRONT_HEAD; col += WARP_SIZE) {
             o[(int64_t) (t0 + i)*l2_stride_t + col] = scale * s_y[i][col];
@@ -573,18 +551,18 @@ void ggml_cuda_op_gdn_conv_front(ggml_backend_cuda_context & ctx, const ggml_cud
         (const char *) a.xt->data, a.xt->nb[0], \
         (const float *) a.w->data, a.w->nb[1] / sizeof(float), \
         (float *) a.y->data, a.y->nb[1] / sizeof(float), \
-        (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, \
+        (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, a.y_skip_l2, \
         (int) nt, a.eps, a.n_dst, out)
     if (nt > GDN_CONV_FRONT_MAX_TOKENS) {
         const dim3 blocks_long(C / GDN_CONV_FRONT_HEAD, (nt + GDN_CONV_FRONT_LONG_T - 1) / GDN_CONV_FRONT_LONG_T, 1);
 #define GDN_CONV_FRONT_LONG_LAUNCH(DC) \
-        gdn_conv_front_long_f32<DC><<<blocks_long, GDN_CONV_FRONT_HEAD, 0, stream>>>( \
+        gdn_conv_front_long_f32<DC, GDN_CONV_FRONT_LONG_T><<<blocks_long, GDN_CONV_FRONT_HEAD, 0, stream>>>( \
             (const char *) a.states->data, a.states->nb[0], a.states->nb[1], \
             (const char *) a.xt->data, a.xt->nb[0], \
             (const float *) a.w->data, a.w->nb[1] / sizeof(float), \
             (float *) a.y->data, a.y->nb[1] / sizeof(float), \
-            (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, \
-            (int) nt, a.eps, a.n_dst, out)
+            (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, a.y_skip_l2, \
+            (int) nt, GDN_CONV_FRONT_LONG_T, a.eps, a.n_dst, out)
         if (d_conv == 4) {
             GDN_CONV_FRONT_LONG_LAUNCH(4);
         } else {
@@ -597,4 +575,37 @@ void ggml_cuda_op_gdn_conv_front(ggml_backend_cuda_context & ctx, const ggml_cud
         GDN_CONV_FRONT_LAUNCH(3);
     }
 #undef GDN_CONV_FRONT_LAUNCH
+}
+
+void ggml_cuda_op_gdn_conv_front_tiles(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_front_args & a, const int tile) {
+    const int64_t d_conv = a.w->ne[0];
+    const int64_t C      = a.w->ne[1];
+    const int64_t nt     = a.y->ne[1];
+    GGML_ASSERT(ggml_cuda_gdn_conv_front_supported(d_conv, C, nt) && tile >= d_conv);
+    GGML_ASSERT(a.xt->nb[1] == sizeof(float) && a.w->nb[0] == sizeof(float) && a.y->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(a.l2) && a.l2->ne[0] == GDN_CONV_FRONT_HEAD && a.l2->ne[1]*GDN_CONV_FRONT_HEAD <= C);
+    GGML_ASSERT(a.n_dst >= 0 && a.n_dst <= GDN_CONV_FRONT_MAX_DST);
+
+    gdn_conv_front_dst out = {};
+    for (int k = 0; k < a.n_dst; ++k) {
+        out.d[k]     = a.dst[k];
+        out.s_idx[k] = a.s_idx[k];
+    }
+    const int n_heads = (int) a.l2->ne[1];
+    const dim3 blocks(C / GDN_CONV_FRONT_HEAD, (nt + tile - 1) / tile, 1);
+    cudaStream_t stream = ctx.stream();
+#define GDN_CONV_FRONT_TILES_LAUNCH(DC) \
+    gdn_conv_front_long_f32<DC, DC - 1><<<blocks, GDN_CONV_FRONT_HEAD, 0, stream>>>( \
+        (const char *) a.states->data, a.states->nb[0], a.states->nb[1], \
+        (const char *) a.xt->data, a.xt->nb[0], \
+        (const float *) a.w->data, a.w->nb[1] / sizeof(float), \
+        (float *) a.y->data, a.y->nb[1] / sizeof(float), \
+        (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, a.y_skip_l2, \
+        (int) nt, tile, a.eps, a.n_dst, out)
+    if (d_conv == 4) {
+        GDN_CONV_FRONT_TILES_LAUNCH(4);
+    } else {
+        GDN_CONV_FRONT_TILES_LAUNCH(3);
+    }
+#undef GDN_CONV_FRONT_TILES_LAUNCH
 }

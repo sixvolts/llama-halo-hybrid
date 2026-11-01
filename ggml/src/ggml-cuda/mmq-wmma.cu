@@ -1,6 +1,7 @@
 #include "mmq-wmma.cuh"
 #include "convert.cuh"
 #include "hc.cuh"
+#include "ssm-conv.cuh"
 
 // halo-hybrid: dense q8_0 GEMM for RDNA WMMA at prefill widths.
 //
@@ -137,13 +138,23 @@ struct mmqw_mix_args {
     const float * gamma      = nullptr;   // [gamma_rows][n_embd]
     int           gamma_rows = 1;
     half *        out16      = nullptr;   // O16: the f16 copy of out its consumers' WMMA / routed GEMMs read (f16 side copy)
+    // CV > 0, the GDN conv front epilogue (ggml_cuda_mul_mat_q_wmma_gdn_conv)
+    const float * conv_w     = nullptr;   // [M][CV] conv weight
+    float *       conv_y     = nullptr;   // SiLU output, rows conv_ys floats apart
+    float *       conv_l2    = nullptr;   // l2 output of the leading conv_nh heads, rows conv_ls floats apart
+    int64_t       conv_ys    = 0;
+    int64_t       conv_ls    = 0;
+    int           conv_nh    = 0;
+    int           conv_raw   = 0;         // tokens >= conv_raw are also stored raw (the rollback slots read them)
+    float         conv_eps   = 0.0f;
+    bool          conv_yskip = false;     // the l2 heads' SiLU columns are not written (no reader)
 };
 
 static __device__ __forceinline__ float mmqw_hc_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));   // identical to hc.cu's hc_sigmoid
 }
 
-template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0, bool LZ = false, bool O16 = false>
+template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0, bool LZ = false, bool O16 = false, int CV = 0>
 static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
         const void * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ dst,
         const int M, const int N, const int K, const int64_t ldx, const int64_t ldd, const mmqw_mix_args mix) {
@@ -437,6 +448,121 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
     }
 
     // epilogue: element e of lane l holds C[n = 2e + l/16 (gfx11) | 8*(l/16) + e (gfx12)][m = l % 16]
+    if constexpr (CV > 0) {
+        // halo-hybrid: the GDN conv front (gdn_conv_front_long_f32, ssm-conv.cu) on the block's 128 tokens x one 128-channel
+        // head instead of storing x: conv + SiLU per channel along the tokens, then the head's l2 norm per token (Q/K heads)
+        // or the SiLU row (V heads), with the conv front's arithmetic (gdn_conv_silu, gdn_conv_l2_scale) on the same f32
+        // values it would read back, so the outputs are bit-identical. The first CV-1 tokens of the block need the previous
+        // block's x: they are left to ggml_cuda_op_gdn_conv_front_tiles, which reads the raw x stored here for the first and
+        // last CV-1 tokens of every block (and from conv_raw on, the rollback slots' columns). Two rounds of BN/WN tokens
+        // (one warp row each) through the dead LDS tiles, f32 [CV-1 + BN/WN][BM]: rows 0..CV-2 hold the history.
+        static_assert(!KQ && HC == 0 && BM == GDN_CONV_FRONT_HEAD && BN == 128 && WN == 2 && NT == 2*BM, "conv epilogue tile");
+        constexpr int ns = CV - 1;
+        constexpr int RT = BN / WN;                       // tokens per round
+        constexpr int HT = RT / 2;                        // tokens per thread per round (two threads per channel)
+        static_assert((size_t) (ns + RT) * BM * sizeof(float) <= (size_t) NBUF * (BN + BM) * PITCH * sizeof(half), "LDS");
+        float * sx = (float *) mmqw_smem;
+#pragma unroll
+        for (int i = 0; i < TN; ++i) {
+#pragma unroll
+            for (int j = 0; j < TM; ++j) {
+                const int m = m0 + wm * TM * 16 + j * 16 + lane % 16;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+#if defined(RDNA4)
+                    const int n = n0 + wn * TN * 16 + i * 16 + 8 * (lane / 16) + e;
+#else
+                    const int n = n0 + wn * TN * 16 + i * 16 + 2 * e + lane / 16;
+#endif
+                    const int tl = n - n0;
+                    if (n < N && (tl < ns || tl >= BN - ns || n >= mix.conv_raw)) {
+                        dst[(int64_t) n * ldd + m] = acc[i][j][e];
+                    }
+                }
+            }
+        }
+        const int  c    = tid % BM;                       // the thread's channel
+        const int  h    = tid / BM;                       // its half of the round's tokens
+        const bool norm = m0 / BM < mix.conv_nh;
+        float wr[CV];
+#pragma unroll
+        for (int j = 0; j < CV; ++j) {
+            wr[j] = mix.conv_w[(int64_t) (m0 + c) * CV + j];
+        }
+        float win[CV];
+#pragma unroll
+        for (int r = 0; r < WN; ++r) {
+            __syncthreads();                              // r = 0: the K loop's last fragment reads; r = 1: round 0's row reads
+            if (r > 0 && h == 1) {
+#pragma unroll
+                for (int j = 0; j < ns; ++j) {
+                    sx[j * BM + c] = win[j];              // raw x of round 0's last ns tokens: this round's history
+                }
+            }
+            if (wn == r) {
+#pragma unroll
+                for (int i = 0; i < TN; ++i) {
+#pragma unroll
+                    for (int j = 0; j < TM; ++j) {
+                        const int mc = wm * TM * 16 + j * 16 + lane % 16;
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+#if defined(RDNA4)
+                            const int tr = i * 16 + 8 * (lane / 16) + e;
+#else
+                            const int tr = i * 16 + 2 * e + lane / 16;
+#endif
+                            sx[(ns + tr) * BM + mc] = acc[i][j][e];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            // conv in place: the thread slides its channel's window over tokens h*HT .. h*HT + HT-1 of the round, holding the
+            // raw values in registers. Round 0's first ns tokens read stale history; the boundary kernel owns their outputs.
+            const int tb = h * HT;
+#pragma unroll
+            for (int j = 0; j < ns; ++j) {
+                win[j] = sx[(tb + j) * BM + c];
+            }
+            __syncthreads();                              // h = 0 overwrites rows h = 1 just read as history
+#pragma unroll 4
+            for (int t = 0; t < HT; ++t) {
+                float * p = sx + (ns + tb + t) * BM + c;
+                win[ns] = *p;
+                *p = gdn_conv_silu<CV>(win, wr);
+#pragma unroll
+                for (int j = 0; j < ns; ++j) {
+                    win[j] = win[j + 1];
+                }
+            }
+            __syncthreads();
+            // one warp per token row: the l2-normalised head (and its SiLU row unless unread), or the SiLU row
+            for (int t = warp; t < RT; t += NT / 32) {
+                const int n = n0 + r * RT + t;
+                if (n >= N || (r == 0 && t < ns)) {
+                    continue;
+                }
+                const float * row = sx + (ns + t) * BM;
+                if (norm) {
+                    const float scale = gdn_conv_l2_scale(row, lane, mix.conv_eps);
+                    float * o = mix.conv_l2 + (int64_t) n * mix.conv_ls + m0;
+#pragma unroll
+                    for (int col = lane; col < BM; col += 32) {
+                        o[col] = scale * row[col];
+                    }
+                }
+                if (!norm || !mix.conv_yskip) {
+                    float * y = mix.conv_y + (int64_t) n * mix.conv_ys + m0;
+#pragma unroll
+                    for (int col = lane; col < BM; col += 32) {
+                        y[col] = row[col];
+                    }
+                }
+            }
+        }
+        return;
+    }
     if constexpr (HC > 0) {
 #pragma unroll
         for (int i = 0; i < TN; ++i) {
@@ -537,13 +663,13 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
     }
 }
 
-template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0, bool LZ = false, bool O16 = false>
+template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0, bool LZ = false, bool O16 = false, int CV = 0>
 static void launch_mul_mat_q_wmma(const void * W, const void * X, float * dst, int M, int N, int K, int64_t ldx, int64_t ldd, cudaStream_t stream,
         const mmqw_mix_args mix = {}) {
     constexpr int PITCH = KT + 8;
     constexpr size_t smem = (size_t) NBUF * (BN + BM) * PITCH * sizeof(half);
     const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
-    mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32, HC, LZ, O16><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd, mix);
+    mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32, HC, LZ, O16, CV><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd, mix);
     CUDA_CHECK(cudaGetLastError());
 }
 template <ggml_type WT>
@@ -653,6 +779,69 @@ bool ggml_cuda_mul_mat_q_wmma_hc_mix(ggml_backend_cuda_context & ctx, const ggml
 // the checks ggml_cuda_mul_mat_q_wmma takes a call on (dst aside): an f32 dst of the same contiguous shape is assumed
 static bool mmqw_accepts(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
 #endif
+
+bool ggml_cuda_mul_mat_q_wmma_gdn_conv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        ggml_tensor * dst, const ggml_cuda_gdn_conv_front_args & a) {
+#ifndef MMQ_WMMA_ENABLED
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, a);
+    return false;
+#else
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || src0->type != GGML_TYPE_Q8_0 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            !mmqw_accepts(ctx, src0, src1)) {
+        return false;
+    }
+    const int64_t K      = src0->ne[0];
+    const int64_t M      = src0->ne[1];
+    const int64_t N      = src1->ne[1];
+    const int64_t d_conv = a.w->ne[0];
+    if (!ggml_cuda_gdn_conv_front_supported(d_conv, M, N) || N <= GDN_CONV_FRONT_MAX_TOKENS || M % 128 != 0 ||
+            a.w->ne[1] != M || a.w->nb[1] != d_conv * (int64_t) sizeof(float) || a.y->ne[0] != M || a.y->ne[1] != N ||
+            a.y->nb[0] != sizeof(float) || a.y->nb[1] % sizeof(float) != 0 || !ggml_is_contiguous(a.l2) ||
+            a.l2->ne[0] != GDN_CONV_FRONT_HEAD || a.l2->ne[1] * GDN_CONV_FRONT_HEAD > M || a.l2->ne[2] != N) {
+        return false;
+    }
+    // the conv front reads x(t, c) at xt->data + t*nb[0] + c*4: x must be this GEMM's dst
+    if (a.xt->data != dst->data || a.xt->nb[0] != dst->nb[1] || dst->nb[1] != M * (int64_t) sizeof(float)) {
+        return false;
+    }
+    // the tile mmqw_launch takes for this shape: the f16 pre-pass and 128x128 blocks
+    static const int64_t prepass_min = ggml_env_int("GGML_CUDA_Q8_WMMA_PREPASS_MIN", (int64_t) 8 * 1024 * 1024);
+    const int64_t blocks128 = ((M + 127) / 128) * ((N + 127) / 128);
+    if (M * K <= prepass_min || blocks128 < 2 * ggml_cuda_info().devices[ctx.device].nsm) {
+        return false;
+    }
+    int raw = (int) (N - (d_conv - 1));
+    for (int k = 0; k < a.n_dst; ++k) {
+        raw = std::min(raw, a.s_idx[k] - (int) (d_conv - 1));
+    }
+    mmqw_mix_args mix = {};
+    mix.conv_w     = (const float *) a.w->data;
+    mix.conv_y     = (float *) a.y->data;
+    mix.conv_ys    = a.y->nb[1] / sizeof(float);
+    mix.conv_l2    = (float *) a.l2->data;
+    mix.conv_ls    = a.l2->nb[2] / sizeof(float);
+    mix.conv_nh    = (int) a.l2->ne[1];
+    mix.conv_raw   = raw;
+    mix.conv_eps   = a.eps;
+    mix.conv_yskip = a.y_skip_l2;
+
+    cudaStream_t stream = ctx.stream();
+    const half * pre = ggml_cuda_f16_side_find(ctx, src1);
+    ggml_cuda_pool_alloc<half> x16_buf(ctx.pool());
+    if (pre == nullptr) {
+        x16_buf.alloc((size_t) N * K);
+        mmqw_f32_to_f16_sat<<<(N * K + 255) / 256, 256, 0, stream>>>((const float *) src1->data, x16_buf.get(), N * K);
+    }
+    const half * x16 = pre ? pre : x16_buf.get();
+#define MMQW_CONV(DC) launch_mul_mat_q_wmma<GGML_TYPE_Q8_0, 128, 128, 64, 2, 4, 1, 1, false, 0, false, false, DC>(src0->data, x16, \
+        (float *) dst->data, (int) M, (int) N, (int) K, K, M, stream, mix)
+    if (d_conv == 4) { MMQW_CONV(4); } else { MMQW_CONV(3); }
+#undef MMQW_CONV
+    ggml_cuda_op_gdn_conv_front_tiles(ctx, a, 128);
+    return true;
+#endif
+}
 
 bool ggml_cuda_mul_mat_q_wmma_prepass(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
 #ifndef MMQ_WMMA_ENABLED

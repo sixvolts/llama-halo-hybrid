@@ -22,6 +22,7 @@ struct ggml_cuda_gdn_conv_front_args {
     ggml_tensor       * y;        // SiLU output [C, nt, 1]
     ggml_tensor       * l2;       // L2-normalised leading heads, contiguous [128, H, nt, 1]
     float               eps;
+    bool                y_skip_l2;   // the l2-normalised heads' SiLU columns have no reader besides the norm: not written
     int                 n_dst;    // rollback slots
     float             * dst[GDN_CONV_FRONT_MAX_DST];    // contiguous [(d_conv-1)*C] each
     int                 s_idx[GDN_CONV_FRONT_MAX_DST];  // first conv_input column copied into dst[k]
@@ -29,3 +30,34 @@ struct ggml_cuda_gdn_conv_front_args {
 
 bool ggml_cuda_gdn_conv_front_supported(int64_t d_conv, int64_t C, int64_t nt);
 void ggml_cuda_op_gdn_conv_front(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_front_args & args);
+// the same front for only the first d_conv-1 tokens of every `tile`-token block (the rest computed by the qkv GEMM's conv
+// epilogue, mmq-wmma.cu); chunk 0 still writes the slots. x must hold those tokens, the d_conv-1 before each block and the
+// last d_conv-1 of the batch.
+void ggml_cuda_op_gdn_conv_front_tiles(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_front_args & args, int tile);
+
+#include "unary.cuh"
+
+// conv taps + SiLU and the l2 scale of one 128-wide head row, shared by the conv front kernels and the GEMM epilogue so
+// every path rounds the same way: ssm_conv_f32's sum from 0 in tap order plus its (zero) bias, and l2_norm_f32<WARP_SIZE>'s
+// order (lane sums columns lane, +32, +64, +96 as x0*x0 then fmaf, then warp_reduce_sum)
+template <int d_conv>
+static __device__ __forceinline__ float gdn_conv_silu(const float * win, const float * wr) {
+    float sumf = 0.0f;
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        sumf += win[j] * wr[j];
+    }
+    sumf += 0.0f;   // the unfused kernel's (zero) bias term
+    return ggml_cuda_op_silu_single(sumf);
+}
+
+static __device__ __forceinline__ float gdn_conv_l2_scale(const float * row, const int lane, const float eps) {
+    float tmp = row[lane] * row[lane];
+#pragma unroll
+    for (int col = lane + WARP_SIZE; col < GDN_CONV_FRONT_HEAD; col += WARP_SIZE) {
+        const float xi = row[col];
+        tmp = fmaf(xi, xi, tmp);
+    }
+    tmp = warp_reduce_sum(tmp);
+    return rsqrtf(fmaxf(tmp, eps * eps));
+}

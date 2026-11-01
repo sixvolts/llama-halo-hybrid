@@ -5252,6 +5252,42 @@ static bool ggml_cuda_gdn_conv_front_disjoint(const ggml_cuda_gdn_conv_front_mat
     return true;
 }
 
+// the SiLU columns of the l2-normalised heads are read by the norm alone (qwen4exp's q/k views are replaced by views of
+// the l2 output): then the kernel normalises them from LDS and never writes them (1/4 of its traffic for Qwen3.8).
+// Every other reader of the SiLU output must be a view whose bytes, within a token row, lie past those heads.
+static bool ggml_cuda_gdn_conv_front_qk_unread(const ggml_cgraph * g, const ggml_cuda_gdn_conv_front_match & m) {
+    static const bool keep = ggml_env_flag("GGML_CUDA_NO_GDN_CONV_QK_SKIP", false);
+    const ggml_tensor * silu = m.silu;
+    if (keep || (silu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const size_t row = silu->nb[1];
+    const size_t qk  = (size_t) m.l2->src[0]->ne[1]*GDN_CONV_FRONT_HEAD*sizeof(float);
+    auto past_qk = [&](const ggml_tensor * t) {
+        size_t ext = ggml_element_size(t);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (t->ne[d] > 1 && t->nb[d] % row != 0) {
+                ext += (size_t) (t->ne[d] - 1)*t->nb[d];
+            }
+        }
+        const size_t o = t->view_offs % row;
+        return o >= qk && o + ext <= row;
+    };
+    for (int p = m.i_l2 + 1; p < g->n_nodes; ++p) {
+        const ggml_tensor * node = g->nodes[p];
+        if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+            const ggml_tensor * t = node->src[s];
+            if (t == silu || (t->view_src == silu && !past_qk(t))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse_gdn_conv_front(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     if (ggml_cuda_gdn_conv_front_disabled()) {
         return 0;
@@ -5281,12 +5317,86 @@ static int ggml_cuda_try_fuse_gdn_conv_front(ggml_backend_cuda_context * cuda_ct
     a.y      = m.silu;
     a.l2     = m.l2;
     a.eps    = ggml_get_op_params_f32(m.l2, 0);
+    // prefill widths only: the reader scan walks the rest of the graph, a cost the decode kernel's few bytes don't repay
+    a.y_skip_l2 = m.silu->ne[1] > GDN_CONV_FRONT_MAX_TOKENS && ggml_cuda_gdn_conv_front_qk_unread(cgraph, m);
     a.n_dst  = m.n_cpy;
     for (int k = 0; k < m.n_cpy; ++k) {
         a.dst[k]   = (float *) m.cpy[k]->src[1]->data;
         a.s_idx[k] = m.s_idx[k];
     }
     ggml_cuda_op_gdn_conv_front(*cuda_ctx, a);
+    return m.i_l2 - i;
+}
+
+// halo-hybrid: the qkv projection with the GDN conv front as its epilogue at prefill widths (ggml_cuda_mul_mat_q_wmma_gdn_conv,
+//     mmq-wmma.cu): MUL_MAT(w, cur) = x, then the conv front's run (graph_optimize puts the GEMM right before it), and x is
+//     read by nothing but its views into the CONCAT. x is then written only at the GEMM tiles' edges (the boundary kernel's
+//     rows) instead of in full and read back: 2 x 134 MB less traffic per DeltaNet layer at 4096 tokens on Qwen3.8.
+//     GGML_CUDA_NO_GDN_CONV_GEMM=1 disables.
+static bool ggml_cuda_gdn_conv_gemm_disabled() {
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_GDN_CONV_GEMM", false);
+    return disabled;
+}
+
+// x = the GEMM output is read only through views by the CONCAT
+static bool ggml_cuda_gdn_conv_gemm_x_private(const ggml_cgraph * g, const ggml_tensor * mm, const ggml_tensor * c3) {
+    if (mm->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    for (int p = 0; p < g->n_nodes; ++p) {
+        const ggml_tensor * node = g->nodes[p];
+        if (node == c3 || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE ||
+                node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+            if (node->src[s] == mm || node->src[s]->view_src == mm) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_gdn_conv_gemm_candidate(const ggml_tensor * mm, const ggml_cuda_gdn_conv_front_match & m) {
+    return mm->op == GGML_OP_MUL_MAT && mm->src[0]->type == GGML_TYPE_Q8_0 && mm->type == GGML_TYPE_F32 &&
+           m.silu->ne[1] > GDN_CONV_FRONT_MAX_TOKENS && ggml_cuda_fuse_root(m.c3->src[1]) == mm;
+}
+
+static int ggml_cuda_try_fuse_gdn_conv_gemm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * mm = cgraph->nodes[i];
+    if (ggml_cuda_gdn_conv_front_disabled() || ggml_cuda_gdn_conv_gemm_disabled() || mm->op != GGML_OP_MUL_MAT ||
+            mm->src[0]->type != GGML_TYPE_Q8_0 || mm->src[1]->ne[1] <= GDN_CONV_FRONT_MAX_TOKENS) {
+        return 0;
+    }
+    static const bool no_long = ggml_env_flag("GGML_CUDA_NO_GDN_CONV_FRONT_LONG", false);
+    const int j = ggml_cuda_fuse_next(cgraph, i + 1);
+    ggml_cuda_gdn_conv_front_match m;
+    if (no_long || j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_CONCAT ||
+            !ggml_cuda_gdn_conv_front_find(cgraph, j, m, /*adjacent =*/ true) || !ggml_cuda_gdn_conv_gemm_candidate(mm, m) ||
+            !ggml_cuda_gdn_conv_front_disjoint(m) || !ggml_cuda_gdn_conv_gemm_x_private(cgraph, mm, m.c3)) {
+        return 0;
+    }
+    // the epilogue writes the SiLU and l2 outputs while the GEMM reads its activations
+    if (!ggml_cuda_fuse_disjoint(m.silu, mm->src[1]) || !ggml_cuda_fuse_disjoint(m.l2, mm->src[1])) {
+        return 0;
+    }
+    ggml_cuda_gdn_conv_front_args a = {};
+    a.states    = m.c3->src[0];
+    a.xt        = m.c3->src[1];
+    a.w         = m.conv->src[1];
+    a.y         = m.silu;
+    a.l2        = m.l2;
+    a.eps       = ggml_get_op_params_f32(m.l2, 0);
+    a.y_skip_l2 = ggml_cuda_gdn_conv_front_qk_unread(cgraph, m);
+    a.n_dst     = m.n_cpy;
+    for (int k = 0; k < m.n_cpy; ++k) {
+        a.dst[k]   = (float *) m.cpy[k]->src[1]->data;
+        a.s_idx[k] = m.s_idx[k];
+    }
+    if (!ggml_cuda_mul_mat_q_wmma_gdn_conv(*cuda_ctx, mm->src[0], mm->src[1], mm, a)) {
+        return 0;
+    }
     return m.i_l2 - i;
 }
 
@@ -5910,6 +6020,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT_ID) {   // halo-hybrid: MoE tail at decode widths
         const int skip = ggml_cuda_try_fuse_moe_tail(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int skip = ggml_cuda_try_fuse_gdn_conv_gemm(cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
         }
@@ -7737,6 +7854,46 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ggml_cuda_fuse_root(m.c3->src[0])), m.l2);
             params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ggml_cuda_fuse_root(m.c3->src[1])), m.l2);
             i = to + (m.i_l2 - m.i_conv);
+        }
+    }
+
+    // halo-hybrid: the conv front as the qkv GEMM's epilogue (ggml_cuda_try_fuse_gdn_conv_gemm). qwen4exp builds the qkv, z,
+    //     beta and alpha projections of the layer input together, the gate math and the state views, then the conv front:
+    //     move the qkv GEMM and the views of its output down to right before the CONCAT (nothing in between reads them;
+    //     the GEMM's inputs exist at its old place) and keep the GEMM's activations alive until the l2 output is allocated
+    //     (the epilogue writes the SiLU and l2 outputs while the GEMM reads them). After the conv front reorder.
+    if (!disable_fusion && !ggml_cuda_gdn_conv_front_disabled() && !ggml_cuda_gdn_conv_gemm_disabled() &&
+            GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_gdn_conv_front_match m;
+            if (cgraph->nodes[i]->op != GGML_OP_CONCAT || !ggml_cuda_gdn_conv_front_find(cgraph, i, m, /*adjacent =*/ true)) {
+                continue;
+            }
+            ggml_tensor * mm = const_cast<ggml_tensor *>(ggml_cuda_fuse_root(m.c3->src[1]));
+            if (!ggml_cuda_gdn_conv_gemm_candidate(mm, m) || !ggml_cuda_gdn_conv_gemm_x_private(cgraph, mm, m.c3)) {
+                continue;
+            }
+            int g = -1;
+            for (int p = i - 1; p >= 0 && p >= i - 256; --p) {
+                if (cgraph->nodes[p] == mm) {
+                    g = p;
+                    break;
+                }
+            }
+            if (g < 0) {
+                continue;
+            }
+            // [g, i): the GEMM and its views go last, in order; everything else keeps its order ahead of them
+            std::vector<ggml_tensor *> rest, mine;
+            for (int p = g; p < i; ++p) {
+                ggml_tensor * t = cgraph->nodes[p];
+                (t == mm || t->view_src == mm ? mine : rest).push_back(t);
+            }
+            int p = g;
+            for (ggml_tensor * t : rest) { cgraph->nodes[p++] = t; }
+            for (ggml_tensor * t : mine) { cgraph->nodes[p++] = t; }
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ggml_cuda_fuse_root(mm->src[1])), m.l2);
+            i = m.i_l2;
         }
     }
 
