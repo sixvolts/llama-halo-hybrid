@@ -20,4 +20,4 @@ struct ggml_cuda_hc_xn_src {
 };
 bool ggml_cuda_mul_mat_q_wmma_hc_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
         const ggml_tensor * xn, int64_t n_embd, int64_t hc, float scale, float bias, ggml_tensor * out, float * g_debug = nullptr,
-        const ggml_cuda_hc_xn_src * xs = nullptr);
+        const ggml_cuda_hc_xn_src * xs = nullptr, half * out16 = nullptr);

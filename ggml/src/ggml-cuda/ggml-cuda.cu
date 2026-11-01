@@ -4409,9 +4409,30 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
             if (!ggml_cuda_fuse_disjoint(scale_node, lazy.res)) { HCMIX_NO("check 17"); }
             xsrc = { (const float *) lazy.res->data, cuda_ctx->hc_rstd_buf, lazy.gamma, lazy.gamma_rows };
         }
+        // the f16 copy of the mixed rows for the next GEMMs that read them (the attention / GDN projections' pre-pass,
+        // the narrow shared-expert tiles, the routed experts' input), written by the epilogue in place of their own
+        // f32 -> f16 conversions. GGML_CUDA_NO_HC_MIX_F16=1 disables
+        half * out16 = nullptr;
+        {
+            static const bool f16_off = ggml_env_flag("GGML_CUDA_NO_HC_MIX_F16", false);
+            for (int q = sidx + 1; !f16_off && q < n && q <= sidx + 24 && out16 == nullptr; ++q) {
+                const ggml_tensor * t = cgraph->nodes[q];
+                const bool reads = (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) &&
+                        ggml_cuda_fuse_root(t->src[1]) == scale_node && t->src[1]->data == scale_node->data;
+                if (reads && ((t->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_q_wmma_f16_input(*cuda_ctx, t->src[0], t->src[1])) ||
+                              (t->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmid_f16_takes(*cuda_ctx, t)))) {
+                    out16 = ggml_cuda_f16_side_reserve(*cuda_ctx, scale_node);
+                }
+            }
+        }
         if (!ggml_cuda_mul_mat_q_wmma_hc_mix(*cuda_ctx, node->src[0], node->src[1], xn, n_embd, hc,
                 ggml_cuda_fuse_param_f32(scale_node, 0), ggml_cuda_fuse_param_f32(scale_node, 1), scale_node, nullptr,
-                use_lazy ? &xsrc : nullptr)) { HCMIX_NO("check 16"); }
+                use_lazy ? &xsrc : nullptr, out16)) {
+            if (out16) {
+                cuda_ctx->f16_side_prod = nullptr;   // reserved for nothing
+            }
+            HCMIX_NO("check 16");
+        }
         if (use_lazy) {
             lazy.xn = nullptr;
         }

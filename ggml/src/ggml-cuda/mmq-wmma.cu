@@ -136,13 +136,14 @@ struct mmqw_mix_args {
     const float * rstd       = nullptr;   // [n][HC]
     const float * gamma      = nullptr;   // [gamma_rows][n_embd]
     int           gamma_rows = 1;
+    half *        out16      = nullptr;   // O16: the f16 copy of out its consumers' WMMA / routed GEMMs read (f16 side copy)
 };
 
 static __device__ __forceinline__ float mmqw_hc_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));   // identical to hc.cu's hc_sigmoid
 }
 
-template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0, bool LZ = false>
+template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0, bool LZ = false, bool O16 = false>
 static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
         const void * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ dst,
         const int M, const int N, const int K, const int64_t ldx, const int64_t ldd, const mmqw_mix_args mix) {
@@ -483,6 +484,9 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
                     }
                     const float r = mix.scale * sum + mix.bias;
                     mix.out[(int64_t) n * mix.n_embd + ie] = r;
+                    if constexpr (O16) {
+                        mix.out16[(int64_t) n * mix.n_embd + ie] = __float2half(f16_sat(r));
+                    }
                 }
             }
         }
@@ -508,13 +512,13 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
     }
 }
 
-template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0, bool LZ = false>
+template <ggml_type WT, int BN, int BM, int KT, int WN, int WM, int NBUF, int PF, bool XF32, int HC = 0, bool LZ = false, bool O16 = false>
 static void launch_mul_mat_q_wmma(const void * W, const void * X, float * dst, int M, int N, int K, int64_t ldx, int64_t ldd, cudaStream_t stream,
         const mmqw_mix_args mix = {}) {
     constexpr int PITCH = KT + 8;
     constexpr size_t smem = (size_t) NBUF * (BN + BM) * PITCH * sizeof(half);
     const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
-    mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32, HC, LZ><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd, mix);
+    mul_mat_q_wmma<WT, BN, BM, KT, WN, WM, NBUF, PF, XF32, HC, LZ, O16><<<grid, 32 * WN * WM, smem, stream>>>(W, X, dst, M, N, K, ldx, ldd, mix);
     CUDA_CHECK(cudaGetLastError());
 }
 template <ggml_type WT>
@@ -579,9 +583,9 @@ static bool mmqw_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * src
 
 bool ggml_cuda_mul_mat_q_wmma_hc_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
         const ggml_tensor * xn, int64_t n_embd, int64_t hc, float scale, float bias, ggml_tensor * out, float * g_debug,
-        const ggml_cuda_hc_xn_src * xs) {
+        const ggml_cuda_hc_xn_src * xs, half * out16) {
 #ifndef MMQ_WMMA_ENABLED
-    GGML_UNUSED_VARS(ctx, w, x, xn, n_embd, hc, scale, bias, out, g_debug, xs);
+    GGML_UNUSED_VARS(ctx, w, x, xn, n_embd, hc, scale, bias, out, g_debug, xs, out16);
     return false;
 #else
     static const bool off = ggml_env_flag("GGML_CUDA_NO_HC_MIX_GEMM", false);
@@ -607,13 +611,15 @@ bool ggml_cuda_mul_mat_q_wmma_hc_mix(ggml_backend_cuda_context & ctx, const ggml
     if (xs != nullptr) {
         mix.res = xs->res; mix.rstd = xs->rstd; mix.gamma = xs->gamma; mix.gamma_rows = xs->gamma_rows;
     }
+    mix.out16 = out16;
+#define MMQW_MIX(LZ, O16) launch_mul_mat_q_wmma<GGML_TYPE_Q8_0, 128, 128, 64, 4, 2, 1, 1, true, 4, LZ, O16>(w->data, x->data, g_debug, \
+        (int) M, (int) N, (int) K, K, M, ctx.stream(), mix)
     if (xs != nullptr) {
-        launch_mul_mat_q_wmma<GGML_TYPE_Q8_0, 128, 128, 64, 4, 2, 1, 1, true, 4, true>(w->data, x->data, g_debug, (int) M, (int) N, (int) K,
-                K, M, ctx.stream(), mix);
+        if (out16 != nullptr) { MMQW_MIX(true, true); } else { MMQW_MIX(true, false); }
     } else {
-        launch_mul_mat_q_wmma<GGML_TYPE_Q8_0, 128, 128, 64, 4, 2, 1, 1, true, 4>(w->data, x->data, g_debug, (int) M, (int) N, (int) K, K, M,
-                ctx.stream(), mix);
+        if (out16 != nullptr) { MMQW_MIX(false, true); } else { MMQW_MIX(false, false); }
     }
+#undef MMQW_MIX
     return true;
 #endif
 }

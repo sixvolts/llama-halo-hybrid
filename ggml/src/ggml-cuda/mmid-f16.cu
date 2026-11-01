@@ -15,6 +15,7 @@
 #include "common.cuh"
 #include "mmid.cuh"
 #include "mmid-f16.cuh"
+#include "hc.cuh"
 
 #include <cstdint>
 #include <cstddef>
@@ -842,13 +843,20 @@ bool ggml_cuda_mmid_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src
   const int64_t n_used = ids->ne[0], n_tokens = ids->ne[1];
   const int64_t ne11 = src1->ne[1], ne12 = src1->ne[2];
   const int64_t n_rows = n_used*n_tokens;
-  ggml_cuda_pool_alloc<__half>  x16(ctx.pool(), ne11*ne12*k);
   ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_rows);
   ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_rows);
   ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
 
-  mmid_f16_convert_src1<<<(unsigned) (ne11*ne12), 256, 0, stream>>>((const char *) src1->data, x16.get(), k, ne11,
-                                                                    src1->nb[1], src1->nb[2]);
+  // the producer may have written this f16 copy already (hc.cu f16 side copies: the hc mix epilogue), the same conversion
+  // (allocated last: the pool frees in reverse order)
+  ggml_cuda_pool_alloc<__half>  x16(ctx.pool());
+  const __half * x16p = ggml_is_contiguous(src1) ? ggml_cuda_f16_side_find(ctx, src1) : nullptr;
+  if (x16p == nullptr) {
+    x16.alloc(ne11*ne12*k);
+    mmid_f16_convert_src1<<<(unsigned) (ne11*ne12), 256, 0, stream>>>((const char *) src1->data, x16.get(), k, ne11,
+                                                                      src1->nb[1], src1->nb[2]);
+    x16p = x16.get();
+  }
   const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
   const int sis1 = (int) ne11;   // rows of the contiguous F16 copy per token
   ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
@@ -866,8 +874,8 @@ bool ggml_cuda_mmid_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src
   }
   float * out = (float *) dst->data;
 #define MMID_F16_CASE(T) \
-  if (bn == 48) mmid_f16_launch<T, 48>(src0->data, x16.get(), tiles.get(), cap, bounds.get(), ids_src1.get(), ids_dst.get(), out, m, k, stream); \
-  else          mmid_f16_launch<T, 16>(src0->data, x16.get(), tiles.get(), cap, bounds.get(), ids_src1.get(), ids_dst.get(), out, m, k, stream);
+  if (bn == 48) mmid_f16_launch<T, 48>(src0->data, x16p, tiles.get(), cap, bounds.get(), ids_src1.get(), ids_dst.get(), out, m, k, stream); \
+  else          mmid_f16_launch<T, 16>(src0->data, x16p, tiles.get(), cap, bounds.get(), ids_src1.get(), ids_dst.get(), out, m, k, stream);
   switch (type) {
     case WeightType::kQ4_K: MMID_F16_CASE(WeightType::kQ4_K); break;
     case WeightType::kQ5_K: MMID_F16_CASE(WeightType::kQ5_K); break;
@@ -908,14 +916,19 @@ bool ggml_cuda_mmid_f16_moe(ggml_backend_cuda_context & ctx, const ggml_tensor *
   const int64_t n_rows = n_used*n_tokens;
   const int64_t m_down = down->src[0]->ne[1];
 
-  ggml_cuda_pool_alloc<__half>  x16(ctx.pool(), n_tokens*k);
   ggml_cuda_pool_alloc<__half>  act(ctx.pool(), n_rows*m);          // down's F16 input, row = token*n_used + slot
   ggml_cuda_pool_alloc<int32_t> in_g(ctx.pool(), n_rows), out_g(ctx.pool(), n_rows);
   ggml_cuda_pool_alloc<int32_t> in_d(ctx.pool(), n_rows), out_d(ctx.pool(), n_rows);
   ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1), bounds_d(ctx.pool(), n_experts + 1);
 
-  mmid_f16_convert_src1<<<(unsigned) n_tokens, 256, 0, stream>>>((const char *) src1->data, x16.get(), k, 1,
-                                                                src1->nb[1], src1->nb[2]);
+  ggml_cuda_pool_alloc<__half>  x16(ctx.pool());   // allocated last, as above
+  const __half * x16p = ggml_is_contiguous(src1) ? ggml_cuda_f16_side_find(ctx, src1) : nullptr;   // as above
+  if (x16p == nullptr) {
+    x16.alloc(n_tokens*k);
+    mmid_f16_convert_src1<<<(unsigned) n_tokens, 256, 0, stream>>>((const char *) src1->data, x16.get(), k, 1,
+                                                                  src1->nb[1], src1->nb[2]);
+    x16p = x16.get();
+  }
   const int si1 = (int) (ids->nb[1] / sizeof(int32_t));
   ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, in_g.get(), out_g.get(), bounds.get(),
       (int) n_experts, (int) n_tokens, (int) n_used, 1, si1, 1, /*write_inverse =*/ false, stream);
@@ -932,8 +945,8 @@ bool ggml_cuda_mmid_f16_moe(ggml_backend_cuda_context & ctx, const ggml_tensor *
     mmid_f16_tile_list<16><<<1, 1024, 0, stream>>>(bounds.get(), (int) n_experts, tiles.get(), cap);
   }
 #define MMID_F16_PAIR_CASE(T) \
-  if (bn == 48) mmid_f16_launch_pair<T, 48>(wg->data, wu->data, x16.get(), tiles.get(), cap, bounds.get(), in_g.get(), out_g.get(), act.get(), m, k, stream); \
-  else          mmid_f16_launch_pair<T, 16>(wg->data, wu->data, x16.get(), tiles.get(), cap, bounds.get(), in_g.get(), out_g.get(), act.get(), m, k, stream);
+  if (bn == 48) mmid_f16_launch_pair<T, 48>(wg->data, wu->data, x16p, tiles.get(), cap, bounds.get(), in_g.get(), out_g.get(), act.get(), m, k, stream); \
+  else          mmid_f16_launch_pair<T, 16>(wg->data, wu->data, x16p, tiles.get(), cap, bounds.get(), in_g.get(), out_g.get(), act.get(), m, k, stream);
   if (tg == WeightType::kQ4_K) { MMID_F16_PAIR_CASE(WeightType::kQ4_K) } else { MMID_F16_PAIR_CASE(WeightType::kQ5_K) }
 #undef MMID_F16_PAIR_CASE
 
