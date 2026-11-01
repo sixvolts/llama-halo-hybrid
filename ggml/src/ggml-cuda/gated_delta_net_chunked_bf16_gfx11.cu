@@ -54,9 +54,10 @@
 //   g,beta:[1,  H,   n_tokens, n_seqs] contiguous (scalar-per-head gate)
 //   state: [S_v, S_v, H, n_seqs] contiguous, stored transposed: state[v*S_v + k] = S[k][v]
 //   out:   attn [S_v, H, n_tokens, n_seqs] followed by the new state (K == 1: one slot)
-//   A_sc:  [n_chunks][H][n_seqs][64][64] bf16 row-major (the KKT inverse, unit-lower,
-//          decay folded in). The scan's fragment reads use the r4d [token][head][64] stride
-//          convention: A_sc[((chunk*64 + r)*H + h)*64 + c].
+//   A_sc:  [n_seqs][H][n_chunks][64][64] bf16 row-major (the KKT inverse, unit-lower,
+//          decay folded in), one contiguous 8 KiB tile per (seq, head, chunk), so kkt's stores
+//          and the scan's A reads are sequential (the r4d [chunk][token][head][64] order put the
+//          rows H*128 B apart: 6 KiB at Qwen3.8's H = 48, kkt -11% from the change).
 //
 // The v-head h reads q/k from k-head h % H_k (llama.cpp's GQA mapping) and g/beta from h.
 // Geometry is fixed to the target model: BT=64, KD=VD=S_v=128. Other S_v take the fp32 path.
@@ -249,7 +250,7 @@ gdn_bf16_kkt_cuda(
         const float * __restrict__ k,       // [S_v, H_k, T, N] fp32
         const float * __restrict__ g,       // [1, H, T, N] fp32
         const float * __restrict__ beta,    // [1, H, T, N] fp32
-        unsigned short * __restrict__ A_sc, // [n_chunks][H][n_seqs][64][64] bf16
+        unsigned short * __restrict__ A_sc, // [n_seqs][H][n_chunks][64][64] bf16
         int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1, int64_t sq2, int64_t sq3)
 {
@@ -415,9 +416,9 @@ gdn_bf16_kkt_cuda(
 
         // ---- store: one row of the inverse is 64 bf16, contiguous in HBM --------------------
         {
-            unsigned short * op = A_sc + ((int64_t) (c * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
-                                      + (int64_t) nq * ((n_tokens + GDN_BF16_BT - 1) / GDN_BF16_BT) * (GDN_BF16_BT * GDN_BF16_BT * H); // halo-hybrid: a sequence spans all its chunks (was one chunk: seq 1 overwrote seq 0)
-            const size_t orow = (size_t) H * GDN_BF16_BT;
+            unsigned short * op = A_sc + (((int64_t) nq * H + hv) * ((n_tokens + GDN_BF16_BT - 1) / GDN_BF16_BT) + c)
+                                      * (GDN_BF16_BT * GDN_BF16_BT);
+            const size_t orow = GDN_BF16_BT;
             for (int r = tid / 8; r < rows; r += GDN_BF16_KKT_NTHR / 8) {
                 const int c8 = (tid & 7) * 8;
                 *(uint4 *) (op + (size_t) r * orow + c8) = *(const uint4 *) (&s.A[r][c8]);
@@ -470,7 +471,7 @@ gdn_bf16_scan_cuda(
         const float * __restrict__ state_in,// [S_v, S_v, H, N] fp32, transposed: state[v][k]
         float * __restrict__ attn_out,      // [S_v, H, T, N] fp32
         float * __restrict__ state_out,     // [S_v, S_v, H, N] fp32
-        const unsigned short * __restrict__ A_sc,   // [n_chunks][H][n_seqs][64][64] bf16
+        const unsigned short * __restrict__ A_sc,   // [n_seqs][H][n_chunks][64][64] bf16
         int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
@@ -570,9 +571,8 @@ gdn_bf16_scan_cuda(
     for (int ci = 0; ci < nchunk; ++ci) {
         const int c0 = ci * GDN_BF16_BT, nval = min(GDN_BF16_BT, (int) n_tokens - c0);
         const int lim = nval - 1;
-        const unsigned short * ag = A_sc + ((int64_t) c0 * H + h) * GDN_BF16_BT
-                                        + (int64_t) nq * ((n_tokens + GDN_BF16_BT - 1) / GDN_BF16_BT) * (GDN_BF16_BT * GDN_BF16_BT * H); // halo-hybrid: a sequence spans all its chunks (was one chunk: seq 1 overwrote seq 0)
-        const size_t ars = (size_t) H * GDN_BF16_BT;
+        const unsigned short * ag = A_sc + (((int64_t) nq * H + h) * nchunk + ci) * (GDN_BF16_BT * GDN_BF16_BT);
+        const size_t ars = GDN_BF16_BT;
         const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
         const size_t qrs = (size_t) sq2;   // token stride of q (permuted-safe)
         const float * gbase = g + ((int64_t) nq * n_tokens + c0) * H + h;
