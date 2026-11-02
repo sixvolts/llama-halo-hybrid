@@ -621,7 +621,6 @@ gdn_bf16_scan_cuda(
                 GDN_BF16_PFSTORE(&s.D[vr0 + GDN_BF16_VRU * u][vc], vb[u]);
         }
         GDN_BAR();                                                   // (1)
-        GDN_BF16_PREFETCH(min(ci + 1, nchunk - 1));                  // issue next chunk's loads
 
         const float glast = s.ge[nval - 1];   // e^{g_last} (the state carry factor)
 
@@ -681,6 +680,9 @@ gdn_bf16_scan_cuda(
 
         }
 
+        // issue the next chunk's K/V loads behind the U/O/P loop, whose q reads they would otherwise queue ahead of
+        // (-11% per call at Qwen3.8's H = 48 once q/k/v are head-major; with 4 KiB-multiple strides it did nothing)
+        GDN_BF16_PREFETCH(min(ci + 1, nchunk - 1));
         float mxU = 0.0f;
         // ---- W = beta * (V - ge*U)  (beta folded here: (A*beta_col)@W == A@(beta_row*W)) ----
         {
