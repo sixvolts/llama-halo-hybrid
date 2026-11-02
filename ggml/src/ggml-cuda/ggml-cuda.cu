@@ -56,6 +56,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ple-conv.cuh"
+#include "ggml-cuda/qsa-mask.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -6174,6 +6175,126 @@ static int ggml_cuda_try_fuse_ple_conv(ggml_backend_cuda_context * cuda_ctx, ggm
     return m.i_end - i;
 }
 
+// halo-hybrid: qwen4exp's sparse KQ mask (qsa-mask.cuh): FILL(dup(kq_mask), -inf) and FILL(zeros, 0) in either order,
+//     SET_ROWS(zeros into the filled mask viewed as [1, n_kv, R, S], top_k) and ADD_inplace(that viewed back, kq_mask),
+//     as one launch (Qwen3.8 at 11K: ~1.3 ms of fills, scatter and add per layer and ubatch). The filled mask's memory
+//     is the output, so later readers of any view of it see the same bytes; only the zeros are never written.
+//     GGML_CUDA_NO_QSA_MASK=1 disables.
+struct ggml_cuda_qsa_mask_match {
+    const ggml_tensor * mask   = nullptr;   // kq_mask
+    const ggml_tensor * filled = nullptr;   // FILL(-inf), the output's memory
+    const ggml_tensor * zeros  = nullptr;   // FILL(0)
+    const ggml_tensor * rows   = nullptr;   // SET_ROWS
+    const ggml_tensor * idx    = nullptr;   // SET_ROWS's index view
+    const ggml_tensor * out    = nullptr;   // the ADD
+    int                 i_end  = -1;
+};
+
+static bool ggml_cuda_qsa_mask_disabled() {
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_QSA_MASK", false);
+    return disabled;
+}
+
+// structure only (safe before allocation)
+static bool ggml_cuda_qsa_mask_find(const ggml_cgraph * g, int i, ggml_cuda_qsa_mask_match & m) {
+    if (g->nodes[i]->op != GGML_OP_FILL) {
+        return false;
+    }
+    m = {};
+    const int jmax = std::min(g->n_nodes, i + 16);
+    for (int j = i; j < jmax; ++j) {
+        const ggml_tensor * t = g->nodes[j];
+        if (ggml_cuda_fuse_is_view(t)) {
+            continue;
+        }
+        if (t->op == GGML_OP_FILL) {
+            const float v = ggml_cuda_fuse_param_f32(t, 0);
+            if (t->type == GGML_TYPE_F32 && v == 0.0f && !std::signbit(v) && !m.zeros && ggml_is_contiguous(t)) {
+                // never written by the fused kernel: one reader (the SET_ROWS), not an output
+                if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_cuda_fuse_uses1(g, j)) {
+                    return false;
+                }
+                m.zeros = t;
+            } else if (t->type == GGML_TYPE_F16 && std::isinf(v) && v < 0.0f && !m.filled && t->src[0] &&
+                    t->src[0]->type == GGML_TYPE_F16 && ggml_are_same_layout(t, t->src[0]) && t->ne[2] == 1) {
+                m.filled = t;
+                m.mask   = t->src[0];
+            } else {
+                return false;
+            }
+        } else if (t->op == GGML_OP_SET_ROWS) {
+            const ggml_tensor * b = t->src[0];
+            const ggml_tensor * c = t->src[1];
+            const ggml_tensor * a = t->src[2];
+            const ggml_tensor * M = m.filled;
+            if (!m.zeros || !M || m.rows || b != m.zeros || !a || ggml_cuda_fuse_root(a) != M || t->type != GGML_TYPE_F16) {
+                return false;
+            }
+            // a: the filled mask as one-element rows [1, n_kv, R, S]
+            if (a->ne[0] != 1 || a->ne[1] != M->ne[0] || a->ne[2] != M->ne[1] || a->ne[3] != M->ne[3] ||
+                    a->nb[1] != M->nb[0] || a->nb[2] != M->nb[1] || a->nb[3] != M->nb[3] || a->view_offs != 0) {
+                return false;
+            }
+            if ((c->type != GGML_TYPE_I32 && c->type != GGML_TYPE_I64) || c->nb[0] != ggml_type_size(c->type) ||
+                    c->ne[0] != b->ne[1] || c->ne[3] != 1) {
+                return false;
+            }
+            m.rows = t;
+            m.idx  = c;
+        } else if (t->op == GGML_OP_ADD) {
+            const ggml_tensor * M = m.filled;
+            if (!m.rows || t->type != GGML_TYPE_F16 || !t->src[0] || t->src[0]->src[0] != m.rows ||
+                    ggml_cuda_fuse_root(t) != M || t->src[1] != m.mask || t->view_offs != 0 ||
+                    !ggml_are_same_shape(t, M) || t->nb[1] != M->nb[1] || t->nb[3] != M->nb[3]) {
+                return false;
+            }
+            m.out   = t;
+            m.i_end = j;
+            return ggml_cuda_fuse_views_belong(g, i, j, { M, ggml_cuda_fuse_root(m.idx) });
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+
+static int ggml_cuda_try_fuse_qsa_mask(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_qsa_mask_disabled()) {
+        return 0;
+    }
+    ggml_cuda_qsa_mask_match m;
+    if (!ggml_cuda_qsa_mask_find(cgraph, i, m)) {
+        return 0;
+    }
+    const ggml_tensor * M = m.filled;
+    if (M->ne[0] > ggml_cuda_qsa_mask_max_kv() || M->ne[3] > 65535 || !ggml_cuda_fuse_disjoint(M, m.mask) ||
+            !ggml_cuda_fuse_disjoint(M, ggml_cuda_fuse_root(m.idx))) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: %s too wide or overlapping its inputs, unfused path (logged once)\n", __func__, m.out->name);
+        }
+        return 0;
+    }
+    ggml_cuda_qsa_mask_args a = {};
+    a.mask    = (const half *) m.mask->data;
+    a.out     = (half *) M->data;
+    a.n_kv    = M->ne[0];
+    a.R       = M->ne[1];
+    a.S       = M->ne[3];
+    a.nb1     = M->nb[1];
+    a.nb3     = M->nb[3];
+    a.idx     = (const char *) m.idx->data;
+    a.idx_i64 = m.idx->type == GGML_TYPE_I64;
+    a.n_top   = m.idx->ne[0];
+    a.idx_ne1 = m.idx->ne[1];
+    a.idx_ne2 = m.idx->ne[2];
+    a.idx_nb1 = m.idx->nb[1];
+    a.idx_nb2 = m.idx->nb[2];
+    ggml_cuda_op_qsa_mask(*cuda_ctx, a);
+    return m.i_end - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -6242,6 +6363,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_CONT) {
         const int skip = ggml_cuda_try_fuse_ple_conv(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_FILL) {
+        const int skip = ggml_cuda_try_fuse_qsa_mask(cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
         }

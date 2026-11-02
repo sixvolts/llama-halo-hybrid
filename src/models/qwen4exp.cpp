@@ -1394,6 +1394,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    // the indexer first: the mask build below then lands in the graph as one run of nodes (FILL, FILL, SET_ROWS, ADD),
+    // which the CUDA backend fuses into one launch (qsa-mask.cuh)
+    ggml_build_forward_expand(gf, top_k);
+
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
