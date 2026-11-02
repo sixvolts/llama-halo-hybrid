@@ -23,11 +23,21 @@ struct ggml_cuda_gdn_conv_front_args {
     ggml_tensor       * l2;       // L2-normalised leading heads, contiguous [128, H, nt, 1]
     float               eps;
     bool                y_skip_l2;   // the l2-normalised heads' SiLU columns have no reader besides the norm: not written
+    bool                head_major;  // y_skip_l2 and the GDN scan is the only reader: the SiLU V heads and the l2 output are
+                                     // written head-major ([head][nt][128]) in their own memory (ggml_cuda_gdn_head_major)
     int                 n_dst;    // rollback slots
     float             * dst[GDN_CONV_FRONT_MAX_DST];    // contiguous [(d_conv-1)*C] each
     int                 s_idx[GDN_CONV_FRONT_MAX_DST];  // first conv_input column copied into dst[k]
 };
 
+// where the conv front writes: token / head strides in floats; y is offset so that y + h*y_hs + t*y_ts is V head h
+struct ggml_cuda_gdn_conv_front_out {
+    float * y;
+    int64_t y_ts, y_hs;
+    float * l2;
+    int64_t l2_ts, l2_hs;
+};
+ggml_cuda_gdn_conv_front_out ggml_cuda_gdn_conv_front_out_layout(const ggml_cuda_gdn_conv_front_args & a);
 bool ggml_cuda_gdn_conv_front_supported(int64_t d_conv, int64_t C, int64_t nt);
 void ggml_cuda_op_gdn_conv_front(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_front_args & args);
 // the same front for only the first d_conv-1 tokens of every `tile`-token block (the rest computed by the qkv GEMM's conv

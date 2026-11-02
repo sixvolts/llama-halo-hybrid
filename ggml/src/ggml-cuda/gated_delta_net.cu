@@ -848,12 +848,31 @@ static void ggml_cuda_op_gated_delta_net_impl(
     GGML_ASSERT(ggml_is_contiguous(src_state));
 
     // strides in floats (beta strides used for both g and beta offset computation)
-    const int64_t sq1 = nbq1 / sizeof(float);
-    const int64_t sq2 = nbq2 / sizeof(float);
-    const int64_t sq3 = nbq3 / sizeof(float);
-    const int64_t sv1 = nbv1 / sizeof(float);
-    const int64_t sv2 = nbv2 / sizeof(float);
-    const int64_t sv3 = nbv3 / sizeof(float);
+    int64_t sq1 = nbq1 / sizeof(float);
+    int64_t sq2 = nbq2 / sizeof(float);
+    int64_t sq3 = nbq3 / sizeof(float);
+    int64_t sv1 = nbv1 / sizeof(float);
+    int64_t sv2 = nbv2 / sizeof(float);
+    int64_t sv3 = nbv3 / sizeof(float);
+
+    // q/k/v written head-major by the conv front ([head][nt][S_v], one sequence): every path below reads through these
+    const ggml_cuda_gdn_qkv * qkv = nullptr;
+    ggml_cuda_gdn_qkv qkv_hm;
+    for (auto & e : ctx.gdn_head_major) {
+        if (e.gdn == dst) {
+            GGML_ASSERT(e.nt == n_tokens && n_seqs == 1 && neq3 == 1);
+            const int64_t hs = n_tokens * S_v;
+            q_d = e.qk;
+            k_d = e.qk + neqk1 * hs;
+            v_d = e.v;
+            sq1 = hs; sq2 = S_v; sq3 = 2 * neqk1 * hs;
+            sv1 = hs; sv2 = S_v; sv3 = H * hs;
+            qkv_hm = { q_d, k_d, v_d, sq1, sq2, sq3, sv1, sv2, sv3 };
+            qkv = &qkv_hm;
+            e = {};
+            break;
+        }
+    }
     const int64_t sb1 = nbb1 / sizeof(float);
     const int64_t sb2 = nbb2 / sizeof(float);
     const int64_t sb3 = nbb3 / sizeof(float);
@@ -917,8 +936,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
         ggml_cuda_pool_alloc<float> state_mid(ctx.pool());
         float * state_main = n_tail > 0 ? state_mid.alloc((size_t) S_v * S_v * H * n_seqs) : state_d;
+        GGML_ASSERT(qkv == nullptr || GGML_CUDA_CC_IS_RDNA3(cc));   // the gfx12 kernels read the tensors' strides
         const bool ok = GGML_CUDA_CC_IS_RDNA4(cc) ? ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_main, n_main, s_plain)
-                                                  : ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, state_main, n_main, s_plain);
+                                                  : ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, state_main, n_main, s_plain, qkv);
         if (ok) {
             if (n_tail == 0) {
                 return;

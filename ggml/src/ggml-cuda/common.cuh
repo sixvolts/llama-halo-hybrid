@@ -1499,6 +1499,16 @@ struct ggml_backend_cuda_context {
         const ggml_tensor * rows = nullptr; // the deferred GGML_OP_GET_ROWS
     } gdn_state_gather[GDN_STATE_GATHER_SLOTS];
 
+    // halo-hybrid: gated_delta_nets whose q/k (the l2 output) and v (the SiLU output's V heads) the conv front wrote
+    // head-major, [head][nt][128], in those tensors' own memory (ggml_cuda_gdn_head_major_find): token strides that are
+    // multiples of 4 KiB cost the gfx11 bf16 scan ~30%. Consumed by the recurrence, cleared per evaluation.
+    struct gdn_head_major_entry {
+        const ggml_tensor * gdn = nullptr;  // consumer
+        const float *       qk  = nullptr;  // q heads, then the k heads
+        const float *       v   = nullptr;
+        int64_t             nt  = 0;
+    } gdn_head_major[GDN_STATE_GATHER_SLOTS];
+
     // q8_1 side copies of single-row f32 activations, written by the fused kernels in hc.cu in the
     // same launch that produces the f32 value, and consumed by mul_mat_vec_q instead of a separate
     // quantize launch. Keyed by data pointer, validated against the producing tensor; reset per

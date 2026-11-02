@@ -927,7 +927,8 @@ static bool launch_gdn_bf16_scan(
         neqk1_magic, rq3_magic, scale, state_seq_stride);
 }
 
-bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext, int64_t n_tokens_limit, const float * s_d_ext) {
+bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext, int64_t n_tokens_limit, const float * s_d_ext,
+        const ggml_cuda_gdn_qkv * qkv) {
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
     ggml_tensor * src_v     = dst->src[2];
@@ -953,9 +954,9 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
     const int64_t neqk1 = neq1;
     const int64_t rq3 = nev3 / neq3;
 
-    const float * q_d = (const float *) src_q->data;
-    const float * k_d = (const float *) src_k->data;
-    const float * v_d = (const float *) src_v->data;
+    const float * q_d = qkv ? qkv->q : (const float *) src_q->data;
+    const float * k_d = qkv ? qkv->k : (const float *) src_k->data;
+    const float * v_d = qkv ? qkv->v : (const float *) src_v->data;
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
     const float * s_d = s_d_ext ? s_d_ext : (const float *) src_state->data; // halo-hybrid: a gathered state row
@@ -964,12 +965,12 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
     // state_d_ext: fused-cache slot base when the GDN->cpy is fused (K == 1: single slot)
     float * state_d   = state_d_ext ? state_d_ext : dst_d + S_v * H * n_tokens * n_seqs;   // K == 1: single slot
 
-    const int64_t sq1 = nbq1 / sizeof(float);
-    const int64_t sq2 = nbq2 / sizeof(float);
-    const int64_t sq3 = nbq3 / sizeof(float);
-    const int64_t sv1 = nbv1 / sizeof(float);
-    const int64_t sv2 = nbv2 / sizeof(float);
-    const int64_t sv3 = nbv3 / sizeof(float);
+    const int64_t sq1 = qkv ? qkv->sq1 : nbq1 / sizeof(float);
+    const int64_t sq2 = qkv ? qkv->sq2 : nbq2 / sizeof(float);
+    const int64_t sq3 = qkv ? qkv->sq3 : nbq3 / sizeof(float);
+    const int64_t sv1 = qkv ? qkv->sv1 : nbv1 / sizeof(float);
+    const int64_t sv2 = qkv ? qkv->sv2 : nbv2 / sizeof(float);
+    const int64_t sv3 = qkv ? qkv->sv3 : nbv3 / sizeof(float);
 
     const float scale = 1.0f / sqrtf((float) S_v);
     const int64_t state_seq_stride = H * S_v * S_v;

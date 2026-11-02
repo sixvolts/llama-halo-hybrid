@@ -5370,6 +5370,85 @@ static bool ggml_cuda_gdn_conv_front_qk_unread(const ggml_cgraph * g, const ggml
     return true;
 }
 
+// halo-hybrid: q/k and v of the recurrence head-major ([head][nt][128]) at prefill widths on RDNA3. In-model their token
+//     strides are the l2 output's and the SiLU output's rows (16 KiB and 40 KiB on Qwen3.8), multiples of 4 KiB: the
+//     gfx11 bf16 scan's 64-token tiles then camp on a few memory channels (scan 3.63 -> 2.58 ms, kkt 1.29 -> 0.46 ms per
+//     4096-token call with the layouts moved). The conv front writes both layouts in the tensors' own memory when one
+//     gated_delta_net is the only reader of the l2 output and of the SiLU output past the Q/K heads (y_skip_l2: nothing
+//     reads those), reading q, k and v as the plain views qwen4exp builds, for one sequence. GGML_CUDA_NO_GDN_HEAD_MAJOR=1
+//     disables.
+static const ggml_tensor * ggml_cuda_gdn_head_major_find(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * g,
+        const ggml_cuda_gdn_conv_front_match & m) {
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_GDN_HEAD_MAJOR", false);
+    const ggml_tensor * silu = m.silu;
+    const ggml_tensor * l2   = m.l2;
+    if (disabled || !GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[cuda_ctx->device].cc) || (l2->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            (silu->flags & GGML_TENSOR_FLAG_OUTPUT) || silu->ne[2] != 1 || silu->ne[3] != 1 || l2->ne[1] % 2 != 0) {
+        return nullptr;
+    }
+    const int64_t nt  = silu->ne[1];
+    const int64_t hk  = l2->ne[1] / 2;
+    const size_t  row = GDN_CONV_FRONT_HEAD*sizeof(float);
+    const ggml_tensor * gdn = nullptr;
+    for (int p = m.i_l2 + 1; p < g->n_nodes; ++p) {
+        const ggml_tensor * node = g->nodes[p];
+        if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+            const ggml_tensor * t = node->src[s];
+            const bool of_l2 = t == l2 || t->view_src == l2, of_y = t == silu || t->view_src == silu;
+            if (!of_l2 && !of_y) {
+                continue;
+            }
+            if (node->op != GGML_OP_GATED_DELTA_NET || (gdn != nullptr && gdn != node) || t == l2 || t == silu ||
+                    (of_l2 && s != 0 && s != 1) || (of_y && s != 2)) {
+                return nullptr;
+            }
+            gdn = node;
+        }
+    }
+    if (gdn == nullptr) {
+        return nullptr;
+    }
+    const ggml_tensor * q = gdn->src[0], * k = gdn->src[1], * v = gdn->src[2];
+    const int64_t hv = silu->ne[0] / GDN_CONV_FRONT_HEAD - 2*hk;
+    auto plain = [&](const ggml_tensor * t, const ggml_tensor * base, int64_t heads, size_t offs) {
+        return t->view_src == base && t->type == GGML_TYPE_F32 && t->view_offs == offs && t->ne[0] == GDN_CONV_FRONT_HEAD &&
+               t->ne[1] == heads && t->ne[2] == nt && t->ne[3] == 1 && t->nb[0] == sizeof(float) && t->nb[1] == row &&
+               t->nb[2] == base->nb[1 + (base == l2)];
+    };
+    if (!plain(q, l2, hk, 0) || !plain(k, l2, hk, hk*row) || hv <= 0 || !plain(v, silu, hv, 2*hk*row) ||
+            silu->ne[0] != (2*hk + hv)*GDN_CONV_FRONT_HEAD) {
+        return nullptr;
+    }
+    return gdn;
+}
+
+// a free registry slot for gdn (nullptr: none, write the plain layout)
+static ggml_backend_cuda_context::gdn_head_major_entry * ggml_cuda_gdn_head_major_slot(ggml_backend_cuda_context * cuda_ctx,
+        const ggml_tensor * gdn) {
+    if (gdn == nullptr) {
+        return nullptr;
+    }
+    for (auto & e : cuda_ctx->gdn_head_major) {
+        if (e.gdn == nullptr) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+static void ggml_cuda_gdn_head_major_register(ggml_backend_cuda_context::gdn_head_major_entry * e, const ggml_tensor * gdn,
+        const ggml_cuda_gdn_conv_front_args & a) {
+    if (e != nullptr && a.head_major) {
+        e->gdn = gdn;
+        e->qk  = (const float *) a.l2->data;
+        e->v   = (const float *) a.y->data;
+        e->nt  = a.y->ne[1];
+    }
+}
+
 static int ggml_cuda_try_fuse_gdn_conv_front(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     if (ggml_cuda_gdn_conv_front_disabled()) {
         return 0;
@@ -5401,12 +5480,16 @@ static int ggml_cuda_try_fuse_gdn_conv_front(ggml_backend_cuda_context * cuda_ct
     a.eps    = ggml_get_op_params_f32(m.l2, 0);
     // prefill widths only: the reader scan walks the rest of the graph, a cost the decode kernel's few bytes don't repay
     a.y_skip_l2 = m.silu->ne[1] > GDN_CONV_FRONT_MAX_TOKENS && ggml_cuda_gdn_conv_front_qk_unread(cgraph, m);
+    const ggml_tensor * gdn = a.y_skip_l2 ? ggml_cuda_gdn_head_major_find(cuda_ctx, cgraph, m) : nullptr;
+    auto * hm = ggml_cuda_gdn_head_major_slot(cuda_ctx, gdn);
+    a.head_major = hm != nullptr;
     a.n_dst  = m.n_cpy;
     for (int k = 0; k < m.n_cpy; ++k) {
         a.dst[k]   = (float *) m.cpy[k]->src[1]->data;
         a.s_idx[k] = m.s_idx[k];
     }
     ggml_cuda_op_gdn_conv_front(*cuda_ctx, a);
+    ggml_cuda_gdn_head_major_register(hm, gdn, a);
     return m.i_l2 - i;
 }
 
@@ -5471,6 +5554,9 @@ static int ggml_cuda_try_fuse_gdn_conv_gemm(ggml_backend_cuda_context * cuda_ctx
     a.l2        = m.l2;
     a.eps       = ggml_get_op_params_f32(m.l2, 0);
     a.y_skip_l2 = ggml_cuda_gdn_conv_front_qk_unread(cgraph, m);
+    const ggml_tensor * gdn = a.y_skip_l2 ? ggml_cuda_gdn_head_major_find(cuda_ctx, cgraph, m) : nullptr;
+    auto * hm = ggml_cuda_gdn_head_major_slot(cuda_ctx, gdn);
+    a.head_major = hm != nullptr;
     a.n_dst     = m.n_cpy;
     for (int k = 0; k < m.n_cpy; ++k) {
         a.dst[k]   = (float *) m.cpy[k]->src[1]->data;
@@ -5479,6 +5565,7 @@ static int ggml_cuda_try_fuse_gdn_conv_gemm(ggml_backend_cuda_context * cuda_ctx
     if (!ggml_cuda_mul_mat_q_wmma_gdn_conv(*cuda_ctx, mm->src[0], mm->src[1], mm, a)) {
         return 0;
     }
+    ggml_cuda_gdn_head_major_register(hm, gdn, a);
     return m.i_l2 - i;
 }
 
@@ -7596,6 +7683,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             if (ggml_cuda_optimer::enabled() && !use_cuda_graph) { ggml_cuda_optimer_for(cuda_ctx->device).set_tag(cgraph); }
             for (auto & e : cuda_ctx->gdn_state_gather) { e = {}; } // deferrals never outlive one evaluation
+            for (auto & e : cuda_ctx->gdn_head_major) { e = {}; }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {

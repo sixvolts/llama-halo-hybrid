@@ -5167,10 +5167,32 @@ struct test_gdn_conv_front : public test_case {
     }
     static constexpr int64_t gemm_k = 1024;   // "gemm": C*gemm_k past the q8_0 WMMA pre-pass bound, the 128x128 tile
     bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    // "gdn", "gemm-gdn": a gated_delta_net reads q/k from the l2 output and v from the SiLU output (qwen4exp), so the
+    // backend may write both head-major (ggml_cuda_gdn_head_major_find); only the recurrence and the slots are compared
+    bool gdn() const { return mode == "gdn" || mode == "gemm-gdn"; }
+    bool gemm() const { return mode == "gemm" || mode == "gemm-gdn"; }
     double max_nmse_err() override {
-        return mode == "gemm" ? 5e-4 : 1e-7;   // the CPU reference quantizes the GEMM activations to q8_0
+        // the CPU reference quantizes the GEMM activations to q8_0; the RDNA bf16 recurrence (gdn_max_nmse)
+        return gemm() ? 5e-4 : gdn() ? 3e-5 : 1e-7;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -2.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (gdn()) {
+            std::vector<ggml_tensor *> v = { sum };
+            v.insert(v.end(), cpys.begin(), cpys.end());
+            return v;
+        }
         // the Q/K part of the SiLU output is dead at prefill (only the fused l2 reads it) and the backend may skip it;
         // its V part is checked through sum, and the whole tensor only when it is a graph output ("y-out")
         std::vector<ggml_tensor *> v = { l2_out, sum };
@@ -5189,7 +5211,7 @@ struct test_gdn_conv_front : public test_case {
         const int64_t ns = d_conv - 1;
         const int64_t hd = 128;
         ggml_tensor * x;
-        if (mode == "gemm") {
+        if (gemm()) {
             ggml_tensor * wqkv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, gemm_k, C);
             ggml_set_name(wqkv, "wqkv");
             ggml_tensor * act = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gemm_k, nt);
@@ -5244,9 +5266,30 @@ struct test_gdn_conv_front : public test_case {
         qk = ggml_l2_norm(ctx, qk, 1e-6f);
         ggml_set_name(qk, "qk_norm");
 
+        ggml_tensor * o = qk;
+        if (gdn()) {
+            // qwen4exp: q and k = the two halves of the normed heads, v = every head after them
+            GGML_ASSERT(H % 2 == 0 && C/hd > H);
+            const int64_t hk = H/2, hv = C/hd - H;
+            ggml_tensor * q = ggml_view_4d(ctx, qk, hd, hk, nt, 1, qk->nb[1], qk->nb[2], qk->nb[3], 0);
+            ggml_tensor * k = ggml_view_4d(ctx, qk, hd, hk, nt, 1, qk->nb[1], qk->nb[2], qk->nb[3], hk*qk->nb[1]);
+            ggml_tensor * v = ggml_view_4d(ctx, y, hd, hv, nt, 1, ggml_row_size(y->type, hd), nb1, nb1*nt,
+                    ggml_row_size(y->type, H*hd));
+            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, hv, nt, 1);
+            ggml_set_name(g, "g");
+            ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, hv, nt, 1);
+            ggml_set_name(beta, "beta");
+            ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, hd, hv, 1);
+            ggml_set_name(state, "state");
+            o = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+            ggml_set_name(o, "out");
+            y_out  = y;
+            l2_out = qk;
+            sum    = o;
+            return o;
+        }
         // consumer: the normed heads plus the first H heads after them (the V part in qwen4exp)
         const int64_t Hv = std::min<int64_t>(H, C/hd - H);
-        ggml_tensor * o = qk;
         if (Hv > 0) {
             o = ggml_view_4d(ctx, qk, hd, Hv, nt, 1, qk->nb[1], qk->nb[2], qk->nb[3], 0);
             ggml_tensor * v = ggml_view_4d(ctx, y, hd, Hv, nt, 1, ggml_row_size(y->type, hd), nb1, nb1*nt,
@@ -11173,6 +11216,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nt : {64, 200, 300}) {   // halo-hybrid: GDN conv front as the qkv GEMM epilogue (RDNA3, partial tiles)
         test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1, "gemm"));
         test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 3, "gemm"));   // rollback slots read raw x
+    }
+    for (int64_t nt : {64, 200, 300}) {   // halo-hybrid: the recurrence reading the conv front's outputs (head-major on RDNA3)
+        test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1, "gdn"));
+        test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 3, "gemm-gdn"));
+        test_cases.emplace_back(new test_gdn_conv_front(1280, 4, 4, nt, 2, "gdn"));      // 2 k heads, 6 v heads
     }
     // halo-hybrid: KDA conv-input assembly (one launch at decode on CUDA/HIP, nt <= 8; gated off at nt = 64)
     for (int64_t C : {24576, 300}) {

@@ -144,6 +144,8 @@ struct mmqw_mix_args {
     float *       conv_l2    = nullptr;   // l2 output of the leading conv_nh heads, rows conv_ls floats apart
     int64_t       conv_ys    = 0;
     int64_t       conv_ls    = 0;
+    int64_t       conv_yhs   = 0;         // head (128-channel) strides of conv_y / conv_l2 (128, or nt*128 head-major)
+    int64_t       conv_lhs   = 0;
     int           conv_nh    = 0;
     int           conv_raw   = 0;         // tokens >= conv_raw are also stored raw (the rollback slots read them)
     float         conv_eps   = 0.0f;
@@ -546,14 +548,14 @@ static __global__ void __launch_bounds__(32 * WN * WM) mul_mat_q_wmma(
                 const float * row = sx + (ns + t) * BM;
                 if (norm) {
                     const float scale = gdn_conv_l2_scale(row, lane, mix.conv_eps);
-                    float * o = mix.conv_l2 + (int64_t) n * mix.conv_ls + m0;
+                    float * o = mix.conv_l2 + (int64_t) n * mix.conv_ls + (m0 / BM) * mix.conv_lhs;
 #pragma unroll
                     for (int col = lane; col < BM; col += 32) {
                         o[col] = scale * row[col];
                     }
                 }
                 if (!norm || !mix.conv_yskip) {
-                    float * y = mix.conv_y + (int64_t) n * mix.conv_ys + m0;
+                    float * y = mix.conv_y + (int64_t) n * mix.conv_ys + (m0 / BM) * mix.conv_yhs;
 #pragma unroll
                     for (int col = lane; col < BM; col += 32) {
                         y[col] = row[col];
@@ -817,10 +819,13 @@ bool ggml_cuda_mul_mat_q_wmma_gdn_conv(ggml_backend_cuda_context & ctx, const gg
     }
     mmqw_mix_args mix = {};
     mix.conv_w     = (const float *) a.w->data;
-    mix.conv_y     = (float *) a.y->data;
-    mix.conv_ys    = a.y->nb[1] / sizeof(float);
-    mix.conv_l2    = (float *) a.l2->data;
-    mix.conv_ls    = a.l2->nb[2] / sizeof(float);
+    const ggml_cuda_gdn_conv_front_out o = ggml_cuda_gdn_conv_front_out_layout(a);
+    mix.conv_y     = o.y;
+    mix.conv_ys    = o.y_ts;
+    mix.conv_yhs   = o.y_hs;
+    mix.conv_l2    = o.l2;
+    mix.conv_ls    = o.l2_ts;
+    mix.conv_lhs   = o.l2_hs;
     mix.conv_nh    = (int) a.l2->ne[1];
     mix.conv_raw   = raw;
     mix.conv_eps   = a.eps;

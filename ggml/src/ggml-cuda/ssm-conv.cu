@@ -357,8 +357,8 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_f32
         const char * st, const int64_t nbs0, const int64_t nbs1,
         const char * __restrict__ x, const int64_t nbx_t,
         const float * __restrict__ w, const int64_t stride_w,
-        float * __restrict__ y, const int64_t stride_y,
-        float * __restrict__ l2, const int64_t l2_stride_t, const int n_heads, const bool y_skip_l2,
+        float * __restrict__ y, const int64_t stride_y, const int64_t y_hs,
+        float * __restrict__ l2, const int64_t l2_stride_t, const int64_t l2_hs, const int n_heads, const bool y_skip_l2,
         const int nt, const float eps, const int n_dst, const gdn_conv_front_dst out) {
     static_assert(GDN_CONV_FRONT_HEAD == 4*WARP_SIZE, "one head = four warps");
     constexpr int ns   = d_conv - 1;
@@ -405,7 +405,7 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_f32
         if (i < nt) {
             const float v = gdn_conv_silu<d_conv>(win + i, wr);
             if (!norm || !y_skip_l2) {
-                y[i*stride_y + c] = v;
+                y[i*stride_y + head*y_hs + tid] = v;
             }
             if (norm) {
                 s_y[i][tid] = v;
@@ -420,7 +420,7 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_f32
 
     const int warp = tid / WARP_SIZE;
     const int lane = tid % WARP_SIZE;
-    float * o = l2 + (int64_t) head*GDN_CONV_FRONT_HEAD;
+    float * o = l2 + head*l2_hs;
     for (int i = warp; i < nt; i += GDN_CONV_FRONT_HEAD / WARP_SIZE) {
         const float scale = gdn_conv_l2_scale(s_y[i], lane, eps);
 #pragma unroll
@@ -442,8 +442,8 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_lon
         const char * st, const int64_t nbs0, const int64_t nbs1,
         const char * __restrict__ x, const int64_t nbx_t,
         const float * __restrict__ w, const int64_t stride_w,
-        float * __restrict__ y, const int64_t stride_y,
-        float * __restrict__ l2, const int64_t l2_stride_t, const int n_heads, const bool y_skip_l2,
+        float * __restrict__ y, const int64_t stride_y, const int64_t y_hs,
+        float * __restrict__ l2, const int64_t l2_stride_t, const int64_t l2_hs, const int n_heads, const bool y_skip_l2,
         const int nt, const int cstride, const float eps, const int n_dst, const gdn_conv_front_dst out) {
     static_assert(GDN_CONV_FRONT_HEAD == 4*WARP_SIZE, "one head = four warps");
     constexpr int ns = d_conv - 1;
@@ -478,7 +478,7 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_lon
         win[ns] = xv(t0 + i);
         const float v = gdn_conv_silu<d_conv>(win, wr);
         if (!norm || !y_skip_l2) {
-            y[(int64_t) (t0 + i)*stride_y + c] = v;
+            y[(int64_t) (t0 + i)*stride_y + head*y_hs + tid] = v;
         }
         if (norm) {
             s_y[i][tid] = v;
@@ -513,7 +513,7 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_lon
 
     const int warp = tid / WARP_SIZE;
     const int lane = tid % WARP_SIZE;
-    float * o = l2 + (int64_t) head*GDN_CONV_FRONT_HEAD;
+    float * o = l2 + head*l2_hs;
     for (int i = warp; i < n; i += GDN_CONV_FRONT_HEAD / WARP_SIZE) {
         const float scale = gdn_conv_l2_scale(s_y[i], lane, eps);
 #pragma unroll
@@ -521,6 +521,29 @@ static __global__ void __launch_bounds__(GDN_CONV_FRONT_HEAD) gdn_conv_front_lon
             o[(int64_t) (t0 + i)*l2_stride_t + col] = scale * s_y[i][col];
         }
     }
+}
+
+ggml_cuda_gdn_conv_front_out ggml_cuda_gdn_conv_front_out_layout(const ggml_cuda_gdn_conv_front_args & a) {
+    const int64_t n_heads = a.l2->ne[1];
+    const int64_t nt      = a.y->ne[1];
+    ggml_cuda_gdn_conv_front_out o;
+    if (a.head_major) {
+        GGML_ASSERT(a.y_skip_l2);
+        // [head][nt][128]: V head h (>= n_heads) at y + (h - n_heads)*nt*128, l2 head h at l2 + h*nt*128
+        o.y_ts  = GDN_CONV_FRONT_HEAD;
+        o.y_hs  = nt*GDN_CONV_FRONT_HEAD;
+        o.y     = (float *) a.y->data - n_heads*o.y_hs;
+        o.l2_ts = GDN_CONV_FRONT_HEAD;
+        o.l2_hs = nt*GDN_CONV_FRONT_HEAD;
+    } else {
+        o.y_ts  = a.y->nb[1] / sizeof(float);
+        o.y_hs  = GDN_CONV_FRONT_HEAD;
+        o.y     = (float *) a.y->data;
+        o.l2_ts = a.l2->nb[2] / sizeof(float);
+        o.l2_hs = GDN_CONV_FRONT_HEAD;
+    }
+    o.l2 = (float *) a.l2->data;
+    return o;
 }
 
 bool ggml_cuda_gdn_conv_front_supported(int64_t d_conv, int64_t C, int64_t nt) {
@@ -543,6 +566,7 @@ void ggml_cuda_op_gdn_conv_front(ggml_backend_cuda_context & ctx, const ggml_cud
         out.s_idx[k] = a.s_idx[k];
     }
     const int n_heads = (int) a.l2->ne[1];
+    const ggml_cuda_gdn_conv_front_out o = ggml_cuda_gdn_conv_front_out_layout(a);
     const dim3 blocks(C / GDN_CONV_FRONT_HEAD, 1, 1);
     cudaStream_t stream = ctx.stream();
 #define GDN_CONV_FRONT_LAUNCH(DC) \
@@ -550,8 +574,7 @@ void ggml_cuda_op_gdn_conv_front(ggml_backend_cuda_context & ctx, const ggml_cud
         (const char *) a.states->data, a.states->nb[0], a.states->nb[1], \
         (const char *) a.xt->data, a.xt->nb[0], \
         (const float *) a.w->data, a.w->nb[1] / sizeof(float), \
-        (float *) a.y->data, a.y->nb[1] / sizeof(float), \
-        (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, a.y_skip_l2, \
+        o.y, o.y_ts, o.y_hs, o.l2, o.l2_ts, o.l2_hs, n_heads, a.y_skip_l2, \
         (int) nt, a.eps, a.n_dst, out)
     if (nt > GDN_CONV_FRONT_MAX_TOKENS) {
         const dim3 blocks_long(C / GDN_CONV_FRONT_HEAD, (nt + GDN_CONV_FRONT_LONG_T - 1) / GDN_CONV_FRONT_LONG_T, 1);
@@ -560,8 +583,7 @@ void ggml_cuda_op_gdn_conv_front(ggml_backend_cuda_context & ctx, const ggml_cud
             (const char *) a.states->data, a.states->nb[0], a.states->nb[1], \
             (const char *) a.xt->data, a.xt->nb[0], \
             (const float *) a.w->data, a.w->nb[1] / sizeof(float), \
-            (float *) a.y->data, a.y->nb[1] / sizeof(float), \
-            (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, a.y_skip_l2, \
+            o.y, o.y_ts, o.y_hs, o.l2, o.l2_ts, o.l2_hs, n_heads, a.y_skip_l2, \
             (int) nt, GDN_CONV_FRONT_LONG_T, a.eps, a.n_dst, out)
         if (d_conv == 4) {
             GDN_CONV_FRONT_LONG_LAUNCH(4);
@@ -592,6 +614,7 @@ void ggml_cuda_op_gdn_conv_front_tiles(ggml_backend_cuda_context & ctx, const gg
         out.s_idx[k] = a.s_idx[k];
     }
     const int n_heads = (int) a.l2->ne[1];
+    const ggml_cuda_gdn_conv_front_out o = ggml_cuda_gdn_conv_front_out_layout(a);
     const dim3 blocks(C / GDN_CONV_FRONT_HEAD, (nt + tile - 1) / tile, 1);
     cudaStream_t stream = ctx.stream();
 #define GDN_CONV_FRONT_TILES_LAUNCH(DC) \
@@ -599,8 +622,7 @@ void ggml_cuda_op_gdn_conv_front_tiles(ggml_backend_cuda_context & ctx, const gg
         (const char *) a.states->data, a.states->nb[0], a.states->nb[1], \
         (const char *) a.xt->data, a.xt->nb[0], \
         (const float *) a.w->data, a.w->nb[1] / sizeof(float), \
-        (float *) a.y->data, a.y->nb[1] / sizeof(float), \
-        (float *) a.l2->data, a.l2->nb[2] / sizeof(float), n_heads, a.y_skip_l2, \
+        o.y, o.y_ts, o.y_hs, o.l2, o.l2_ts, o.l2_hs, n_heads, a.y_skip_l2, \
         (int) nt, tile, a.eps, a.n_dst, out)
     if (d_conv == 4) {
         GDN_CONV_FRONT_TILES_LAUNCH(4);

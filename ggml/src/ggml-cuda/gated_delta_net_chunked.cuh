@@ -12,4 +12,11 @@ static __inline__ bool ggml_cuda_kernel_launch_try(Kernel kernel, const ggml_cud
 
 bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0, const float * s_d_ext = nullptr);
 
-bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0, const float * s_d_ext = nullptr);
+// q/k/v base pointers and strides (floats) in place of the tensors' own, for a head-major layout (ggml_backend_cuda_context::gdn_head_major)
+struct ggml_cuda_gdn_qkv {
+    const float * q, * k, * v;
+    int64_t sq1, sq2, sq3, sv1, sv2, sv3;
+};
+
+bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0, const float * s_d_ext = nullptr,
+        const ggml_cuda_gdn_qkv * qkv = nullptr);

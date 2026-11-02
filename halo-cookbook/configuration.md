@@ -139,6 +139,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `GGML_CUDA_NO_GDN_CONV_FRONT_LONG=1` | the same conv front at prefill widths (the graph reordering and allocation dependencies stay: the baseline for an exactness check) |
 | `GGML_CUDA_NO_GDN_CONV_QK_SKIP=1` | the prefill conv front also writes the Q/K heads' SiLU output, which only its fused L2 norm reads (the baseline for an exactness check) |
 | `GGML_CUDA_NO_GDN_CONV_GEMM=1` | the prefill conv front as the qkv projection's GEMM epilogue on RDNA3 (x is then written only at the GEMM tiles' edges; off: the separate conv front kernel) |
+| `GGML_CUDA_NO_GDN_HEAD_MAJOR=1` | the prefill conv front writes q/k (the l2 output) and v (the SiLU output) in the plain token-major layout instead of head-major for the recurrence on RDNA3 (token strides that are multiples of 4 KiB cost the gfx11 bf16 scan ~25% and kkt ~65%) |
 | `GGML_CUDA_NO_PLE_CONV=1` | qwen4exp's PLE conv (per-tap transposed copies, multiplies, the add chain, SiLU and a copy) as the separate graph ops instead of one launch (the baseline for an exactness check) |
 | `GGML_CUDA_NO_QSA_MASK=1` | qwen4exp's sparse attention mask (fill with -inf, scatter zeros at the top-k cells, add the KQ mask) as the separate graph ops instead of one launch (the baseline for an exactness check) |
 | `GGML_CUDA_NO_NORM_MROPE=1` | the attention Q/K RMS norm, its weight and the mrope / imrope rotation as separate launches instead of one (the baseline for an exactness check) |
