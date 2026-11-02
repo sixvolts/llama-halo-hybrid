@@ -3171,10 +3171,19 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
+    // the fused kernel handles the norm/neox rope modes and (halo-hybrid) mrope / imrope (rope_multi's angle per section;
+    // not vision, whose pairs span the whole row). GGML_CUDA_NO_NORM_MROPE=1 keeps mrope / imrope unfused.
+    static const bool no_norm_mrope = ggml_env_flag("GGML_CUDA_NO_NORM_MROPE", false);
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    const bool mrope = mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE;
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && !(mrope && !no_norm_mrope)) {
         return false;
+    }
+    if (mrope) {
+        const int32_t * sect = (const int32_t *) rope->op_params + 11;
+        if (sect[0] <= 0 && sect[1] <= 0 && sect[2] <= 0) {
+            return false;
+        }
     }
 
     const int n_dims = ((const int32_t *) rope->op_params)[1];
