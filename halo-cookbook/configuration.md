@@ -139,6 +139,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `GGML_CUDA_NO_GDN_CONV_FRONT_LONG=1` | the same conv front at prefill widths (the graph reordering and allocation dependencies stay: the baseline for an exactness check) |
 | `GGML_CUDA_NO_GDN_CONV_QK_SKIP=1` | the prefill conv front also writes the Q/K heads' SiLU output, which only its fused L2 norm reads (the baseline for an exactness check) |
 | `GGML_CUDA_NO_GDN_CONV_GEMM=1` | the prefill conv front as the qkv projection's GEMM epilogue on RDNA3 (x is then written only at the GEMM tiles' edges; off: the separate conv front kernel) |
+| `GGML_CUDA_NO_PLE_CONV=1` | qwen4exp's PLE conv (per-tap transposed copies, multiplies, the add chain, SiLU and a copy) as the separate graph ops instead of one launch (the baseline for an exactness check) |
 | `GGML_CUDA_NO_GDN_OUT_FUSE=1` | the GDN output RMS norm, weight and sigmoid gate as one launch at prefill |
 | `GGML_CUDA_NO_KDA_CONV_L2=1` | conv + SiLU + Q/K l2 norms as one launch at decode |
 | `GGML_CUDA_NO_KDA_CONV_ROWS=1` | the KDA conv-input assembly (concats and state copies) as one launch at decode |

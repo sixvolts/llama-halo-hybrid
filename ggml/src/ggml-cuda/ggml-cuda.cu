@@ -55,6 +55,7 @@
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
+#include "ggml-cuda/ple-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -6002,6 +6003,177 @@ static bool ggml_cuda_try_f32_pair(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     return false;
 }
 
+// halo-hybrid: qwen4exp's PLE conv (ple-conv.cuh): per tap k CONT(TRANSPOSE(VIEW(p, start k))) * w_k (w_k a CONT of one
+//     column of the conv weight), the ADD chain over the taps, SILU and a CONT, as one launch that reads p once
+//     (Qwen3.8 at 4096 tokens: ~25 ms of copies and element-wise passes per PLE block -> ~2 ms). Starts at the first tap's
+//     CONT; every non-view node up to the final CONT must belong to the pattern and every intermediate have one reader.
+//     GGML_CUDA_NO_PLE_CONV=1 disables.
+struct ggml_cuda_ple_conv_match {
+    const ggml_tensor * p      = nullptr;
+    const ggml_tensor * out    = nullptr;   // the final CONT
+    int                 n_taps = 0;
+    int64_t             start[PLE_CONV_MAX_TAPS] = {};
+    const ggml_tensor * wv[PLE_CONV_MAX_TAPS]    = {};   // the weight column view the graph copies
+    int                 i_end  = -1;
+};
+
+static bool ggml_cuda_ple_conv_disabled() {
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_PLE_CONV", false);
+    return disabled;
+}
+
+// c = CONT(TRANSPOSE(VIEW(p))) with the view a token window [start, start + T) of every channel row of p
+static bool ggml_cuda_ple_conv_shift(const ggml_tensor * c, const ggml_tensor ** p, int64_t * start) {
+    if (c->op != GGML_OP_CONT || c->type != GGML_TYPE_F32 || !c->src[0] || c->src[0]->op != GGML_OP_TRANSPOSE) {
+        return false;
+    }
+    const ggml_tensor * v = c->src[0]->src[0];
+    if (!v || v->op != GGML_OP_VIEW || !v->src[0]) {
+        return false;
+    }
+    const ggml_tensor * pp = v->src[0];
+    if (pp->type != GGML_TYPE_F32 || pp->view_src || !ggml_is_contiguous(pp) || pp->ne[3] != 1 || v->ne[3] != 1 ||
+            v->nb[0] != sizeof(float) || v->nb[1] != pp->nb[1] || v->nb[2] != pp->nb[2] || v->ne[1] != pp->ne[1] ||
+            v->ne[2] != pp->ne[2] || v->view_offs % sizeof(float) != 0) {
+        return false;
+    }
+    const int64_t st = (int64_t) (v->view_offs / sizeof(float));
+    if (st + v->ne[0] > pp->ne[0] || c->ne[0] != v->ne[1] || c->ne[1] != v->ne[0] || c->ne[2] != v->ne[2]) {
+        return false;
+    }
+    *p     = pp;
+    *start = st;
+    return true;
+}
+
+// w = [RESHAPE(]CONT(VIEW(W))[)], the view one column of a weight leaf: returns the view, or nullptr
+static const ggml_tensor * ggml_cuda_ple_conv_weight(const ggml_tensor * w, int64_t C) {
+    while (w && w->op == GGML_OP_RESHAPE) {
+        w = w->src[0];
+    }
+    if (!w || w->op != GGML_OP_CONT || w->type != GGML_TYPE_F32 || !w->src[0] || w->src[0]->op != GGML_OP_VIEW) {
+        return nullptr;
+    }
+    const ggml_tensor * v = w->src[0];
+    if (v->type != GGML_TYPE_F32 || ggml_cuda_fuse_root(v)->op != GGML_OP_NONE || v->ne[0] != 1 || v->ne[1] != C ||
+            v->ne[2] != 1 || v->ne[3] != 1) {
+        return nullptr;
+    }
+    return v;
+}
+
+// structure only (safe before allocation); uses = false skips the reader counts (graph_optimize)
+static bool ggml_cuda_ple_conv_find(const ggml_cgraph * g, int i, ggml_cuda_ple_conv_match & m, bool uses) {
+    const ggml_tensor * c0 = g->nodes[i];
+    const ggml_tensor * p  = nullptr;
+    int64_t st = 0;
+    if (!ggml_cuda_ple_conv_shift(c0, &p, &st)) {
+        return false;
+    }
+    const int64_t C = c0->ne[0];
+    const ggml_tensor * shift = nullptr;   // the latest tap's shifted copy, waiting for its MUL
+    const ggml_tensor * term  = nullptr;   // the latest MUL after the first, waiting for its ADD
+    const ggml_tensor * acc   = nullptr;
+    const ggml_tensor * silu  = nullptr;
+    m = {};
+    m.p = p;
+    const int jmax = std::min(g->n_nodes, i + 128);
+    for (int j = i; j < jmax; ++j) {
+        const ggml_tensor * t = g->nodes[j];
+        if (ggml_cuda_fuse_is_view(t)) {
+            continue;
+        }
+        bool inner = true;   // an intermediate: one reader, not an output
+        if (t->op == GGML_OP_CONT && silu && t->src[0] == silu) {
+            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, c0)) {
+                return false;
+            }
+            m.out   = t;
+            m.i_end = j;
+            inner   = false;
+        } else if (t->op == GGML_OP_CONT && ggml_cuda_ple_conv_shift(t, &p, &st)) {
+            if (p != m.p || shift || term || silu || !ggml_are_same_shape(t, c0) || m.n_taps >= PLE_CONV_MAX_TAPS ||
+                    (m.n_taps > 0 && st < m.start[m.n_taps - 1])) {
+                return false;
+            }
+            shift = t;
+            m.start[m.n_taps] = st;
+        } else if (t->op == GGML_OP_CONT) {
+            // a weight column copy: checked when its MUL reads it
+            if (t->src[0] == nullptr || t->src[0]->op != GGML_OP_VIEW || ggml_nelements(t) != C) {
+                return false;
+            }
+        } else if (t->op == GGML_OP_MUL) {
+            const ggml_tensor * wv = ggml_cuda_ple_conv_weight(t->src[1], C);
+            if (!shift || t->src[0] != shift || !wv || t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, c0)) {
+                return false;
+            }
+            m.wv[m.n_taps++] = wv;
+            shift = nullptr;
+            if (acc) {
+                term = t;
+            } else {
+                acc = t;
+            }
+        } else if (t->op == GGML_OP_ADD) {
+            if (!term || t->src[0] != acc || t->src[1] != term || t->type != GGML_TYPE_F32) {
+                return false;
+            }
+            acc  = t;
+            term = nullptr;
+        } else if (ggml_cuda_fuse_unary(t, GGML_UNARY_OP_SILU)) {
+            if (!acc || term || shift || silu || t->src[0] != acc) {
+                return false;
+            }
+            silu = t;
+        } else {
+            return false;
+        }
+        if (inner && ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || (uses && !ggml_cuda_fuse_uses1(g, j)))) {
+            return false;
+        }
+        if (m.out) {
+            return m.n_taps >= 2;
+        }
+    }
+    return false;
+}
+
+static int ggml_cuda_try_fuse_ple_conv(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_ple_conv_disabled()) {
+        return 0;
+    }
+    ggml_cuda_ple_conv_match m;
+    if (!ggml_cuda_ple_conv_find(cgraph, i, m, /*uses =*/ true)) {
+        return 0;
+    }
+    if (!ggml_cuda_fuse_disjoint(m.out, m.p)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: %s overlaps the padded input, unfused path (logged once)\n", __func__, m.out->name);
+        }
+        return 0;
+    }
+    ggml_cuda_ple_conv_args a = {};
+    a.p      = (const float *) m.p->data;
+    a.L      = m.p->ne[0];
+    a.p_nb1  = m.p->nb[1];
+    a.p_nb2  = m.p->nb[2];
+    a.C      = m.out->ne[0];
+    a.T      = m.out->ne[1];
+    a.S      = m.out->ne[2];
+    a.n_taps = m.n_taps;
+    for (int k = 0; k < m.n_taps; ++k) {
+        a.start[k] = m.start[k];
+        a.w[k]     = (const char *) m.wv[k]->data;
+        a.w_nb[k]  = m.wv[k]->nb[1];
+    }
+    a.out = (float *) m.out->data;
+    ggml_cuda_op_ple_conv(*cuda_ctx, a);
+    return m.i_end - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -6063,6 +6235,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_CONCAT) {
         const int skip = ggml_cuda_try_fuse_kda_conv_l2(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
+    if (node->op == GGML_OP_CONT) {
+        const int skip = ggml_cuda_try_fuse_ple_conv(cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
         }
@@ -7540,6 +7719,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (mul && scale) {
                 params->add_alloc_dep(params->user_data, mm->src[1], scale);
                 params->add_alloc_dep(params->user_data, mul->src[0] == sig ? mul->src[1] : mul->src[0], scale);
+            }
+        }
+    }
+
+    // halo-hybrid: the fused PLE conv reads the padded input while it writes the final CONT, which the allocator could
+    // otherwise place in the input's memory once the last tap's copy has read it
+    if (!disable_fusion && !ggml_cuda_ple_conv_disabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_ple_conv_match m;
+            if (cgraph->nodes[i]->op == GGML_OP_CONT && ggml_cuda_ple_conv_find(cgraph, i, m, /*uses =*/ false)) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.p), const_cast<ggml_tensor *>(m.out));
+                i = m.i_end;
             }
         }
     }

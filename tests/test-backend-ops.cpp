@@ -5257,6 +5257,55 @@ struct test_gdn_conv_front : public test_case {
     }
 };
 
+// halo-hybrid: qwen4exp's PLE conv as llama_model_qwen4exp builds it: padded = concat(history, x^T, 0) with tokens on
+// ne[0], per tap k a CONT(TRANSPOSE(VIEW(padded))) at start hist - (kern-1-k)*dil times one weight column (a CONT of a
+// view), the left-to-right ADD chain, SILU and a CONT. The CUDA backend runs it as one launch (ggml_cuda_try_fuse_ple_conv).
+struct test_ple_conv : public test_case {
+    const int64_t C, T, kern, dil, S;
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "PLE_CONV";
+    }
+    std::string vars() override {
+        return VARS_TO_STR5(C, T, kern, dil, S);
+    }
+    bool run_whole_graph() override { return true; }   // node-by-node evaluation never reaches the fusion
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    test_ple_conv(int64_t C, int64_t T, int64_t kern = 4, int64_t dil = 3, int64_t S = 1)
+        : C(C), T(T), kern(kern), dil(dil), S(S) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hist = (kern - 1) * dil;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, T, S);
+        ggml_set_name(x, "normalized");
+        ggml_tensor * st = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hist, C, S);
+        ggml_set_name(st, "conv_state");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kern, C);
+        ggml_set_name(w, "ple_conv1d");
+
+        ggml_tensor * padded = ggml_concat(ctx, st, ggml_transpose(ctx, x), 0);
+        ggml_set_name(padded, "padded");
+
+        ggml_tensor * conv_out = nullptr;
+        for (int64_t k = 0; k < kern; ++k) {
+            const int64_t start = hist - (kern - 1 - k) * dil;
+            ggml_tensor * shifted = ggml_cont(ctx, ggml_transpose(ctx,
+                    ggml_view_3d(ctx, padded, T, C, S, padded->nb[1], padded->nb[2], ggml_row_size(padded->type, start))));
+            ggml_tensor * wk = ggml_cont(ctx, ggml_view_2d(ctx, w, 1, C, w->nb[1], k * w->nb[0]));
+            wk = ggml_reshape_1d(ctx, wk, C);
+            ggml_tensor * term = ggml_mul(ctx, shifted, wk);
+            conv_out = conv_out ? ggml_add(ctx, conv_out, term) : term;
+        }
+        conv_out = ggml_cont(ctx, ggml_silu(ctx, conv_out));
+        ggml_set_name(conv_out, "ple_conv_out");
+        out = conv_out;
+        return conv_out;
+    }
+};
+
 // halo-hybrid: glm5next DSA indexer pool compressor (build_indexer's new-pool branch) in GLM node order:
 // GET_ROWS(members) -> CONT(PERMUTE key), CONT(PERMUTE gate), CONT(TRANSPOSE ape) -> ADD -> SOFT_MAX -> MUL ->
 // SUM_ROWS -> SET_ROWS(pooled head of the same cache). The CUDA backend fuses the whole chain (kpool-compress.cu).
@@ -10966,6 +11015,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_conv_front(384, 3, 4, nt, 1));               // every head normed
         test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1, "y-out"));   // SiLU output read outside
         test_cases.emplace_back(new test_gdn_conv_front(384, 3, 4, nt, 1, "y-out"));
+    }
+    // halo-hybrid: qwen4exp PLE conv (one launch on CUDA/HIP at every width)
+    for (int64_t T : {1, 3, 64, 200}) {
+        test_cases.emplace_back(new test_ple_conv(10240, T));            // Qwen3.8-Flash-Next: 4 taps, dilation 3
+        test_cases.emplace_back(new test_ple_conv(300, T, 3, 2, 2));     // partial channel tile, two sequences
     }
     for (int64_t nt : {64, 200, 300}) {   // halo-hybrid: GDN conv front as the qkv GEMM epilogue (RDNA3, partial tiles)
         test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1, "gemm"));
