@@ -5312,6 +5312,44 @@ struct test_ple_conv : public test_case {
     }
 };
 
+// halo-hybrid: two bf16 GEMMs of one f32 input (qwen4exp's indexer q and k projections). The CUDA backend converts the
+// input to bf16 once (ggml_cuda_bf16_side); with write_between an in-place add rewrites the input between the GEMMs, so
+// the second must not reuse the first one's copy.
+struct test_bf16_shared_src1 : public test_case {
+    const int64_t k, n, m0, m1;
+    const bool write_between;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "BF16_SHARED_SRC1";
+    }
+    std::string vars() override {
+        return VARS_TO_STR5(k, n, m0, m1, write_between);
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_bf16_shared_src1(int64_t k, int64_t n, int64_t m0, int64_t m1, bool write_between)
+        : k(k), n(n), m0(m0), m1(m1), write_between(write_between) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * w0 = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, k, m0);
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, k, m1);
+        ggml_set_name(x, "x");
+        ggml_tensor * y0 = ggml_mul_mat(ctx, w0, x);
+        ggml_tensor * x1 = x;
+        if (write_between) {
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            x1 = ggml_add_inplace(ctx, ggml_view_2d(ctx, x, k, n, x->nb[1], 0), b);
+        }
+        ggml_tensor * y1 = ggml_mul_mat(ctx, w1, x1);
+        ggml_tensor * out = ggml_concat(ctx, y0, y1, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // halo-hybrid: qwen4exp's sparse KQ mask (build_attn_qsa): FILL(dup(kq_mask), -inf), FILL(zeros, 0), SET_ROWS of the
 // zeros at the top-k cells and ADD_inplace(kq_mask). The CUDA backend fuses the four (qsa-mask.cu); the output is f16
 // and must match exactly, with -inf at the unselected cells.
@@ -11122,6 +11160,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t T : {1, 3, 64, 200}) {
         test_cases.emplace_back(new test_ple_conv(10240, T));            // Qwen3.8-Flash-Next: 4 taps, dilation 3
         test_cases.emplace_back(new test_ple_conv(300, T, 3, 2, 2));     // partial channel tile, two sequences
+    }
+    // halo-hybrid: one bf16 copy of a shared GEMM input (and its invalidation by a write in between)
+    for (bool wb : {false, true}) {
+        test_cases.emplace_back(new test_bf16_shared_src1(256, 512, 128, 64, wb));
     }
     // halo-hybrid: qwen4exp sparse KQ mask (FILL, FILL, SET_ROWS, ADD as one launch on CUDA/HIP)
     test_cases.emplace_back(new test_qsa_mask(4096, 32, 2051));                       // Qwen3.8 width (top_k + r - 1)

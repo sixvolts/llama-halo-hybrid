@@ -33,6 +33,8 @@ void ggml_cuda_q8_side_reset(ggml_backend_cuda_context & ctx) {
     ctx.q8_side.clear();
     ctx.mmq_side_prod = nullptr;
     ctx.f16_side_prod = nullptr;
+    ctx.bf16_side_src = nullptr;
+    ctx.eval_graph    = nullptr;
     ctx.hc_xn_lazy.xn = nullptr;
     ctx.f32_pair_done = nullptr;
     ctx.q8_arena_used = 0;

@@ -780,6 +780,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(f16_side_buf));
     }
+    if (bf16_side_buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(bf16_side_buf));
+    }
     if (hc_rstd_buf != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(hc_rstd_buf));
@@ -1512,6 +1516,65 @@ static inline void ggml_cuda_clear_handled_blas_error() {
 #endif // defined(GGML_USE_HIP)
 }
 
+// halo-hybrid: see ggml_backend_cuda_context::bf16_side_*. The bf16 copy of src1 (contiguous f32) for a bf16 cuBLAS
+// GEMM: reused when the last copy is of the same bytes, made earlier in this graph on this stream, and no non-view node
+// since wrote over them; converted into the slot otherwise. nullptr = convert as usual (outside the evaluator, during
+// stream capture, allocation failure, GGML_CUDA_NO_BF16_SIDE=1). The conversion is the usual one, so reuse is exact.
+static const void * ggml_cuda_bf16_side(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, cudaStream_t stream) {
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_BF16_SIDE", false);
+    const ggml_cgraph * g = ctx.eval_graph;
+    const int           i = ctx.eval_node;
+    if (disabled || g == nullptr || i < 0 || i >= g->n_nodes || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) {
+        return nullptr;
+    }
+    const ggml_tensor * e = ctx.bf16_side_src;
+    if (e != nullptr && ctx.bf16_side_stream == ctx.curr_stream_no && ctx.bf16_side_node < i && e->data == src1->data &&
+            ggml_nelements(e) == ggml_nelements(src1) && ggml_is_contiguous(e)) {
+        bool clean = true;
+        for (int j = ctx.bf16_side_node + 1; clean && j < i; ++j) {
+            const ggml_tensor * t = g->nodes[j];
+            clean = ggml_cuda_fuse_is_view(t) || ggml_cuda_fuse_disjoint(t, src1);
+        }
+        if (clean) {
+            ctx.bf16_side_node = i;
+            return ctx.bf16_side_buf;
+        }
+    }
+    ctx.bf16_side_src = nullptr;
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(stream, &cs) != hipSuccess || cs != hipStreamCaptureStatusNone) {
+#else
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+#endif
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    const size_t need = (size_t) ggml_nelements(src1);
+    if (need > ctx.bf16_side_cap) {
+        ggml_cuda_set_device(ctx.device);
+        if (ctx.bf16_side_buf != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));   // the previous copy may still be read
+            CUDA_CHECK(cudaFree(ctx.bf16_side_buf));
+            ctx.bf16_side_buf = nullptr; ctx.bf16_side_cap = 0;
+        }
+        void * p = nullptr;
+        if (cudaMalloc(&p, need * sizeof(nv_bfloat16)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        ctx.bf16_side_buf = p; ctx.bf16_side_cap = need;
+    }
+    const auto convert_func = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+    GGML_ASSERT(convert_func != nullptr);
+    convert_func(src1->data, (nv_bfloat16 *) ctx.bf16_side_buf, ggml_nelements(src1), stream);
+    ctx.bf16_side_src    = src1;
+    ctx.bf16_side_node   = i;
+    ctx.bf16_side_stream = ctx.curr_stream_no;
+    return ctx.bf16_side_buf;
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1576,8 +1639,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
+    const void * src1_side = nullptr;
+    if constexpr (compute_type == GGML_TYPE_BF16) {
+        if (src1->type != compute_type) {
+            src1_side = ggml_cuda_bf16_side(ctx, src1, main_stream);
+        }
+    }
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
+    } else if (src1_side != nullptr) {
+        src1_ptr = (const cuda_t *) src1_side;   // contiguous: the strides above already describe the copy
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
@@ -7558,6 +7629,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 prev_i = i;
+                cuda_ctx->eval_graph = cgraph;
+                cuda_ctx->eval_node  = i;
 
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
@@ -7783,6 +7856,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    cuda_ctx->eval_graph = nullptr;   // the bf16 side copy (ggml_cuda_bf16_side) checks writes within one graph only
 
     return GGML_STATUS_SUCCESS;
 }

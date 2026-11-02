@@ -1533,6 +1533,18 @@ struct ggml_backend_cuda_context {
     size_t              f16_side_cap  = 0;          // elements
     const ggml_tensor * f16_side_prod = nullptr;
 
+    // halo-hybrid: the bf16 copy of an f32 input that several bf16 cuBLAS GEMMs read (qwen4exp's indexer q and k
+    // projections of one input): converted by the first, reused by the next while no node in between wrote over its
+    // source (ggml-cuda.cu, ggml_cuda_bf16_side). One slot, reset per graph. eval_graph / eval_node: the evaluator's
+    // current graph and node (nullptr outside ggml_cuda_graph_evaluate_and_capture's loop).
+    void *              bf16_side_buf    = nullptr;
+    size_t              bf16_side_cap    = 0;          // elements
+    const ggml_tensor * bf16_side_src    = nullptr;
+    int                 bf16_side_node   = -1;
+    int                 bf16_side_stream = -1;
+    const ggml_cgraph * eval_graph       = nullptr;
+    int                 eval_node        = -1;
+
     // halo-hybrid: a qwen4exp hc boundary that left its xn unwritten (ggml-cuda.cu, ggml_cuda_hc_xn_lazy): the hc down
     // GEMM reads the f16 side copy and the mix epilogue rebuilds xn from res and the per-stream rms scales in hc_rstd;
     // any other reader gets it materialised first. One at a time, reset per graph.

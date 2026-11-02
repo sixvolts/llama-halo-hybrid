@@ -143,6 +143,7 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `GGML_CUDA_NO_QSA_MASK=1` | qwen4exp's sparse attention mask (fill with -inf, scatter zeros at the top-k cells, add the KQ mask) as the separate graph ops instead of one launch (the baseline for an exactness check) |
 | `GGML_CUDA_NO_NORM_MROPE=1` | the attention Q/K RMS norm, its weight and the mrope / imrope rotation as separate launches instead of one (the baseline for an exactness check) |
 | `GGML_CUDA_NO_NORM_ROPE_WARP=1` | the fused norm + rope with one block per row instead of one warp per row (rows of up to 512 columns) |
+| `GGML_CUDA_NO_BF16_SIDE=1` | each bf16 cuBLAS GEMM converts its f32 input itself instead of reusing the previous GEMM's bf16 copy of the same input (qwen4exp's indexer q and k projections) |
 | `GGML_CUDA_NO_GDN_OUT_FUSE=1` | the GDN output RMS norm, weight and sigmoid gate as one launch at prefill |
 | `GGML_CUDA_NO_KDA_CONV_L2=1` | conv + SiLU + Q/K l2 norms as one launch at decode |
 | `GGML_CUDA_NO_KDA_CONV_ROWS=1` | the KDA conv-input assembly (concats and state copies) as one launch at decode |
