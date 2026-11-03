@@ -2,6 +2,7 @@
 #include "ggml-env.h"   // halo-hybrid
 
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <future>
 #include <memory>
@@ -794,7 +795,29 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
-    cur = build_lora_mm(head_w, cur, head_s);
+    // halo-hybrid: draft vocabulary (llama_set_draft_vocab). Byte-level BPE numbers tokens in merge order, so the head's
+    // first rows are the frequent tokens (98,304: ~99.8% of English prose and code) and the special tokens sit at the
+    // end; the head scores those two ranges in place (row i stays token i) and the rows between get -inf. Only the
+    // proposals change: the target verifies over the full vocabulary, so greedy output is unchanged and rejection
+    // sampling stays exact. The driver keeps the full head for requests whose recent tokens leave the subset
+    const int64_t n_rows = head_w->ne[1];
+    const int64_t dv_n   = cparams.draft_vocab_prefix;
+    const int64_t dv_t   = std::min<int64_t>(std::max<int64_t>(cparams.draft_vocab_tail, dv_n), n_rows);
+    // (a per-row output scale would need slicing as well: such heads keep every row)
+    if (dv_n > 0 && dv_n < dv_t && (head_s == nullptr || ggml_nelements(head_s) == 1)) {
+        ggml_tensor * w_pre = ggml_view_2d(ctx0, head_w, head_w->ne[0], dv_n, head_w->nb[1], 0);
+        ggml_tensor * logits = build_lora_mm(w_pre, cur, head_s);
+        ggml_tensor * pad = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dv_t - dv_n, cur->ne[1]);
+        pad = ggml_fill_inplace(ctx0, pad, -INFINITY);
+        logits = ggml_concat(ctx0, logits, pad, 0);
+        if (dv_t < n_rows) {
+            ggml_tensor * w_tail = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_rows - dv_t, head_w->nb[1], dv_t * head_w->nb[1]);
+            logits = ggml_concat(ctx0, logits, build_lora_mm(w_tail, cur, head_s), 0);
+        }
+        cur = logits;
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

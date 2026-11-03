@@ -1411,6 +1411,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // copy to dp.result, which ends this sequence's draft
     std::function<bool(llama_seq_id, common_speculative_draft_params &)> after_draft;
 
+    // halo-hybrid: draft vocabulary (--spec-draft-vocab, gufo's rule without the per-request table): a draft step scores
+    // the head's first dv_prefix rows and the special tokens from dv_tail on when every drafting sequence's last token is
+    // among them and at most one of its previous DV_WINDOW tokens is not; other text drafts over the whole vocabulary
+    static constexpr size_t DV_WINDOW = 32;
+    int32_t dv_prefix = 0;
+    int32_t dv_tail   = 0;
+    bool    dv_small  = false; // what the draft context is set to
+    size_t  n_dv_small = 0;
+    size_t  n_dv_full  = 0;
+
+    bool dv_in(llama_token id) const {
+        return id >= 0 && (id < dv_prefix || id >= dv_tail);
+    }
+
+    bool dv_fits(const common_speculative_draft_params & dp) const {
+        if (!dv_in(dp.id_last)) {
+            return false;
+        }
+        const llama_tokens & p = *dp.prompt;
+        int misses = 0;
+        for (size_t k = p.size() > DV_WINDOW ? p.size() - DV_WINDOW : 0; k < p.size(); ++k) {
+            misses += !dv_in(p[k]);
+        }
+        return misses <= 1;
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1485,6 +1511,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
+        {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_dft));
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            if (this->params.vocab > 0 && this->params.vocab < n_vocab && !chain_heads && !is_mem_shared) {
+                // the special tokens (chat, thinking and tool-call markers) close the vocabulary
+                int32_t tail = n_vocab;
+                while (tail > this->params.vocab &&
+                        (llama_vocab_get_attr(vocab, tail - 1) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNUSED))) {
+                    --tail;
+                }
+                dv_prefix = this->params.vocab;
+                dv_tail   = tail;
+                SPC_INF("MTP draft vocabulary: rows [0, %d) + [%d, %d) when the recent tokens fit\n", dv_prefix, dv_tail, n_vocab);
+            }
+        }
+
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         pending_pos.assign(n_seq, -1);
         verify_pos0.assign(n_seq, -1);
@@ -1520,6 +1562,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        static const bool dv_trace = ggml_env_flag("LLAMA_MTP_DV_TRACE", false);
+        if (dv_trace && dv_prefix > 0 && n_dv_small + n_dv_full > 0) {
+            SPC_INF("MTP draft vocabulary: %zu draft steps on the subset, %zu on the full head\n", n_dv_small, n_dv_full);
+            n_dv_small = n_dv_full = 0;
+        }
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
@@ -1755,6 +1802,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        if (dv_prefix > 0) {
+            bool small = true;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting && !dv_fits(dparams[seq_id])) {
+                    small = false;
+                    break;
+                }
+            }
+            if (small != dv_small) {
+                llama_set_draft_vocab(ctx_dft, small ? dv_prefix : 0, small ? dv_tail : 0);
+                dv_small = small;
+            }
+            (small ? n_dv_small : n_dv_full)++;
+        }
 
         batch.clear();
 

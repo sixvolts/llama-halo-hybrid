@@ -4388,6 +4388,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
+        {"--spec-draft-vocab"}, "N",
+        string_format("MTP drafts score only the first N vocabulary rows and the special tokens while the request's recent "
+            "tokens are among them, the full vocabulary otherwise; output is unchanged (default: %d, 0 = off)", params.speculative.draft.vocab),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("draft vocab must be >= 0");
+            }
+            params.speculative.draft.vocab = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-lookup-n-max"}, "N",
         string_format("tokens copied per draft by prompt-lookup speculative decoding (default: %d)", params.speculative.lookup.n_max),
         [](common_params & params, int value) {

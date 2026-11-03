@@ -21,6 +21,11 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // halo-hybrid: MTP draft vocabulary - the head scores rows [0, draft_vocab_prefix) and [draft_vocab_tail, n_vocab)
+    // only (0: all rows)
+    int32_t  draft_vocab_prefix = 0;
+    int32_t  draft_vocab_tail   = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

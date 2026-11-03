@@ -891,6 +891,11 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.draft_vocab_prefix != other.cparams.draft_vocab_prefix ||
+            cparams.draft_vocab_tail   != other.cparams.draft_vocab_tail) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

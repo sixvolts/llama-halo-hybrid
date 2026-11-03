@@ -100,6 +100,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// halo-hybrid: the MTP draft head scores only rows [0, prefix) and [tail, n_vocab) and gives the others -inf logits
+// (prefix 0: every row). Takes effect at the next decode; the draft driver decides per draft step
+LLAMA_API void llama_set_draft_vocab(struct llama_context * ctx, int32_t prefix, int32_t tail);
+
 // halo-hybrid: called from inside llama_decode, on the decoding thread, once the nextn rows of a ubatch are in host
 // memory. h_nextn is the batch's row buffer (row i = batch token i; the context must output unmasked nextn
 // embeddings, see llama_set_embeddings_nextn) and rows [0, i_first + n_tokens) are complete; i_first/n_tokens is

@@ -337,6 +337,8 @@ struct common_params_speculative_draft {
     // halo-hybrid
     int32_t n_max_sampled = 2; // sampled (T > 0) requests with an MTP draft draft at most this many tokens (0 = no cap)
     int32_t n_ubatch      = 0; // the draft context's n_ubatch (0 = the target's); not for block drafts (DFlash, DSpark)
+    int32_t vocab         = 0; // MTP draft head scores the first `vocab` rows + the special tokens when the request's
+                               // recent tokens are all among them (0 = always every row)
 
     common_params_model mparams;
 
