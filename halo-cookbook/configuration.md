@@ -27,6 +27,8 @@ the host whose device runs the kernel.
 | `--qsa-chunk-mb N` | `LLAMA_QSA_CHUNK_MB` | 2048 | Build the QSA indexer's prefill scratch (Qwen3.8 and other `qwen4exp` models) in chunks of at most N MiB per tensor, for ubatches holding one sequence. 256 fits 256K of context on a 32 GB card. 0 = no chunking. |
 | `--spec-draft-ubatch-size N` | `LLAMA_SPEC_DRAFT_UB` | 0 | Physical batch size of the draft context (0 = the target's `-ub`); the draft otherwise sizes its compute buffer for the target's ubatch although it runs one layer. Not for block drafts (DFlash, DSpark). |
 | `--spec-draft-n-max-sampled N` | `LLAMA_SPEC_NMAX_SAMPLED` | 2 | Sampled (T > 0) requests with an MTP draft draft at most N tokens; greedy requests use `--spec-draft-n-max`. 0 = no cap. |
+| `--spec-type prompt-lookup,draft-mtp` | — | off | Prompt lookup ahead of the MTP head: a draft that copies up to `--spec-lookup-n-max` (7) tokens from the prompt when the last tokens match at least `--spec-lookup-min-match` (12; 24 for sampled requests, prompt only, after a 5-token resume) prompt tokens; the MTP head drafts otherwise and its drafts are extended by copies. Lossless (point-mass draft probabilities under rejection sampling). |
+| `--spec-draft-vocab N` | — | 0 | The MTP head scores only the first N vocabulary rows plus the special tokens while the request's last 32 tokens hold at most one token outside them, the full head otherwise. Exact: the target verifies every draft. 98304 on Qwen3.8 (+7-10% APU-only prose decode). 0 = full head. |
 | `--checkpoint-min-new N` | `LLAMA_ARG_CHECKPOINT_MIN_NEW` | see `--help` | Skip the checkpoint (and the prompt split) at the last user message unless at least N new tokens follow it, so a short chat turn runs as one batch with one checkpoint. Models that use context checkpoints only. |
 
 Either form works. `--prefill-lanes` and `--qsa-chunk-mb` set their environment variable for the library, so the
@@ -269,6 +271,8 @@ They log at the library's INFO level, which `llama-server` and `llama-cli` show 
 | `LLAMA_QSA_LAYOUT_CHECK=1` | verify every cell of the shared-pool QSA layout |
 | `GGML_CUDA_HC_MIX_GEMM_CHECK=N` | compare the fused hc up projection + mix against the plain GEMM + k_hc_mix on the first N calls (host copies; disable graphs) |
 | `GGML_CUDA_HC_MIX_GEMM_DEBUG=1` | why a hc up projection did not take the fused WMMA mix |
+| `LLAMA_LOOKUP_TRACE=1` | every prompt-lookup copy: position, match length, accepted tokens |
+| `LLAMA_MTP_DV_TRACE=1` | per request, MTP drafts on the draft vocabulary vs the full head |
 | `GGML_RPC_SEND_TRACE=1` | phase timing of bulk RPC sends (8 MiB and more) |
 
 ## Unsafe diagnostic switches
