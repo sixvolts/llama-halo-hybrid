@@ -13608,6 +13608,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_score(16384, 1, 2, b));   // 2 streams
         test_cases.emplace_back(new test_qsa_score(2048, 1, 1, b));    // gfx1201 cliff: block 32
         test_cases.emplace_back(new test_qsa_score(701, 1, 3, b));     // odd rows, 3 streams
+        test_cases.emplace_back(new test_qsa_score(2560, 64, 1, b));   // prefill widths: the wide kernel
+        test_cases.emplace_back(new test_qsa_score(4103, 97, 1, b));   // partial key and query tiles
+        test_cases.emplace_back(new test_qsa_score(1030, 33, 2, b));   // 2 streams
         test_cases.emplace_back(new test_qsa_score(700, 3, 1, b));     // 12 columns: not fused
     }
     test_cases.emplace_back(new test_qsa_head_sum(701, 3, 33, true, true));

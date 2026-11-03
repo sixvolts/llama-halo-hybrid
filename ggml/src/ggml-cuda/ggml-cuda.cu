@@ -6001,7 +6001,9 @@ static int ggml_cuda_try_fuse_moe_tail(ggml_backend_cuda_context * cuda_ctx, ggm
 
 // halo-hybrid: qwen4exp's decode block scoring MUL_MAT(block keys, queries) -> RESHAPE -> QSA_HEAD_SUM as one kernel
 // (qsa-topk.cu ggml_cuda_qsa_score_fused), only where the unfused MUL_MAT runs mul_mat_vec_f, whose arithmetic it
-// replays: the result is bit-identical. GGML_CUDA_NO_QSA_SCORE=1 disables it.
+// replays: the result is bit-identical. At prefill widths (64+ query rows) the pair runs as ggml_cuda_qsa_score_fused_wide
+// instead (f32, another summation order than the MUL_MAT; GGML_CUDA_NO_QSA_SCORE_WIDE=1). GGML_CUDA_NO_QSA_SCORE=1
+// disables both.
 static int ggml_cuda_try_fuse_qsa_score(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_env_flag("GGML_CUDA_NO_QSA_SCORE", false);
     ggml_tensor * mm = cgraph->nodes[i];
@@ -6016,8 +6018,12 @@ static int ggml_cuda_try_fuse_qsa_score(ggml_backend_cuda_context * cuda_ctx, gg
     const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(k->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(k) != ggml_backend_buffer_get_alloc_size(k->buffer, k) && k->view_src;
-    if (bad_padding_clear || ggml_cuda_op_mul_mat_use_fwht(mm) ||
-            !ggml_cuda_should_use_mmvf(k->type, cc, warp_size, k->ne, k->nb, q->ne[1])) {
+    if (ggml_cuda_op_mul_mat_use_fwht(mm)) {
+        return 0;
+    }
+    // vec: the decode kernel (bit-identical to mul_mat_vec_f); otherwise prefill widths take the wide kernel
+    const bool vec = !bad_padding_clear && ggml_cuda_should_use_mmvf(k->type, cc, warp_size, k->ne, k->nb, q->ne[1]);
+    if (!vec && q->ne[1] < 64) {
         return 0;
     }
     const int j = ggml_cuda_fuse_next(cgraph, i + 1);
@@ -6040,12 +6046,29 @@ static int ggml_cuda_try_fuse_qsa_score(ggml_backend_cuda_context * cuda_ctx, gg
         }
     }
     // the fused kernel writes the head sum while it reads the keys, queries and bias: the allocator may have put the
-    // head sum's output over a buffer the unfused graph had finished with (the queries)
-    if (!ggml_cuda_fuse_disjoint(hs, k) || !ggml_cuda_fuse_disjoint(hs, q) || (hs->src[1] && !ggml_cuda_fuse_disjoint(hs, hs->src[1]))) {
+    // head sum's output over a buffer the unfused graph had finished with (the queries). At prefill widths the kernel
+    // then writes into the MUL_MAT's own (larger, dead) scores buffer and the head sum is copied out.
+    const ggml_tensor * bias = hs->src[1];
+    const bool clash = !ggml_cuda_fuse_disjoint(hs, k) || !ggml_cuda_fuse_disjoint(hs, q) || (bias && !ggml_cuda_fuse_disjoint(hs, bias));
+    if (vec) {
+        if (clash || !ggml_cuda_qsa_score_fused(*cuda_ctx, mm, hs)) {
+            return 0;
+        }
+        return j - i;
+    }
+    float * scratch = nullptr;
+    if (clash) {
+        if (!ggml_is_contiguous(hs) || ggml_nbytes(mm) < ggml_nbytes(hs) || !ggml_cuda_fuse_disjoint(mm, k) ||
+                !ggml_cuda_fuse_disjoint(mm, q) || (bias && !ggml_cuda_fuse_disjoint(mm, bias))) {
+            return 0;
+        }
+        scratch = (float *) mm->data;
+    }
+    if (!ggml_cuda_qsa_score_fused_wide(*cuda_ctx, mm, hs, scratch)) {
         return 0;
     }
-    if (!ggml_cuda_qsa_score_fused(*cuda_ctx, mm, hs)) {
-        return 0;
+    if (scratch != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(hs->data, scratch, ggml_nbytes(hs), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
     }
     return j - i;
 }

@@ -12,3 +12,8 @@ void ggml_cuda_op_qsa_head_sum(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 // bit-identical to the two ops (see qsa-topk.cu). mm: the MUL_MAT node, hs: the QSA_HEAD_SUM over its reshaped
 // result. Returns false (nothing launched) for shapes it does not cover.
 bool ggml_cuda_qsa_score_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * hs);
+
+// halo-hybrid: the same pair at prefill widths (at least 16 queries per stream), f32 with a different summation order
+// than the unfused MUL_MAT (see qsa-topk.cu). GGML_CUDA_NO_QSA_SCORE_WIDE=1 disables it.
+// out: where to write the head sum in hs's (contiguous) layout, nullptr = hs itself
+bool ggml_cuda_qsa_score_fused_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * hs, float * out = nullptr);

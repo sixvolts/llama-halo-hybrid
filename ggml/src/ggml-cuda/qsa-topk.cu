@@ -552,3 +552,152 @@ bool ggml_cuda_qsa_score_fused(ggml_backend_cuda_context & ctx, const ggml_tenso
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// halo-hybrid: the same MUL_MAT -> RESHAPE -> QSA_HEAD_SUM at prefill widths (a ubatch of queries against every block).
+// Unfused, the MUL_MAT writes [n_blocks, 4 heads, n_tok] f32 scores (2 GiB per layer for 4096 queries at 128K) that
+// QSA_HEAD_SUM reads back: 10.8% + 2.8% of an APU-only 128K prefill. Here a block owns QSA_SW_BK blocks x QSA_SW_BT
+// queries (all 4 heads), stages K and Q in LDS QSA_SW_KS dims at a time and writes only the head sum.
+// f32 throughout; each dot product is a sequential fmaf chain over the 128 dims, so it differs from the unfused
+// MUL_MAT (rocBLAS) only in summation order. The relu, head order and bias add are QSA_HEAD_SUM's.
+// GGML_CUDA_NO_QSA_SCORE_WIDE=1 disables it.
+#define QSA_SW_BK 64   // blocks (keys) per tile: 16 lanes x 4
+#define QSA_SW_BT 32   // queries per tile: 16 rows x 2
+#define QSA_SW_KS 32   // dims per LDS step
+#define QSA_SW_NH 4
+
+template <bool has_bias>
+static __global__ void __launch_bounds__(256) k_qsa_score_wide(
+        const float * __restrict__ K, const float * __restrict__ Q, const float * __restrict__ bias, float * __restrict__ dst,
+        const int n_blocks, const int n_tok,
+        const int64_t sk1, const int64_t sk2, const int64_t sq1, const int64_t sq2,
+        const int64_t sb1, const int64_t sb2, const int64_t sd1, const int64_t sd2, const bool vec_out) {
+    constexpr int D = 128;
+    __shared__ __attribute__((aligned(16))) float sK[QSA_SW_KS][QSA_SW_BK + 4];
+    __shared__ __attribute__((aligned(16))) float sQ[QSA_SW_KS][QSA_SW_BT*QSA_SW_NH + 4];
+
+    const int tid = threadIdx.x;
+    const int tx  = tid % 16;   // keys tx*4 .. tx*4 + 3
+    const int ty  = tid / 16;   // queries ty and ty + 16
+    const int b0  = blockIdx.x*QSA_SW_BK;
+    const int t0  = blockIdx.y*QSA_SW_BT;
+    const int s   = blockIdx.z;
+    const float * Ks = K + s*sk2;
+    const float * Qs = Q + s*sq2;
+
+    float acc[4][2][QSA_SW_NH];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int h = 0; h < QSA_SW_NH; ++h) acc[i][j][h] = 0.0f;
+
+    for (int k0 = 0; k0 < D; k0 += QSA_SW_KS) {
+#pragma unroll
+        for (int l = tid; l < QSA_SW_BK*QSA_SW_KS/4; l += 256) {
+            const int key = l / (QSA_SW_KS/4);
+            const int kq  = (l % (QSA_SW_KS/4))*4;
+            const int b   = min(b0 + key, n_blocks - 1);
+            const float4 v = *(const float4 *) (Ks + b*sk1 + k0 + kq);
+            sK[kq + 0][key] = v.x; sK[kq + 1][key] = v.y; sK[kq + 2][key] = v.z; sK[kq + 3][key] = v.w;
+        }
+#pragma unroll
+        for (int l = tid; l < QSA_SW_BT*QSA_SW_NH*QSA_SW_KS/4; l += 256) {
+            const int col = l / (QSA_SW_KS/4);
+            const int kq  = (l % (QSA_SW_KS/4))*4;
+            const int t   = min(t0 + col/QSA_SW_NH, n_tok - 1);
+            const float4 v = *(const float4 *) (Qs + (int64_t) (t*QSA_SW_NH + col%QSA_SW_NH)*sq1 + k0 + kq);
+            sQ[kq + 0][col] = v.x; sQ[kq + 1][col] = v.y; sQ[kq + 2][col] = v.z; sQ[kq + 3][col] = v.w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < QSA_SW_KS; ++kk) {
+            const float4 a  = *(const float4 *) &sK[kk][tx*4];
+            const float4 q0 = *(const float4 *) &sQ[kk][ty*QSA_SW_NH];
+            const float4 q1 = *(const float4 *) &sQ[kk][(ty + 16)*QSA_SW_NH];
+            const float av[4] = {a.x, a.y, a.z, a.w};
+            const float qv[2][4] = {{q0.x, q0.y, q0.z, q0.w}, {q1.x, q1.y, q1.z, q1.w}};
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j)
+#pragma unroll
+                    for (int h = 0; h < QSA_SW_NH; ++h) acc[i][j][h] = fmaf(av[i], qv[j][h], acc[i][j][h]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int t = t0 + ty + 16*j;
+        if (t >= n_tok) {
+            continue;
+        }
+        float o[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            // QSA_HEAD_SUM's order: relu per head, heads in order, then the bias
+            float v = fmaxf(acc[i][j][0], 0.0f);
+#pragma unroll
+            for (int h = 1; h < QSA_SW_NH; ++h) {
+                v = v + fmaxf(acc[i][j][h], 0.0f);
+            }
+            o[i] = v;
+        }
+        const int b = b0 + tx*4;
+        if (vec_out && b + 4 <= n_blocks) {
+            if (has_bias) {
+                const float4 bb = *(const float4 *) (bias + t*sb1 + s*sb2 + b);
+                o[0] = o[0] + bb.x; o[1] = o[1] + bb.y; o[2] = o[2] + bb.z; o[3] = o[3] + bb.w;
+            }
+            *(float4 *) (dst + t*sd1 + s*sd2 + b) = make_float4(o[0], o[1], o[2], o[3]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                if (b + i < n_blocks) {
+                    dst[t*sd1 + s*sd2 + b + i] = has_bias ? o[i] + bias[t*sb1 + s*sb2 + b + i] : o[i];
+                }
+            }
+        }
+    }
+}
+
+bool ggml_cuda_qsa_score_fused_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * hs, float * out) {
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_QSA_SCORE_WIDE", false);
+    const ggml_tensor * k    = mm->src[0];
+    const ggml_tensor * q    = mm->src[1];
+    const ggml_tensor * x    = hs->src[0];   // the reshaped scores [n_blocks, nh, n_tok, ns]
+    const ggml_tensor * bias = hs->src[1];
+    const int64_t NC = q->ne[1];
+    const int     nh = (int) x->ne[1];
+    if (disabled || k->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            hs->type != GGML_TYPE_F32 || k->ne[0] != 128 || q->ne[0] != 128 || k->nb[0] != sizeof(float) ||
+            q->nb[0] != sizeof(float) || k->nb[1] % 16 != 0 || k->nb[2] % 16 != 0 || q->nb[1] % 16 != 0 ||
+            q->nb[2] % 16 != 0 || (uintptr_t) k->data % 16 != 0 || (uintptr_t) q->data % 16 != 0 ||
+            k->ne[3] != 1 || q->ne[3] != 1 || k->ne[2] != q->ne[2] || nh != QSA_SW_NH || NC < 16*QSA_SW_NH ||
+            NC % nh != 0 || x->ne[2]*nh != NC || x->ne[0] != k->ne[1] || x->ne[3] != k->ne[2] ||
+            hs->ne[0] != k->ne[1] || hs->ne[1] != NC/nh || hs->ne[2] != k->ne[2] || hs->nb[0] != sizeof(float) ||
+            k->ne[1] > INT_MAX || NC/nh > 65535*QSA_SW_BT || k->ne[2] > 65535 ||
+            (bias && (bias->type != GGML_TYPE_F32 || bias->nb[0] != sizeof(float)))) {
+        return false;
+    }
+    const int n_blocks = (int) k->ne[1];
+    const int n_tok    = (int) (NC/nh);
+    const int64_t ns   = k->ne[2];
+    const int64_t sk1 = k->nb[1]/sizeof(float), sk2 = k->nb[2]/sizeof(float);
+    const int64_t sq1 = q->nb[1]/sizeof(float), sq2 = q->nb[2]/sizeof(float);
+    const int64_t sb1 = bias ? bias->nb[1]/sizeof(float) : 0, sb2 = bias ? bias->nb[2]/sizeof(float) : 0;
+    const int64_t sd1 = hs->nb[1]/sizeof(float), sd2 = hs->nb[2]/sizeof(float);
+    float * dst = out ? out : (float *) hs->data;
+    const bool vec_out = sd1 % 4 == 0 && sd2 % 4 == 0 && (uintptr_t) dst % 16 == 0 &&
+        (!bias || (sb1 % 4 == 0 && sb2 % 4 == 0 && (uintptr_t) bias->data % 16 == 0));
+    const dim3 grid((unsigned) ((n_blocks + QSA_SW_BK - 1)/QSA_SW_BK), (unsigned) ((n_tok + QSA_SW_BT - 1)/QSA_SW_BT), (unsigned) ns);
+    auto launch = [&](auto kern) {
+        kern<<<grid, 256, 0, ctx.stream()>>>((const float *) k->data, (const float *) q->data,
+            bias ? (const float *) bias->data : nullptr, dst, n_blocks, n_tok,
+            sk1, sk2, sq1, sq2, sb1, sb2, sd1, sd2, vec_out);
+    };
+    bias ? launch(k_qsa_score_wide<true>) : launch(k_qsa_score_wide<false>);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}

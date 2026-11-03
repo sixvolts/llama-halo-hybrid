@@ -121,7 +121,8 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 | `LLAMA_QSA_SHARED=0` | per-sequence QSA groups in a shared (`-kvu`) pool |
 | `LLAMA_QSA_BLK_CACHE=0` | the block-key cache |
 | `LLAMA_QSA_INPUT_FAST=0` | the O(n_kv) QSA input fill for the decode layout |
-| `GGML_CUDA_NO_QSA_SCORE=1` | the fused decode block scoring kernel |
+| `GGML_CUDA_NO_QSA_SCORE=1` | the fused QSA indexer block scoring kernels (decode and prefill) |
+| `GGML_CUDA_NO_QSA_SCORE_WIDE=1` | the fused QSA indexer block scoring at prefill widths only (score MUL_MAT + head sum in one f32 kernel) |
 | `LLAMA_NO_MASK_DEVICE=1` | building attention masks on the device (back to uploading them) |
 | `LLAMA_FUSED_LID_DISABLE=1` | the fused lightning-indexer op of the DSA layers (it sums heads in another order, so near-tied top-k picks can differ) |
 | `LLAMA_KV_NO_WINDOW=1` | the per-sequence KV window of a unified (`-kvu`) cache |
