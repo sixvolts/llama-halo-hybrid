@@ -1509,6 +1509,19 @@ struct ggml_backend_cuda_context {
         int64_t             nt  = 0;
     } gdn_head_major[GDN_STATE_GATHER_SLOTS];
 
+    // halo-hybrid: qwen4exp sparse KQ masks left unwritten (ggml_cuda_try_fuse_qsa_mask) because their one reader, the
+    // RDNA3 QSA attention kernel, takes key lists and per-row mask values built from the top-k indices and kq_mask at the
+    // mask's place in the graph (ggml_cuda_qsa_mask_lists; both inputs may be reused before the attention runs). Keyed
+    // by the mask's memory; the pool buffer is freed by that attention launch; cleared per evaluation.
+    struct qsa_mask_skip_entry {
+        const void * mask     = nullptr;   // the sparse mask's data (never written)
+        void *       buf      = nullptr;   // pool buffer holding lists and vals
+        size_t       buf_size = 0;
+        int32_t *    lists    = nullptr;   // groups x (cap + 1)
+        half *       vals     = nullptr;   // groups x cap x 4
+        int          cap = 0, groups = 0;
+    } qsa_mask_skip[GDN_STATE_GATHER_SLOTS];
+
     // q8_1 side copies of single-row f32 activations, written by the fused kernels in hc.cu in the
     // same launch that produces the f32 value, and consumed by mul_mat_vec_q instead of a separate
     // quantize launch. Keyed by data pointer, validated against the producing tensor; reset per

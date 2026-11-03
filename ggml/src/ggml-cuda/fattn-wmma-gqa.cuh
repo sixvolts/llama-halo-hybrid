@@ -10,3 +10,6 @@ bool ggml_cuda_flash_attn_ext_wmma_gqa12(ggml_backend_cuda_context & ctx, ggml_t
 // and d16 (when not null) the f16 copy of out for the output projection's WMMA pre-pass
 bool ggml_cuda_flash_attn_ext_wmma_gqa12_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * fa, const ggml_tensor * gate,
         ggml_tensor * out, half * d16);
+
+// whether ggml_cuda_flash_attn_ext and the gated form run this kernel for dst (a FLASH_ATTN_EXT)
+bool ggml_cuda_flash_attn_ext_wmma_gqa12_fits(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);

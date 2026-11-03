@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-wmma-gqa.cuh"
+#include "qsa-mask.cuh"
 
 // halo-hybrid: Qwen3.8's QSA attention at prefill widths on RDNA3 (gfx11) WMMA: D = 256, 12 query heads per KV head,
 // every query selecting up to 2051 cells (op param 4) through the mask.
@@ -77,11 +78,13 @@ static __device__ __forceinline__ void fgqa_sync_lds() {
 } // namespace
 
 // grid: (ceil(n_q / 4), n_kv_heads); 256 threads = 8 waves
+// MB: the lists and the rows' mask values at their entries come from ggml_cuda_qsa_mask_lists (vals); mask is unused
+template <bool MB>
 __launch_bounds__(256, 2)
 static __global__ void flash_attn_wmma_gqa12(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
-        const half * __restrict__ mask, const int32_t * __restrict__ lists, float * __restrict__ dst,
-        const float scale, const int n_q, const int list_stride,
+        const half * __restrict__ mask, const int32_t * __restrict__ lists, const half * __restrict__ vals,
+        float * __restrict__ dst, const float scale, const int n_q, const int list_stride,
         const int64_t nbq1, const int64_t nbq2, const int64_t nbk1, const int64_t nbk2,
         const int64_t nbv1, const int64_t nbv2, const int64_t s31, const int64_t nbd1, const int64_t nbd2,
         const float * __restrict__ gate, const int64_t gate_s, const int64_t gate_hs, half * __restrict__ d16) {
@@ -233,11 +236,14 @@ static __global__ void flash_attn_wmma_gqa12(
     const int   sm_rb   = sm_rg / 16;
     const int   sm_row  = sm_rg % 16;
     const int   sm_q    = sm_rg < kRows ? row_query(sm_rb, sm_row) : n_q;
-    const half * sm_mrow = mask + int64_t(sm_q < n_q ? sm_q : 0) * s31;
+    // MB: ci holds list positions and the values sit at vals_g[position * kQueries + the row's query in the group]
+    const half * sm_mrow = MB ? vals + (int64_t(group) * (list_stride - 1) * kQueries + (sm_q - q0))
+                              : mask + int64_t(sm_q < n_q ? sm_q : 0) * s31;
     const auto idx_m = [&](int t0, int * ci) {
 #pragma unroll
         for (int m = 0; m < 4; ++m) {
-            ci[m] = sm_q < n_q ? tile_cell(t0, sm_seg * 4 + m) : -1;
+            const int i = t0 + sm_seg * 4 + m;
+            ci[m] = sm_q < n_q ? (MB ? (i < count ? i * kQueries : -1) : tile_cell(t0, sm_seg * 4 + m)) : -1;
         }
     };
     const auto load_m = [&](const int * ci, half * mv) {
@@ -427,7 +433,7 @@ static __global__ void flash_attn_wmma_gqa12(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, lists, dst, scale, n_q, list_stride, nbq1, nbq2, nbk1, nbk2, nbv1, nbv2, s31, nbd1, nbd2,
+    GGML_UNUSED_VARS(Q, K, V, mask, lists, vals, dst, scale, n_q, list_stride, nbq1, nbq2, nbk1, nbk2, nbv1, nbv2, s31, nbd1, nbd2,
         gate, gate_s, gate_hs, d16);
     NO_DEVICE_CODE;
 #endif // defined(AMD_WMMA_AVAILABLE) && !defined(RDNA4)
@@ -482,17 +488,44 @@ static void fa_gqa12_launch(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int n_q    = (int) Q->ne[1];
     const int cap    = (int) std::min<int64_t>(int64_t(kQueries) * n_kv_max, K->ne[1]);
     const int groups = (int) ((mask->ne[1] + kQueries - 1) / kQueries);
-    ggml_cuda_pool_alloc<int32_t> lists(ctx.pool(), size_t(groups) * (cap + 1));
-    ggml_cuda_flash_attn_ext_compact_mask(mask, lists.get(), cap, kQueries, stream);
 
+    // a sparse mask ggml_cuda_try_fuse_qsa_mask left unwritten: its lists and values were built there
+    ggml_backend_cuda_context::qsa_mask_skip_entry * skip = nullptr;
+    for (auto & e : ctx.qsa_mask_skip) {
+        if (e.mask != nullptr && e.mask == mask->data) {
+            GGML_ASSERT(e.cap == cap && e.groups == groups);
+            skip = &e;
+            break;
+        }
+    }
     const dim3 grid((n_q + kQueries - 1) / kQueries, (unsigned) K->ne[2], 1);
-    flash_attn_wmma_gqa12<<<grid, 256, 0, stream>>>(
-        (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data, lists.get(),
-        out, scale, n_q, cap + 1, Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-        mask->nb[1] / (int64_t) sizeof(half), nbo1, nbo2, gate, gate_s, gate_hs, d16);
+    if (skip != nullptr) {
+        flash_attn_wmma_gqa12<true><<<grid, 256, 0, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, nullptr, skip->lists, skip->vals,
+            out, scale, n_q, cap + 1, Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2],
+            0, nbo1, nbo2, gate, gate_s, gate_hs, d16);
+        ctx.pool().free(skip->buf, skip->buf_size);
+        *skip = {};
+    } else {
+        ggml_cuda_pool_alloc<int32_t> lists(ctx.pool(), size_t(groups) * (cap + 1));
+        ggml_cuda_flash_attn_ext_compact_mask(mask, lists.get(), cap, kQueries, stream);
+        flash_attn_wmma_gqa12<false><<<grid, 256, 0, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data, lists.get(),
+            nullptr, out, scale, n_q, cap + 1, Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2],
+            mask->nb[1] / (int64_t) sizeof(half), nbo1, nbo2, gate, gate_s, gate_hs, d16);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 #endif // defined(GGML_USE_HIP)
+
+bool ggml_cuda_flash_attn_ext_wmma_gqa12_fits(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP)
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+#else
+    return fa_gqa12_fits(ctx, dst);
+#endif // !defined(GGML_USE_HIP)
+}
 
 bool ggml_cuda_flash_attn_ext_wmma_gqa12(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if !defined(GGML_USE_HIP)

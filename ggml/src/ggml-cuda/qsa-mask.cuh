@@ -23,3 +23,10 @@ struct ggml_cuda_qsa_mask_args {
 int64_t ggml_cuda_qsa_mask_max_kv();
 
 void ggml_cuda_op_qsa_mask(ggml_backend_cuda_context & ctx, const ggml_cuda_qsa_mask_args & a);
+
+// halo-hybrid: the group-of-G key lists of ggml_cuda_flash_attn_ext_compact_mask for the sparse mask ggml_cuda_op_qsa_mask
+// would write, built from the top-k indices and kq_mask without the mask (one stream): list g at lists + g*(cap + 1) is
+// [count, the ascending cells some row selected whose kq_mask value is finite], and vals + (g*cap + i)*G + r holds row
+// r's value at entry i, the written mask's (half) ((selected ? 0 : -inf) + (float) kq_mask). The same lists as
+// compacting the written mask, and the values it holds at their cells.
+void ggml_cuda_qsa_mask_lists(const ggml_cuda_qsa_mask_args & a, int32_t * lists, half * vals, int cap, int group, cudaStream_t stream);

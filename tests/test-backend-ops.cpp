@@ -5489,6 +5489,82 @@ struct test_qsa_mask : public test_case {
     }
 };
 
+// halo-hybrid: qwen4exp's sparse KQ mask (test_qsa_mask's FILL, FILL, SET_ROWS, ADD) read only by the QSA attention:
+// on RDNA3 the mask is never written and the attention kernel builds its key lists from the top-k indices
+// (GGML_CUDA_NO_QSA_MASK_LISTS=1 writes it). Selected cells past a row's causal -inf tail included.
+struct test_qsa_mask_attn : public test_case {
+    const int64_t n_kv, n_q, n_top;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_MASK_ATTN"; }
+    std::string vars() override { return VARS_TO_STR3(n_kv, n_q, n_top); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_qsa_mask_attn(int64_t n_kv, int64_t n_q, int64_t n_top) : n_kv(n_kv), n_q(n_q), n_top(n_top) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                // distinct cells per row (SET_ROWS takes in-range ids only); neighbouring rows share half of them
+                std::default_random_engine rng(7);
+                std::vector<int32_t> cells(n_kv), row(n_top);
+                std::iota(cells.begin(), cells.end(), 0);
+                std::shuffle(cells.begin(), cells.end(), rng);
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    if (r % 2 == 0) {
+                        std::shuffle(cells.begin() + n_top/2, cells.end(), rng);
+                    }
+                    std::copy(cells.begin(), cells.begin() + n_top, row.begin());
+                    ggml_backend_tensor_set(t, row.data(), r*t->nb[1], n_top*sizeof(int32_t));
+                }
+            } else if (strcmp(t->name, "kq_mask") == 0) {
+                std::vector<ggml_fp16_t> v(ggml_nelements(t));
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    const int64_t vis = n_kv - (t->ne[1] - 1 - r) * n_kv / (2 * t->ne[1]);
+                    for (int64_t c = 0; c < n_kv; ++c) {
+                        v[r * n_kv + c] = ggml_fp32_to_fp16(c < vis ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 256, n_head = 12;
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+        ggml_set_name(kq_mask, "kq_mask");
+        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top, n_q, 1, 1);
+        ggml_set_name(top_k, "top_k");
+
+        ggml_tensor * all = ggml_fill(ctx, kq_mask, -INFINITY);
+        all = ggml_view_4d(ctx, all, 1, all->ne[0], all->ne[1], all->ne[3], all->nb[0], all->nb[1], all->nb[2], 0);
+        ggml_tensor * idx = ggml_view_4d(ctx, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2],
+                top_k->ne[3]*top_k->nb[3], 0);
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, idx->ne[0], idx->ne[1], idx->ne[2]);
+        zeros = ggml_fill(ctx, zeros, 0.0f);
+        ggml_tensor * sel = ggml_set_rows(ctx, all, zeros, idx);
+        sel = ggml_view_4d(ctx, sel, sel->ne[1], sel->ne[2], 1, sel->ne[3], sel->nb[2], sel->nb[3], sel->nb[3], 0);
+        ggml_tensor * mask = ggml_add_inplace(ctx, sel, kq_mask);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, n_head, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, n_kv, 1, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, n_kv, 1, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/16.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_n_kv_max(out, (int32_t) n_top);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // halo-hybrid: glm5next DSA indexer pool compressor (build_indexer's new-pool branch) in GLM node order:
 // GET_ROWS(members) -> CONT(PERMUTE key), CONT(PERMUTE gate), CONT(TRANSPOSE ape) -> ADD -> SOFT_MAX -> MUL ->
 // SUM_ROWS -> SET_ROWS(pooled head of the same cache). The CUDA backend fuses the whole chain (kpool-compress.cu).
@@ -11213,6 +11289,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_mask(1003, 7, 300));                         // odd n_kv: scalar row path
     test_cases.emplace_back(new test_qsa_mask(2048, 16, 1027, 2));                    // two streams
     test_cases.emplace_back(new test_qsa_mask(640, 3, 640, 1, GGML_TYPE_I64));        // every cell selected, i64 ids
+    test_cases.emplace_back(new test_qsa_mask_attn(8192, 67, 2051));                   // the mask unwritten on RDNA3
+    test_cases.emplace_back(new test_qsa_mask_attn(4100, 64, 515));
     for (int64_t nt : {64, 200, 300}) {   // halo-hybrid: GDN conv front as the qkv GEMM epilogue (RDNA3, partial tiles)
         test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 1, "gemm"));
         test_cases.emplace_back(new test_gdn_conv_front(10240, 32, 4, nt, 3, "gemm"));   // rollback slots read raw x

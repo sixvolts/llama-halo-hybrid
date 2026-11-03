@@ -6448,6 +6448,51 @@ static bool ggml_cuda_qsa_mask_find(const ggml_cgraph * g, int i, ggml_cuda_qsa_
     return false;
 }
 
+// halo-hybrid: leave the sparse mask unwritten when its one reader is a FLASH_ATTN_EXT the RDNA3 QSA kernel runs: the
+//     key lists and each row's mask values at their cells are built here, while the top-k indices and kq_mask are
+//     still live (qsa-mask.cuh ggml_cuda_qsa_mask_lists), and that attention launch reads them instead of compacting
+//     the mask. One sequence. At 128K a mask is 1 GiB per layer and ubatch. GGML_CUDA_NO_QSA_MASK_LISTS=1 writes it.
+//     Not with the HIP VMM pool, which frees in LIFO order: the buffer outlives the ops between here and the attention.
+static const ggml_tensor * ggml_cuda_qsa_mask_skip_fa(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * g,
+        const ggml_cuda_qsa_mask_match & m) {
+#if defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_VMM)
+    GGML_UNUSED_VARS(cuda_ctx, g, m);
+    return nullptr;
+#else
+    static const bool disabled = ggml_env_flag("GGML_CUDA_NO_QSA_MASK_LISTS", false);
+    const ggml_tensor * M = m.filled;
+    if (disabled || M->ne[3] != 1 || M->ne[2] != 1 || m.idx->ne[2] != 1 || (M->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            (m.out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return nullptr;
+    }
+    const ggml_tensor * fa = nullptr;
+    for (int p = m.i_end + 1; p < g->n_nodes; ++p) {
+        const ggml_tensor * node = g->nodes[p];
+        if (ggml_cuda_fuse_is_view(node)) {
+            if (ggml_cuda_fuse_root(node) == M && (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return nullptr;
+            }
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+            if (ggml_cuda_fuse_root(node->src[s]) != M) {
+                continue;
+            }
+            const ggml_tensor * t = node->src[s];
+            if (node->op != GGML_OP_FLASH_ATTN_EXT || s != 3 || fa != nullptr || t->data != M->data ||
+                    t->ne[0] != M->ne[0] || t->ne[1] != M->ne[1] || t->nb[1] != M->nb[1]) {
+                return nullptr;
+            }
+            fa = node;
+        }
+    }
+    if (fa == nullptr || !ggml_cuda_flash_attn_ext_wmma_gqa12_fits(*cuda_ctx, fa)) {
+        return nullptr;
+    }
+    return fa;
+#endif
+}
+
 static int ggml_cuda_try_fuse_qsa_mask(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     if (ggml_cuda_qsa_mask_disabled()) {
         return 0;
@@ -6481,6 +6526,31 @@ static int ggml_cuda_try_fuse_qsa_mask(ggml_backend_cuda_context * cuda_ctx, ggm
     a.idx_ne2 = m.idx->ne[2];
     a.idx_nb1 = m.idx->nb[1];
     a.idx_nb2 = m.idx->nb[2];
+    if (const ggml_tensor * fa = ggml_cuda_qsa_mask_skip_fa(cuda_ctx, cgraph, m)) {
+        ggml_backend_cuda_context::qsa_mask_skip_entry * e = nullptr;
+        for (auto & slot : cuda_ctx->qsa_mask_skip) {
+            if (slot.mask == nullptr) {
+                e = &slot;
+                break;
+            }
+        }
+        if (e != nullptr) {
+            // the attention launch's list geometry (fattn-wmma-gqa.cu): groups of 4 queries, cap = min(4*n_kv_max, n_kv)
+            const int G      = 4;
+            const int cap    = (int) std::min<int64_t>(int64_t(G) * ggml_get_op_params_i32(fa, 4), fa->src[1]->ne[1]);
+            const int groups = (int) ((M->ne[1] + G - 1) / G);
+            const size_t n_list = GGML_PAD(size_t(groups) * (cap + 1) * sizeof(int32_t), 256);
+            const size_t n_vals = size_t(groups) * cap * G * sizeof(half);
+            e->buf      = cuda_ctx->pool().alloc(n_list + n_vals, &e->buf_size);
+            e->mask     = M->data;
+            e->lists    = (int32_t *) e->buf;
+            e->vals     = (half *) ((char *) e->buf + n_list);
+            e->cap      = cap;
+            e->groups   = groups;
+            ggml_cuda_qsa_mask_lists(a, e->lists, e->vals, cap, G, cuda_ctx->stream());
+            return m.i_end - i;
+        }
+    }
     ggml_cuda_op_qsa_mask(*cuda_ctx, a);
     return m.i_end - i;
 }
@@ -7707,6 +7777,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (ggml_cuda_optimer::enabled() && !use_cuda_graph) { ggml_cuda_optimer_for(cuda_ctx->device).set_tag(cgraph); }
             for (auto & e : cuda_ctx->gdn_state_gather) { e = {}; } // deferrals never outlive one evaluation
             for (auto & e : cuda_ctx->gdn_head_major) { e = {}; }
+            for (auto & e : cuda_ctx->qsa_mask_skip) {
+                if (e.buf != nullptr) { cuda_ctx->pool().free(e.buf, e.buf_size); }
+                e = {};
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
