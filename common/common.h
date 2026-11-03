@@ -182,6 +182,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP, // halo-hybrid: copies from the request's context after a long match (gufo's rule)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -368,6 +369,17 @@ struct common_params_speculative_ngram_map {
     uint16_t min_hits = 1;  // minimum hits at ngram/mgram lookup for mgram to be proposed
 };
 
+// halo-hybrid: prompt lookup (gufo's PromptLookup): copy the tokens that followed an earlier occurrence of the context's
+// last 3 tokens once at least min_match context tokens agree with it (min_match_sampled at T > 0, matched in the prompt
+// only), or resume_min tokens where the last mostly accepted copy left off
+struct common_params_speculative_lookup {
+    int32_t n_max             = 7;  // tokens copied per draft (the verify batch is n_max + 1 wide)
+    int32_t n_min             = 3;  // shorter copies are not proposed
+    int32_t min_match         = 12;
+    int32_t min_match_sampled = 24;
+    int32_t resume_min        = 5;
+};
+
 struct common_params_speculative_ngram_cache {
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
@@ -389,6 +401,8 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    common_params_speculative_lookup lookup;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -402,7 +416,9 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // halo-hybrid: a lookup copy is verified on the same recurrent state, so its rollback needs as many slots
+        const bool has_lookup = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP) != types.end();
+        return needs_rs_seq ? (uint32_t) std::max(draft.n_max, has_lookup ? lookup.n_max : 0) : 0u;
     }
 };
 

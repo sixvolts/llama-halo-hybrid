@@ -83,6 +83,10 @@ struct common_speculative_draft_params {
     // distribution so the drafter does not spend draws on tokens the target can never emit
     float top_p = 1.0f;
     float min_p = 0.0f;
+
+    // halo-hybrid: the neural drafter's own cap when it is lower (the sampled cap of an MTP head next to prompt lookup,
+    // whose copies keep n_max; -1: n_max)
+    int32_t n_max_neural = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

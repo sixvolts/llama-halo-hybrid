@@ -19,6 +19,8 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <unordered_map>
+#include <functional>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -42,7 +44,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"prompt-lookup", COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -1404,6 +1407,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     } early;
     int32_t n_batch_dft = 0;
 
+    // halo-hybrid: prompt lookup after each draft token (set when prompt-lookup is enabled): true when it appended a
+    // copy to dp.result, which ends this sequence's draft
+    std::function<bool(llama_seq_id, common_speculative_draft_params &)> after_draft;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1912,7 +1919,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if ((params.n_max <= (int) result.size()) || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                if (after_draft && !chain_heads && !is_mem_shared && after_draft(seq_id, dp)) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
+                }
+
+                const int32_t n_max_dp = dp.n_max_neural > 0 ? dp.n_max_neural : dp.n_max;
+                if ((params.n_max <= (int) result.size()) || (n_max_dp > 0 && n_max_dp <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2405,6 +2419,242 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// halo-hybrid: prompt lookup, ported from gufo's PromptLookup (MIT, src/models/qwen38_flash_next/prompt_lookup.hpp).
+// The context (committed tokens + the uncommitted chain: the sampled token and any drafts so far) ends in a 3-token key;
+// among the 16 most recent earlier occurrences of the key, the one whose preceding tokens agree with the context furthest
+// back wins (at least min_match tokens, or resume_min where the last mostly accepted copy left off), and the tokens that
+// followed it are copied. Proposals depend only on the prefix and are verified like any draft, so the output is unchanged.
+// It runs ahead of the MTP head (a match replaces the neural draft) and after each MTP draft token (append_after).
+struct common_speculative_impl_prompt_lookup : public common_speculative_impl {
+    common_params_speculative_lookup params;
+
+    static constexpr size_t   KEY        = 3;
+    static constexpr size_t   MAX_MATCH  = 64;
+    static constexpr size_t   MAX_CAND   = 16;
+    static constexpr size_t   RESUME_WIN = 512;
+    static constexpr size_t   RESUME_BACK = 8;
+    static constexpr size_t   NONE_SZ    = SIZE_MAX;
+    static constexpr uint32_t NONE       = UINT32_MAX;
+
+    struct match {
+        size_t start  = 0; // committed index of the first copied token
+        size_t length = 0; // matched context tokens (0: none)
+    };
+
+    struct seq_state {
+        std::unordered_map<uint64_t, uint32_t> head; // key -> end of its most recent occurrence
+        std::vector<uint32_t> prev;                  // prev[end]: the previous occurrence of the key ending at end
+        llama_token last = 0;                        // committed[prev.size() - 1] when indexed
+
+        size_t resume        = NONE_SZ; // where the last mostly accepted copy's source continues
+        size_t request_start = NONE_SZ; // committed size at the request's first draft
+
+        // the copy in the pending draft: source start, length, offset in the draft
+        size_t copy_start = 0;
+        size_t copy_n     = 0;
+        size_t copy_off   = 0;
+        size_t copy_match = 0;
+
+        void clear_index() {
+            head.clear();
+            prev.clear();
+            resume = NONE_SZ;
+        }
+    };
+
+    std::vector<seq_state> seqs;
+
+    common_speculative_impl_prompt_lookup(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP, n_seq, params.lookup.n_max)
+        , params(params.lookup)
+        , seqs(n_seq)
+    {
+        SPC_TRC("%s", "adding speculative implementation 'prompt-lookup'\n");
+        SPC_TRC("- n_max=%d, n_min=%d, min_match=%d, min_match_sampled=%d, resume_min=%d\n",
+                this->params.n_max, this->params.n_min, this->params.min_match, this->params.min_match_sampled, this->params.resume_min);
+    }
+
+    static uint64_t key_of(llama_token a, llama_token b, llama_token c) {
+        // token ids fit in 21 bits, so equal keys are equal triples
+        return ((uint64_t) ((uint32_t) a & 0x1FFFFF) << 42) | ((uint64_t) ((uint32_t) b & 0x1FFFFF) << 21) | ((uint32_t) c & 0x1FFFFF);
+    }
+
+    // index the committed tokens appended since the last call (prompt_only: up to the request's start)
+    void extend(seq_state & st, const llama_tokens & committed_all, bool prompt_only) {
+        size_t n = committed_all.size();
+        if (prompt_only && st.request_start != NONE_SZ) {
+            n = std::min(n, st.request_start);
+        }
+        if (n < st.prev.size() || (!st.prev.empty() && committed_all[st.prev.size() - 1] != st.last)) {
+            st.clear_index();
+        }
+        for (size_t end = st.prev.size(); end < n; ++end) {
+            uint32_t previous = NONE;
+            if (end >= KEY) {
+                auto [it, ins] = st.head.try_emplace(key_of(committed_all[end - 3], committed_all[end - 2], committed_all[end - 1]), (uint32_t) end);
+                if (!ins) {
+                    previous = it->second;
+                    it->second = (uint32_t) end;
+                }
+            }
+            st.prev.push_back(previous);
+        }
+        if (!st.prev.empty()) {
+            st.last = committed_all[st.prev.size() - 1];
+        }
+    }
+
+    match find(const seq_state & st, const llama_tokens & committed, const llama_tokens & tail, size_t minimum, bool require_resume) const {
+        const size_t context   = committed.size() + tail.size();
+        const size_t available = st.request_start == NONE_SZ ? context : context - std::min(context, st.request_start);
+        const size_t max_match = std::min(MAX_MATCH, available);
+        if (max_match < KEY || (require_resume && (st.resume == NONE_SZ || max_match < minimum))) {
+            return {};
+        }
+        auto at = [&](size_t i) { return i < committed.size() ? committed[i] : tail[i - committed.size()]; };
+
+        const auto it = st.head.find(key_of(at(context - 3), at(context - 2), at(context - 1)));
+        if (it == st.head.end()) {
+            return {};
+        }
+        match best;
+        uint32_t end = it->second;
+        for (size_t n = 0; n < MAX_CAND && end != NONE; ++n) {
+            // the occurrence ending at end proposes committed[end...]; extend the match backwards against the context
+            size_t length = KEY;
+            while (length < max_match && end > length && committed[end - length - 1] == at(context - length - 1)) {
+                ++length;
+            }
+            const bool resumes = st.resume != NONE_SZ && end + RESUME_BACK >= st.resume && end <= st.resume + RESUME_WIN;
+            const bool allowed = require_resume
+                ? resumes && length >= minimum
+                : length >= minimum || (resumes && length >= (size_t) params.resume_min);
+            if (end < st.prev.size() && length > best.length && allowed) {
+                best = { end, length };
+            }
+            end = st.prev[end];
+        }
+        return best;
+    }
+
+    // copy after the chain id_last + result into result (and point-mass distributions into result_q); n_cap bounds the
+    // whole draft. Returns the number of tokens copied
+    size_t append(llama_seq_id seq_id, common_speculative_draft_params & dp, int32_t n_cap, size_t minimum, bool require_resume) {
+        auto & st     = seqs[seq_id];
+        auto & result = *dp.result;
+        const bool sampled = dp.temp > 0.0f;
+
+        if ((int32_t) result.size() >= n_cap) {
+            return 0;
+        }
+        llama_tokens tail;
+        tail.reserve(1 + result.size());
+        tail.push_back(dp.id_last);
+        tail.insert(tail.end(), result.begin(), result.end());
+
+        const match m = find(st, *dp.prompt, tail, sampled ? params.min_match_sampled : params.min_match, require_resume);
+        if (m.length == 0) {
+            return 0;
+        }
+        const size_t n = std::min((size_t) (n_cap - (int32_t) result.size()), st.prev.size() - m.start);
+        if (n < minimum) {
+            return 0;
+        }
+        st.copy_match = m.length;
+        st.copy_start = m.start;
+        st.copy_n     = n;
+        st.copy_off   = result.size();
+        for (size_t k = 0; k < n; ++k) {
+            const llama_token id = (*dp.prompt)[m.start + k];
+            result.push_back(id);
+            if (dp.result_q != nullptr && dp.temp > 0.0f) {
+                // a point mass: accepted with the target's p(id), a rejection resamples without it
+                dp.result_q->push_back({ llama_token_data{ id, 0.0f, 1.0f } });
+            }
+        }
+        return n;
+    }
+
+    // the request's first draft copies nothing; it marks where the request's own output starts
+    bool prepare(llama_seq_id seq_id, common_speculative_draft_params & dp) {
+        auto & st = seqs[seq_id];
+        if (st.request_start == NONE_SZ) {
+            st.request_start = dp.prompt->size();
+            return false;
+        }
+        extend(st, *dp.prompt, dp.temp > 0.0f);
+        return true;
+    }
+
+    int32_t cap(const common_speculative_draft_params & dp) const {
+        return dp.n_max > 0 ? std::min(dp.n_max, params.n_max) : params.n_max;
+    }
+
+    // called by the MTP drafter after each of its draft tokens: true when a copy now ends the draft
+    bool append_after(llama_seq_id seq_id, common_speculative_draft_params & dp) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || seqs[seq_id].request_start == NONE_SZ) {
+            return false;
+        }
+        const size_t n = append(seq_id, dp, cap(dp), 1, false);
+        n_gen_tokens += n;
+        return n > 0;
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        // a slot's next request may share only part of its history: index it from scratch
+        auto & st = seqs[seq_id];
+        st.clear_index();
+        st.request_start = NONE_SZ;
+        st.copy_n = 0;
+    }
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            seqs[seq_id].copy_n = 0;
+            if (!dp.drafting || !prepare(seq_id, dp)) {
+                continue;
+            }
+            // sampled requests skip the neural draft only to continue an accepted copy
+            append(seq_id, dp, cap(dp), (size_t) params.n_min, dp.temp > 0.0f);
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        auto & st = seqs[seq_id];
+        if (st.copy_n == 0) {
+            return;
+        }
+        const size_t acc = n_accepted > st.copy_off ? std::min(st.copy_n, (size_t) n_accepted - st.copy_off) : 0;
+        if (is_other) {
+            // a copy appended to an MTP draft: count it here too
+            n_gen_drafts++;
+            if (acc > 0) {
+                n_acc_drafts++;
+                n_acc_tokens += acc;
+            }
+        }
+        static const bool trace = ggml_env_flag("LLAMA_LOOKUP_TRACE", false);
+        if (trace) {
+            SPC_INF("lookup seq %d: copied %zu after %zu drafts (match %zu, src %zu, resume %d), accepted %zu\n", (int) seq_id,
+                    st.copy_n, st.copy_off, st.copy_match, st.copy_start, (int) (st.resume != NONE_SZ), acc);
+        }
+        // only a mostly accepted copy enables the short resume match
+        st.resume = 2 * acc < st.copy_n ? NONE_SZ : st.copy_start + acc;
+        st.copy_n = 0;
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -2481,6 +2731,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP: return "prompt-lookup";
         default:                                    return "unknown";
     }
 }
@@ -2583,6 +2834,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP:
+                n_max = std::max(n_max, std::max(0, spec->lookup.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -2870,10 +3124,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
@@ -2903,6 +3158,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP: {
+                impls.push_back(std::make_unique<common_speculative_impl_prompt_lookup>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
@@ -2965,6 +3224,21 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     if (impls.empty()) {
         SPC_TRC("%s", "no implementations specified for speculative decoding\n");
         return nullptr;
+    }
+
+    {   // halo-hybrid: prompt lookup also extends the MTP head's drafts
+        common_speculative_impl_prompt_lookup * lookup = nullptr;
+        for (auto & impl : impls) {
+            if (impl->type == COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP) {
+                lookup = static_cast<common_speculative_impl_prompt_lookup *>(impl.get());
+            }
+        }
+        for (auto & impl : impls) {
+            if (lookup != nullptr && impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                static_cast<common_speculative_impl_draft_mtp *>(impl.get())->after_draft =
+                    [lookup](llama_seq_id seq_id, common_speculative_draft_params & dp) { return lookup->append_after(seq_id, dp); };
+            }
+        }
     }
 
     common_speculative_ptr result(new common_speculative {

@@ -457,7 +457,8 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    // halo-hybrid: neural = false leaves out the sampled MTP cap (prompt-lookup copies are not drafted by the head)
+    int get_n_draft_max(bool neural = true) const {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
@@ -482,7 +483,7 @@ struct server_slot {
         // (MTP drafts only: measured with the draft-mtp head and rejection sampling; other draft types keep their n-max)
         const bool spec_mtp = task && std::find(task->params.speculative.types.begin(), task->params.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != task->params.speculative.types.end();
-        if (task && spec_mtp && task->params.sampling.temp > 0.0f) {
+        if (neural && task && spec_mtp && task->params.sampling.temp > 0.0f) {
             const int nmax_sampled = task->params.speculative.draft.n_max_sampled;
             if (nmax_sampled > 0) {
                 // never below the draft's n_min: a shorter draft would be discarded entirely
@@ -3143,7 +3144,11 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                // halo-hybrid: with prompt lookup the draft keeps the full length and the MTP head its own cap
+                const auto & stypes = slot.task->params.speculative.types;
+                const bool spec_lookup = std::find(stypes.begin(), stypes.end(), COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP) != stypes.end();
+                const int n_draft_max        = slot.get_n_draft_max(!spec_lookup);
+                const int n_draft_max_neural = spec_lookup ? slot.get_n_draft_max(true) : -1;
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3175,6 +3180,7 @@ private:
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                         };
+                        common_speculative_get_draft_params(spec.get(), slot.id).n_max_neural = n_draft_max_neural;
 
                         // halo-hybrid: lossless speculative sampling when the task samples (on by default; LLAMA_SPEC_RS=0 turns it off)
                         slot.spec_draft_q.clear();

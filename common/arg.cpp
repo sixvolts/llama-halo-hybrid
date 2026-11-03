@@ -4388,6 +4388,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
+        {"--spec-lookup-n-max"}, "N",
+        string_format("tokens copied per draft by prompt-lookup speculative decoding (default: %d)", params.speculative.lookup.n_max),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {
+                throw std::invalid_argument("prompt-lookup n-max must be between 1 and 64 inclusive");
+            }
+            params.speculative.lookup.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-lookup-min-match"}, "N",
+        string_format("context tokens that must match before prompt-lookup copies (default: %d; sampled requests: %d)",
+            params.speculative.lookup.min_match, params.speculative.lookup.min_match_sampled),
+        [](common_params & params, int value) {
+            if (value < 3 || value > 64) {
+                throw std::invalid_argument("prompt-lookup min match must be between 3 and 64 inclusive");
+            }
+            params.speculative.lookup.min_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
         {"--spec-ngram-map-k-size-n"}, "N",
         string_format("ngram size N for ngram-map-k speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_map_k.size_n),
         [](common_params & params, int value) {
