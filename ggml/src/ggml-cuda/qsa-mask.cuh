@@ -30,3 +30,5 @@ void ggml_cuda_op_qsa_mask(ggml_backend_cuda_context & ctx, const ggml_cuda_qsa_
 // r's value at entry i, the written mask's (half) ((selected ? 0 : -inf) + (float) kq_mask). The same lists as
 // compacting the written mask, and the values it holds at their cells.
 void ggml_cuda_qsa_mask_lists(const ggml_cuda_qsa_mask_args & a, int32_t * lists, half * vals, int cap, int group, cudaStream_t stream);
+// its LDS bytes for one group (callers keep the written mask past ~60 KB: n_kv over ~190K at Qwen3.8's width)
+size_t ggml_cuda_qsa_mask_lists_smem(int64_t n_kv, int64_t n_top, int group);

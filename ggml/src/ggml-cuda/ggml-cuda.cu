@@ -6486,7 +6486,8 @@ static const ggml_tensor * ggml_cuda_qsa_mask_skip_fa(ggml_backend_cuda_context 
             fa = node;
         }
     }
-    if (fa == nullptr || !ggml_cuda_flash_attn_ext_wmma_gqa12_fits(*cuda_ctx, fa)) {
+    if (fa == nullptr || !ggml_cuda_flash_attn_ext_wmma_gqa12_fits(*cuda_ctx, fa) ||
+            ggml_cuda_qsa_mask_lists_smem(M->ne[0], m.idx->ne[0], 4) > 60*1024) {
         return nullptr;
     }
     return fa;
