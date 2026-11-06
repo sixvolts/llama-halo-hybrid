@@ -102,10 +102,16 @@ prod_restore() {
     [ $PROD_WAS_UP = 1 ] || return 0
     PROD_WAS_UP=0
     halo_log "restoring production ($PROD_LAUNCHER)"
+    local old=$(cat "$PROD_PIDFILE" 2>/dev/null) p
     sleep 3
     setsid nohup "$PROD_LAUNCHER" > /dev/null 2>&1 < /dev/null &
+    # healthy = the health URL answers and the launcher has written its new pid: the launcher writes the pidfile after
+    # the health check, so a suite chained right after this one read the old pid, stopped nothing and waited on the
+    # lock the new server holds (base full -> gpu rdna4, 2026-11-03: 3 days)
     for i in $(seq 1 600); do
-        curl -s -m 2 "$PROD_HEALTH" 2>/dev/null | grep -q '"ok"' && { halo_log "production healthy after ${i}s"; return 0; }
+        p=$(cat "$PROD_PIDFILE" 2>/dev/null)
+        [ -n "$p" ] && [ "$p" != "$old" ] && kill -0 "$p" 2>/dev/null && curl -s -m 2 "$PROD_HEALTH" 2>/dev/null | grep -q '"ok"' \
+            && { halo_log "production healthy after ${i}s (pid $p)"; return 0; }
         sleep 1
     done
     halo_log "WARNING: production not healthy after 600 s"
