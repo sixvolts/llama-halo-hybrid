@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
+#include "../src/llama-ext.h" // llama_set_seq_keep_whole
 
 #include <algorithm>
 #include <cinttypes>
@@ -1307,6 +1308,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    if (cparams.n_rs_seq > 0) {
+        llama_set_seq_keep_whole(lctx, params.speculative.n_draft_longest() + 1);
+    }
 
     set_process_priority(params.cpuparams.priority);
 

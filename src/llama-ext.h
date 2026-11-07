@@ -104,6 +104,10 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // (prefix 0: every row). Takes effect at the next decode; the draft driver decides per draft step
 LLAMA_API void llama_set_draft_vocab(struct llama_context * ctx, int32_t prefix, int32_t tail);
 
+// halo-hybrid: a recurrent context with rollback slots keeps a sequence of at most n tokens of a batch in one ubatch
+// (the longest speculative verify batch, so sequences of unequal draft lengths split one ubatch per sequence)
+LLAMA_API void llama_set_seq_keep_whole(struct llama_context * ctx, uint32_t n);
+
 // halo-hybrid: called from inside llama_decode, on the decoding thread, once the nextn rows of a ubatch are in host
 // memory. h_nextn is the batch's row buffer (row i = batch token i; the context must output unmasked nextn
 // embeddings, see llama_set_embeddings_nextn) and rows [0, i_first + n_tokens) are complete; i_first/n_tokens is

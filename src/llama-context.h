@@ -122,6 +122,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_draft_vocab(int32_t prefix, int32_t tail);
+    void set_seq_keep_whole(uint32_t n);
     void set_ubatch_done_callback(llama_ubatch_done_callback cb, void * user_data);
     void set_causal_attn(bool value);
     void set_warmup(bool value);

@@ -1506,6 +1506,10 @@ void llama_context::set_draft_vocab(int32_t prefix, int32_t tail) {
     cparams.draft_vocab_tail   = std::max(cparams.draft_vocab_prefix, tail);
 }
 
+void llama_context::set_seq_keep_whole(uint32_t n) {
+    balloc->n_keep_whole = n;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -4976,6 +4980,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 void llama_set_draft_vocab(llama_context * ctx, int32_t prefix, int32_t tail) {
     ctx->set_draft_vocab(prefix, tail);
+}
+
+void llama_set_seq_keep_whole(llama_context * ctx, uint32_t n) {
+    ctx->set_seq_keep_whole(n);
 }
 
 void llama_set_ubatch_done_callback(llama_context * ctx, llama_ubatch_done_callback cb, void * user_data) {

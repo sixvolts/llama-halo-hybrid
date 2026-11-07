@@ -160,7 +160,14 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
+    //   (raised to n_keep_whole when it is set, see below)
     llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+
+    // halo-hybrid: with rollback (n_keep_tail > 0), a seq of at most this many tokens is never split. A speculative
+    // verify batch of a long draft and a short one then splits into one ubatch per seq, which the prefill lanes
+    // overlap; split by the short one's length (n_rs_seq + 1 below the long draft), its remainder waits on the
+    // first ubatch (2-slot Flash-Next hybrid, lookup copy beside an MTP draft: 77 -> 114 ms a step)
+    uint32_t n_keep_whole = 0;
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);

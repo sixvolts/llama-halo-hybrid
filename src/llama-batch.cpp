@@ -639,6 +639,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     //   n_keep_tail tokens remaining for a future ubatch, so that the trailing n_keep_tail tokens
     //   of each seq are never split across ubatches
     if (n_keep_tail > 0) {
+        n_keep_tail = std::max(n_keep_tail, std::min(n_keep_whole, n_ubatch - 1));
         GGML_ASSERT(n_ubatch > n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
