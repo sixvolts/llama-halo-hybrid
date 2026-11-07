@@ -798,11 +798,16 @@ static __device__ __forceinline__ float hc_softplus(float x) {
     return (x > 20.0f) ? x : logf(1.0f + expf(x));   // identical to unary.cu op_softplus
 }
 
-static __global__ void k_gdn_gate(const float * x, const float * b, const float * a, float * dst, const int64_t n, const int64_t ne0) {
+// sx / sdst, ns <= n: the beta sigmoid that follows the gate in the graph (ns = 0: none), as unary.cu op_sigmoid
+static __global__ void k_gdn_gate(const float * x, const float * b, const float * a, float * dst, const int64_t n, const int64_t ne0,
+        const float * sx, float * sdst, const int64_t ns) {
     const int64_t stride = (int64_t) blockDim.x * gridDim.x;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
         const int64_t r = i % ne0;
         dst[i] = __fmul_rn(hc_softplus(__fadd_rn(x[i], b[r])), a[r]);
+        if (i < ns) {   // ns <= n; sdst may be x (same base): x[i] was read above
+            sdst[i] = hc_sigmoid(sx[i]);
+        }
     }
 }
 
@@ -826,9 +831,11 @@ void ggml_cuda_op_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tenso
 }
 
 void ggml_cuda_op_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * b,
-        const ggml_tensor * a, ggml_tensor * dst) {
+        const ggml_tensor * a, ggml_tensor * dst, ggml_tensor * sig) {
     GGML_ASSERT(x->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(b) && ggml_is_contiguous(a) && ggml_is_contiguous(dst));
-    const int64_t n = ggml_nelements(dst);
-    k_gdn_gate<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data, (const float *) a->data, (float *) dst->data, n, x->ne[0]);
+    const int64_t n  = ggml_nelements(dst);
+    const int64_t ns = sig ? ggml_nelements(sig) : 0;
+    k_gdn_gate<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) x->data, (const float *) b->data, (const float *) a->data,
+            (float *) dst->data, n, x->ne[0], sig ? (const float *) sig->src[0]->data : nullptr, sig ? (float *) sig->data : nullptr, ns);
 }

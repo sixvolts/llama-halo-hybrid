@@ -4571,8 +4571,21 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
         const ggml_tensor * a = out->src[1];
         if (a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || a->ne[0] != x->ne[0] || a->ne[1] != 1 || a->ne[2] != 1 || a->ne[3] != 1 ||
                 !ggml_are_same_shape(out, x) || !ggml_is_contiguous(out) || !ggml_cuda_fuse_views_belong(cgraph, i, k, { node, cgraph->nodes[j] })) { return 0; }
-        ggml_cuda_op_gdn_gate(*cuda_ctx, x, b, a, out);
-        return k - i;
+        // the beta sigmoid that follows (qwen4exp build_gdn): one launch for both, thread i doing element i of each. Its
+        // output may take x's slot (x is dead after the add) at the same base: thread i reads x[i] before writing it
+        const int s = ggml_cuda_fuse_next(cgraph, k + 1);
+        ggml_tensor * sig = s < n ? cgraph->nodes[s] : nullptr;
+        if (!sig || !ggml_cuda_fuse_unary(sig, GGML_UNARY_OP_SIGMOID) || sig->type != GGML_TYPE_F32 || sig->src[0]->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(sig) || !ggml_is_contiguous(sig->src[0]) || ggml_nelements(sig) != ggml_nelements(sig->src[0]) ||
+                ggml_nelements(sig) > ggml_nelements(out) || !ggml_cuda_fuse_disjoint(sig, out) ||
+                !(ggml_cuda_fuse_disjoint(sig, x) || (sig->data == x->data && ggml_nelements(sig) == ggml_nelements(x))) ||
+                !ggml_cuda_fuse_disjoint(sig->src[0], out) ||
+                (sig->data != sig->src[0]->data && !ggml_cuda_fuse_disjoint(sig, sig->src[0])) ||
+                !ggml_cuda_fuse_views_belong(cgraph, i, s, { node, cgraph->nodes[j], out })) {
+            sig = nullptr;
+        }
+        ggml_cuda_op_gdn_gate(*cuda_ctx, x, b, a, out, sig);
+        return (sig ? s : k) - i;
     }
 
     // (C) REPEAT(b) ; SCALE(inj) -> SIGMOID -> SCALE ; MUL(rep, w) ; ADD(x, mul)      => hc_combine
