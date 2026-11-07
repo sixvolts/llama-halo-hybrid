@@ -1540,6 +1540,10 @@ struct ggml_backend_cuda_context {
     // a pool allocation captured into a CUDA graph dangles once the legacy pool frees its cache on an allocation
     // failure (clear_pool), and a replay then reads freed memory (GLM two-host decode on the APU, 2026-09-28)
     int32_t * mmvq_grp = nullptr;
+    // the ids tensor (and table shape) whose groups mmvq_grp holds, so the down projection reuses gate_up's table
+    // instead of rebuilding it; cleared per graph with the q8_1 side registry
+    const ggml_tensor * mmvq_grp_ids = nullptr;
+    int64_t             mmvq_grp_key = 0;
 
     // halo-hybrid: one producer-side MMQ q8_1 copy (block_q8_1_mmq, D4 layout) of a prefill activation, written by the
     // producer (k_hc_combine_norm) and consumed by the next q8_0 MMQ GEMM on the same stream instead of its quantize

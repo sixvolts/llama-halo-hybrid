@@ -11346,6 +11346,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 512, 10, true, 640, n_tokens, 2560));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+            // whole MoE blocks: the down projection reuses gate_up's expert-group table (same ids tensor)
+            for (ggml_type td : {GGML_TYPE_Q5_0, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_moe_block(GGML_TYPE_Q4_K, td, 512, 10, 640, n_tokens, 2560));
+            }
         }
         return test_cases;
     }

@@ -1395,6 +1395,7 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     }
 
     const int kbx_offset = channel_x*stride_channel_x + row0*stride_row_x;
+    const int row_last   = (int) nrows_x - 1 - row0;   // rows past the expert read its last row; their stores are skipped
 
     float tmp[c_max_cols][c_rows_per_block]      = {{0.0f}};
     float tmp_gate[c_max_cols][c_rows_per_block] = {{0.0f}};
@@ -1408,10 +1409,10 @@ static __global__ void mul_mat_vec_q_moe_grouped(
             if (j < cnt) {
 #pragma unroll
                 for (int i = 0; i < c_rows_per_block; ++i) {
-                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j][kby], kbx_offset + (i < row_last ? i : row_last)*stride_row_x + kbx, kqs);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, &y[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, &y[j][kby], kbx_offset + (i < row_last ? i : row_last)*stride_row_x + kbx, kqs);
                         }
                     }
                 }
@@ -1483,9 +1484,10 @@ static void mul_mat_vec_q_moe_grouped_launch_cols(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const int n_pairs, const int warp_size, cudaStream_t stream) {
-    // q5_0 above 4 columns: four rows a wave (2026-11-07, gfx1151 at 5/6/8 tokens 286/338/455 -> 254/303/410 us for
-    // ~50-75 distinct experts; its 22-byte blocks take 16-bit loads, more rows keep more of them in flight)
-    constexpr int rows_per_block = type == GGML_TYPE_Q5_0 && c_max_cols > 4 ? 4 : 2;
+    // q5_0 / q8_0: four rows a wave (2026-11-07, gfx1151; their 22/34-byte blocks take 16-bit loads, more rows keep more
+    // in flight): Swift Q8T hybrid in situ at 4 tokens (27 distinct experts) q5_0 down 162 -> 149 us, q8_0 216.5 -> 213.8;
+    // q5_0 at 5/6/8 tokens (bench) 286/338/455 -> 254/303/410. q4_K loses at 4 rows (232 -> 247), q5_0 at 8 (149 -> 152).
+    constexpr int rows_per_block = type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0 ? 4 : 2;
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, n_pairs);
     const dim3 block_dims(warp_size, 1);
@@ -1529,7 +1531,8 @@ bool ggml_cuda_mmvq_moe_grouped_enabled(ggml_type type) {
 // With the env set, get_mmvq_mmid_max_batch admits up to MMVQ_MAX_BATCH_SIZE tokens for these types, which the per-pair
 // kernel's launch bounds do not cover: n_used <= MMVQ_GRP_MAX_PAIRS / MMVQ_MAX_BATCH_SIZE (32) keeps every such call here.
 static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
-        const void * vx, const ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion,
+        const void * vx, const ggml_type type, const void * vy, const int32_t * ids, const ggml_tensor * ids_t,
+        const ggml_cuda_mm_fusion_args_device fusion,
         float * dst, const int ncols_x, const int nrows_x, const int n_tokens, const int n_slots, const int ids_stride,
         const int nchannels_y, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst, cudaStream_t stream) {
@@ -1541,8 +1544,15 @@ static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
     // the persistent table (stream-ordered reuse across launches); the pool only if it could not be allocated
     ggml_cuda_pool_alloc<int32_t> grp_pool(ctx.pool());
     int32_t * grp = ctx.mmvq_grp ? ctx.mmvq_grp : grp_pool.alloc(1 + (size_t) n_pairs*(2 + max_cols));
-    mmvq_moe_group_ids<<<1, MMVQ_GRP_MAX_PAIRS, 0, stream>>>(ids, grp, n_tokens, n_slots, ids_stride, max_cols);
-    CUDA_CHECK(cudaGetLastError());
+    // the same ids tensor as the previous grouped GEMV (a layer's down after its gate_up): its groups are already in
+    // the persistent table, written earlier on this stream and not overwritten since
+    const int64_t key = ((int64_t) n_tokens << 40) | ((int64_t) n_slots << 24) | ((int64_t) max_cols << 16) | ids_stride;
+    if (!ctx.mmvq_grp || ids_t != ctx.mmvq_grp_ids || key != ctx.mmvq_grp_key) {
+        mmvq_moe_group_ids<<<1, MMVQ_GRP_MAX_PAIRS, 0, stream>>>(ids, grp, n_tokens, n_slots, ids_stride, max_cols);
+        CUDA_CHECK(cudaGetLastError());
+        ctx.mmvq_grp_ids = ctx.mmvq_grp ? ids_t : nullptr;
+        ctx.mmvq_grp_key = key;
+    }
     const int device    = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const uint3 nchannels_y_fd = init_fastdiv_values(nchannels_y);
@@ -2490,7 +2500,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (ids && ncols_dst > 1 && ne03 == 1 && ggml_cuda_mmvq_moe_grouped_enabled(src0->type) &&
             ncols_dst*nchannels_dst <= MMVQ_GRP_MAX_PAIRS) {
-        ggml_cuda_mul_mat_vec_q_moe_grouped(ctx, src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00, ne01,
+        ggml_cuda_mul_mat_vec_q_moe_grouped(ctx, src0->data, src0->type, src1_q8_1_d, ids_d, ids, fusion_local, dst_d, ne00, ne01,
             ncols_dst, nchannels_dst, ids_stride, nchannels_y, s01, stride_col_y, stride_col_dst,
             s02, stride_channel_y, stride_channel_dst, stream);
         return;
