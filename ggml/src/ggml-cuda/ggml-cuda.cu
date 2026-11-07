@@ -2011,6 +2011,17 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// halo-hybrid: on RDNA4 a q8_0 matrix of >= 4096 rows at 5..8 columns (a prompt-lookup verify batch) runs faster on MMQ's
+// int8 WMMA tiles than on the dp4a GEMV, quantize included (DRAM-streamed, 2026-11-07): 10240x2560 at n=8 72.7 -> 57.5 us,
+// 6144x2560 47.9 -> 38.2, 12288x2560 84.5 -> 70.5, 4096x2560 35.3 -> 29.1, the 248320-row lm head 1409 -> 1147; n=5 -13..-15%.
+// Below 4096 rows (2560x6144 42.8 vs 44.5) and at <= 4 columns (the grouped GEMV) the GEMV stays. GGML_CUDA_NO_R4_MMQ_VERIFY=1
+// keeps the GEMV.
+static bool ggml_cuda_r4_mmq_verify(const ggml_tensor * src0, int64_t ne11, int cc) {
+    static const bool off = ggml_env_flag("GGML_CUDA_NO_R4_MMQ_VERIFY", false);
+    return !off && GGML_CUDA_CC_IS_RDNA4(cc) && src0->type == GGML_TYPE_Q8_0 && ne11 > 4 && ne11 <= MMVQ_MAX_BATCH_SIZE &&
+           src0->ne[1] >= 4096 && src0->ne[2] == 1 && src0->ne[3] == 1;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2104,6 +2115,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // halo-hybrid: a thin f32 weight at prefill widths (the MoE router) stays in exact f32 on an LDS-tiled FMA
     //     kernel instead of rocBLAS's 32x32x8 tile (sgemm-tile.cu)
     if (GGML_CUDA_CC_IS_AMD(cc) && ggml_cuda_mul_mat_f32_tile(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (ggml_cuda_r4_mmq_verify(src0, ne11, cc)) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
@@ -6870,7 +6885,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 return w->ne[0] == src1->ne[0] && w->ne[1] >= f32_rows;
             }
             return ggml_is_quantized(w->type) &&
-                   ggml_cuda_should_use_mmvq(w->type, cc, src1->ne[1]) &&
+                   ggml_cuda_should_use_mmvq(w->type, cc, src1->ne[1]) && !ggml_cuda_r4_mmq_verify(w, src1->ne[1], cc) &&
                    !ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb, src1->ne[1], false);
         };
         if (eligible(node)) {
