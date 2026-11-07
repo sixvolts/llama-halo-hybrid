@@ -404,6 +404,7 @@ struct common_params_speculative {
     common_params_speculative_ngram_cache ngram_cache;
 
     common_params_speculative_lookup lookup;
+    int32_t n_rs_seq = 0; // recurrent rollback slots (0 = the longest draft); longer drafts checkpoint and replay
 
     bool has_dft() const {
         return !draft.mparams.empty();
@@ -418,9 +419,17 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
+        if (!needs_rs_seq) {
+            return 0u;
+        }
         // halo-hybrid: a lookup copy is verified on the same recurrent state, so its rollback needs as many slots
+        return n_rs_seq > 0 ? (uint32_t) n_rs_seq : (uint32_t) n_draft_longest();
+    }
+
+    // the longest draft any drafter in types proposes (a verify batch holds this + 1 tokens of a sequence)
+    int32_t n_draft_longest() const {
         const bool has_lookup = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_PROMPT_LOOKUP) != types.end();
-        return needs_rs_seq ? (uint32_t) std::max(draft.n_max, has_lookup ? lookup.n_max : 0) : 0u;
+        return std::max(draft.n_max, has_lookup ? lookup.n_max : 0);
     }
 };
 

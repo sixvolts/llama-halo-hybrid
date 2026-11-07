@@ -4409,6 +4409,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-rs-seq"}, "N",
+        "recurrent-state rollback slots per sequence for speculative decoding (default: 0 = the longest draft); a "
+        "longer draft saves a checkpoint and replays when more than N of its tokens are rejected, each slot costs "
+        "one copy of the recurrent state per sequence",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 64) {
+                throw std::invalid_argument("spec-rs-seq must be between 0 and 64 inclusive");
+            }
+            params.speculative.n_rs_seq = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-lookup-min-match"}, "N",
         string_format("context tokens that must match before prompt-lookup copies (default: %d; sampled requests: %d)",
             params.speculative.lookup.min_match, params.speculative.lookup.min_match_sampled),
