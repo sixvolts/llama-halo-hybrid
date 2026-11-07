@@ -1493,10 +1493,11 @@ static void mul_mat_vec_q_moe_grouped_launch_cols(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const int n_pairs, const int warp_size, cudaStream_t stream) {
-    // q5_0 / q8_0: four rows a wave (2026-11-07, gfx1151; their 22/34-byte blocks take 16-bit loads, more rows keep more
-    // in flight): Swift Q8T hybrid in situ at 4 tokens (27 distinct experts) q5_0 down 162 -> 149 us, q8_0 216.5 -> 213.8;
-    // q5_0 at 5/6/8 tokens (bench) 286/338/455 -> 254/303/410. q4_K loses at 4 rows (232 -> 247), q5_0 at 8 (149 -> 152).
-    constexpr int rows_per_block = type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0 ? 4 : 2;
+    // q5_0: four rows a wave (2026-11-07, gfx1151; its 22-byte blocks take 16-bit loads, more rows keep more in flight):
+    // Swift Q8T hybrid in situ at 4 tokens (27 distinct experts) 162 -> 149 us, at 5/6/8 tokens (bench) 286/338/455 ->
+    // 254/303/410. q4_K loses at 4 rows (232 -> 247 us), q5_0 at 8 (149 -> 152). q8_0 at 4 rows was 1% faster in a launch but
+    // made copy throughput bimodal across server launches (118 / 107-111 t/s vs a steady 117.5 at 2 rows), so it keeps 2.
+    constexpr int rows_per_block = type == GGML_TYPE_Q5_0 ? 4 : 2;
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, n_pairs);
     const dim3 block_dims(warp_size, 1);
