@@ -966,7 +966,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (bf16_mma_hardware_available(cc)) {
-                    return ne11 <= 3;
+                    // halo-hybrid: RDNA4 keeps the vector kernel through 8 columns: MMF at 4..8 ran the lightning-indexer
+                    // projections (bf16 512/128 x 2560) at 49-54 us vs 5-15 (Swift Q8T verify widths, ~1 ms a step), and
+                    // DRAM-streamed 4096^2 / 12288x2560 / 2048x8192 at n 4..8 are 1.17-2.2x faster too (2026-11-07). gfx1151
+                    // is mixed (512x2560 n=4 and 12288x2560 n=8 favour MMF) and keeps 3.
+                    return ne11 <= (GGML_CUDA_CC_IS_RDNA4(cc) ? MMVF_MAX_BATCH_SIZE : 3);
                 }
                 return ne11 <= MMVF_MAX_BATCH_SIZE;
             }

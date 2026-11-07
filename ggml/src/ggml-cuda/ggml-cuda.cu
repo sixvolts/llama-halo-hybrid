@@ -4578,6 +4578,7 @@ static int ggml_cuda_try_fuse_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgra
         if (!sig || !ggml_cuda_fuse_unary(sig, GGML_UNARY_OP_SIGMOID) || sig->type != GGML_TYPE_F32 || sig->src[0]->type != GGML_TYPE_F32 ||
                 !ggml_is_contiguous(sig) || !ggml_is_contiguous(sig->src[0]) || ggml_nelements(sig) != ggml_nelements(sig->src[0]) ||
                 ggml_nelements(sig) > ggml_nelements(out) || !ggml_cuda_fuse_disjoint(sig, out) ||
+                !ggml_cuda_fuse_disjoint(sig, a) || !ggml_cuda_fuse_disjoint(sig, b) ||
                 !(ggml_cuda_fuse_disjoint(sig, x) || (sig->data == x->data && ggml_nelements(sig) == ggml_nelements(x))) ||
                 !ggml_cuda_fuse_disjoint(sig->src[0], out) ||
                 (sig->data != sig->src[0]->data && !ggml_cuda_fuse_disjoint(sig, sig->src[0])) ||

@@ -1547,10 +1547,12 @@ static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
     // the same ids tensor as the previous grouped GEMV (a layer's down after its gate_up): its groups are already in
     // the persistent table, written earlier on this stream and not overwritten since
     const int64_t key = ((int64_t) n_tokens << 40) | ((int64_t) n_slots << 24) | ((int64_t) max_cols << 16) | ids_stride;
-    if (!ctx.mmvq_grp || ids_t != ctx.mmvq_grp_ids || key != ctx.mmvq_grp_key) {
+    // (forked streams: another stream's grouped GEMV may have rewritten the shared table in between, so no reuse)
+    const bool forked = !ctx.stream_context().concurrent_events.empty();
+    if (!ctx.mmvq_grp || forked || ids_t != ctx.mmvq_grp_ids || key != ctx.mmvq_grp_key) {
         mmvq_moe_group_ids<<<1, MMVQ_GRP_MAX_PAIRS, 0, stream>>>(ids, grp, n_tokens, n_slots, ids_stride, max_cols);
         CUDA_CHECK(cudaGetLastError());
-        ctx.mmvq_grp_ids = ctx.mmvq_grp ? ids_t : nullptr;
+        ctx.mmvq_grp_ids = ctx.mmvq_grp && !forked ? ids_t : nullptr;
         ctx.mmvq_grp_key = key;
     }
     const int device    = ggml_cuda_get_device();
