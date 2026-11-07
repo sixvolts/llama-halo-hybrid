@@ -11199,6 +11199,7 @@ static const halo_case_set halo_case_sets[] = {
     { "TBO_Q38_SHAPES",        "perf", true,  "Qwen3.8 GEMM shapes" },
     { "TBO_Q38_F32",           "perf", true,  "Qwen3.8 f32 GEMM shapes" },
     { "TBO_Q38_MOE",           "perf", true,  "Qwen3.8 expert GEMMs and gate+up+SwiGLU" },
+    { "TBO_Q38_MOE_DEC",       "both", true,  "Qwen3.8 expert GEMVs and gate+up+SwiGLU at decode/verify widths" },
 };
 
 // one line on stderr naming the active case sets of this mode and the number of cases they produced
@@ -11340,6 +11341,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Qwen3.8-Flash-Next expert GEMMs at prefill widths, correctness of the MMQ subtile / K-tail skips (TBO_Q38_MOE_EVAL=1):
     //     gate/up q4_K [2560 -> 640], down q5_1 / q8_0 [640 -> 2560] (K = 640: the last K iteration is half padding)
+    if (getenv("TBO_Q38_MOE_DEC") != nullptr) {
+        for (int64_t n_tokens : {1, 2, 3, 4, 5, 6, 8}) {
+            test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 512, 10, true, 640, n_tokens, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+        }
+        return test_cases;
+    }
+
     if (getenv("TBO_Q38_MOE_EVAL") != nullptr) {
         for (int64_t n : {1, 3, 37, 256, 1024, 2048, 4096}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,  640,  n, 2560));
@@ -14246,6 +14256,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int64_t n : {1199, 2048}) {
                 test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4, n, 10240, {1, 1}, {1, 1}));
             }
+        }
+        return test_cases;
+    }
+
+    // Qwen3.8-Flash-Next routed experts at decode / speculative verify widths (TBO_Q38_MOE_DEC=1): gate+up+SwiGLU q4_K,
+    //     down q8_0 / q5_0 (Swift Q8T mixes both)
+    if (getenv("TBO_Q38_MOE_DEC") != nullptr) {
+        for (int64_t n_tokens : {1, 2, 3, 4, 5, 6, 8}) {
+            test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 512, 10, true, 640, n_tokens, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
         }
         return test_cases;
     }

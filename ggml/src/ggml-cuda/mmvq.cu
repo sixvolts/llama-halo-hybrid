@@ -1483,7 +1483,9 @@ static void mul_mat_vec_q_moe_grouped_launch_cols(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const int n_pairs, const int warp_size, cudaStream_t stream) {
-    constexpr int rows_per_block = 2;
+    // q5_0 above 4 columns: four rows a wave (2026-11-07, gfx1151 at 5/6/8 tokens 286/338/455 -> 254/303/410 us for
+    // ~50-75 distinct experts; its 22-byte blocks take 16-bit loads, more rows keep more of them in flight)
+    constexpr int rows_per_block = type == GGML_TYPE_Q5_0 && c_max_cols > 4 ? 4 : 2;
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, n_pairs);
     const dim3 block_dims(warp_size, 1);
@@ -1532,7 +1534,8 @@ static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
         const int nchannels_y, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst, cudaStream_t stream) {
     const int n_pairs  = n_tokens*n_slots;
-    const int max_cols = n_tokens <= 4 ? 4 : MMVQ_GRP_MAX_COLS;
+    // a 6-column instance for 5..6 tokens (q5_0 -5..7% against the 8-column one; the others unchanged)
+    const int max_cols = n_tokens <= 4 ? 4 : n_tokens <= 6 ? 6 : MMVQ_GRP_MAX_COLS;
     GGML_ASSERT(n_pairs <= MMVQ_GRP_MAX_PAIRS && n_tokens <= MMVQ_GRP_MAX_COLS);
 
     // the persistent table (stream-ordered reuse across launches); the pool only if it could not be allocated
@@ -1540,7 +1543,6 @@ static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
     int32_t * grp = ctx.mmvq_grp ? ctx.mmvq_grp : grp_pool.alloc(1 + (size_t) n_pairs*(2 + max_cols));
     mmvq_moe_group_ids<<<1, MMVQ_GRP_MAX_PAIRS, 0, stream>>>(ids, grp, n_tokens, n_slots, ids_stride, max_cols);
     CUDA_CHECK(cudaGetLastError());
-
     const int device    = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const uint3 nchannels_y_fd = init_fastdiv_values(nchannels_y);
@@ -1549,6 +1551,10 @@ static void ggml_cuda_mul_mat_vec_q_moe_grouped(ggml_backend_cuda_context & ctx,
     case T: \
         if (max_cols == 4) { \
             mul_mat_vec_q_moe_grouped_launch_cols<T, 4>(vx, vy, grp, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, \
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
+                n_pairs, warp_size, stream); \
+        } else if (max_cols == 6) { \
+            mul_mat_vec_q_moe_grouped_launch_cols<T, 6>(vx, vy, grp, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, \
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
                 n_pairs, warp_size, stream); \
         } else { \
