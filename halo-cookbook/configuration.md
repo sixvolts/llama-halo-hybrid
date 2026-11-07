@@ -72,7 +72,8 @@ The tables of [HALO-HYBRID.md](../HALO-HYBRID.md#changes-on-by-default) say what
 
 | Switch | What it turns off |
 |---|---|
-| `GGML_CUDA_MMVQ_NO_WIDE=1` | 8-warp blocks for 2-4 columns on RDNA4 and RDNA3 (back to one wave per row) |
+| `GGML_CUDA_MMVQ_NO_WIDE=1` | 8-warp blocks for 2-8 columns on RDNA4 (2-4 on RDNA3) and RDNA4's two-rows-a-wave launch at 5-8 columns (back to one wave per row) |
+| `GGML_CUDA_NO_R4_MMQ_VERIFY=1` | MMQ for q8_0 matrices of 4096+ rows at 5-8 columns on RDNA4 (back to the vector kernel) |
 | `GGML_CUDA_MMVQ_NO_SMALLK=1` | the small-K rows-per-block GEMV mode on RDNA4 (upstream disables it on RDNA) |
 | `GGML_CUDA_MMVQ_NO_TALL=1` | the launch that steps clear of gfx1201's / gfx1101's wave-slot dispatch cliff |
 | `GGML_CUDA_MMVQ_GROUPED=0` | reading each distinct expert once per verify batch (back to one pass per token-expert pair) |
