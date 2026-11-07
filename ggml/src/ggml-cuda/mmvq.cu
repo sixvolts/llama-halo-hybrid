@@ -518,6 +518,8 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 // halo-hybrid: RDNA3 launch variants for ncols_dst 2..4 beyond upstream's one wave per row, the 8-warp wide block
 // (halve_iters tag) and the 32-warp tall block (small_k tag): 2 or 4 warps splitting K, or one wave per 2 rows.
 // The host picks one per launch (see the ncols_dst 2..4 planner in mul_mat_vec_q_switch_ncols_dst).
+// RDNA4 uses the one-wave-per-2-rows variant at ncols_dst 5..8 over a short K, where a wave would otherwise re-read
+// up to 8 activation columns for one short weight row.
 enum mmvq_lv : int { MMVQ_LV_NONE = 0, MMVQ_LV_2W = 1, MMVQ_LV_4W = 2, MMVQ_LV_RPB2 = 3 };
 static constexpr __host__ __device__ int mmvq_lv_nwarps(int lv) { return lv == MMVQ_LV_2W ? 2 : lv == MMVQ_LV_4W ? 4 : 1; }
 static constexpr __host__ __device__ int mmvq_lv_rows(int lv) { return lv == MMVQ_LV_RPB2 ? 2 : 1; }
@@ -525,6 +527,10 @@ static constexpr __host__ __device__ int mmvq_lv_rows(int lv) { return lv == MMV
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false, int lv = MMVQ_LV_NONE) {
     if (lv != MMVQ_LV_NONE && table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst != 1 && ncols_dst <= 4 &&
             calc_nwarps(type, ncols_dst, table_id, false, true) > 1) {   // the types the wide block is promoted for
+        return mmvq_lv_nwarps(lv);
+    }
+    if (lv != MMVQ_LV_NONE && table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst > 4 && ncols_dst <= 8 &&
+            calc_nwarps(type, ncols_dst, table_id, false, true) > 1) {
         return mmvq_lv_nwarps(lv);
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
@@ -568,6 +574,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // The small_k tag at ncols_dst 2..4 is the TALL launch instead: 32 warps per block for a handful of rows
         // over a long K (hc_fn 24 x 16384: 24 blocks x 8 warps = 192 waves, 8 dependent DRAM trips each, 15-18 us
         // in situ; 32 warps make it 2 trips).
+        // (2026-11-07: the wide block below through ncols_dst 8, the verify widths of a prompt-lookup copy; tall stays
+        // at 2..4, its 31 x ncols x 32 float reduction buffers would take 63 KB of LDS at 8 columns with a fused gate)
         if (ncols_dst != 1 && ncols_dst <= 4 && small_k) {
             switch (type) {
                 case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
@@ -577,7 +585,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 1;
             }
         }
-        if (ncols_dst == 1 || (ncols_dst <= 4 && halve_iters)) {
+        if (ncols_dst == 1 || (ncols_dst <= 8 && halve_iters)) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
@@ -696,7 +704,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, int lv = MMVQ_LV_NONE) {
-    if (lv != MMVQ_LV_NONE && table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst != 1 && ncols_dst <= 4) {
+    if (lv != MMVQ_LV_NONE && ((table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst != 1 && ncols_dst <= 4) ||
+                               (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst > 4 && ncols_dst <= 8))) {
         return mmvq_lv_rows(lv);
     }
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
@@ -1724,9 +1733,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 2:
         case 3:
-        case 4: {
-            // halo-hybrid: RDNA4 and RDNA3 get more than upstream's one wave per row here; every other table keeps
-            // upstream's launch. Tag types keep the flags compile-time.
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+        case 8: {
+            // halo-hybrid: RDNA4 (2..8) and RDNA3 (2..4) get more than upstream's one wave per row here; every other
+            // table, and RDNA3 at 5..8 (its table promotes nothing there), keeps upstream's launch. Tag types keep the
+            // flags compile-time.
             const bool wide_table = (table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0) &&
                 ggml_cuda_mmvq_wide();
             const auto launch_n = [&](auto ncols_tag) {
@@ -1830,7 +1844,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     // 4096x2048 38.7 -> 27.8; >= 2^25 weights unchanged (enough waves, reduction costs 3-5%);
                     // K=256/512 shapes LOST 1.3-2.1x under wide (idle warps + reduction) and K=128 gained nothing
                     // from a rows-per-block variant, so short K keeps the upstream launch.
-                    const bool long_k = blocks_per_row_x >= 8 * blocks_per_iter_1warp;
+                    // 5..8 columns (2026-11-07, DRAM-streamed q8_0 at n=8): wide pays only with ~3 K trips a warp left -
+                    // 320x10240 20.7 -> 12.3 us, 2560x6144 47.5 -> 44.2 - and loses at K=2560 (1280..12288 rows 1.15-1.24x
+                    // slower: the 8-column LDS reduction outweighs 1-2 trips)
+                    const bool long_k = blocks_per_row_x >= (c_ncols_dst > 4 ? 24 : 8) * blocks_per_iter_1warp;
                     // halo-hybrid experiment: GGML_CUDA_MMVQ_BIG_WIDE=1 keeps the wide launch for >= 2^25 weights too
                     // (in situ the 8192-row K=4096 KDA q projection ran at ~170 GB/s under the one-wave-per-row launch)
                     static const bool big_wide = ggml_env_flag("GGML_CUDA_MMVQ_BIG_WIDE", false);
@@ -1849,10 +1866,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
                             nrows_x, ncols_x, c_ncols_dst,
                             (long long) launches, (long long) slots, long_k, big, tall ? "tall" : wide ? "wide" : "upstream");
                     }
+                    // 5..8 columns over a short K (<= 3 trips of one wave): one wave per 2 rows, which reads the activation
+                    // columns once for both (DRAM-streamed q8_0 at n=8: 10240x320 17.9 -> 15.7 us, 2560x640 9.9 -> 8.9,
+                    // n=5/6 -9%; 4 rows a wave loses)
+                    const bool rpb2 = c_ncols_dst > 4 && !wide && !tall && blocks_per_row_x <= 3 * blocks_per_iter_1warp &&
+                        nrows_x % 2 == 0 && !on_cliff(w_up / 2);
                     if (tall) {
                         launch_tall();
                     } else if (wide) {
                         launch_wide();
+                    } else if (rpb2) {
+                        launch(std::false_type{}, std::false_type{}, std::integral_constant<int, MMVQ_LV_RPB2>{});
                     } else {
                         launch_up();
                     }
@@ -1863,40 +1887,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
             switch (ncols_dst) {
                 case 2: launch_n(std::integral_constant<int, 2>{}); break;
                 case 3: launch_n(std::integral_constant<int, 3>{}); break;
-                default: launch_n(std::integral_constant<int, 4>{}); break;
+                case 4: launch_n(std::integral_constant<int, 4>{}); break;
+                case 5: launch_n(std::integral_constant<int, 5>{}); break;
+                case 6: launch_n(std::integral_constant<int, 6>{}); break;
+                case 7: launch_n(std::integral_constant<int, 7>{}); break;
+                default: launch_n(std::integral_constant<int, 8>{}); break;
             }
-        } break;
-        case 5: {
-            constexpr int c_ncols_dst = 5;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
-        } break;
-        case 6: {
-            constexpr int c_ncols_dst = 6;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
-        } break;
-        case 7: {
-            constexpr int c_ncols_dst = 7;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
-        } break;
-        case 8: {
-            constexpr int c_ncols_dst = 8;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
         } break;
         default:
             GGML_ABORT("fatal error");
