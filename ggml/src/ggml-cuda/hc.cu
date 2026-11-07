@@ -228,13 +228,16 @@ const half * ggml_cuda_f16_side_find(ggml_backend_cuda_context & ctx, const ggml
     return same ? ctx.f16_side_buf : nullptr;
 }
 
-static __global__ void k_scale_silu(const float * x, float * dst, block_q8_1 * q8, const float scale, const float bias, const int64_t n) {
+// q8: the consumer GEMV's q8_1 copy, ne0 elements a column at a column pitch of ne0_pad (ne0 % QK8_1 == 0, so a warp's
+// 32 consecutive elements are one block of one column)
+static __global__ void k_scale_silu(const float * x, float * dst, block_q8_1 * q8, const float scale, const float bias, const int64_t n,
+        const int64_t ne0, const int64_t ne0_pad) {
     const int64_t stride = (int64_t) blockDim.x * gridDim.x;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
         const float v = scale * x[i] + bias;
         const float r = v / (1.0f + expf(-v));
         dst[i] = r;
-        if (q8) { q8_side_store(q8, i, r); }
+        if (q8) { q8_side_store(q8, ne0 == ne0_pad ? i : (i / ne0) * ne0_pad + i % ne0, r); }
     }
 }
 
@@ -295,8 +298,15 @@ void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor 
     memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
     memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
     const int64_t n = ggml_nelements(dst);
-    block_q8_1 * q8 = ggml_cuda_q8_side_reserve(ctx, dst, n);
-    k_scale_silu<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) src0->data, (float *) dst->data, q8, scale, bias, n);
+    // a verify step's [K, nt] activation (qwen4exp's hc low rank, K = 320) in the consumer's padded column layout;
+    // one column is the flat sequence of its blocks
+    const int64_t ne0 = dst->ne[0], ne1 = ggml_nrows(dst);
+    const int64_t ne0_pad = ne1 > 1 ? GGML_PAD(ne0, MATRIX_ROW_PADDING) : ne0;
+    block_q8_1 * q8 = ne1 == 1 ? ggml_cuda_q8_side_reserve(ctx, dst, n)
+                    : ne0 % QK8_1 == 0 && dst->ne[2] == 1 && dst->ne[3] == 1 ? ggml_cuda_q8_side_reserve_rows(ctx, dst, ne0, ne1, ne0_pad)
+                    : nullptr;
+    k_scale_silu<<<hc_grid(n), HC_BLOCK, 0, ctx.stream()>>>((const float *) src0->data, (float *) dst->data, q8, scale, bias, n,
+            ne0, ne0_pad);
 }
 
 void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * xn, const ggml_tensor * g,
@@ -304,7 +314,10 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * xn
     GGML_ASSERT(xn->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(g) && ggml_is_contiguous(dst));
     const int64_t n = n_embd * nt;
-    block_q8_1 * q8 = nt == 1 ? ggml_cuda_q8_side_reserve(ctx, dst, n) : nullptr;
+    // verify widths: n_embd % MATRIX_ROW_PADDING == 0 makes the consumer's column layout the flat one
+    block_q8_1 * q8 = nt == 1 ? ggml_cuda_q8_side_reserve(ctx, dst, n)
+                    : n_embd % MATRIX_ROW_PADDING == 0 && dst->ne[0] == n_embd && ggml_nrows(dst) == nt
+                        ? ggml_cuda_q8_side_reserve_rows(ctx, dst, n_embd, nt, n_embd) : nullptr;
     // prefill widths on an MMQ device: the q8_1 copy the next q8_0 GEMM (attn_qkv / ssm in-projections) would quantize
     block_q8_1_mmq * mmq = nullptr;
     if (nt > 8 && n_embd % QK8_1_MMQ == 0 && n_embd % MATRIX_ROW_PADDING == 0 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) {
@@ -680,7 +693,7 @@ void ggml_cuda_op_hc_xn_materialize(ggml_backend_cuda_context & ctx, const float
 // conversion: bit-identical to the three launches and the pre-pass it replaces. Saves the normed rows' write and re-read
 // and the pre-pass read and write (Qwen3.8: ~400 MB per DeltaNet layer at 4096 tokens).
 static __global__ void __launch_bounds__(32) k_gdn_out_norm_gate(const float * x, const float * w, const float * z, float * dst,
-        half * d16, const int nr1, const int nr2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        half * d16, block_q8_1 * q8, const int nr1, const int nr2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
         const int64_t sz1, const int64_t sz2, const int64_t sz3, const float eps) {
     constexpr int ncols = 128;
     __shared__ float s_sum[32];
@@ -708,6 +721,23 @@ static __global__ void __launch_bounds__(32) k_gdn_out_norm_gate(const float * x
     if (dst) {   // nullptr: the f16 copy is the only output (its GEMM runs in the same fusion)
         ((float4 *) (dst + row*ncols))[tid] = o;
     }
+    if (q8) {   // the next GEMV's q8_1 copy (decode / verify widths): a block is 8 lanes, quantized as q8_side_store does
+        float amax = fmaxf(fmaxf(fabsf(o.x), fabsf(o.y)), fmaxf(fabsf(o.z), fabsf(o.w)));
+        amax = warp_reduce_max<8>(amax);
+        const float d = amax / 127.0f;
+        const int8_t q0 = amax == 0.0f ? 0 : roundf(o.x / d);
+        const int8_t q1 = amax == 0.0f ? 0 : roundf(o.y / d);
+        const int8_t q2 = amax == 0.0f ? 0 : roundf(o.z / d);
+        const int8_t q3 = amax == 0.0f ? 0 : roundf(o.w / d);
+        const int sumq = warp_reduce_sum<8>((int) q0 + (int) q1 + (int) q2 + (int) q3);
+        const int64_t idx = row*ncols + 4*tid;
+        block_q8_1 * bq = q8 + idx / QK8_1;
+        const int iqs = idx % QK8_1;
+        bq->qs[iqs + 0] = q0; bq->qs[iqs + 1] = q1; bq->qs[iqs + 2] = q2; bq->qs[iqs + 3] = q3;
+        if (iqs == 0) {
+            bq->ds = make_half2(d, d*sumq);
+        }
+    }
     if (d16) {
         const auto sat = [](const float v) { return v != v ? v : fminf(fmaxf(v, -65504.0f), 65504.0f); };
         half * h = d16 + row*ncols + 4*tid;
@@ -724,8 +754,13 @@ void ggml_cuda_op_gdn_out_norm_gate(ggml_backend_cuda_context & ctx, const ggml_
     GGML_ASSERT(x->ne[0] == 128 && ggml_are_same_shape(x, z) && ggml_are_same_shape(x, dst) && ggml_is_contiguous(dst));
     GGML_ASSERT(x->ne[1] <= 65535 && x->ne[2] <= 65535 && x->ne[3] <= 65535);
     const dim3 grid((unsigned) x->ne[1], (unsigned) x->ne[2], (unsigned) x->ne[3]);
+    // decode / verify widths: register the q8_1 copy of the [128*heads, nt] view the out projection reads; with
+    // 128*heads % MATRIX_ROW_PADDING == 0 the consumer's padded column layout is the flat block sequence
+    const int64_t ne0f = x->ne[0]*x->ne[1];
+    block_q8_1 * q8 = !f16_only && !d16 && x->ne[3] == 1 && ne0f % MATRIX_ROW_PADDING == 0
+        ? ggml_cuda_q8_side_reserve_rows(ctx, dst, ne0f, x->ne[2], ne0f) : nullptr;
     k_gdn_out_norm_gate<<<grid, 32, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (const float *) z->data,
-            f16_only ? nullptr : (float *) dst->data, d16, (int) x->ne[1], (int) x->ne[2],
+            f16_only ? nullptr : (float *) dst->data, d16, q8, (int) x->ne[1], (int) x->ne[2],
             x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
             z->nb[1] / sizeof(float), z->nb[2] / sizeof(float), z->nb[3] / sizeof(float), eps);
     CUDA_CHECK(cudaGetLastError());
